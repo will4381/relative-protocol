@@ -11,6 +11,7 @@
 
 #ifdef TARGET_OS_IOS
 #import <Foundation/Foundation.h>
+#import <Network/Network.h>
 #import <CoreTelephony/CTTelephonyNetworkInfo.h>
 #import <CoreTelephony/CTCarrier.h>
 #endif

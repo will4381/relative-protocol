@@ -1,4 +1,4 @@
-# Cross-platform sources that work everywhere
+# iOS VPN Framework - NetworkExtension compatible components
 set(RELATIVE_VPN_SOURCES
     core/logging.c
     packet/buffer_manager.c
@@ -12,22 +12,14 @@ set(RELATIVE_VPN_SOURCES
     privacy/guards.c
     api/vpn_api.c
     api/vpn_engine.c
+    reachability/monitor.mm
+    crash/reporter.mm
 )
 
-# Add platform-specific sources
-if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
-    # iOS uses NetworkExtension framework - exclude macOS-specific components
-    message(STATUS "Building for iOS - excluding macOS-specific components")
-    # iOS versions of these would be implemented differently using NetworkExtension
-else()
-    # macOS can use direct kernel APIs and Objective-C imports
-    list(APPEND RELATIVE_VPN_SOURCES
-        packet/utun.c
-        socket_bridge/bridge.c
-        reachability/monitor.c
-        crash/reporter.c
-    )
-endif()
+# Note: Excluded macOS-specific files:
+# - packet/utun.c (uses macOS kernel control APIs)
+# - socket_bridge/bridge.c (low-level socket bridging not needed on iOS)
+# On iOS, packet flow is handled via NEPacketTunnelProvider
 
 # Core headers that work on all platforms
 set(RELATIVE_VPN_HEADERS

@@ -36,7 +36,7 @@ tcp_connection_t *connection_manager_find_tcp_connection(connection_manager_t *m
 // iOS Memory pressure handling
 static void ios_memory_pressure_handler(void);
 static bool ios_get_memory_info(uint64_t *memory_used, uint64_t *memory_available);
-static void ios_reduce_memory_usage(comprehensive_vpn_state_t *state);
+// Forward declaration moved after struct definition
 #endif
 
 // Stub implementations for missing functions
@@ -96,6 +96,11 @@ typedef struct comprehensive_vpn_state {
     pthread_mutex_t queue_mutex;
     pthread_cond_t queue_cond;
 } comprehensive_vpn_state_t;
+
+#ifdef TARGET_OS_IOS
+// Forward declaration now that struct is defined
+static void ios_reduce_memory_usage(comprehensive_vpn_state_t *state);
+#endif
 
 static _Atomic(comprehensive_vpn_state_t*) g_vpn_state = NULL;
 static pthread_mutex_t g_state_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -858,7 +863,7 @@ vpn_result_t vpn_start_comprehensive(const vpn_config_t *config) {
     
     if (state->memory_pressure_source) {
         dispatch_source_set_event_handler(state->memory_pressure_source, ^{
-            dispatch_memorypressure_level_t level = dispatch_source_get_data(state->memory_pressure_source);
+            unsigned long level = dispatch_source_get_data(state->memory_pressure_source);
             
             pthread_mutex_lock(&state->mutex);
             state->last_memory_warning = clock_gettime_nsec_np(CLOCK_MONOTONIC);

@@ -13,7 +13,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include <libproc.h>
+// libproc.h not available on iOS
 #include <mach/mach.h>
 #include <mach/thread_info.h>
 #include <mach/thread_act.h>
