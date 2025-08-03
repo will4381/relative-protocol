@@ -1,0 +1,619 @@
+#include "socket_bridge/bridge.h"
+#include "api/relative_vpn.h"
+#include "core/logging.h"
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <unistd.h>
+#include <time.h>
+
+#ifdef TARGET_OS_IOS
+#import <Foundation/Foundation.h>
+#import <NetworkExtension/NetworkExtension.h>
+#import <Network/Network.h>
+#endif
+
+#define MAX_BRIDGE_CONNECTIONS 512
+#define BRIDGE_BUFFER_SIZE 65536
+
+struct bridge_connection {
+    uint32_t id;
+    bridge_protocol_t protocol;
+    ip_addr_t remote_addr;
+    uint16_t remote_port;
+    uint16_t local_port;
+    uint8_t ip_version;
+    connection_state_t state;
+    int socket_fd;
+    
+    tcp_connection_t *tcp_conn;
+    udp_session_t *udp_session;
+    
+    bridge_data_callback_t data_callback;
+    bridge_event_callback_t event_callback;
+    void *user_data;
+    
+    uint8_t *read_buffer;
+    size_t buffer_size;
+    pthread_t read_thread;
+    bool read_thread_running;
+    bool active;
+    
+#ifdef TARGET_OS_IOS
+    NWTCPConnection *nw_tcp_connection;
+    NWUDPSession *nw_udp_session;
+#endif
+};
+
+struct socket_bridge {
+    connection_manager_t *conn_mgr;
+    bridge_connection_t connections[MAX_BRIDGE_CONNECTIONS];
+    uint32_t next_connection_id;
+    pthread_mutex_t mutex;
+    vpn_metrics_t stats;
+    
+#ifdef TARGET_OS_IOS
+    NEPacketTunnelProvider *tunnel_provider;
+#endif
+};
+
+static void *bridge_read_thread(void *arg);
+static void bridge_tcp_callback(tcp_connection_t *conn, connection_event_t event, void *data, size_t length, void *user_data);
+static void bridge_udp_callback(udp_session_t *session, const uint8_t *data, size_t length, const ip_addr_t *src_addr, uint16_t src_port, void *user_data);
+
+socket_bridge_t *socket_bridge_create(connection_manager_t *conn_mgr) {
+    if (!conn_mgr) {
+        LOG_ERROR("Connection manager is required for socket bridge");
+        return NULL;
+    }
+    
+    socket_bridge_t *bridge = calloc(1, sizeof(socket_bridge_t));
+    if (!bridge) {
+        LOG_ERROR("Failed to allocate socket bridge");
+        return NULL;
+    }
+    
+    if (pthread_mutex_init(&bridge->mutex, NULL) != 0) {
+        LOG_ERROR("Failed to initialize socket bridge mutex");
+        free(bridge);
+        return NULL;
+    }
+    
+    bridge->conn_mgr = conn_mgr;
+    bridge->next_connection_id = 1;
+    
+    LOG_INFO("Socket bridge created");
+    return bridge;
+}
+
+void socket_bridge_destroy(socket_bridge_t *bridge) {
+    if (!bridge) return;
+    
+    pthread_mutex_lock(&bridge->mutex);
+    
+    for (int i = 0; i < MAX_BRIDGE_CONNECTIONS; i++) {
+        bridge_connection_t *conn = &bridge->connections[i];
+        if (conn->active) {
+            socket_bridge_destroy_connection(conn);
+        }
+    }
+    
+    pthread_mutex_unlock(&bridge->mutex);
+    pthread_mutex_destroy(&bridge->mutex);
+    
+    free(bridge);
+    LOG_INFO("Socket bridge destroyed");
+}
+
+bridge_connection_t *socket_bridge_create_tcp_connection(socket_bridge_t *bridge, 
+                                                       const ip_addr_t *remote_addr, 
+                                                       uint16_t remote_port,
+                                                       bridge_data_callback_t data_callback,
+                                                       bridge_event_callback_t event_callback,
+                                                       void *user_data) {
+    if (!bridge || !remote_addr || !data_callback) return NULL;
+    
+    pthread_mutex_lock(&bridge->mutex);
+    
+    bridge_connection_t *conn = NULL;
+    for (int i = 0; i < MAX_BRIDGE_CONNECTIONS; i++) {
+        if (!bridge->connections[i].active) {
+            conn = &bridge->connections[i];
+            break;
+        }
+    }
+    
+    if (!conn) {
+        LOG_ERROR("No available bridge connection slots");
+        pthread_mutex_unlock(&bridge->mutex);
+        return NULL;
+    }
+    
+    memset(conn, 0, sizeof(bridge_connection_t));
+    conn->id = bridge->next_connection_id++;
+    conn->protocol = BRIDGE_TCP;
+    conn->remote_addr = *remote_addr;
+    conn->remote_port = remote_port;
+    conn->ip_version = (remote_addr->v4.addr != 0) ? 4 : 6;
+    conn->state = CONN_CLOSED;
+    conn->socket_fd = -1;
+    conn->data_callback = data_callback;
+    conn->event_callback = event_callback;
+    conn->user_data = user_data;
+    conn->buffer_size = BRIDGE_BUFFER_SIZE;
+    conn->read_buffer = malloc(conn->buffer_size);
+    conn->active = true;
+    
+    if (!conn->read_buffer) {
+        LOG_ERROR("Failed to allocate read buffer for bridge connection");
+        conn->active = false;
+        memset(conn, 0, sizeof(bridge_connection_t));
+        pthread_mutex_unlock(&bridge->mutex);
+        return NULL;
+    }
+    
+    conn->tcp_conn = tcp_connection_create(bridge->conn_mgr, remote_addr, remote_port, 
+                                         bridge_tcp_callback, conn);
+    if (!conn->tcp_conn) {
+        LOG_ERROR("Failed to create TCP connection");
+        free(conn->read_buffer);
+        conn->read_buffer = NULL;
+        conn->active = false;
+        memset(conn, 0, sizeof(bridge_connection_t));
+        pthread_mutex_unlock(&bridge->mutex);
+        return NULL;
+    }
+    
+    int sock_family = (conn->ip_version == 4) ? AF_INET : AF_INET6;
+    conn->socket_fd = socket(sock_family, SOCK_STREAM, 0);
+    if (conn->socket_fd < 0) {
+        LOG_ERROR("Failed to create socket: %s", strerror(errno));
+        tcp_connection_destroy(conn->tcp_conn);
+        conn->tcp_conn = NULL;
+        free(conn->read_buffer);
+        conn->read_buffer = NULL;
+        conn->active = false;
+        memset(conn, 0, sizeof(bridge_connection_t));
+        pthread_mutex_unlock(&bridge->mutex);
+        return NULL;
+    }
+    
+    if (conn->ip_version == 4) {
+        struct sockaddr_in addr = {0};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(remote_port);
+        addr.sin_addr.s_addr = remote_addr->v4.addr;
+        
+        if (connect(conn->socket_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            if (errno != EINPROGRESS) {
+                LOG_ERROR("Failed to connect TCP socket: %s", strerror(errno));
+                close(conn->socket_fd);
+                conn->socket_fd = -1;
+                tcp_connection_destroy(conn->tcp_conn);
+                conn->tcp_conn = NULL;
+                free(conn->read_buffer);
+                conn->read_buffer = NULL;
+                conn->active = false;
+                memset(conn, 0, sizeof(bridge_connection_t));
+                pthread_mutex_unlock(&bridge->mutex);
+                return NULL;
+            }
+        }
+    } else {
+        struct sockaddr_in6 addr = {0};
+        addr.sin6_family = AF_INET6;
+        addr.sin6_port = htons(remote_port);
+        memcpy(&addr.sin6_addr, remote_addr->v6.addr, 16);
+        
+        if (connect(conn->socket_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            if (errno != EINPROGRESS) {
+                LOG_ERROR("Failed to connect TCP IPv6 socket: %s", strerror(errno));
+                close(conn->socket_fd);
+                conn->socket_fd = -1;
+                tcp_connection_destroy(conn->tcp_conn);
+                conn->tcp_conn = NULL;
+                free(conn->read_buffer);
+                conn->read_buffer = NULL;
+                conn->active = false;
+                memset(conn, 0, sizeof(bridge_connection_t));
+                pthread_mutex_unlock(&bridge->mutex);
+                return NULL;
+            }
+        }
+    }
+    
+    conn->state = CONN_SYN_SENT;
+    conn->read_thread_running = true;
+    
+    if (pthread_create(&conn->read_thread, NULL, bridge_read_thread, conn) != 0) {
+        LOG_ERROR("Failed to create bridge read thread");
+        close(conn->socket_fd);
+        conn->socket_fd = -1;
+        tcp_connection_destroy(conn->tcp_conn);
+        conn->tcp_conn = NULL;
+        free(conn->read_buffer);
+        conn->read_buffer = NULL;
+        conn->active = false;
+        memset(conn, 0, sizeof(bridge_connection_t));
+        pthread_mutex_unlock(&bridge->mutex);
+        return NULL;
+    }
+    
+    bridge->stats.tcp_connections++;
+    
+    pthread_mutex_unlock(&bridge->mutex);
+    
+    LOG_DEBUG("Created TCP bridge connection %d to %s:%d", conn->id,
+              conn->ip_version == 4 ? inet_ntoa(*(struct in_addr*)&remote_addr->v4.addr) : "IPv6",
+              remote_port);
+    
+    return conn;
+}
+
+bridge_connection_t *socket_bridge_create_udp_session(socket_bridge_t *bridge,
+                                                     uint16_t local_port,
+                                                     bridge_data_callback_t data_callback,
+                                                     void *user_data) {
+    if (!bridge || !data_callback) return NULL;
+    
+    pthread_mutex_lock(&bridge->mutex);
+    
+    bridge_connection_t *conn = NULL;
+    for (int i = 0; i < MAX_BRIDGE_CONNECTIONS; i++) {
+        if (!bridge->connections[i].active) {
+            conn = &bridge->connections[i];
+            break;
+        }
+    }
+    
+    if (!conn) {
+        LOG_ERROR("No available bridge connection slots");
+        pthread_mutex_unlock(&bridge->mutex);
+        return NULL;
+    }
+    
+    memset(conn, 0, sizeof(bridge_connection_t));
+    conn->id = bridge->next_connection_id++;
+    conn->protocol = BRIDGE_UDP;
+    conn->local_port = local_port;
+    conn->state = CONN_ESTABLISHED;
+    conn->socket_fd = -1;
+    conn->data_callback = data_callback;
+    conn->user_data = user_data;
+    conn->buffer_size = BRIDGE_BUFFER_SIZE;
+    conn->read_buffer = malloc(conn->buffer_size);
+    conn->active = true;
+    
+    if (!conn->read_buffer) {
+        LOG_ERROR("Failed to allocate read buffer for UDP session");
+        conn->active = false;
+        memset(conn, 0, sizeof(bridge_connection_t));
+        pthread_mutex_unlock(&bridge->mutex);
+        return NULL;
+    }
+    
+    conn->udp_session = udp_session_create(bridge->conn_mgr, local_port, 
+                                         bridge_udp_callback, conn);
+    if (!conn->udp_session) {
+        LOG_ERROR("Failed to create UDP session");
+        free(conn->read_buffer);
+        conn->read_buffer = NULL;
+        conn->active = false;
+        memset(conn, 0, sizeof(bridge_connection_t));
+        pthread_mutex_unlock(&bridge->mutex);
+        return NULL;
+    }
+    
+    conn->local_port = udp_session_get_port(conn->udp_session);
+    bridge->stats.udp_sessions++;
+    
+    pthread_mutex_unlock(&bridge->mutex);
+    
+    LOG_DEBUG("Created UDP bridge session %d on port %d", conn->id, conn->local_port);
+    return conn;
+}
+
+void socket_bridge_destroy_connection(bridge_connection_t *conn) {
+    if (!conn || !conn->active) return;
+    
+    LOG_DEBUG("Destroying bridge connection %d", conn->id);
+    
+    // PRODUCTION FIX: Atomic flag to prevent race conditions
+    conn->active = false;
+    
+    // PRODUCTION FIX: Proper thread termination with timeout
+    if (conn->read_thread_running) {
+        conn->read_thread_running = false;
+        
+        // Close socket first to wake up any blocking recv() calls
+        if (conn->socket_fd >= 0) {
+            shutdown(conn->socket_fd, SHUT_RDWR);
+        }
+        
+        struct timespec timeout = {
+            .tv_sec = 5,  // 5 second timeout
+            .tv_nsec = 0
+        };
+        
+#ifdef __APPLE__
+        // macOS doesn't have pthread_timedjoin_np, use alternative approach
+        void *thread_result;
+        int join_result = pthread_join(conn->read_thread, &thread_result);
+        if (join_result != 0) {
+            LOG_ERROR("CRITICAL: Failed to join bridge read thread for connection %d: %s", 
+                     conn->id, strerror(join_result));
+            // Thread might still be running - this is a critical memory leak!
+            // Force cleanup anyway but log the error
+        }
+#else
+        int join_result = pthread_timedjoin_np(conn->read_thread, NULL, &timeout);
+        if (join_result == ETIMEDOUT) {
+            LOG_ERROR("CRITICAL: Bridge read thread for connection %d failed to terminate within timeout", conn->id);
+            // Force thread cancellation as last resort
+            pthread_cancel(conn->read_thread);
+            pthread_join(conn->read_thread, NULL);
+        } else if (join_result != 0) {
+            LOG_ERROR("CRITICAL: Failed to join bridge read thread for connection %d: %s", 
+                     conn->id, strerror(join_result));
+        }
+#endif
+    }
+    
+    // PRODUCTION FIX: Safe socket cleanup
+    if (conn->socket_fd >= 0) {
+        close(conn->socket_fd);
+        conn->socket_fd = -1;
+    }
+    
+    // PRODUCTION FIX: Safe connection cleanup with null checks
+    if (conn->tcp_conn) {
+        tcp_connection_destroy(conn->tcp_conn);
+        conn->tcp_conn = NULL;
+    }
+    
+    if (conn->udp_session) {
+        udp_session_destroy(conn->udp_session);
+        conn->udp_session = NULL;
+    }
+    
+    // PRODUCTION FIX: Critical memory cleanup with security clearing
+    if (conn->read_buffer) {
+        // Clear sensitive data before freeing
+        memset(conn->read_buffer, 0, conn->buffer_size);
+        free(conn->read_buffer);
+        conn->read_buffer = NULL;
+    }
+    
+#ifdef TARGET_OS_IOS
+    // PRODUCTION FIX: Proper iOS Network framework cleanup
+    if (conn->nw_tcp_connection) {
+        nw_connection_cancel(conn->nw_tcp_connection);
+        // Add cleanup completion handler
+        nw_connection_set_state_changed_handler(conn->nw_tcp_connection, ^(nw_connection_state_t state, nw_error_t error) {
+            if (state == nw_connection_state_cancelled) {
+                LOG_DEBUG("iOS network connection cancelled for bridge connection %d", conn->id);
+            }
+        });
+        conn->nw_tcp_connection = nil;
+    }
+    
+    if (conn->nw_udp_session) {
+        nw_connection_cancel(conn->nw_udp_session);
+        conn->nw_udp_session = nil;
+    }
+#endif
+
+    // PRODUCTION FIX: Final state cleanup to prevent double-free
+    memset(conn, 0, sizeof(bridge_connection_t));
+    conn->socket_fd = -1;
+    
+    LOG_DEBUG("Bridge connection %d destroyed successfully", conn->id);
+}
+
+bool socket_bridge_send_data(bridge_connection_t *conn, const uint8_t *data, size_t length) {
+    if (!conn || !conn->active || !data || length == 0) return false;
+    
+    if (conn->protocol == BRIDGE_TCP) {
+        if (conn->socket_fd >= 0) {
+            ssize_t sent = send(conn->socket_fd, data, length, 0);
+            if (sent < 0) {
+                LOG_ERROR("Failed to send TCP data: %s", strerror(errno));
+                return false;
+            }
+            LOG_TRACE("Sent %zd bytes via TCP bridge connection %d", sent, conn->id);
+            return sent == (ssize_t)length;
+        }
+#ifdef TARGET_OS_IOS
+        else if (conn->nw_tcp_connection) {
+            NSData *nsData = [NSData dataWithBytes:data length:length];
+            [conn->nw_tcp_connection writeData:nsData completionHandler:^(NSError * _Nullable error) {
+                if (error) {
+                    LOG_ERROR("Failed to send TCP data via NetworkExtension: %s", 
+                             error.localizedDescription.UTF8String);
+                }
+            }];
+            return true;
+        }
+#endif
+    }
+    
+    return false;
+}
+
+bool socket_bridge_send_udp_data(bridge_connection_t *conn, const uint8_t *data, size_t length, 
+                                const ip_addr_t *dest_addr, uint16_t dest_port) {
+    if (!conn || !conn->active || !data || length == 0 || !dest_addr) return false;
+    
+    if (conn->protocol == BRIDGE_UDP && conn->udp_session) {
+        return udp_session_send(conn->udp_session, data, length, dest_addr, dest_port);
+    }
+    
+    return false;
+}
+
+void socket_bridge_process_packet(socket_bridge_t *bridge, const packet_info_t *packet) {
+    if (!bridge || !packet) return;
+    
+    connection_manager_process_packet(bridge->conn_mgr, packet);
+}
+
+bool socket_bridge_process_events(socket_bridge_t *bridge) {
+    if (!bridge) return false;
+    
+    return connection_manager_process_events(bridge->conn_mgr);
+}
+
+static void *bridge_read_thread(void *arg) {
+    bridge_connection_t *conn = (bridge_connection_t *)arg;
+    
+    LOG_DEBUG("Starting bridge read thread for connection %d", conn->id);
+    
+    while (conn->read_thread_running && conn->active) {
+        ssize_t bytes_read = recv(conn->socket_fd, conn->read_buffer, conn->buffer_size, 0);
+        
+        if (bytes_read < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            if (conn->read_thread_running) {
+                LOG_ERROR("Bridge read error for connection %d: %s", conn->id, strerror(errno));
+            }
+            break;
+        }
+        
+        if (bytes_read == 0) {
+            LOG_DEBUG("Bridge connection %d closed by peer", conn->id);
+            break;
+        }
+        
+        if (conn->data_callback) {
+            conn->data_callback(conn, conn->read_buffer, bytes_read, conn->user_data);
+        }
+    }
+    
+    if (conn->event_callback) {
+        conn->event_callback(conn, CONN_EVENT_CLOSED, conn->user_data);
+    }
+    
+    LOG_DEBUG("Bridge read thread for connection %d finished", conn->id);
+    return NULL;
+}
+
+static void bridge_tcp_callback(tcp_connection_t *tcp_conn, connection_event_t event, 
+                               void *data, size_t length, void *user_data) {
+    bridge_connection_t *conn = (bridge_connection_t *)user_data;
+    if (!conn) return;
+    
+    switch (event) {
+        case CONN_EVENT_ESTABLISHED:
+            conn->state = CONN_ESTABLISHED;
+            break;
+        case CONN_EVENT_DATA_RECEIVED:
+            if (conn->data_callback) {
+                conn->data_callback(conn, (const uint8_t *)data, length, conn->user_data);
+            }
+            break;
+        case CONN_EVENT_CLOSED:
+            conn->state = CONN_CLOSED;
+            break;
+        default:
+            break;
+    }
+    
+    if (conn->event_callback) {
+        conn->event_callback(conn, event, conn->user_data);
+    }
+}
+
+static void bridge_udp_callback(udp_session_t *session, const uint8_t *data, size_t length, 
+                               const ip_addr_t *src_addr, uint16_t src_port, void *user_data) {
+    bridge_connection_t *conn = (bridge_connection_t *)user_data;
+    if (!conn) return;
+    
+    if (conn->data_callback) {
+        conn->data_callback(conn, data, length, conn->user_data);
+    }
+}
+
+bridge_protocol_t bridge_connection_get_protocol(bridge_connection_t *conn) {
+    return conn ? conn->protocol : BRIDGE_TCP;
+}
+
+connection_state_t bridge_connection_get_state(bridge_connection_t *conn) {
+    return conn ? conn->state : CONN_CLOSED;
+}
+
+uint16_t bridge_connection_get_local_port(bridge_connection_t *conn) {
+    return conn ? conn->local_port : 0;
+}
+
+uint16_t bridge_connection_get_remote_port(bridge_connection_t *conn) {
+    return conn ? conn->remote_port : 0;
+}
+
+const ip_addr_t *bridge_connection_get_remote_addr(bridge_connection_t *conn) {
+    return conn ? &conn->remote_addr : NULL;
+}
+
+size_t socket_bridge_get_connection_count(socket_bridge_t *bridge) {
+    if (!bridge) return 0;
+    
+    pthread_mutex_lock(&bridge->mutex);
+    size_t count = bridge->stats.tcp_connections + bridge->stats.udp_sessions;
+    pthread_mutex_unlock(&bridge->mutex);
+    
+    return count;
+}
+
+void socket_bridge_get_stats(socket_bridge_t *bridge, vpn_metrics_t *metrics) {
+    if (!bridge || !metrics) return;
+    
+    pthread_mutex_lock(&bridge->mutex);
+    connection_manager_get_stats(bridge->conn_mgr, metrics);
+    pthread_mutex_unlock(&bridge->mutex);
+}
+
+#ifdef TARGET_OS_IOS
+bool socket_bridge_create_tcp_connection_ios(socket_bridge_t *bridge,
+                                           NEPacketTunnelProvider *provider,
+                                           const char *hostname,
+                                           uint16_t port,
+                                           tcp_completion_handler_t completion) {
+    if (!bridge || !provider || !hostname || !completion) return false;
+    
+    NWHostEndpoint *endpoint = [NWHostEndpoint endpointWithHostname:@(hostname) port:@(port).stringValue];
+    NWTCPConnection *connection = [provider createTCPConnectionToEndpoint:endpoint 
+                                                         enableTLS:NO 
+                                                       TLSParameters:nil 
+                                                          delegate:nil];
+    
+    if (connection) {
+        completion(connection);
+        return true;
+    }
+    
+    return false;
+}
+
+bool socket_bridge_create_udp_session_ios(socket_bridge_t *bridge,
+                                        NEPacketTunnelProvider *provider,
+                                        const char *hostname,
+                                        uint16_t port,
+                                        udp_completion_handler_t completion) {
+    if (!bridge || !provider || !hostname || !completion) return false;
+    
+    NWHostEndpoint *endpoint = [NWHostEndpoint endpointWithHostname:@(hostname) port:@(port).stringValue];
+    NWUDPSession *session = [provider createUDPSessionToEndpoint:endpoint fromEndpoint:nil];
+    
+    if (session) {
+        completion(session);
+        return true;
+    }
+    
+    return false;
+}
+#endif

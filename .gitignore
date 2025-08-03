@@ -1,0 +1,86 @@
+# Build directories
+build/
+install/
+out/
+
+# Analysis results
+analysis_results/
+
+# Test results
+test_results/
+
+# CMake generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.cmake
+
+# C/C++ build artifacts
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+*.exe
+
+# Compiled binaries
+*.bin
+*.app
+*.dmg
+
+# Debug files
+*.dSYM/
+*.pdb
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Core dumps
+core
+core.*
+
+# Package managers
+node_modules/
+.npm/
+
+# Python cache (for analysis scripts)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Coverage reports
+*.gcov
+*.gcda
+*.gcno
+coverage/
+*.lcov
+
+# Profiling data
+*.prof
+gmon.out
+
+# Valgrind output
+*.valgrind
+
+# Backup files
+*.bak
+*.backup
+*.orig
