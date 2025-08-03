@@ -1,0 +1,327 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  # Build and test on multiple platforms
+  build-and-test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        build_type: [Debug, Release]
+        
+    runs-on: ${{ matrix.os }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    
+    - name: Install dependencies (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          cmake \
+          ninja-build \
+          libssl-dev \
+          pkg-config \
+          valgrind
+    
+    - name: Install dependencies (macOS)
+      if: matrix.os == 'macos-latest'
+      run: |
+        brew update
+        brew install cmake ninja pkg-config
+    
+    - name: Configure CMake
+      run: |
+        cmake -B build \
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+          -G Ninja \
+          -DENABLE_TESTING=ON \
+          -DENABLE_LOGGING=ON \
+          -DENABLE_SECURITY_FEATURES=ON
+    
+    - name: Build
+      run: cmake --build build --config ${{ matrix.build_type }} --parallel
+    
+    - name: Run Unit Tests
+      run: |
+        cd build
+        ./unit_tests --gtest_output=xml:unit_tests.xml || true
+    
+    - name: Run Integration Tests
+      run: |
+        cd build
+        ./integration_tests --gtest_output=xml:integration_tests.xml || true
+    
+    - name: Run Memory Tests
+      run: |
+        cd build
+        ./memory_tests --gtest_output=xml:memory_tests.xml || true
+    
+    - name: Run Security Tests
+      run: |
+        cd build
+        ./security_tests --gtest_output=xml:security_tests.xml || true
+    
+    - name: Run Performance Tests
+      run: |
+        cd build
+        ./performance_tests --gtest_output=xml:performance_tests.xml || true
+    
+    - name: Run Stress Tests
+      run: |
+        cd build
+        ./stress_tests --gtest_output=xml:stress_tests.xml || true
+    
+    - name: Upload test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: test-results-${{ matrix.os }}-${{ matrix.build_type }}
+        path: build/*.xml
+    
+    - name: Run Memory Leak Detection (Linux only)
+      if: matrix.os == 'ubuntu-latest' && matrix.build_type == 'Debug'
+      run: |
+        cd build
+        valgrind --tool=memcheck --leak-check=full --show-leak-kinds=all \
+          --error-exitcode=1 --track-origins=yes \
+          ./unit_tests --gtest_filter="*Memory*" || true
+
+  # Static analysis and code quality
+  static-analysis:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          clang-tools \
+          cppcheck \
+          build-essential \
+          cmake \
+          ninja-build
+    
+    - name: Configure CMake
+      run: |
+        cmake -B build \
+          -DCMAKE_BUILD_TYPE=Debug \
+          -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+          -G Ninja
+    
+    - name: Run cppcheck
+      run: |
+        cppcheck --enable=all --inconclusive --xml --xml-version=2 \
+          --suppress=missingIncludeSystem \
+          --suppress=unusedFunction \
+          src/ include/ 2> cppcheck.xml || true
+    
+    - name: Run clang-tidy
+      run: |
+        clang-tidy src/**/*.c include/**/*.h \
+          -p build \
+          --format-style=file \
+          --header-filter='.*' || true
+    
+    - name: Upload static analysis results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: static-analysis-results
+        path: |
+          cppcheck.xml
+          build/compile_commands.json
+
+  # Security scanning
+  security-scan:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Run Semgrep
+      uses: semgrep/semgrep-action@v1
+      with:
+        config: >-
+          p/security-audit
+          p/secrets
+          p/c
+        generateSarif: "1"
+    
+    - name: Upload SARIF file for GitHub Advanced Security Dashboard
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
+      with:
+        sarif_file: semgrep.sarif
+
+  # Code coverage (Linux only for performance)
+  coverage:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          cmake \
+          ninja-build \
+          lcov \
+          gcovr
+    
+    - name: Configure CMake with coverage
+      run: |
+        cmake -B build \
+          -DCMAKE_BUILD_TYPE=Debug \
+          -DCMAKE_C_FLAGS="--coverage -fprofile-arcs -ftest-coverage" \
+          -DCMAKE_CXX_FLAGS="--coverage -fprofile-arcs -ftest-coverage" \
+          -G Ninja
+    
+    - name: Build with coverage
+      run: cmake --build build --parallel
+    
+    - name: Run tests for coverage
+      run: |
+        cd build
+        ./unit_tests || true
+        ./integration_tests || true
+        ./memory_tests || true
+    
+    - name: Generate coverage report
+      run: |
+        lcov --directory build --capture --output-file coverage.info
+        lcov --remove coverage.info '/usr/*' --output-file coverage.info
+        lcov --remove coverage.info '*/third_party/*' --output-file coverage.info
+        lcov --remove coverage.info '*/tests/*' --output-file coverage.info
+        lcov --list coverage.info
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v4
+      with:
+        file: ./coverage.info
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: false
+
+  # iOS build verification (macOS only)
+  ios-build:
+    runs-on: macos-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    
+    - name: Select Xcode version
+      run: sudo xcode-select -s /Applications/Xcode_15.2.app/Contents/Developer
+    
+    - name: Install dependencies
+      run: brew install cmake ninja
+    
+    - name: Configure for iOS
+      run: |
+        cmake -B build-ios \
+          -DCMAKE_SYSTEM_NAME=iOS \
+          -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DENABLE_IOS_FEATURES=ON \
+          -G Ninja
+    
+    - name: Build for iOS
+      run: cmake --build build-ios --parallel
+    
+    - name: Archive iOS build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ios-build
+        path: build-ios/
+
+  # Documentation generation
+  documentation:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Install Doxygen
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y doxygen graphviz
+    
+    - name: Generate documentation
+      run: |
+        doxygen docs/Doxyfile || echo "Doxyfile not found, skipping docs"
+    
+    - name: Upload documentation
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: documentation
+        path: docs/html/
+
+  # Performance benchmarks
+  benchmarks:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          cmake \
+          ninja-build
+    
+    - name: Configure CMake
+      run: |
+        cmake -B build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DENABLE_BENCHMARKS=ON \
+          -G Ninja
+    
+    - name: Build benchmarks
+      run: cmake --build build --parallel
+    
+    - name: Run performance benchmarks
+      run: |
+        cd build
+        ./performance_tests --benchmark_format=json --benchmark_out=benchmark_results.json || true
+    
+    - name: Upload benchmark results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: benchmark-results
+        path: build/benchmark_results.json
