@@ -9,18 +9,24 @@
 #include <random>
 #include <queue>
 #include <mutex>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <cstring>
 
 class ConcurrentStressTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        vpn_config_init(&config);
-        config.enable_logging = false;
+        memset(&config, 0, sizeof(config));
+        config.ipv4_enabled = true;
+        config.ipv6_enabled = false;
+        config.mtu = 1500;
         config.tunnel_mtu = 1500;
-        inet_pton(AF_INET, "10.0.0.1", &config.tunnel_ipv4);
-        inet_pton(AF_INET, "255.255.255.0", &config.tunnel_netmask);
+        config.enable_dns_leak_protection = true;
+        config.enable_kill_switch = true;
         
         config.dns_server_count = 1;
-        inet_pton(AF_INET, "8.8.8.8", &config.dns_servers[0]);
+        config.dns_servers[0] = inet_addr("8.8.8.8");
         
         config.enable_kill_switch = true;
         config.enable_dns_leak_protection = true;
@@ -28,7 +34,7 @@ protected:
     
     void TearDown() override {
         if (result.handle != VPN_INVALID_HANDLE) {
-            vpn_stop(result.handle);
+            vpn_stop_comprehensive(result.handle);
         }
     }
     
@@ -89,8 +95,8 @@ protected:
 };
 
 TEST_F(ConcurrentStressTest, MassiveConnectionCreation) {
-    result = vpn_start(&config);
-    ASSERT_EQ(result.status, VPN_STATUS_SUCCESS);
+    result = vpn_start_comprehensive(&config);
+    ASSERT_EQ(result.status, VPN_SUCCESS);
     
     const int total_connections = 10000;
     const int num_threads = 10;
@@ -132,7 +138,7 @@ TEST_F(ConcurrentStressTest, MassiveConnectionCreation) {
                 packet.flow.dst_port = dst_port;
                 packet.timestamp_ns = clock_gettime_nsec_np(CLOCK_MONOTONIC);
                 
-                if (vpn_inject_packet(result.handle, &packet)) {
+                if (vpn_inject_packet_comprehensive(result.handle, &packet)) {
                     packets_sent.fetch_add(1);
                     if (pkt == 0) successful_connections.fetch_add(1);
                 } else {
@@ -166,7 +172,7 @@ TEST_F(ConcurrentStressTest, MassiveConnectionCreation) {
     std::cout << "Total packets sent: " << packets_sent.load() << std::endl;
     
     vpn_metrics_t metrics;
-    EXPECT_TRUE(vpn_get_metrics(result.handle, &metrics));
+    EXPECT_TRUE(vpn_get_metrics_comprehensive(result.handle, &metrics));
     std::cout << "VPN processed: " << metrics.total_packets_processed << " packets" << std::endl;
     std::cout << "TCP connections: " << metrics.tcp_connections << std::endl;
     std::cout << "UDP sessions: " << metrics.udp_sessions << std::endl;
@@ -174,12 +180,12 @@ TEST_F(ConcurrentStressTest, MassiveConnectionCreation) {
     // Expect reasonable success rate even under stress
     EXPECT_GT(successful_connections.load(), total_connections * 0.7); // 70% success rate
     EXPECT_GT(packets_sent.load(), 0);
-    EXPECT_TRUE(vpn_is_running(result.handle));
+    EXPECT_TRUE(vpn_is_running_comprehensive(result.handle));
 }
 
 TEST_F(ConcurrentStressTest, HighFrequencyPacketBurst) {
-    result = vpn_start(&config);
-    ASSERT_EQ(result.status, VPN_STATUS_SUCCESS);
+    result = vpn_start_comprehensive(&config);
+    ASSERT_EQ(result.status, VPN_SUCCESS);
     
     const int burst_size = 1000;
     const int num_bursts = 50;
@@ -229,7 +235,7 @@ TEST_F(ConcurrentStressTest, HighFrequencyPacketBurst) {
             // Send burst as fast as possible
             int sent_in_burst = 0;
             for (int i = 0; i < burst_size; i++) {
-                if (vpn_inject_packet(result.handle, &packet_infos[i])) {
+                if (vpn_inject_packet_comprehensive(result.handle, &packet_infos[i])) {
                     sent_in_burst++;
                 }
             }
@@ -265,7 +271,7 @@ TEST_F(ConcurrentStressTest, HighFrequencyPacketBurst) {
     std::cout << "Packet rate: " << packets_per_second << " packets/sec" << std::endl;
     
     vpn_metrics_t metrics;
-    EXPECT_TRUE(vpn_get_metrics(result.handle, &metrics));
+    EXPECT_TRUE(vpn_get_metrics_comprehensive(result.handle, &metrics));
     std::cout << "VPN processed: " << metrics.total_packets_processed << " packets" << std::endl;
     
     EXPECT_EQ(bursts_completed.load(), num_bursts);
@@ -274,8 +280,8 @@ TEST_F(ConcurrentStressTest, HighFrequencyPacketBurst) {
 }
 
 TEST_F(ConcurrentStressTest, LongRunningStability) {
-    result = vpn_start(&config);
-    ASSERT_EQ(result.status, VPN_STATUS_SUCCESS);
+    result = vpn_start_comprehensive(&config);
+    ASSERT_EQ(result.status, VPN_SUCCESS);
     
     const auto test_duration = std::chrono::minutes(2); // 2 minute stress test
     const int num_traffic_threads = 6;
@@ -316,7 +322,7 @@ TEST_F(ConcurrentStressTest, LongRunningStability) {
             packet.flow.dst_port = dst_port;
             packet.timestamp_ns = clock_gettime_nsec_np(CLOCK_MONOTONIC);
             
-            if (vpn_inject_packet(result.handle, &packet)) {
+            if (vpn_inject_packet_comprehensive(result.handle, &packet)) {
                 total_packets.fetch_add(1);
             } else {
                 errors_detected.fetch_add(1);
@@ -332,13 +338,13 @@ TEST_F(ConcurrentStressTest, LongRunningStability) {
         vpn_metrics_t last_metrics = {};
         
         while (test_running.load()) {
-            if (!vpn_is_running(result.handle)) {
+            if (!vpn_is_running_comprehensive(result.handle)) {
                 errors_detected.fetch_add(1000); // Major error
                 break;
             }
             
             vpn_metrics_t current_metrics;
-            if (vpn_get_metrics(result.handle, &current_metrics)) {
+            if (vpn_get_metrics_comprehensive(result.handle, &current_metrics)) {
                 // Check for progress and consistency
                 if (current_metrics.total_packets_processed < last_metrics.total_packets_processed) {
                     errors_detected.fetch_add(1); // Metrics regression
@@ -382,7 +388,7 @@ TEST_F(ConcurrentStressTest, LongRunningStability) {
     std::cout << "Errors detected: " << errors_detected.load() << std::endl;
     
     vpn_metrics_t final_metrics;
-    EXPECT_TRUE(vpn_get_metrics(result.handle, &final_metrics));
+    EXPECT_TRUE(vpn_get_metrics_comprehensive(result.handle, &final_metrics));
     
     std::cout << "Final VPN metrics:" << std::endl;
     std::cout << "  Processed: " << final_metrics.total_packets_processed << " packets" << std::endl;
@@ -392,7 +398,7 @@ TEST_F(ConcurrentStressTest, LongRunningStability) {
     std::cout << "  Uptime: " << final_metrics.uptime_seconds << " seconds" << std::endl;
     
     // Stability checks
-    EXPECT_TRUE(vpn_is_running(result.handle));
+    EXPECT_TRUE(vpn_is_running_comprehensive(result.handle));
     EXPECT_GT(total_packets.load(), 1000); // Should have sent substantial traffic
     EXPECT_LT(errors_detected.load(), total_packets.load() * 0.01); // < 1% error rate
     EXPECT_GT(final_metrics.total_packets_processed, 0);
@@ -400,8 +406,8 @@ TEST_F(ConcurrentStressTest, LongRunningStability) {
 }
 
 TEST_F(ConcurrentStressTest, MemoryPressureTest) {
-    result = vpn_start(&config);
-    ASSERT_EQ(result.status, VPN_STATUS_SUCCESS);
+    result = vpn_start_comprehensive(&config);
+    ASSERT_EQ(result.status, VPN_SUCCESS);
     
     const int num_memory_stress_threads = 4;
     const int allocations_per_thread = 1000;
@@ -445,7 +451,7 @@ TEST_F(ConcurrentStressTest, MemoryPressureTest) {
                 packet.flow.dst_port = 53;
                 packet.timestamp_ns = clock_gettime_nsec_np(CLOCK_MONOTONIC);
                 
-                if (vpn_inject_packet(result.handle, &packet)) {
+                if (vpn_inject_packet_comprehensive(result.handle, &packet)) {
                     packets_sent.fetch_add(1);
                 }
             }
@@ -477,19 +483,19 @@ TEST_F(ConcurrentStressTest, MemoryPressureTest) {
     std::cout << "Packets sent: " << packets_sent.load() << std::endl;
     
     vpn_metrics_t metrics;
-    EXPECT_TRUE(vpn_get_metrics(result.handle, &metrics));
+    EXPECT_TRUE(vpn_get_metrics_comprehensive(result.handle, &metrics));
     std::cout << "VPN processed: " << metrics.total_packets_processed << " packets" << std::endl;
     
     // Memory stress should not break the VPN
-    EXPECT_TRUE(vpn_is_running(result.handle));
+    EXPECT_TRUE(vpn_is_running_comprehensive(result.handle));
     EXPECT_EQ(allocations_completed.load(), num_memory_stress_threads * allocations_per_thread);
     EXPECT_GT(packets_sent.load(), 0);
     EXPECT_GT(metrics.total_packets_processed, 0);
 }
 
 TEST_F(ConcurrentStressTest, ConfigurationChangeUnderLoad) {
-    result = vpn_start(&config);
-    ASSERT_EQ(result.status, VPN_STATUS_SUCCESS);
+    result = vpn_start_comprehensive(&config);
+    ASSERT_EQ(result.status, VPN_SUCCESS);
     
     const int traffic_duration_seconds = 30;
     const int config_changes = 10;
@@ -520,7 +526,7 @@ TEST_F(ConcurrentStressTest, ConfigurationChangeUnderLoad) {
             packet.flow.dst_port = 53;
             packet.timestamp_ns = clock_gettime_nsec_np(CLOCK_MONOTONIC);
             
-            if (vpn_inject_packet(result.handle, &packet)) {
+            if (vpn_inject_packet_comprehensive(result.handle, &packet)) {
                 packets_sent.fetch_add(1);
             }
             
@@ -543,7 +549,7 @@ TEST_F(ConcurrentStressTest, ConfigurationChangeUnderLoad) {
                 test_config.enable_dns_leak_protection = true;
             }
             
-            if (vpn_update_config(result.handle, &test_config)) {
+            if (vpn_update_config_comprehensive(result.handle, &test_config)) {
                 config_changes_applied.fetch_add(1);
             }
             
@@ -563,11 +569,11 @@ TEST_F(ConcurrentStressTest, ConfigurationChangeUnderLoad) {
     std::cout << "Configuration changes applied: " << config_changes_applied.load() << "/" << config_changes << std::endl;
     
     vpn_metrics_t metrics;
-    EXPECT_TRUE(vpn_get_metrics(result.handle, &metrics));
+    EXPECT_TRUE(vpn_get_metrics_comprehensive(result.handle, &metrics));
     std::cout << "VPN processed: " << metrics.total_packets_processed << " packets" << std::endl;
     
     // VPN should remain stable during config changes
-    EXPECT_TRUE(vpn_is_running(result.handle));
+    EXPECT_TRUE(vpn_is_running_comprehensive(result.handle));
     EXPECT_GT(packets_sent.load(), 1000);
     EXPECT_GT(config_changes_applied.load(), config_changes / 2); // At least half should succeed
 }

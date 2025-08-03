@@ -607,3 +607,233 @@ static bool nat64_translate_udp_6to4(nat64_translator_t *translator, const struc
     
     return true;
 }
+
+// PRODUCTION FIX: Implement missing NAT64 checksum translation functions
+uint16_t nat64_translate_checksum_4to6(uint16_t ipv4_checksum, const ipv4_addr_t *ipv4_src, 
+                                      const ipv4_addr_t *ipv4_dst, const ipv6_addr_t *ipv6_src, 
+                                      const ipv6_addr_t *ipv6_dst) {
+    if (!ipv4_src || !ipv4_dst || !ipv6_src || !ipv6_dst) {
+        return ipv4_checksum;  // Return original if invalid parameters
+    }
+    
+    // RFC 6052: Checksum adjustment for IPv4 to IPv6 translation
+    // We need to adjust the checksum by removing IPv4 addresses and adding IPv6 addresses
+    uint32_t checksum = ~ipv4_checksum & 0xFFFF;
+    
+    // Remove IPv4 source address contribution (32-bit)
+    uint32_t ipv4_src_addr = ntohl(ipv4_src->addr);
+    checksum -= (ipv4_src_addr >> 16) & 0xFFFF;
+    checksum -= ipv4_src_addr & 0xFFFF;
+    
+    // Remove IPv4 destination address contribution (32-bit)  
+    uint32_t ipv4_dst_addr = ntohl(ipv4_dst->addr);
+    checksum -= (ipv4_dst_addr >> 16) & 0xFFFF;
+    checksum -= ipv4_dst_addr & 0xFFFF;
+    
+    // Add IPv6 source address contribution (128-bit)
+    for (int i = 0; i < 8; i++) {
+        uint16_t word = ntohs(((uint16_t*)ipv6_src->addr)[i]);
+        checksum += word;
+    }
+    
+    // Add IPv6 destination address contribution (128-bit)
+    for (int i = 0; i < 8; i++) {
+        uint16_t word = ntohs(((uint16_t*)ipv6_dst->addr)[i]);
+        checksum += word;
+    }
+    
+    // Handle carry bits
+    while (checksum >> 16) {
+        checksum = (checksum & 0xFFFF) + (checksum >> 16);
+    }
+    
+    return ~checksum & 0xFFFF;
+}
+
+uint16_t nat64_translate_checksum_6to4(uint16_t ipv6_checksum, const ipv6_addr_t *ipv6_src, 
+                                      const ipv6_addr_t *ipv6_dst, const ipv4_addr_t *ipv4_src, 
+                                      const ipv4_addr_t *ipv4_dst) {
+    if (!ipv6_src || !ipv6_dst || !ipv4_src || !ipv4_dst) {
+        return ipv6_checksum;  // Return original if invalid parameters
+    }
+    
+    // RFC 6052: Checksum adjustment for IPv6 to IPv4 translation
+    // We need to adjust the checksum by removing IPv6 addresses and adding IPv4 addresses
+    uint32_t checksum = ~ipv6_checksum & 0xFFFF;
+    
+    // Remove IPv6 source address contribution (128-bit)
+    for (int i = 0; i < 8; i++) {
+        uint16_t word = ntohs(((uint16_t*)ipv6_src->addr)[i]);
+        checksum -= word;
+    }
+    
+    // Remove IPv6 destination address contribution (128-bit)  
+    for (int i = 0; i < 8; i++) {
+        uint16_t word = ntohs(((uint16_t*)ipv6_dst->addr)[i]);
+        checksum -= word;
+    }
+    
+    // Add IPv4 source address contribution (32-bit)
+    uint32_t ipv4_src_addr = ntohl(ipv4_src->addr);
+    checksum += (ipv4_src_addr >> 16) & 0xFFFF;
+    checksum += ipv4_src_addr & 0xFFFF;
+    
+    // Add IPv4 destination address contribution (32-bit)
+    uint32_t ipv4_dst_addr = ntohl(ipv4_dst->addr);
+    checksum += (ipv4_dst_addr >> 16) & 0xFFFF;
+    checksum += ipv4_dst_addr & 0xFFFF;
+    
+    // Handle carry bits and underflow
+    while (checksum >> 16) {
+        checksum = (checksum & 0xFFFF) + (checksum >> 16);
+    }
+    
+    return ~checksum & 0xFFFF;
+}
+
+// PRODUCTION FIX: Add missing NAT64 stats function
+void nat64_get_stats(nat64_translator_t *translator, nat64_stats_t *stats) {
+    if (!translator || !stats) {
+        return;
+    }
+    
+    pthread_mutex_lock(&translator->mutex);
+    
+    // Copy current statistics
+    memcpy(stats, &translator->stats, sizeof(nat64_stats_t));
+    
+    // Update active mapping count
+    stats->active_mappings = 0;
+    for (size_t i = 0; i < translator->mapping_count; i++) {
+        if (translator->mappings[i].active) {
+            stats->active_mappings++;
+        }
+    }
+    
+    stats->total_mappings = translator->mapping_count;
+    
+    pthread_mutex_unlock(&translator->mutex);
+}
+
+// PRODUCTION FIX: Add missing NAT64 functions required by unit tests
+bool nat64_set_prefix(nat64_translator_t *translator, const ipv6_addr_t *prefix, uint8_t prefix_length) {
+    if (!translator || !prefix || prefix_length > 128) {
+        return false;
+    }
+    
+    pthread_mutex_lock(&translator->mutex);
+    memcpy(&translator->prefix, prefix, sizeof(ipv6_addr_t));
+    translator->prefix_length = prefix_length;
+    pthread_mutex_unlock(&translator->mutex);
+    
+    return true;
+}
+
+bool nat64_get_prefix(nat64_translator_t *translator, ipv6_addr_t *prefix, uint8_t *prefix_length) {
+    if (!translator || !prefix || !prefix_length) {
+        return false;
+    }
+    
+    pthread_mutex_lock(&translator->mutex);
+    memcpy(prefix, &translator->prefix, sizeof(ipv6_addr_t));
+    *prefix_length = translator->prefix_length;
+    pthread_mutex_unlock(&translator->mutex);
+    
+    return true;
+}
+
+bool nat64_add_static_mapping(nat64_translator_t *translator, const ipv4_addr_t *ipv4_addr, 
+                             const ipv6_addr_t *ipv6_addr) {
+    if (!translator || !ipv4_addr || !ipv6_addr) {
+        return false;
+    }
+    
+    pthread_mutex_lock(&translator->mutex);
+    
+    nat64_mapping_t *mapping = nat64_create_mapping(translator, ipv4_addr, ipv6_addr, 0, 0, 0);
+    if (mapping) {
+        // Mark as static mapping (won't timeout)
+        mapping->created_time_ns = 0;
+        mapping->last_activity_ns = UINT64_MAX;
+    }
+    
+    pthread_mutex_unlock(&translator->mutex);
+    
+    return (mapping != NULL);
+}
+
+bool nat64_remove_static_mapping(nat64_translator_t *translator, const ipv4_addr_t *ipv4_addr) {
+    if (!translator || !ipv4_addr) {
+        return false;
+    }
+    
+    pthread_mutex_lock(&translator->mutex);
+    
+    bool found = false;
+    for (size_t i = 0; i < translator->mapping_count; i++) {
+        nat64_mapping_t *mapping = &translator->mappings[i];
+        if (mapping->active && 
+            mapping->ipv4_addr.addr == ipv4_addr->addr &&
+            mapping->created_time_ns == 0) { // Static mapping marker
+            mapping->active = false;
+            translator->stats.active_mappings--;
+            found = true;
+            break;
+        }
+    }
+    
+    pthread_mutex_unlock(&translator->mutex);
+    
+    return found;
+}
+
+void nat64_set_mapping_timeout(nat64_translator_t *translator, uint32_t timeout_seconds) {
+    if (!translator) {
+        return;
+    }
+    
+    pthread_mutex_lock(&translator->mutex);
+    translator->mapping_timeout_seconds = timeout_seconds;
+    pthread_mutex_unlock(&translator->mutex);
+}
+
+void nat64_cleanup_expired_mappings(nat64_translator_t *translator) {
+    if (!translator) {
+        return;
+    }
+    
+    pthread_mutex_lock(&translator->mutex);
+    
+    uint64_t current_time = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    uint64_t timeout_ns = (uint64_t)translator->mapping_timeout_seconds * 1000000000ULL;
+    
+    for (size_t i = 0; i < translator->mapping_count; i++) {
+        nat64_mapping_t *mapping = &translator->mappings[i];
+        if (mapping->active && 
+            mapping->created_time_ns != 0 && // Not a static mapping
+            (current_time - mapping->last_activity_ns) > timeout_ns) {
+            mapping->active = false;
+            translator->stats.active_mappings--;
+            translator->stats.mapping_timeouts++;
+        }
+    }
+    
+    pthread_mutex_unlock(&translator->mutex);
+}
+
+size_t nat64_get_mapping_count(nat64_translator_t *translator) {
+    if (!translator) {
+        return 0;
+    }
+    
+    pthread_mutex_lock(&translator->mutex);
+    size_t active_count = 0;
+    for (size_t i = 0; i < translator->mapping_count; i++) {
+        if (translator->mappings[i].active) {
+            active_count++;
+        }
+    }
+    pthread_mutex_unlock(&translator->mutex);
+    
+    return active_count;
+}

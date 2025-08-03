@@ -5,6 +5,10 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct ring_buffer ring_buffer_t;
 
 typedef struct flow_metrics {
@@ -33,5 +37,9 @@ bool ring_buffer_is_full(ring_buffer_t *rb);
 void ring_buffer_clear(ring_buffer_t *rb);
 size_t ring_buffer_get_size(ring_buffer_t *rb);
 size_t ring_buffer_get_count(ring_buffer_t *rb);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

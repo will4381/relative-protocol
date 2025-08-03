@@ -12,6 +12,7 @@ set(RELATIVE_VPN_SOURCES
     reachability/monitor.c
     classifier/tls_quic.c
     privacy/guards.c
+    crash/reporter.c
     api/vpn_api.c
     api/vpn_engine.c
 )
@@ -42,6 +43,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
         "-framework Network"
         "-framework NetworkExtension"
         "-framework SystemConfiguration"
+        "-framework Security"
     )
 endif()
 

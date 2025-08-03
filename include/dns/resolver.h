@@ -5,6 +5,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define DNS_MAX_NAME_LENGTH 253
 #define DNS_MAX_LABEL_LENGTH 63
 #define DNS_DEFAULT_TIMEOUT_MS 5000
@@ -97,5 +101,9 @@ size_t dns_build_query(const char *hostname, dns_record_type_t type, uint16_t tr
 
 const char *dns_rcode_to_string(dns_response_code_t rcode);
 const char *dns_type_to_string(dns_record_type_t type);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

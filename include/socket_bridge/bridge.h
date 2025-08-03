@@ -6,6 +6,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct socket_bridge socket_bridge_t;
 typedef struct bridge_connection bridge_connection_t;
 
@@ -50,7 +54,7 @@ const ip_addr_t *bridge_connection_get_remote_addr(bridge_connection_t *conn);
 size_t socket_bridge_get_connection_count(socket_bridge_t *bridge);
 void socket_bridge_get_stats(socket_bridge_t *bridge, vpn_metrics_t *metrics);
 
-#ifdef TARGET_OS_IOS
+#if defined(TARGET_OS_IOS) && defined(__OBJC__)
 #import <NetworkExtension/NetworkExtension.h>
 
 typedef void (^tcp_completion_handler_t)(NWTCPConnection * _Nullable connection);
@@ -67,6 +71,10 @@ bool socket_bridge_create_udp_session_ios(socket_bridge_t *bridge,
                                         const char *hostname,
                                         uint16_t port,
                                         udp_completion_handler_t completion);
+#endif
+
+#ifdef __cplusplus
+}
 #endif
 
 #endif

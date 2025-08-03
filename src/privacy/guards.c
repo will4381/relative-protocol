@@ -64,6 +64,11 @@ struct privacy_guards {
     bool kill_switch_enabled;
     bool kill_switch_active;
     
+    // VPN configuration context for proper leak detection
+    bool vpn_supports_ipv4;
+    bool vpn_supports_ipv6;
+    bool vpn_tunnel_active;
+    
     ip_addr_t allowed_dns_servers[MAX_ALLOWED_DNS_SERVERS];
     size_t allowed_dns_server_count;
     
@@ -88,6 +93,7 @@ static bool privacy_hostname_matches_pin(const char *hostname, const cert_pin_t 
 static void privacy_record_violation(privacy_guards_t *guards, privacy_violation_type_t type,
                                    const flow_tuple_t *flow, const char *description, bool blocked);
 static void privacy_activate_kill_switch(privacy_guards_t *guards, const char *reason);
+static bool privacy_guards_is_legitimate_ipv6_traffic(privacy_guards_t *guards, const flow_tuple_t *flow);
 
 privacy_guards_t *privacy_guards_create(void) {
     privacy_guards_t *guards = calloc(1, sizeof(privacy_guards_t));
@@ -108,6 +114,11 @@ privacy_guards_t *privacy_guards_create(void) {
     guards->kill_switch_enabled = true;
     guards->kill_switch_active = false;
     guards->dns_leak_status = DNS_LEAK_STATUS_NONE;
+    
+    // Initialize VPN configuration context (will be updated by VPN engine)
+    guards->vpn_supports_ipv4 = true;   // Default to dual-stack
+    guards->vpn_supports_ipv6 = true;
+    guards->vpn_tunnel_active = false;
     
     LOG_INFO("Privacy guards created with default protections enabled");
     return guards;
@@ -262,20 +273,28 @@ bool privacy_guards_inspect_packet(privacy_guards_t *guards, const uint8_t *pack
         }
     }
     
-    // Check for IPv6 leaks when VPN is IPv4-only
+    // Check for IPv6 leaks - only block if VPN is configured as IPv4-only
+    // Note: This requires VPN configuration context to determine if IPv6 is supported
+    // For now, we implement intelligent IPv6 leak detection that considers:
+    // 1. Whether the VPN tunnel supports IPv6
+    // 2. Whether this IPv6 traffic is bypassing the VPN inappropriately
     if (guards->ipv6_leak_protection_enabled && flow->ip_version == 6) {
-        guards->stats.ipv6_leaks_detected++;
+        bool is_legitimate_ipv6 = privacy_guards_is_legitimate_ipv6_traffic(guards, flow);
         
-        if (guards->kill_switch_enabled) {
-            *should_block = true;
-            guards->stats.ipv6_leaks_blocked++;
-            guards->stats.packets_blocked++;
+        if (!is_legitimate_ipv6) {
+            guards->stats.ipv6_leaks_detected++;
             
-            privacy_record_violation(guards, PRIVACY_VIOLATION_IPV6_LEAK, flow,
-                                   "IPv6 traffic detected in IPv4-only VPN", true);
-        } else {
-            privacy_record_violation(guards, PRIVACY_VIOLATION_IPV6_LEAK, flow,
-                                   "IPv6 traffic detected in IPv4-only VPN", false);
+            if (guards->kill_switch_enabled) {
+                *should_block = true;
+                guards->stats.ipv6_leaks_blocked++;
+                guards->stats.packets_blocked++;
+                
+                privacy_record_violation(guards, PRIVACY_VIOLATION_IPV6_LEAK, flow,
+                                       "IPv6 traffic bypassing VPN tunnel detected", true);
+            } else {
+                privacy_record_violation(guards, PRIVACY_VIOLATION_IPV6_LEAK, flow,
+                                       "IPv6 traffic bypassing VPN tunnel detected", false);
+            }
         }
     }
     
@@ -1059,4 +1078,93 @@ static bool privacy_hostname_matches_pin(const char *hostname, const cert_pin_t 
         // Exact hostname match
         return strcasecmp(hostname, pin->hostname) == 0;
     }
+}
+
+// Intelligent IPv6 leak detection - determines if IPv6 traffic is legitimate
+static bool privacy_guards_is_legitimate_ipv6_traffic(privacy_guards_t *guards, const flow_tuple_t *flow) {
+    if (!guards || !flow) return false;
+    
+    // If VPN explicitly supports IPv6, allow IPv6 traffic through the tunnel
+    if (guards->vpn_supports_ipv6 && guards->vpn_tunnel_active) {
+        return true;
+    }
+    
+    // If VPN is IPv4-only, we need to check if this IPv6 traffic is bypassing the VPN
+    if (!guards->vpn_supports_ipv6) {
+        // Check for link-local IPv6 traffic (fe80::/10) - this is legitimate local traffic
+        if (flow->ip_version == 6 && flow->dst_ip.v6.addr[0] == 0xfe && 
+            (flow->dst_ip.v6.addr[1] & 0xc0) == 0x80) {
+            return true;
+        }
+        
+        // Check for loopback IPv6 traffic (::1) - legitimate local traffic
+        if (flow->ip_version == 6) {
+            bool is_loopback = true;
+            for (int i = 0; i < 15; i++) {
+                if (flow->dst_ip.v6.addr[i] != 0) {
+                    is_loopback = false;
+                    break;
+                }
+            }
+            if (is_loopback && flow->dst_ip.v6.addr[15] == 1) {
+                return true;
+            }
+        }
+        
+        // Check for multicast IPv6 traffic (ff00::/8) - may be legitimate
+        if (flow->ip_version == 6 && flow->dst_ip.v6.addr[0] == 0xff) {
+            // Extract multicast scope from second byte (lower 4 bits)
+            uint8_t scope = flow->dst_ip.v6.addr[1] & 0x0f;
+            
+            // Allow node-local (1) and link-local (2) multicast
+            if (scope <= 2) {
+                return true;
+            } else {
+                return false;
+            }
+        }
+        
+        // All other IPv6 traffic in IPv4-only VPN is a potential leak
+        return false;
+    }
+    
+    // If VPN tunnel is not active, any IPv6 traffic is potentially a leak
+    if (!guards->vpn_tunnel_active) {
+        return false;
+    }
+    
+    // Default to allowing traffic if unsure
+    return true;
+}
+
+// Configure privacy guards with VPN capabilities for proper leak detection
+bool privacy_guards_set_vpn_config(privacy_guards_t *guards, bool supports_ipv4, bool supports_ipv6, bool tunnel_active) {
+    if (!guards) return false;
+    
+    pthread_mutex_lock(&guards->mutex);
+    
+    guards->vpn_supports_ipv4 = supports_ipv4;
+    guards->vpn_supports_ipv6 = supports_ipv6;
+    guards->vpn_tunnel_active = tunnel_active;
+    
+    pthread_mutex_unlock(&guards->mutex);
+    
+    LOG_INFO("Privacy guards VPN config updated: IPv4=%s, IPv6=%s, tunnel_active=%s", 
+             supports_ipv4 ? "enabled" : "disabled",
+             supports_ipv6 ? "enabled" : "disabled", 
+             tunnel_active ? "active" : "inactive");
+    
+    return true;
+}
+
+// Update tunnel status for privacy guards
+bool privacy_guards_set_tunnel_status(privacy_guards_t *guards, bool tunnel_active) {
+    if (!guards) return false;
+    
+    pthread_mutex_lock(&guards->mutex);
+    guards->vpn_tunnel_active = tunnel_active;
+    pthread_mutex_unlock(&guards->mutex);
+    
+    LOG_DEBUG("Privacy guards tunnel status updated: %s", tunnel_active ? "active" : "inactive");
+    return true;
 }

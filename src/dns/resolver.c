@@ -613,3 +613,24 @@ const char *dns_type_to_string(dns_record_type_t type) {
         default: return "Unknown";
     }
 }
+
+// PRODUCTION FIX: Add missing DNS resolver stats function
+void dns_resolver_get_stats(dns_resolver_t *resolver, uint32_t *queries_sent, uint32_t *responses_received, 
+                           uint32_t *timeouts, uint32_t *errors) {
+    if (!resolver) {
+        if (queries_sent) *queries_sent = 0;
+        if (responses_received) *responses_received = 0;
+        if (timeouts) *timeouts = 0;
+        if (errors) *errors = 0;
+        return;
+    }
+    
+    pthread_mutex_lock(&resolver->mutex);
+    
+    if (queries_sent) *queries_sent = resolver->stats_queries_sent;
+    if (responses_received) *responses_received = resolver->stats_responses_received;
+    if (timeouts) *timeouts = resolver->stats_timeouts;
+    if (errors) *errors = resolver->stats_errors;
+    
+    pthread_mutex_unlock(&resolver->mutex);
+}

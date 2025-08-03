@@ -5,6 +5,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Forward declare vpn_metrics_t to avoid circular dependencies
 typedef struct vpn_metrics vpn_metrics_t;
 
@@ -45,5 +49,9 @@ uint16_t udp_session_get_port(udp_session_t *session);
 size_t connection_manager_get_tcp_count(connection_manager_t *manager);
 size_t connection_manager_get_udp_count(connection_manager_t *manager);
 void connection_manager_get_stats(connection_manager_t *manager, vpn_metrics_t *metrics);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

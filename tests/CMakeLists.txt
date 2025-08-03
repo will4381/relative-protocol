@@ -56,9 +56,12 @@ endif()
 
 # Integration tests
 add_executable(integration_tests
-    integration/test_full_stack.cpp
+    integration/test_full_stack.cpp  
     integration/test_performance.cpp
     integration/test_packet_lifecycle.cpp
+    integration/test_web_browsing_dns.cpp
+    integration/test_dns_comprehensive.cpp
+    integration/test_ipv6_handling.cpp
 )
 
 target_include_directories(integration_tests PRIVATE
@@ -78,6 +81,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
         "-framework Network"
         "-framework NetworkExtension"
         "-framework SystemConfiguration"
+        "-framework Security"
     )
 endif()
 

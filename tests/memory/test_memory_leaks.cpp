@@ -8,6 +8,9 @@
 #include <chrono>
 #include <vector>
 #include <atomic>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 
 #ifdef __APPLE__
 #include <malloc/malloc.h>
@@ -19,14 +22,17 @@ protected:
     void SetUp() override {
         initial_memory = get_memory_usage();
         
-        vpn_config_init(&config);
-        config.enable_logging = false;
+        memset(&config, 0, sizeof(config));
+        config.utun_name = nullptr;
+        config.mtu = 1500;
         config.tunnel_mtu = 1500;
-        inet_pton(AF_INET, "10.0.0.1", &config.tunnel_ipv4);
-        inet_pton(AF_INET, "255.255.255.0", &config.tunnel_netmask);
+        config.ipv4_enabled = true;
+        config.ipv6_enabled = false;
+        config.enable_dns_leak_protection = true;
+        config.enable_kill_switch = true;
         
         config.dns_server_count = 1;
-        inet_pton(AF_INET, "8.8.8.8", &config.dns_servers[0]);
+        config.dns_servers[0] = inet_addr("8.8.8.8");
         
         config.enable_kill_switch = true;
         config.enable_dns_leak_protection = true;
@@ -34,7 +40,7 @@ protected:
     
     void TearDown() override {
         if (result.handle != VPN_INVALID_HANDLE) {
-            vpn_stop(result.handle);
+            vpn_stop_comprehensive(result.handle);
         }
         
         // Force garbage collection and memory cleanup
@@ -68,7 +74,7 @@ protected:
     vpn_config_t config;
     vpn_result_t result = {};
     size_t initial_memory = 0;
-    static const size_t max_allowed_leak = 1024 * 1024; // 1MB allowance
+    static constexpr size_t max_allowed_leak = 1024 * 1024; // 1MB allowance
 };
 
 TEST_F(MemoryLeakTest, VPNStartStopCycles) {
@@ -79,8 +85,8 @@ TEST_F(MemoryLeakTest, VPNStartStopCycles) {
     
     for (int cycle = 0; cycle < num_cycles; cycle++) {
         // Start VPN
-        result = vpn_start(&config);
-        ASSERT_EQ(result.status, VPN_STATUS_SUCCESS);
+        result = vpn_start_comprehensive(&config);
+        ASSERT_EQ(result.status, VPN_SUCCESS);
         
         // Generate some traffic
         for (int i = 0; i < 10; i++) {
@@ -102,11 +108,11 @@ TEST_F(MemoryLeakTest, VPNStartStopCycles) {
             pkt.flow.dst_port = 53;
             pkt.timestamp_ns = clock_gettime_nsec_np(CLOCK_MONOTONIC);
             
-            vpn_inject_packet(result.handle, &pkt);
+            vpn_inject_packet_comprehensive(result.handle, &pkt);
         }
         
         // Stop VPN
-        EXPECT_TRUE(vpn_stop(result.handle));
+        EXPECT_TRUE(vpn_stop_comprehensive(result.handle));
         result.handle = VPN_INVALID_HANDLE;
         
         // Force cleanup
@@ -163,17 +169,21 @@ TEST_F(MemoryLeakTest, RingBufferOperations) {
     
     // Perform many write/read operations
     for (int i = 0; i < num_operations; i++) {
-        vpn_metrics_t metrics = {};
-        metrics.timestamp_ns = clock_gettime_nsec_np(CLOCK_MONOTONIC);
-        metrics.total_packets_processed = i;
-        metrics.bytes_received = i * 1400;
-        metrics.bytes_sent = i * 1200;
+        flow_metrics_t metrics = {};
+        metrics.start_time_ns = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+        metrics.last_activity_ns = metrics.start_time_ns;
+        metrics.bytes_in = i * 1400;
+        metrics.bytes_out = i * 1200;
+        metrics.packets_in = i;
+        metrics.packets_out = i;
+        metrics.protocol = 6; // TCP
+        metrics.ip_version = 4;
         
-        ring_buffer_write(buffer, &metrics, sizeof(metrics));
+        ring_buffer_push(buffer, &metrics);
         
         if (i % 2 == 0) {
-            vpn_metrics_t read_metrics;
-            ring_buffer_read(buffer, &read_metrics, sizeof(read_metrics));
+            flow_metrics_t read_metrics;
+            ring_buffer_pop(buffer, &read_metrics);
         }
     }
     
@@ -361,9 +371,13 @@ TEST_F(MemoryLeakTest, ConcurrentAllocationStress) {
                 case 0: {
                     ring_buffer_t *buffer = ring_buffer_create(1000);
                     if (buffer) {
-                        vpn_metrics_t metrics = {};
+                        flow_metrics_t metrics = {};
+                        metrics.start_time_ns = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+                        metrics.last_activity_ns = metrics.start_time_ns;
+                        metrics.ip_version = 4;
+                        metrics.protocol = 6;
                         for (int j = 0; j < 10; j++) {
-                            ring_buffer_write(buffer, &metrics, sizeof(metrics));
+                            ring_buffer_push(buffer, &metrics);
                         }
                         ring_buffer_destroy(buffer);
                     }
@@ -427,8 +441,8 @@ TEST_F(MemoryLeakTest, ConcurrentAllocationStress) {
 }
 
 TEST_F(MemoryLeakTest, LongRunningLeakDetection) {
-    result = vpn_start(&config);
-    ASSERT_EQ(result.status, VPN_STATUS_SUCCESS);
+    result = vpn_start_comprehensive(&config);
+    ASSERT_EQ(result.status, VPN_SUCCESS);
     
     const auto test_duration = std::chrono::seconds(30);
     const int sample_interval_ms = 1000;
@@ -459,7 +473,7 @@ TEST_F(MemoryLeakTest, LongRunningLeakDetection) {
             pkt.flow.dst_port = 53;
             pkt.timestamp_ns = clock_gettime_nsec_np(CLOCK_MONOTONIC);
             
-            vpn_inject_packet(result.handle, &pkt);
+            vpn_inject_packet_comprehensive(result.handle, &pkt);
             packet_id++;
             
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -498,7 +512,7 @@ TEST_F(MemoryLeakTest, LongRunningLeakDetection) {
     }
     
     vpn_metrics_t final_metrics;
-    EXPECT_TRUE(vpn_get_metrics(result.handle, &final_metrics));
+    EXPECT_TRUE(vpn_get_metrics_comprehensive(result.handle, &final_metrics));
     std::cout << "  Packets processed: " << final_metrics.total_packets_processed << std::endl;
 }
 

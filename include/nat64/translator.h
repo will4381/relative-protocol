@@ -5,6 +5,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define NAT64_PREFIX_LENGTH 96
 #define NAT64_WKP_PREFIX "64:ff9b::/96"  // Well-Known Prefix (RFC 6052)
 
@@ -78,5 +82,9 @@ uint16_t nat64_translate_checksum_6to4(uint16_t ipv6_checksum, const ipv6_addr_t
 
 void nat64_print_mapping(const nat64_mapping_t *mapping);
 void nat64_print_stats(const nat64_stats_t *stats);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

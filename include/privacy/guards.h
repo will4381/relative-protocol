@@ -5,6 +5,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct privacy_guards privacy_guards_t;
 
 typedef enum dns_leak_status {
@@ -95,10 +99,18 @@ const char *dns_leak_status_string(dns_leak_status_t status);
 bool privacy_guards_export_violations(privacy_guards_t *guards, privacy_violation_t *violations, 
                                      size_t max_count, size_t *actual_count);
 
+// VPN configuration functions for proper IPv6 leak detection
+bool privacy_guards_set_vpn_config(privacy_guards_t *guards, bool supports_ipv4, bool supports_ipv6, bool tunnel_active);
+bool privacy_guards_set_tunnel_status(privacy_guards_t *guards, bool tunnel_active);
+
 #if ENABLE_LOGGING == 0
 #define privacy_guards_log_redacted(format, ...) do { } while(0)
 #else
 #define privacy_guards_log_redacted(format, ...) LOG_DEBUG("[REDACTED] " format, ##__VA_ARGS__)
+#endif
+
+#ifdef __cplusplus
+}
 #endif
 
 #endif

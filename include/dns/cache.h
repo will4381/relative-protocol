@@ -5,6 +5,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct dns_cache dns_cache_t;
 
 typedef struct dns_cache_entry {
@@ -56,5 +60,9 @@ typedef enum cache_eviction_policy {
 
 void dns_cache_set_eviction_policy(dns_cache_t *cache, cache_eviction_policy_t policy);
 bool dns_cache_evict_oldest(dns_cache_t *cache);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

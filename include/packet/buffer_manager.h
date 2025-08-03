@@ -9,6 +9,10 @@
 #include <time.h>
 #include "core/types.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // PRODUCTION FIX: Safe packet buffer management system
 typedef struct packet_buffer {
     uint8_t *data;                    // Actual packet data
@@ -68,5 +72,9 @@ bool packet_buffer_is_valid(const packet_buffer_t *buffer);
 #define LARGE_BUFFER_SIZE 9600    // Jumbo frame + headers
 #define INITIAL_SMALL_BUFFERS 1000
 #define INITIAL_LARGE_BUFFERS 100
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -1,605 +1,501 @@
 #include "test_utilities.h"
-#include <algorithm>
-#include <numeric>
-#include <cmath>
-#include <sstream>
-#include <iomanip>
-#include <fstream>
 #include <arpa/inet.h>
-#include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
-#include <netinet/ip_icmp.h>
+#include <iostream>
+#include <iomanip>
+#include <random>
+#include <cstring>
 
-#ifdef __APPLE__
-#include <mach/mach.h>
-#include <sys/resource.h>
-#endif
-
-namespace vpn_test_utils {
-
-// ============================================================================
-// PacketBuilder Implementation
-// ============================================================================
-
-struct PacketBuilder::BuilderState {
-    uint8_t ip_version = 4;
-    std::string src_ip = "10.0.0.1";
-    std::string dst_ip = "8.8.8.8";
-    uint8_t protocol = PROTO_UDP;
-    uint16_t src_port = 12345;
-    uint16_t dst_port = 53;
-    uint8_t icmp_type = 8;
-    uint8_t icmp_code = 0;
-    std::vector<uint8_t> payload_data;
-    uint16_t mtu_size = 1500;
-    uint8_t time_to_live = 64;
-    bool is_fragmented = false;
-    bool is_malformed = false;
-    uint16_t packet_id = 1;
-};
-
-PacketBuilder::PacketBuilder() : state_(std::make_unique<BuilderState>()) {}
-
-PacketBuilder& PacketBuilder::ipv4(const std::string& src_ip, const std::string& dst_ip) {
-    state_->ip_version = 4;
-    state_->src_ip = src_ip;
-    state_->dst_ip = dst_ip;
-    return *this;
+extern "C" {
+    // Forward declarations to avoid linkage issues
+    vpn_status_t vpn_start(const vpn_config_t *config);
+    vpn_status_t vpn_stop(void);
+    vpn_status_t vpn_inject(const uint8_t *packet, size_t length);
+    vpn_status_t vpn_get_metrics(vpn_metrics_t *metrics);
+    bool vpn_is_running(void);
 }
 
-PacketBuilder& PacketBuilder::ipv6(const std::string& src_ip, const std::string& dst_ip) {
-    state_->ip_version = 6;
-    state_->src_ip = src_ip;
-    state_->dst_ip = dst_ip;
-    return *this;
-}
+namespace TestUtils {
 
-PacketBuilder& PacketBuilder::tcp(uint16_t src_port, uint16_t dst_port) {
-    state_->protocol = PROTO_TCP;
-    state_->src_port = src_port;
-    state_->dst_port = dst_port;
-    return *this;
-}
+// Initialize static members
+TestLogger::LogLevel TestLogger::current_level_ = TestLogger::INFO;
 
-PacketBuilder& PacketBuilder::udp(uint16_t src_port, uint16_t dst_port) {
-    state_->protocol = PROTO_UDP;
-    state_->src_port = src_port;
-    state_->dst_port = dst_port;
-    return *this;
-}
+// ======================= PacketBuilder Implementation =======================
 
-PacketBuilder& PacketBuilder::icmp(uint8_t type, uint8_t code) {
-    state_->protocol = PROTO_ICMP;
-    state_->icmp_type = type;
-    state_->icmp_code = code;
-    return *this;
-}
-
-PacketBuilder& PacketBuilder::payload(const uint8_t* data, size_t size) {
-    state_->payload_data.assign(data, data + size);
-    return *this;
-}
-
-PacketBuilder& PacketBuilder::payload(const std::string& data) {
-    state_->payload_data.assign(data.begin(), data.end());
-    return *this;
-}
-
-PacketBuilder& PacketBuilder::random_payload(size_t size) {
-    state_->payload_data.resize(size);
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<uint8_t> dist(0, 255);
+void PacketBuilder::AddIPv4Header(std::vector<uint8_t>& packet, 
+                                  const std::string& src_ip, 
+                                  const std::string& dst_ip,
+                                  uint8_t protocol,
+                                  uint16_t total_length) {
+    struct ip ip_header = {};
+    ip_header.ip_v = 4;
+    ip_header.ip_hl = 5;  // 20 bytes
+    ip_header.ip_tos = 0;
+    ip_header.ip_len = htons(total_length);
+    ip_header.ip_id = htons(rand() % 65536);
+    ip_header.ip_off = 0;
+    ip_header.ip_ttl = 64;
+    ip_header.ip_p = protocol;
+    ip_header.ip_src.s_addr = inet_addr(src_ip.c_str());
+    ip_header.ip_dst.s_addr = inet_addr(dst_ip.c_str());
+    ip_header.ip_sum = 0;  // Will be calculated by stack
     
-    for (size_t i = 0; i < size; i++) {
-        state_->payload_data[i] = dist(gen);
-    }
-    return *this;
+    const uint8_t* ip_data = reinterpret_cast<const uint8_t*>(&ip_header);
+    packet.insert(packet.end(), ip_data, ip_data + sizeof(ip_header));
 }
 
-PacketBuilder& PacketBuilder::mtu(uint16_t mtu_size) {
-    state_->mtu_size = mtu_size;
-    return *this;
-}
-
-PacketBuilder& PacketBuilder::ttl(uint8_t time_to_live) {
-    state_->time_to_live = time_to_live;
-    return *this;
-}
-
-PacketBuilder& PacketBuilder::fragmented(bool enable) {
-    state_->is_fragmented = enable;
-    return *this;
-}
-
-PacketBuilder& PacketBuilder::malformed(bool enable) {
-    state_->is_malformed = enable;
-    return *this;
-}
-
-packet_info_t PacketBuilder::build() {
-    std::vector<uint8_t> raw_packet = build_raw();
+void PacketBuilder::AddTCPHeader(std::vector<uint8_t>& packet,
+                                uint16_t src_port,
+                                uint16_t dst_port,
+                                uint32_t seq_num,
+                                uint8_t flags) {
+    struct tcphdr tcp_header = {};
+    tcp_header.th_sport = htons(src_port);
+    tcp_header.th_dport = htons(dst_port);
+    tcp_header.th_seq = htonl(seq_num);
+    tcp_header.th_ack = 0;
+    tcp_header.th_off = 5;  // 20 bytes
+    tcp_header.th_flags = flags;
+    tcp_header.th_win = htons(8192);
+    tcp_header.th_sum = 0;  // Will be calculated by stack
+    tcp_header.th_urp = 0;
     
-    packet_info_t packet = {};
-    packet.data = raw_packet.data();
-    packet.length = raw_packet.size();
-    packet.flow.ip_version = state_->ip_version;
-    packet.flow.protocol = state_->protocol;
-    packet.flow.src_port = state_->src_port;
-    packet.flow.dst_port = state_->dst_port;
-    packet.timestamp_ns = current_time_ns();
+    const uint8_t* tcp_data = reinterpret_cast<const uint8_t*>(&tcp_header);
+    packet.insert(packet.end(), tcp_data, tcp_data + sizeof(tcp_header));
+}
+
+void PacketBuilder::AddUDPHeader(std::vector<uint8_t>& packet,
+                                uint16_t src_port,
+                                uint16_t dst_port,
+                                uint16_t data_length) {
+    struct udphdr udp_header = {};
+    udp_header.uh_sport = htons(src_port);
+    udp_header.uh_dport = htons(dst_port);
+    udp_header.uh_ulen = htons(8 + data_length);  // UDP header + data
+    udp_header.uh_sum = 0;  // Will be calculated by stack
     
-    if (state_->ip_version == 4) {
-        packet.flow.src_ip.v4.addr = ipv4_string_to_addr(state_->src_ip);
-        packet.flow.dst_ip.v4.addr = ipv4_string_to_addr(state_->dst_ip);
-    }
+    const uint8_t* udp_data = reinterpret_cast<const uint8_t*>(&udp_header);
+    packet.insert(packet.end(), udp_data, udp_data + sizeof(udp_header));
+}
+
+std::vector<uint8_t> PacketBuilder::CreateHTTPRequest(const std::string& src_ip,
+                                                     const std::string& dst_ip,
+                                                     uint16_t src_port,
+                                                     uint16_t dst_port) {
+    std::vector<uint8_t> packet;
+    
+    // HTTP request payload
+    std::string http_request = 
+        "GET / HTTP/1.1\r\n"
+        "Host: example.com\r\n"
+        "User-Agent: VPN-Test-Client/1.0\r\n"
+        "Accept: text/html,application/xhtml+xml\r\n"
+        "Connection: keep-alive\r\n\r\n";
+    
+    uint16_t total_length = 20 + 20 + http_request.length();  // IP + TCP + HTTP
+    
+    AddIPv4Header(packet, src_ip, dst_ip, IPPROTO_TCP, total_length);
+    AddTCPHeader(packet, src_port, dst_port, 1000, 0x18);  // PSH+ACK flags
+    
+    // Add HTTP payload
+    packet.insert(packet.end(), http_request.begin(), http_request.end());
     
     return packet;
 }
 
-std::vector<uint8_t> PacketBuilder::build_raw() {
+std::vector<uint8_t> PacketBuilder::CreateHTTPSRequest(const std::string& src_ip,
+                                                      const std::string& dst_ip,
+                                                      uint16_t src_port,
+                                                      uint16_t dst_port) {
     std::vector<uint8_t> packet;
     
-    if (state_->ip_version == 4) {
-        build_ipv4_header(packet);
-    } else {
-        build_ipv6_header(packet);
+    // TLS handshake simulation (simplified)
+    std::vector<uint8_t> tls_handshake = {
+        0x16, 0x03, 0x01, 0x00, 0x20,  // TLS record header (Client Hello)
+        0x01, 0x00, 0x00, 0x1c,        // Handshake header
+        0x03, 0x03,                    // TLS version
+        // Random bytes (simplified)
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+        0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20
+    };
+    
+    uint16_t total_length = 20 + 20 + tls_handshake.size();
+    
+    AddIPv4Header(packet, src_ip, dst_ip, IPPROTO_TCP, total_length);
+    AddTCPHeader(packet, src_port, dst_port, 2000, 0x18);  // PSH+ACK flags
+    
+    // Add TLS payload
+    packet.insert(packet.end(), tls_handshake.begin(), tls_handshake.end());
+    
+    return packet;
+}
+
+std::vector<uint8_t> PacketBuilder::CreateDNSQuery(const std::string& domain,
+                                                   const std::string& src_ip,
+                                                   const std::string& dns_server,
+                                                   uint16_t query_id) {
+    std::vector<uint8_t> packet;
+    
+    // DNS query payload (simplified)
+    std::vector<uint8_t> dns_query = {
+        static_cast<uint8_t>(query_id >> 8), static_cast<uint8_t>(query_id & 0xFF),  // Transaction ID
+        0x01, 0x00,  // Flags (standard query)
+        0x00, 0x01,  // Questions
+        0x00, 0x00,  // Answer RRs
+        0x00, 0x00,  // Authority RRs
+        0x00, 0x00,  // Additional RRs
+        // Domain name (simplified - just length of domain)
+        static_cast<uint8_t>(domain.length())
+    };
+    
+    // Add domain bytes
+    dns_query.insert(dns_query.end(), domain.begin(), domain.end());
+    dns_query.push_back(0x00);  // Null terminator
+    
+    // Query type and class
+    dns_query.insert(dns_query.end(), {0x00, 0x01, 0x00, 0x01});  // A record, IN class
+    
+    uint16_t total_length = 20 + 8 + dns_query.size();  // IP + UDP + DNS
+    
+    AddIPv4Header(packet, src_ip, dns_server, IPPROTO_UDP, total_length);
+    AddUDPHeader(packet, 54321, 53, dns_query.size());
+    
+    // Add DNS payload
+    packet.insert(packet.end(), dns_query.begin(), dns_query.end());
+    
+    return packet;
+}
+
+std::vector<uint8_t> PacketBuilder::CreateVideoStreamPacket(const std::string& src_ip,
+                                                           const std::string& dst_ip,
+                                                           uint16_t src_port,
+                                                           uint16_t dst_port) {
+    std::vector<uint8_t> packet;
+    
+    // Simulate video streaming data (random bytes representing video stream)
+    std::vector<uint8_t> video_data(1200);  // Typical streaming packet size
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(0, 255);
+    
+    for (auto& byte : video_data) {
+        byte = dis(gen);
     }
     
-    switch (state_->protocol) {
-        case PROTO_TCP:
-            build_tcp_header(packet);
-            break;
-        case PROTO_UDP:
-            build_udp_header(packet);
-            break;
-        case PROTO_ICMP:
-            build_icmp_header(packet);
-            break;
-    }
+    uint16_t total_length = 20 + 20 + video_data.size();
     
-    // Add payload
-    packet.insert(packet.end(), state_->payload_data.begin(), state_->payload_data.end());
+    AddIPv4Header(packet, src_ip, dst_ip, IPPROTO_TCP, total_length);
+    AddTCPHeader(packet, src_port, dst_port, 3000, 0x18);  // PSH+ACK flags
     
-    // Apply malformation if requested
-    if (state_->is_malformed) {
-        if (!packet.empty()) {
-            packet[packet.size() / 2] = 0xFF; // Corrupt middle byte
+    // Add video data
+    packet.insert(packet.end(), video_data.begin(), video_data.end());
+    
+    return packet;
+}
+
+std::vector<uint8_t> PacketBuilder::CreateWebRTCSTUNPacket(const std::string& src_ip,
+                                                          const std::string& stun_server,
+                                                          uint16_t src_port,
+                                                          uint16_t dst_port) {
+    std::vector<uint8_t> packet;
+    
+    // STUN binding request (simplified)
+    std::vector<uint8_t> stun_request = {
+        0x00, 0x01,  // Message type: Binding Request
+        0x00, 0x08,  // Message length: 8 bytes
+        0x21, 0x12, 0xa4, 0x42,  // Magic cookie
+        // Transaction ID (12 bytes)
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c
+    };
+    
+    uint16_t total_length = 20 + 8 + stun_request.size();
+    
+    AddIPv4Header(packet, src_ip, stun_server, IPPROTO_UDP, total_length);
+    AddUDPHeader(packet, src_port, dst_port, stun_request.size());
+    
+    // Add STUN payload
+    packet.insert(packet.end(), stun_request.begin(), stun_request.end());
+    
+    return packet;
+}
+
+// ======================= MockDataFactory Implementation =======================
+
+std::vector<std::vector<uint8_t>> MockDataFactory::GenerateWebBrowsingSession(int num_requests) {
+    std::vector<std::vector<uint8_t>> packets;
+    
+    // Popular websites for realistic testing
+    std::vector<std::string> websites = {
+        "93.184.216.34",   // example.com
+        "172.217.164.196", // google.com  
+        "104.16.124.96",   // cloudflare.com
+        "140.82.112.4"     // github.com
+    };
+    
+    for (int i = 0; i < num_requests; i++) {
+        std::string dst_ip = websites[i % websites.size()];
+        
+        // Mix of HTTP and HTTPS requests
+        if (i % 3 == 0) {
+            packets.push_back(PacketBuilder::CreateHTTPRequest("192.168.1.100", dst_ip, 12345 + i, 80));
+        } else {
+            packets.push_back(PacketBuilder::CreateHTTPSRequest("192.168.1.100", dst_ip, 12345 + i, 443));
+        }
+        
+        // Add DNS queries for domains
+        if (i % 4 == 0) {
+            packets.push_back(PacketBuilder::CreateDNSQuery("example.com"));
         }
     }
     
-    return packet;
+    return packets;
 }
 
-PacketBuilder& PacketBuilder::reset() {
-    state_ = std::make_unique<BuilderState>();
-    return *this;
-}
-
-void PacketBuilder::build_ipv4_header(std::vector<uint8_t>& packet) {
-    struct ip header = {};
-    header.ip_v = 4;
-    header.ip_hl = 5;
-    header.ip_tos = 0;
-    header.ip_len = htons(sizeof(struct ip) + 
-                         (state_->protocol == PROTO_TCP ? sizeof(struct tcphdr) : 
-                          state_->protocol == PROTO_UDP ? sizeof(struct udphdr) : 
-                          sizeof(struct icmp)) + state_->payload_data.size());
-    header.ip_id = htons(state_->packet_id++);
-    header.ip_off = state_->is_fragmented ? htons(IP_MF) : 0;
-    header.ip_ttl = state_->time_to_live;
-    header.ip_p = state_->protocol;
-    header.ip_sum = 0;
-    inet_pton(AF_INET, state_->src_ip.c_str(), &header.ip_src);
-    inet_pton(AF_INET, state_->dst_ip.c_str(), &header.ip_dst);
+std::vector<std::vector<uint8_t>> MockDataFactory::GenerateVideoStreamingSession(int duration_seconds) {
+    std::vector<std::vector<uint8_t>> packets;
     
-    // Calculate checksum
-    header.ip_sum = calculate_checksum(reinterpret_cast<const uint8_t*>(&header), sizeof(header));
+    // Video streaming typically sends packets every ~33ms (30 FPS)
+    int packets_per_second = 30;
+    int total_packets = duration_seconds * packets_per_second;
     
-    const uint8_t* header_bytes = reinterpret_cast<const uint8_t*>(&header);
-    packet.insert(packet.end(), header_bytes, header_bytes + sizeof(header));
-}
-
-void PacketBuilder::build_ipv6_header(std::vector<uint8_t>& packet) {
-    // IPv6 header (simplified)
-    uint8_t ipv6_header[40] = {0};
-    ipv6_header[0] = 0x60; // Version 6
-    
-    // Payload length
-    uint16_t payload_len = (state_->protocol == PROTO_TCP ? sizeof(struct tcphdr) : 
-                           state_->protocol == PROTO_UDP ? sizeof(struct udphdr) : 8) + 
-                           state_->payload_data.size();
-    ipv6_header[4] = (payload_len >> 8) & 0xFF;
-    ipv6_header[5] = payload_len & 0xFF;
-    
-    // Next header
-    ipv6_header[6] = state_->protocol;
-    
-    // Hop limit
-    ipv6_header[7] = state_->time_to_live;
-    
-    // Source and destination addresses (simplified)
-    inet_pton(AF_INET6, state_->src_ip.c_str(), &ipv6_header[8]);
-    inet_pton(AF_INET6, state_->dst_ip.c_str(), &ipv6_header[24]);
-    
-    packet.insert(packet.end(), ipv6_header, ipv6_header + 40);
-}
-
-void PacketBuilder::build_tcp_header(std::vector<uint8_t>& packet) {
-    struct tcphdr header = {};
-    header.th_sport = htons(state_->src_port);
-    header.th_dport = htons(state_->dst_port);
-    header.th_seq = htonl(12345);
-    header.th_ack = 0;
-    header.th_off = 5;
-    header.th_flags = TH_SYN;
-    header.th_win = htons(65535);
-    header.th_sum = 0;
-    header.th_urp = 0;
-    
-    const uint8_t* header_bytes = reinterpret_cast<const uint8_t*>(&header);
-    packet.insert(packet.end(), header_bytes, header_bytes + sizeof(header));
-}
-
-void PacketBuilder::build_udp_header(std::vector<uint8_t>& packet) {
-    struct udphdr header = {};
-    header.uh_sport = htons(state_->src_port);
-    header.uh_dport = htons(state_->dst_port);
-    header.uh_ulen = htons(sizeof(struct udphdr) + state_->payload_data.size());
-    header.uh_sum = 0;
-    
-    const uint8_t* header_bytes = reinterpret_cast<const uint8_t*>(&header);
-    packet.insert(packet.end(), header_bytes, header_bytes + sizeof(header));
-}
-
-void PacketBuilder::build_icmp_header(std::vector<uint8_t>& packet) {
-    struct icmp header = {};
-    header.icmp_type = state_->icmp_type;
-    header.icmp_code = state_->icmp_code;
-    header.icmp_cksum = 0;
-    header.icmp_id = htons(getpid());
-    header.icmp_seq = htons(1);
-    
-    const uint8_t* header_bytes = reinterpret_cast<const uint8_t*>(&header);
-    packet.insert(packet.end(), header_bytes, header_bytes + sizeof(header));
-}
-
-uint16_t PacketBuilder::calculate_checksum(const uint8_t* data, size_t length) {
-    uint32_t sum = 0;
-    
-    // Sum 16-bit words
-    for (size_t i = 0; i < length - 1; i += 2) {
-        sum += (data[i] << 8) + data[i + 1];
+    for (int i = 0; i < total_packets; i++) {
+        // Simulate Netflix/YouTube streaming
+        packets.push_back(PacketBuilder::CreateVideoStreamPacket(
+            "192.168.1.100", 
+            "151.101.1.140",  // CDN IP
+            54321, 
+            443
+        ));
     }
     
-    // Add odd byte if present
-    if (length % 2 == 1) {
-        sum += data[length - 1] << 8;
+    return packets;
+}
+
+std::vector<std::vector<uint8_t>> MockDataFactory::GenerateDNSResolutionSequence(const std::vector<std::string>& domains) {
+    std::vector<std::vector<uint8_t>> packets;
+    
+    for (const auto& domain : domains) {
+        // DNS query
+        packets.push_back(PacketBuilder::CreateDNSQuery(domain, "192.168.1.100", "8.8.8.8"));
+        
+        // Follow up with HTTP request to resolved domain
+        packets.push_back(PacketBuilder::CreateHTTPSRequest("192.168.1.100", "93.184.216.34", 12345, 443));
     }
     
-    // Fold carry bits
-    while (sum >> 16) {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
+    return packets;
+}
+
+// ======================= VPNTestHarness Implementation =======================
+
+VPNTestHarness::VPNTestHarness() : is_initialized_(false) {
+    InitializeConfig();
+}
+
+VPNTestHarness::~VPNTestHarness() {
+    StopVPN();
+}
+
+void VPNTestHarness::InitializeConfig() {
+    memset(&config_, 0, sizeof(config_));
+    config_.utun_name = nullptr;
+    config_.mtu = 1500;
+    config_.tunnel_mtu = 1500;
+    config_.ipv4_enabled = true;
+    config_.ipv6_enabled = true;
+    config_.enable_nat64 = true;
+    config_.enable_dns_leak_protection = true;
+    config_.enable_ipv6_leak_protection = true;
+    config_.enable_kill_switch = false;  // Disabled for testing
+    config_.enable_webrtc_leak_protection = true;
+    config_.dns_cache_size = 1024;
+    config_.metrics_buffer_size = 4096;
+    config_.reachability_monitoring = true;
+    config_.log_level = const_cast<char*>("INFO");
+    config_.dns_servers[0] = inet_addr("8.8.8.8");
+    config_.dns_servers[1] = inet_addr("1.1.1.1");
+    config_.dns_server_count = 2;
     
-    return ~sum;
+    is_initialized_ = true;
 }
 
-// ============================================================================
-// MockDataFactory Implementation
-// ============================================================================
-
-MockDataFactory::MockDataFactory() : rng_(std::random_device{}()), next_packet_id_(1) {}
-
-vpn_config_t MockDataFactory::create_default_config() {
-    vpn_config_t config = {};
-    config.utun_name = nullptr;
-    config.mtu = 1500;
-    config.tunnel_mtu = 1500;
-    config.ipv4_enabled = true;
-    config.ipv6_enabled = true;
-    config.enable_nat64 = false;
-    config.enable_dns_leak_protection = true;
-    config.enable_ipv6_leak_protection = true;
-    config.enable_kill_switch = false;
-    config.enable_webrtc_leak_protection = true;
-    config.dns_servers[0] = inet_addr("8.8.8.8");
-    config.dns_servers[1] = inet_addr("1.1.1.1");
-    config.dns_server_count = 2;
-    config.dns_cache_size = 1024;
-    config.metrics_buffer_size = 4096;
-    config.reachability_monitoring = true;
-    config.log_level = const_cast<char*>("INFO");
-    return config;
-}
-
-vpn_config_t MockDataFactory::create_minimal_config() {
-    vpn_config_t config = {};
-    config.utun_name = nullptr;
-    config.mtu = 1280;
-    config.tunnel_mtu = 1280;
-    config.ipv4_enabled = true;
-    config.ipv6_enabled = false;
-    config.dns_servers[0] = inet_addr("8.8.8.8");
-    config.dns_server_count = 1;
-    config.dns_cache_size = 256;
-    config.metrics_buffer_size = 1024;
-    config.log_level = const_cast<char*>("ERROR");
-    return config;
-}
-
-vpn_config_t MockDataFactory::create_secure_config() {
-    vpn_config_t config = create_default_config();
-    config.enable_kill_switch = true;
-    config.enable_dns_leak_protection = true;
-    config.enable_ipv6_leak_protection = true;
-    config.enable_webrtc_leak_protection = true;
-    return config;
-}
-
-vpn_config_t MockDataFactory::create_performance_config() {
-    vpn_config_t config = create_default_config();
-    config.mtu = 9000; // Jumbo frames
-    config.tunnel_mtu = 9000;
-    config.dns_cache_size = 4096;
-    config.metrics_buffer_size = 16384;
-    config.enable_kill_switch = false; // Reduce overhead
-    return config;
-}
-
-vpn_config_t MockDataFactory::create_ios_config() {
-    vpn_config_t config = create_default_config();
-    config.mtu = 1500;
-    config.tunnel_mtu = 1500;
-    config.enable_kill_switch = true;
-    config.dns_cache_size = 512; // Conservative for mobile
-    config.metrics_buffer_size = 2048;
-    config.reachability_monitoring = true;
-    return config;
-}
-
-vpn_config_t MockDataFactory::create_invalid_config() {
-    vpn_config_t config = {};
-    config.mtu = 0; // Invalid MTU
-    config.tunnel_mtu = 100; // Too small
-    config.ipv4_enabled = false;
-    config.ipv6_enabled = false; // No protocols enabled
-    config.dns_server_count = 0; // No DNS servers
-    config.dns_cache_size = 0; // Invalid cache size
-    return config;
-}
-
-// ============================================================================
-// PerformanceTimer Implementation
-// ============================================================================
-
-PerformanceTimer::PerformanceTimer() : running_(false) {}
-
-void PerformanceTimer::start() {
-    start_time_ = std::chrono::high_resolution_clock::now();
-    running_ = true;
-}
-
-void PerformanceTimer::stop() {
-    if (running_) {
-        end_time_ = std::chrono::high_resolution_clock::now();
-        running_ = false;
-    }
-}
-
-void PerformanceTimer::reset() {
-    samples_.clear();
-    running_ = false;
-}
-
-double PerformanceTimer::elapsed_seconds() const {
-    auto end = running_ ? std::chrono::high_resolution_clock::now() : end_time_;
-    return std::chrono::duration<double>(end - start_time_).count();
-}
-
-double PerformanceTimer::elapsed_milliseconds() const {
-    return elapsed_seconds() * 1000.0;
-}
-
-double PerformanceTimer::elapsed_microseconds() const {
-    return elapsed_seconds() * 1000000.0;
-}
-
-double PerformanceTimer::elapsed_nanoseconds() const {
-    return elapsed_seconds() * 1000000000.0;
-}
-
-void PerformanceTimer::record_sample() {
-    if (!running_) {
-        samples_.push_back(elapsed_seconds());
-    }
-}
-
-double PerformanceTimer::average_time() const {
-    if (samples_.empty()) return 0.0;
-    return std::accumulate(samples_.begin(), samples_.end(), 0.0) / samples_.size();
-}
-
-double PerformanceTimer::min_time() const {
-    if (samples_.empty()) return 0.0;
-    return *std::min_element(samples_.begin(), samples_.end());
-}
-
-double PerformanceTimer::max_time() const {
-    if (samples_.empty()) return 0.0;
-    return *std::max_element(samples_.begin(), samples_.end());
-}
-
-double PerformanceTimer::standard_deviation() const {
-    if (samples_.size() < 2) return 0.0;
+bool VPNTestHarness::StartVPN(bool enable_nat64, bool enable_privacy_guards) {
+    if (!is_initialized_) return false;
     
-    double mean = average_time();
-    double variance = 0.0;
+    config_.enable_nat64 = enable_nat64;
+    config_.enable_dns_leak_protection = enable_privacy_guards;
+    config_.enable_ipv6_leak_protection = enable_privacy_guards;
+    config_.enable_webrtc_leak_protection = enable_privacy_guards;
     
-    for (double sample : samples_) {
-        variance += (sample - mean) * (sample - mean);
-    }
-    
-    variance /= samples_.size() - 1;
-    return std::sqrt(variance);
-}
-
-size_t PerformanceTimer::sample_count() const {
-    return samples_.size();
-}
-
-// ============================================================================
-// Utility Functions Implementation
-// ============================================================================
-
-std::string bytes_to_hex(const uint8_t* data, size_t length) {
-    std::stringstream ss;
-    ss << std::hex << std::setfill('0');
-    for (size_t i = 0; i < length; i++) {
-        ss << std::setw(2) << static_cast<int>(data[i]);
-    }
-    return ss.str();
-}
-
-std::vector<uint8_t> hex_to_bytes(const std::string& hex) {
-    std::vector<uint8_t> bytes;
-    for (size_t i = 0; i < hex.length(); i += 2) {
-        std::string byte_string = hex.substr(i, 2);
-        uint8_t byte = static_cast<uint8_t>(std::strtol(byte_string.c_str(), nullptr, 16));
-        bytes.push_back(byte);
-    }
-    return bytes;
-}
-
-std::string format_packet_info(const packet_info_t& packet) {
-    std::stringstream ss;
-    ss << "Packet[";
-    ss << "len=" << packet.length;
-    ss << ", proto=" << static_cast<int>(packet.flow.protocol);
-    ss << ", src_port=" << packet.flow.src_port;
-    ss << ", dst_port=" << packet.flow.dst_port;
-    ss << ", ip_v=" << static_cast<int>(packet.flow.ip_version);
-    ss << "]";
-    return ss.str();
-}
-
-std::string format_metrics(const vpn_metrics_t& metrics) {
-    std::stringstream ss;
-    ss << "Metrics[";
-    ss << "packets_in=" << metrics.packets_in;
-    ss << ", packets_out=" << metrics.packets_out;
-    ss << ", bytes_in=" << metrics.bytes_in;
-    ss << ", bytes_out=" << metrics.bytes_out;
-    ss << ", errors=" << metrics.packet_errors;
-    ss << ", uptime=" << metrics.uptime_seconds << "s";
-    ss << "]";
-    return ss.str();
-}
-
-uint64_t current_time_ns() {
-    auto now = std::chrono::high_resolution_clock::now();
-    auto duration = now.time_since_epoch();
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
-}
-
-uint64_t current_time_ms() {
-    auto now = std::chrono::high_resolution_clock::now();
-    auto duration = now.time_since_epoch();
-    return std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
-}
-
-void sleep_ms(int milliseconds) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
-}
-
-bool is_valid_ipv4(const std::string& ip) {
-    struct sockaddr_in sa;
-    return inet_pton(AF_INET, ip.c_str(), &(sa.sin_addr)) != 0;
-}
-
-bool is_valid_ipv6(const std::string& ip) {
-    struct sockaddr_in6 sa;
-    return inet_pton(AF_INET6, ip.c_str(), &(sa.sin6_addr)) != 0;
-}
-
-uint32_t ipv4_string_to_addr(const std::string& ip) {
-    struct in_addr addr;
-    if (inet_pton(AF_INET, ip.c_str(), &addr) == 1) {
-        return addr.s_addr;
-    }
-    return 0;
-}
-
-std::string ipv4_addr_to_string(uint32_t addr) {
-    struct in_addr in_addr;
-    in_addr.s_addr = addr;
-    char str[INET_ADDRSTRLEN];
-    if (inet_ntop(AF_INET, &in_addr, str, INET_ADDRSTRLEN)) {
-        return std::string(str);
-    }
-    return "";
-}
-
-bool file_exists(const std::string& path) {
-    std::ifstream file(path);
-    return file.good();
-}
-
-std::string read_file_to_string(const std::string& path) {
-    std::ifstream file(path);
-    if (!file.is_open()) {
-        return "";
-    }
-    
-    std::stringstream buffer;
-    buffer << file.rdbuf();
-    return buffer.str();
-}
-
-bool write_string_to_file(const std::string& content, const std::string& path) {
-    std::ofstream file(path);
-    if (!file.is_open()) {
+    vpn_status_t result = vpn_start(&config_);
+    if (result == VPN_ERROR_PERMISSION) {
+        TestLogger::Log(TestLogger::WARN, "VPN start failed due to permissions");
         return false;
     }
     
-    file << content;
-    return file.good();
+    return result == VPN_SUCCESS;
 }
 
-int get_process_memory_mb() {
-#ifdef __APPLE__
-    struct mach_task_basic_info info;
-    mach_msg_type_number_t info_count = MACH_TASK_BASIC_INFO_COUNT;
+void VPNTestHarness::StopVPN() {
+    if (IsRunning()) {
+        vpn_stop();
+    }
+}
+
+bool VPNTestHarness::IsRunning() const {
+    return vpn_is_running();
+}
+
+bool VPNTestHarness::InjectPacket(const std::vector<uint8_t>& packet) {
+    if (packet.empty() || !IsRunning()) {
+        return false;
+    }
     
-    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
-                  (task_info_t)&info, &info_count) == KERN_SUCCESS) {
-        return static_cast<int>(info.resident_size / (1024 * 1024));
-    }
-#endif
-    return -1;
+    vpn_status_t result = vpn_inject(packet.data(), packet.size());
+    return result == VPN_SUCCESS;
 }
 
-int get_process_thread_count() {
-#ifdef __APPLE__
-    struct task_basic_info info;
-    mach_msg_type_number_t info_count = TASK_BASIC_INFO_COUNT;
+VPNTestHarness::BurstResult VPNTestHarness::InjectPacketBurst(const std::vector<std::vector<uint8_t>>& packets) {
+    BurstResult result = {};
+    result.total_packets = packets.size();
+    result.successful_injections = 0;
+    result.vpn_stable = IsRunning();
     
-    if (task_info(mach_task_self(), TASK_BASIC_INFO,
-                  (task_info_t)&info, &info_count) == KERN_SUCCESS) {
-        return info.virtual_size;
+    if (!result.vpn_stable) {
+        return result;
     }
-#endif
-    return -1;
+    
+    PerformanceTimer timer;
+    
+    for (const auto& packet : packets) {
+        if (InjectPacket(packet)) {
+            result.successful_injections++;
+        }
+    }
+    
+    result.elapsed_ms = timer.ElapsedMilliseconds();
+    result.packets_per_second = timer.CalculatePacketsPerSecond(result.successful_injections);
+    result.vpn_stable = IsRunning();
+    
+    return result;
 }
 
-int get_process_fd_count() {
-    struct rlimit rl;
-    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
-        return static_cast<int>(rl.rlim_cur);
-    }
-    return -1;
+bool VPNTestHarness::GetMetrics(vpn_metrics_t& metrics) {
+    if (!IsRunning()) return false;
+    
+    vpn_status_t result = vpn_get_metrics(&metrics);
+    return result == VPN_SUCCESS;
 }
 
-} // namespace vpn_test_utils
+bool VPNTestHarness::ValidateInternetConnectivity() {
+    return TestHTTPConnectivity() && TestHTTPSConnectivity() && TestDNSResolution();
+}
+
+bool VPNTestHarness::TestHTTPConnectivity() {
+    auto http_packet = PacketBuilder::CreateHTTPRequest();
+    return InjectPacket(http_packet);
+}
+
+bool VPNTestHarness::TestHTTPSConnectivity() {
+    auto https_packet = PacketBuilder::CreateHTTPSRequest();
+    return InjectPacket(https_packet);
+}
+
+bool VPNTestHarness::TestDNSResolution() {
+    auto dns_packet = PacketBuilder::CreateDNSQuery("example.com");
+    return InjectPacket(dns_packet);
+}
+
+bool VPNTestHarness::TestVideoStreaming() {
+    auto video_packet = PacketBuilder::CreateVideoStreamPacket();
+    return InjectPacket(video_packet);
+}
+
+// ======================= TestValidator Implementation =======================
+
+bool TestValidator::ValidatePacketIntegrity(const std::vector<uint8_t>& packet) {
+    if (packet.size() < 20) return false;  // Minimum IP header size
+    
+    // Check IP version
+    if ((packet[0] >> 4) != 4) return false;
+    
+    // Check header length
+    uint8_t header_length = (packet[0] & 0x0F) * 4;
+    if (header_length < 20 || header_length > packet.size()) return false;
+    
+    return true;
+}
+
+bool TestValidator::ValidateIPHeader(const std::vector<uint8_t>& packet) {
+    return ValidatePacketIntegrity(packet);
+}
+
+bool TestValidator::IsValidPacket(const std::vector<uint8_t>& packet) {
+    return ValidatePacketIntegrity(packet);
+}
+
+uint32_t TestValidator::CalculateChecksum(const std::vector<uint8_t>& packet) {
+    uint32_t checksum = 0;
+    for (uint8_t byte : packet) {
+        checksum += byte;
+    }
+    return checksum;
+}
+
+// ======================= TestLogger Implementation =======================
+
+void TestLogger::Log(LogLevel level, const std::string& message) {
+    if (level < current_level_) return;
+    
+    std::cout << "[" << LevelToString(level) << "] " << message << std::endl;
+}
+
+void TestLogger::LogPacketInfo(const std::vector<uint8_t>& packet, const std::string& description) {
+    if (current_level_ > DEBUG) return;
+    
+    std::cout << "[DEBUG] " << description << " - Size: " << packet.size() << " bytes" << std::endl;
+    
+    // Log first 32 bytes in hex
+    std::cout << "        Data: ";
+    for (size_t i = 0; i < std::min<size_t>(32, packet.size()); i++) {
+        std::cout << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(packet[i]) << " ";
+    }
+    if (packet.size() > 32) std::cout << "...";
+    std::cout << std::dec << std::endl;
+}
+
+void TestLogger::LogPerformanceMetrics(const VPNTestHarness::BurstResult& result) {
+    Log(INFO, "Performance Metrics:");
+    Log(INFO, "  Total packets: " + std::to_string(result.total_packets));
+    Log(INFO, "  Successful injections: " + std::to_string(result.successful_injections));
+    Log(INFO, "  Success rate: " + std::to_string(100.0 * result.successful_injections / result.total_packets) + "%");
+    Log(INFO, "  Elapsed time: " + std::to_string(result.elapsed_ms) + "ms");
+    Log(INFO, "  Throughput: " + std::to_string(result.packets_per_second) + " packets/sec");
+    Log(INFO, "  VPN stable: " + std::string(result.vpn_stable ? "Yes" : "No"));
+}
+
+void TestLogger::LogVPNMetrics(const vpn_metrics_t& metrics) {
+    Log(INFO, "VPN Metrics:");
+    Log(INFO, "  Bytes in: " + std::to_string(metrics.bytes_in));
+    Log(INFO, "  Bytes out: " + std::to_string(metrics.bytes_out));
+    Log(INFO, "  Packets in: " + std::to_string(metrics.packets_in));
+    Log(INFO, "  Packets out: " + std::to_string(metrics.packets_out));
+    Log(INFO, "  Active connections: " + std::to_string(metrics.active_connections));
+    Log(INFO, "  DNS queries: " + std::to_string(metrics.dns_queries));
+    Log(INFO, "  Privacy violations: " + std::to_string(metrics.privacy_violations));
+}
+
+std::string TestLogger::LevelToString(LogLevel level) {
+    switch (level) {
+        case DEBUG: return "DEBUG";
+        case INFO: return "INFO";
+        case WARN: return "WARN";
+        case ERROR: return "ERROR";
+        default: return "UNKNOWN";
+    }
+}
+
+} // namespace TestUtils

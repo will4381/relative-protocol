@@ -5,6 +5,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct utun_handle utun_handle_t;
 
 typedef void (*packet_received_callback_t)(const packet_info_t *packet, void *user_data);
@@ -19,5 +23,9 @@ ssize_t utun_read(utun_handle_t *handle, uint8_t *buffer, size_t buffer_size);
 ssize_t utun_write(utun_handle_t *handle, const uint8_t *packet, size_t packet_size);
 bool utun_start_read_loop(utun_handle_t *handle, packet_received_callback_t callback, void *user_data);
 void utun_stop_read_loop(utun_handle_t *handle);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

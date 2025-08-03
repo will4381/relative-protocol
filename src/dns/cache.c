@@ -496,3 +496,16 @@ static void dns_cache_evict_lfu(dns_cache_t *cache) {
 static void dns_cache_evict_expired(dns_cache_t *cache) {
     dns_cache_cleanup_expired(cache);
 }
+
+// PRODUCTION FIX: Add missing DNS cache eviction policy function  
+void dns_cache_set_eviction_policy(dns_cache_t *cache, cache_eviction_policy_t policy) {
+    if (!cache) {
+        return;
+    }
+    
+    pthread_mutex_lock(&cache->mutex);
+    cache->eviction_policy = policy;
+    pthread_mutex_unlock(&cache->mutex);
+    
+    LOG_DEBUG("DNS cache eviction policy set to %d", policy);
+}
