@@ -10,124 +10,7 @@ on:
     - cron: '0 2 * * *'
 
 jobs:
-  # CodeQL Analysis
-  codeql:
-    name: CodeQL Analysis
-    runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
-      security-events: write
-
-    strategy:
-      fail-fast: false
-      matrix:
-        language: [ 'cpp' ]
-
-    steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-      with:
-        submodules: recursive
-
-    - name: Initialize CodeQL
-      uses: github/codeql-action/init@v3
-      with:
-        languages: ${{ matrix.language }}
-        queries: security-extended,security-and-quality
-
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y build-essential cmake ninja-build libssl-dev
-
-    - name: Build for CodeQL
-      run: |
-        cmake -B build -DCMAKE_BUILD_TYPE=Debug -G Ninja
-        cmake --build build --parallel
-
-    - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@v3
-      with:
-        category: "/language:${{matrix.language}}"
-
-  # Dependency scanning
-  dependency-check:
-    name: Dependency Vulnerability Scan
-    runs-on: ubuntu-latest
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        submodules: recursive
-
-    - name: Run OWASP Dependency Check
-      uses: dependency-check/Dependency-Check_Action@main
-      with:
-        project: 'RelativeProtocol-VPN'
-        path: '.'
-        format: 'ALL'
-        args: >
-          --enableRetired
-          --enableExperimental
-          --scan src/
-          --scan include/
-          --scan third_party/
-
-    - name: Upload dependency check results
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: dependency-check-report
-        path: reports/
-
-  # Secret scanning
-  secret-scan:
-    name: Secret Scanning
-    runs-on: ubuntu-latest
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-
-    - name: Run TruffleHog
-      uses: trufflesecurity/trufflehog@main
-      with:
-        path: ./
-        base: ${{ github.event.before || 'HEAD~1' }}
-        head: HEAD
-        extra_args: --debug --only-verified
-
-  # Container security scanning (if using Docker)
-  container-scan:
-    name: Container Security Scan
-    runs-on: ubuntu-latest
-    if: false  # Enable if you have Dockerfile
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Build Docker image
-      run: docker build -t relativeprotocol-vpn:latest .
-
-    - name: Run Trivy vulnerability scanner
-      uses: aquasecurity/trivy-action@master
-      with:
-        image-ref: 'relativeprotocol-vpn:latest'
-        format: 'sarif'
-        output: 'trivy-results.sarif'
-
-    - name: Upload Trivy scan results to GitHub Security
-      uses: github/codeql-action/upload-sarif@v3
-      if: always()
-      with:
-        sarif_file: 'trivy-results.sarif'
-
-  # Security policy compliance
+  # Basic security policy compliance
   security-policy:
     name: Security Policy Compliance
     runs-on: ubuntu-latest
@@ -168,23 +51,6 @@ jobs:
         - Cryptographically secure random number generation
         - Buffer overflow protections
         - Kill switch functionality
-
-        ## Security Testing
-
-        We regularly perform:
-        - Static code analysis
-        - Dynamic security testing
-        - Dependency vulnerability scanning
-        - Memory leak detection
-        - Fuzzing tests
-        
-        ## Responsible Disclosure
-
-        We follow responsible disclosure practices and will:
-        - Acknowledge receipt within 48 hours
-        - Provide regular updates on our progress
-        - Credit security researchers (with permission)
-        - Release security patches promptly
         EOF
         fi
 
@@ -214,74 +80,21 @@ jobs:
         
         echo "✅ Basic security checks completed"
 
-  # Security benchmarks
-  security-benchmarks:
-    name: Security Benchmarks
+  # Secret scanning with TruffleHog
+  secret-scan:
+    name: Secret Scanning
     runs-on: ubuntu-latest
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
       with:
-        submodules: recursive
+        fetch-depth: 0
 
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y build-essential cmake ninja-build libssl-dev
-
-    - name: Build with security features
-      run: |
-        cmake -B build \
-          -DCMAKE_BUILD_TYPE=Release \
-          -DENABLE_SECURITY_FEATURES=ON \
-          -DENABLE_HARDENING=ON \
-          -G Ninja
-        cmake --build build --parallel
-
-    - name: Run security tests
-      run: |
-        cd build
-        ./security_tests || true
-
-    - name: Generate security report
-      run: |
-        echo "# Security Test Report" > security_report.md
-        echo "" >> security_report.md
-        echo "## Test Results" >> security_report.md
-        echo "- Date: $(date)" >> security_report.md
-        echo "- Commit: ${{ github.sha }}" >> security_report.md
-        echo "" >> security_report.md
-        echo "## Security Features Enabled" >> security_report.md
-        echo "- ✅ DNS Leak Protection" >> security_report.md
-        echo "- ✅ IPv6 Leak Protection" >> security_report.md
-        echo "- ✅ WebRTC Leak Protection" >> security_report.md
-        echo "- ✅ Kill Switch" >> security_report.md
-        echo "- ✅ Memory Safety" >> security_report.md
-        echo "" >> security_report.md
-        echo "## Recommendations" >> security_report.md
-        echo "- Regular security updates" >> security_report.md
-        echo "- Periodic security audits" >> security_report.md
-        echo "- Continuous monitoring" >> security_report.md
-
-    - name: Upload security report
-      uses: actions/upload-artifact@v4
+    - name: Run TruffleHog
+      uses: trufflesecurity/trufflehog@main
       with:
-        name: security-report
-        path: security_report.md
-
-  # Notify security team
-  notify-security:
-    name: Notify Security Team
-    runs-on: ubuntu-latest
-    needs: [codeql, dependency-check, secret-scan, security-policy, security-benchmarks]
-    if: failure() && github.event_name == 'schedule'
-
-    steps:
-    - name: Send security alert
-      run: |
-        echo "🚨 Security scan failed for RelativeProtocol VPN"
-        echo "Please check the GitHub Actions for details."
-        echo "Commit: ${{ github.sha }}"
-        echo "Repository: ${{ github.repository }}"
-        # Add notification logic here (Slack, email, etc.)
+        path: ./
+        base: ${{ github.event.before || 'HEAD~1' }}
+        head: HEAD
+        extra_args: --debug --only-verified

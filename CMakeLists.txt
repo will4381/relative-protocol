@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
-project(RelativeVPN VERSION 1.0.0 LANGUAGES C CXX OBJCXX)
+project(RelativeVPN VERSION 1.0.0 LANGUAGES C CXX)
+
+# Enable Objective-C++ only on Apple platforms
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    enable_language(OBJCXX)
+endif()
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
