@@ -13,6 +13,7 @@
 #include <NetworkExtension/NetworkExtension.h>
 #include <SystemConfiguration/SystemConfiguration.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <arpa/inet.h>
 #endif
 
 /**

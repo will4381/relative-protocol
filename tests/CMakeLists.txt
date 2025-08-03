@@ -243,7 +243,7 @@ endif()
 # iOS NetworkExtension tests
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
     add_executable(ios_tests
-        ios/test_networkextension_integration.cpp
+        ios/test_networkextension_integration.mm
         utils/test_utilities.cpp
     )
 
