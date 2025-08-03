@@ -1,4 +1,4 @@
-# Core sources that work on all platforms
+# Cross-platform sources that work everywhere
 set(RELATIVE_VPN_SOURCES
     core/logging.c
     packet/buffer_manager.c
@@ -8,23 +8,24 @@ set(RELATIVE_VPN_SOURCES
     metrics/ring_buffer.c
     nat64/translator.c
     mtu/discovery.c
-    reachability/monitor.c
     classifier/tls_quic.c
     privacy/guards.c
-    crash/reporter.c
     api/vpn_api.c
     api/vpn_engine.c
 )
 
 # Add platform-specific sources
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
-    # iOS uses NetworkExtension framework, not direct utun/socket bridge
-    message(STATUS "Building for iOS - excluding macOS-specific utun and socket bridge")
+    # iOS uses NetworkExtension framework - exclude macOS-specific components
+    message(STATUS "Building for iOS - excluding macOS-specific components")
+    # iOS versions of these would be implemented differently using NetworkExtension
 else()
-    # macOS can use direct utun and socket bridge
+    # macOS can use direct kernel APIs and Objective-C imports
     list(APPEND RELATIVE_VPN_SOURCES
         packet/utun.c
         socket_bridge/bridge.c
+        reachability/monitor.c
+        crash/reporter.c
     )
 endif()
 
