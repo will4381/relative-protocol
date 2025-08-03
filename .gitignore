@@ -56,6 +56,9 @@ Makefile
 core
 core.*
 
+# But allow src/core directory
+!src/core/
+
 # Package managers
 node_modules/
 .npm/

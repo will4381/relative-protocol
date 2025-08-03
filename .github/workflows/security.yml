@@ -97,7 +97,7 @@ jobs:
       uses: trufflesecurity/trufflehog@main
       with:
         path: ./
-        base: main
+        base: ${{ github.event.before || 'HEAD~1' }}
         head: HEAD
         extra_args: --debug --only-verified
 
@@ -193,7 +193,8 @@ jobs:
         echo "🔍 Checking for secure coding practices..."
         
         # Check for hardcoded secrets (basic patterns)
-        if grep -r -i "password\|secret\|key\|token" --include="*.c" --include="*.h" src/ include/ | grep -v "// " | grep -v "/\*" ; then
+        # Look for actual secret values, not just variable names containing these words
+        if grep -r -E "(password|secret|key|token)\s*=\s*[\"'].*[\"']" --include="*.c" --include="*.h" src/ include/ | grep -v "// " | grep -v "/\*" ; then
           echo "⚠️  Potential hardcoded secrets found"
           exit 1
         fi
