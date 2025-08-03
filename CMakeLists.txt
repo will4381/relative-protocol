@@ -57,13 +57,9 @@ if(ENABLE_IOS_FEATURES)
     add_compile_definitions(ENABLE_IOS_FEATURES=1)
 endif()
 
-include_directories(
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lwip/src/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lwip/contrib/ports/unix/port/include
-)
+# Include directories
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-add_subdirectory(third_party)
 add_subdirectory(src)
 
 if(ENABLE_TESTS OR ENABLE_TESTING)

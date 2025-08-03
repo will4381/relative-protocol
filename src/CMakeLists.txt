@@ -1,9 +1,8 @@
+# Core sources that work on all platforms
 set(RELATIVE_VPN_SOURCES
     core/logging.c
-    packet/utun.c
     packet/buffer_manager.c
     tcp_udp/connection_manager.c
-    socket_bridge/bridge.c
     dns/resolver.c
     dns/cache.c
     metrics/ring_buffer.c
@@ -17,14 +16,33 @@ set(RELATIVE_VPN_SOURCES
     api/vpn_engine.c
 )
 
+# Add platform-specific sources
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    # iOS uses NetworkExtension framework, not direct utun/socket bridge
+    message(STATUS "Building for iOS - excluding macOS-specific utun and socket bridge")
+else()
+    # macOS can use direct utun and socket bridge
+    list(APPEND RELATIVE_VPN_SOURCES
+        packet/utun.c
+        socket_bridge/bridge.c
+    )
+endif()
+
+# Core headers that work on all platforms
 set(RELATIVE_VPN_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/../include/api/relative_vpn.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../include/core/types.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../include/core/logging.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../include/packet/utun.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../include/packet/buffer_manager.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../include/metrics/ring_buffer.h
 )
+
+# Add platform-specific headers
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    list(APPEND RELATIVE_VPN_HEADERS
+        ${CMAKE_CURRENT_SOURCE_DIR}/../include/packet/utun.h
+    )
+endif()
 
 if(BUILD_STATIC)
     add_library(relative_vpn STATIC ${RELATIVE_VPN_SOURCES})
@@ -33,7 +51,6 @@ else()
 endif()
 
 target_link_libraries(relative_vpn
-    lwip
     pthread
 )
 
