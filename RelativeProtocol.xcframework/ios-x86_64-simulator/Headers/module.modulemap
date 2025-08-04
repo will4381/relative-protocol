@@ -4,9 +4,5 @@ module RelativeProtocol {
   export *
   module * { export * }
 
-  header "core/types.h"
-  header "core/logging.h"
-  header "api/relative_vpn.h"
-
   link "relative_vpn-x86_64"
 }
