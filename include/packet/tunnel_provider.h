@@ -14,7 +14,7 @@ extern "C" {
 typedef struct tunnel_provider tunnel_provider_t;
 
 // Callback for receiving packets from the tunnel interface
-typedef void (*tunnel_packet_handler_t)(const packet_info_t *packet, void *user_data);
+typedef void (*tunnel_packet_handler_t)(const packet_info_t * _Nonnull packet, void * _Nullable user_data);
 
 // Create a new tunnel provider instance
 tunnel_provider_t *tunnel_provider_create(void);
@@ -48,18 +48,18 @@ bool tunnel_provider_configure_packet_flow(tunnel_provider_t *provider,
                                          NEPacketTunnelFlow *packetFlow);
 
 // Create TCP connection using NEPacketTunnelProvider
-bool tunnel_provider_create_tcp_connection(tunnel_provider_t *provider,
-                                         NEPacketTunnelProvider *tunnelProvider,
-                                         const char *hostname,
+bool tunnel_provider_create_tcp_connection(tunnel_provider_t * _Nonnull provider,
+                                         NEPacketTunnelProvider * _Nonnull tunnelProvider,
+                                         const char * _Nonnull hostname,
                                          uint16_t port,
-                                         void (^completion)(nw_connection_t _Nullable));
+                                         void (^ _Nonnull completion)(nw_connection_t _Nullable));
 
 // Create UDP session using NEPacketTunnelProvider
-bool tunnel_provider_create_udp_session(tunnel_provider_t *provider,
-                                      NEPacketTunnelProvider *tunnelProvider,
-                                      const char *hostname,
+bool tunnel_provider_create_udp_session(tunnel_provider_t * _Nonnull provider,
+                                      NEPacketTunnelProvider * _Nonnull tunnelProvider,
+                                      const char * _Nonnull hostname,
                                       uint16_t port,
-                                      void (^completion)(nw_connection_t _Nullable));
+                                      void (^ _Nonnull completion)(nw_connection_t _Nullable));
 #endif
 #endif
 

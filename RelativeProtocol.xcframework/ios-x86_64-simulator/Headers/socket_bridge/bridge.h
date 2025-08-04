@@ -56,9 +56,10 @@ void socket_bridge_get_stats(socket_bridge_t * _Nonnull bridge, vpn_metrics_t * 
 
 #if defined(TARGET_OS_IOS) && defined(__OBJC__)
 #import <NetworkExtension/NetworkExtension.h>
+#import <Network/Network.h>
 
-typedef void (^tcp_completion_handler_t)(NWTCPConnection * _Nullable connection);
-typedef void (^udp_completion_handler_t)(NWUDPSession * _Nullable session);
+typedef void (^tcp_completion_handler_t)(nw_connection_t _Nullable connection);
+typedef void (^udp_completion_handler_t)(nw_connection_t _Nullable session);
 
 bool socket_bridge_create_tcp_connection_ios(socket_bridge_t * _Nonnull bridge,
                                            NEPacketTunnelProvider * _Nonnull provider,
