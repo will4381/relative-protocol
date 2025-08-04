@@ -106,7 +106,6 @@ tmp/
 
 # XCFramework signing artifacts (keep the framework, ignore signing files)
 *.xcframework/_CodeSignature/
-*.xcframework/*/Headers/module.modulemap
 
 # Testing artifacts
 Testing/
