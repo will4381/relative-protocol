@@ -3,7 +3,7 @@ build/
 build-*/
 install/
 out/
-
+.build
 # Analysis results
 analysis_results/
 
@@ -64,6 +64,10 @@ core.*
 # Package managers
 node_modules/
 .npm/
+
+# Swift Package Manager
+.build/
+.swiftpm/
 
 # Python cache (for analysis scripts)
 __pycache__/
