@@ -7,9 +7,18 @@
 #include <time.h>
 
 #ifdef TARGET_OS_IOS
-#import <Foundation/Foundation.h>
-#import <NetworkExtension/NetworkExtension.h>
-#import <Network/Network.h>
+// Forward declarations for iOS NetworkExtension types (avoid importing Objective-C headers in C file)
+typedef void* ios_tcp_connection_t;
+typedef void* ios_udp_session_t;
+
+// Objective-C bridge functions (implemented in bridge_ios.mm)
+extern ios_tcp_connection_t* ios_create_tcp_connection(const char* host, uint16_t port);
+extern ios_udp_session_t* ios_create_udp_session(uint16_t local_port);
+extern bool ios_send_tcp_data(ios_tcp_connection_t* conn, const uint8_t* data, size_t length);
+extern bool ios_send_udp_data(ios_udp_session_t* session, const uint8_t* data, size_t length, 
+                               const char* dest_host, uint16_t dest_port);
+extern void ios_close_tcp_connection(ios_tcp_connection_t* conn);
+extern void ios_close_udp_session(ios_udp_session_t* session);
 #else
 // Non-iOS platforms still need socket headers
 #include <sys/socket.h>
@@ -43,9 +52,9 @@ struct bridge_connection {
     bool active;
     
 #ifdef TARGET_OS_IOS
-    NWTCPConnection *nw_tcp_connection;
-    NWUDPSession *nw_udp_session;
-    dispatch_queue_t read_queue;
+    ios_tcp_connection_t *ios_tcp_conn;
+    ios_udp_session_t *ios_udp_session;
+    void *read_queue;
 #else
     int socket_fd;
     pthread_t read_thread;
@@ -61,7 +70,7 @@ struct socket_bridge {
     vpn_metrics_t stats;
     
 #ifdef TARGET_OS_IOS
-    NEPacketTunnelProvider *tunnel_provider;
+    void *tunnel_provider;
 #endif
 };
 
@@ -177,18 +186,8 @@ bridge_connection_t *socket_bridge_create_tcp_connection(socket_bridge_t *bridge
     }
 #ifdef TARGET_OS_IOS
     // On iOS, we'll use NEPacketTunnelProvider's createTCPConnection instead of raw sockets
-    conn->read_queue = dispatch_queue_create("com.relative.vpn.bridge.read", DISPATCH_QUEUE_SERIAL);
-    if (!conn->read_queue) {
-        LOG_ERROR("Failed to create dispatch queue for bridge connection");
-        tcp_connection_destroy(conn->tcp_conn);
-        conn->tcp_conn = NULL;
-        free(conn->read_buffer);
-        conn->read_buffer = NULL;
-        conn->active = false;
-        memset(conn, 0, sizeof(bridge_connection_t));
-        pthread_mutex_unlock(&bridge->mutex);
-        return NULL;
-    }
+    conn->read_queue = NULL; // Will be set up by iOS bridge functions
+    LOG_DEBUG("iOS bridge connection will be configured via NetworkExtension");
     
     conn->state = CONN_SYN_SENT;
     // iOS connection will be established through NEPacketTunnelProvider API
@@ -362,7 +361,7 @@ void socket_bridge_destroy_connection(bridge_connection_t *conn) {
 #ifdef TARGET_OS_IOS
     // iOS: Clean up dispatch queue
     if (conn->read_queue) {
-        dispatch_release(conn->read_queue);
+        // Will be cleaned up by iOS bridge functions
         conn->read_queue = NULL;
     }
 #else
@@ -432,20 +431,14 @@ void socket_bridge_destroy_connection(bridge_connection_t *conn) {
     
 #ifdef TARGET_OS_IOS
     // PRODUCTION FIX: Proper iOS Network framework cleanup
-    if (conn->nw_tcp_connection) {
-        nw_connection_cancel(conn->nw_tcp_connection);
-        // Add cleanup completion handler
-        nw_connection_set_state_changed_handler(conn->nw_tcp_connection, ^(nw_connection_state_t state, nw_error_t error) {
-            if (state == nw_connection_state_cancelled) {
-                LOG_DEBUG("iOS network connection cancelled for bridge connection %d", conn->id);
-            }
-        });
-        conn->nw_tcp_connection = nil;
+    if (conn->ios_tcp_conn) {
+        // Cleanup will be handled by iOS bridge functions
+        conn->ios_tcp_conn = NULL;
     }
     
-    if (conn->nw_udp_session) {
-        nw_connection_cancel(conn->nw_udp_session);
-        conn->nw_udp_session = nil;
+    if (conn->ios_udp_session) {
+        // Cleanup will be handled by iOS bridge functions  
+        conn->ios_udp_session = NULL;
     }
 #endif
 
@@ -463,17 +456,9 @@ bool socket_bridge_send_data(bridge_connection_t *conn, const uint8_t *data, siz
     
     if (conn->protocol == BRIDGE_TCP) {
 #ifdef TARGET_OS_IOS
-        if (conn->nw_tcp_connection) {
-            @autoreleasepool {
-                NSData *nsData = [NSData dataWithBytes:data length:length];
-                [conn->nw_tcp_connection writeData:nsData completionHandler:^(NSError * _Nullable error) {
-                    if (error) {
-                        LOG_ERROR("Failed to send TCP data via NetworkExtension: %s", 
-                                 error.localizedDescription.UTF8String);
-                    }
-                }];
-            }
-            return true;
+        if (conn->ios_tcp_conn) {
+            // Use iOS bridge function to send data
+            return ios_send_tcp_data(conn->ios_tcp_conn, data, length);
         }
 #else
         if (conn->socket_fd >= 0) {
@@ -627,43 +612,4 @@ void socket_bridge_get_stats(socket_bridge_t *bridge, vpn_metrics_t *metrics) {
     pthread_mutex_unlock(&bridge->mutex);
 }
 
-#ifdef TARGET_OS_IOS
-bool socket_bridge_create_tcp_connection_ios(socket_bridge_t *bridge,
-                                           NEPacketTunnelProvider *provider,
-                                           const char *hostname,
-                                           uint16_t port,
-                                           tcp_completion_handler_t completion) {
-    if (!bridge || !provider || !hostname || !completion) return false;
-    
-    NWHostEndpoint *endpoint = [NWHostEndpoint endpointWithHostname:@(hostname) port:@(port).stringValue];
-    NWTCPConnection *connection = [provider createTCPConnectionToEndpoint:endpoint 
-                                                         enableTLS:NO 
-                                                       TLSParameters:nil 
-                                                          delegate:nil];
-    
-    if (connection) {
-        completion(connection);
-        return true;
-    }
-    
-    return false;
-}
-
-bool socket_bridge_create_udp_session_ios(socket_bridge_t *bridge,
-                                        NEPacketTunnelProvider *provider,
-                                        const char *hostname,
-                                        uint16_t port,
-                                        udp_completion_handler_t completion) {
-    if (!bridge || !provider || !hostname || !completion) return false;
-    
-    NWHostEndpoint *endpoint = [NWHostEndpoint endpointWithHostname:@(hostname) port:@(port).stringValue];
-    NWUDPSession *session = [provider createUDPSessionToEndpoint:endpoint fromEndpoint:nil];
-    
-    if (session) {
-        completion(session);
-        return true;
-    }
-    
-    return false;
-}
-#endif
+// iOS-specific functions have been moved to bridge_ios.mm

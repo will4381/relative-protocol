@@ -4,6 +4,7 @@ set(RELATIVE_VPN_SOURCES
     packet/buffer_manager.c
     packet/tunnel_provider.mm
     socket_bridge/bridge.c
+    socket_bridge/bridge_ios.mm
     tcp_udp/connection_manager.c
     dns/resolver.c
     dns/cache.c

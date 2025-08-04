@@ -503,12 +503,12 @@ bool crash_reporter_get_memory_info(char *buffer, size_t buffer_size) {
              "  Active: %llu MB\n"
              "  Inactive: %llu MB\n"
              "  Wired: %llu MB\n"
-             "  Page Size: %u bytes",
+             "  Page Size: %lu bytes",
              free_memory / (1024 * 1024),
              active_memory / (1024 * 1024),
              inactive_memory / (1024 * 1024),
              wired_memory / (1024 * 1024),
-             (unsigned long)page_size);
+             page_size);
 #else
     strncpy(buffer, "Memory info not available on this platform", buffer_size - 1);
 #endif

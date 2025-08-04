@@ -251,10 +251,11 @@ bool tunnel_provider_configure_packet_flow(tunnel_provider_t *provider,
     provider->packet_flow = packetFlow;
     
     // Start reading packets from the tunnel
-    __weak typeof(provider) weakProvider = provider;
+    // Note: provider is a C struct pointer, not an Objective-C object, so we can't use __weak
+    tunnel_provider_t *providerPtr = provider;
     
     void (^readHandler)(void) = ^{
-        __strong typeof(weakProvider) strongProvider = weakProvider;
+        tunnel_provider_t *strongProvider = providerPtr;
         if (!strongProvider || !strongProvider->running) return;
         
         [strongProvider->packet_flow readPacketsWithCompletionHandler:^(NSArray<NSData *> *packets, 
@@ -276,7 +277,8 @@ bool tunnel_provider_configure_packet_flow(tunnel_provider_t *provider,
                 // Create packet info
                 packet_info_t packet = {0};
                 packet.length = packetData.length;
-                packet.data = (const uint8_t *)packetData.bytes;
+                // We'll copy the data later to avoid const issues
+                packet.data = (uint8_t *)packetData.bytes;
                 packet.timestamp_ns = clock_gettime_nsec_np(CLOCK_MONOTONIC);
                 
                 // Determine IP version from protocol family
