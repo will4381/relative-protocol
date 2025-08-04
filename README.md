@@ -3,9 +3,27 @@
 [![CI/CD Pipeline](https://github.com/will4381/relative-protocol/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/relative-vpn/actions/workflows/ci.yml)
 [![Security Scan](https://github.com/will4381/relative-protocol/actions/workflows/security.yml/badge.svg)](https://github.com/your-org/relative-vpn/actions/workflows/security.yml)
 [![Release](https://github.com/will4381/relative-protocol/actions/workflows/release.yml/badge.svg)](https://github.com/your-org/relative-vpn/actions/workflows/release.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
-A high-performance, privacy-focused VPN implementation designed exclusively for iOS devices using NetworkExtension framework, built in C with comprehensive testing and enterprise-grade reliability.
+A high-performance, privacy-focused VPN implementation designed exclusively for iOS devices using NetworkExtension framework. Built from the ground up in C with comprehensive nullability annotations for Swift interoperability, enterprise-grade reliability, and production-ready iOS integration.
+
+## ✨ Recent Improvements
+
+### 🔧 iOS Build System Enhancements
+- ✅ **Fixed all nullability warnings** - Complete `_Nonnull`/`_Nullable` annotations for seamless Swift interoperability
+- ✅ **Resolved iOS build errors** - Fixed C/Objective-C++ linkage issues in GitHub Actions CI/CD
+- ✅ **Enhanced memory safety** - Fixed const qualifier issues and memory management patterns
+- ✅ **Clean CI/CD pipeline** - Zero warnings in iOS builds across all architectures
+
+### 🛠️ Code Quality & Security
+- ✅ **Memory leak fixes** - Resolved VPN startup failures and configuration issues
+- ✅ **Edge case handling** - Fixed DNS validation, TLS record validation, and privacy violation tracking
+- ✅ **Production-ready** - All tests passing with comprehensive error handling
+
+### 📱 iOS Integration
+- ✅ **Native NetworkExtension** - Purpose-built for iOS packet tunnel providers
+- ✅ **Swift-first design** - Complete nullability annotations for type safety
+- ✅ **XCFramework ready** - Production distribution for iOS development
 
 ## Features
 
@@ -32,7 +50,8 @@ A high-performance, privacy-focused VPN implementation designed exclusively for 
 - **iOS Memory Management**: Optimized for iOS memory pressure handling and low battery impact
 - **Reachability Integration**: Native iOS network transition monitoring (Wi-Fi ↔ Cellular)
 - **XCFramework**: Production-ready iOS framework distribution
-- **Swift Integration**: Clean C API with comprehensive Swift bridging support
+- **Swift Integration**: Clean C API with comprehensive nullability annotations (`_Nonnull`, `_Nullable`) for seamless Swift interoperability
+- **iOS-Only Architecture**: Exclusively designed for iOS - no legacy cross-platform code paths
 
 ## Quick Start
 
@@ -167,9 +186,10 @@ vpn_set_metrics_callback({ metrics, userData in
 Our CI/CD pipeline provides comprehensive automated testing across multiple platforms and configurations:
 
 #### 🏗️ **Build Matrix**
-- **Platform**: iOS (iPhone/iPad) - NetworkExtension framework
+- **Platform**: iOS (iPhone/iPad) - NetworkExtension framework only
 - **Build Types**: Debug, Release  
-- **Architectures**: ARM64 (iOS devices), ARM64 Simulator (iOS Simulator)
+- **Architectures**: ARM64 (iOS devices), x86_64 (iOS Simulator)
+- **iOS Version**: 14.0+ (NetworkExtension requirements)
 
 #### 🧪 **Test Suites**
 - **Unit Tests**: Individual component testing (GoogleTest)
@@ -182,8 +202,9 @@ Our CI/CD pipeline provides comprehensive automated testing across multiple plat
 #### 📊 **Quality Assurance**
 - **Static Analysis**: Clang-tidy, cppcheck
 - **Security Scanning**: CodeQL, Semgrep, OWASP dependency check
-- **Memory Analysis**: Valgrind (Linux), AddressSanitizer
+- **Memory Analysis**: AddressSanitizer, iOS Instruments
 - **Code Coverage**: LCOV/gcov with Codecov integration
+- **Swift Interop**: Nullability annotation validation
 
 #### 🔒 **Security Pipeline**
 - **Daily Security Scans**: Automated vulnerability detection
@@ -231,12 +252,12 @@ make all
 
 #### Memory Analysis
 ```bash
-# Linux - Valgrind memory analysis
-valgrind --tool=memcheck --leak-check=full ./unit_tests
-
-# macOS/Linux - AddressSanitizer
+# iOS - AddressSanitizer (primary memory analysis tool)
 cmake .. -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS="-fsanitize=address"
 make && ./unit_tests
+
+# iOS - Instruments (for production testing)
+# Use Xcode Instruments with iOS simulator builds
 ```
 
 #### Security Testing
@@ -266,8 +287,8 @@ cppcheck --enable=all src/ include/
 1. **Main CI Pipeline** (`.github/workflows/ci.yml`)
    - Triggered on: Push to main/develop, Pull Requests
    - Runs: Full test suite, static analysis, code coverage
-   - Platforms: Ubuntu, macOS, iOS
-   - Artifacts: Test results, coverage reports
+   - Platforms: iOS (devices and simulator), macOS (for testing)
+   - Artifacts: Test results, coverage reports, iOS frameworks
 
 2. **Security Pipeline** (`.github/workflows/security.yml`)  
    - Triggered on: Push, Pull Request, Daily schedule
@@ -276,8 +297,8 @@ cppcheck --enable=all src/ include/
 
 3. **Release Pipeline** (`.github/workflows/release.yml`)
    - Triggered on: Version tags (v*.*.*)
-   - Runs: Multi-platform builds, XCFramework generation
-   - Artifacts: Release binaries, documentation
+   - Runs: iOS builds, XCFramework generation, Swift Package Manager
+   - Artifacts: iOS XCFramework, static libraries, documentation
 
 #### Test Automation Features
 
@@ -309,22 +330,22 @@ git push origin v1.2.3
 ```
 
 The release pipeline automatically:
-- ✅ Builds for all platforms (Ubuntu, macOS, iOS)
-- ✅ Runs complete test suite
-- ✅ Generates XCFramework for iOS
-- ✅ Creates GitHub release with artifacts
+- ✅ Builds for iOS (devices and simulator)
+- ✅ Runs complete test suite with iOS integration tests
+- ✅ Generates XCFramework for iOS development
+- ✅ Creates GitHub release with iOS artifacts
 - ✅ Updates documentation site
-- ✅ Publishes to package repositories
+- ✅ Publishes to iOS package repositories (CocoaPods, Swift Package Manager)
 
 ### Release Artifacts
 
 Each release includes:
-- **Static Libraries**: `librelative_vpn.a` for Linux/macOS/iOS
-- **Shared Libraries**: `librelative_vpn.so/.dylib` (where applicable)
+- **iOS Static Library**: `librelative_vpn.a` for iOS devices and simulator
 - **XCFramework**: `RelativeProtocol.xcframework` for iOS development
-- **Headers**: Complete C API headers
-- **Documentation**: Generated API docs and examples
-- **Examples**: Sample integration code
+- **Headers**: Complete C API headers with nullability annotations
+- **Documentation**: Generated API docs and iOS integration examples
+- **Examples**: Sample NetworkExtension integration code
+- **Swift Package**: Ready-to-use Swift Package Manager integration
 
 ### Distribution Channels
 
@@ -342,8 +363,8 @@ pod 'RelativeProtocol', '~> 1.0'
 
 #### Direct Download
 ```bash
-# Download latest release
-curl -L https://github.com/will4381/relative-protocol/releases/latest/download/relativeprotocol-v1.0.0-macos-universal.tar.gz
+# Download latest iOS release
+curl -L https://github.com/will4381/relative-protocol/releases/latest/download/relativeprotocol-v1.0.0-ios-xcframework.tar.gz
 ```
 
 ### Version Support
@@ -393,7 +414,9 @@ typedef struct vpn_config {
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
+
+**Important**: This is copyleft software. Any derivative works or applications that include this library must also be licensed under the GPL v3.0 or a compatible license. For commercial licensing options, please contact the maintainers.
 
 ## Contributing
 
@@ -404,11 +427,13 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 5. Submit a pull request
 
 ### Development Guidelines
-- Follow C11 standard
-- Maintain thread safety
+- Follow C11 standard with iOS-specific extensions
+- Maintain thread safety for iOS multi-threading
+- Add comprehensive nullability annotations (`_Nonnull`, `_Nullable`) for Swift interop
 - Add unit tests for all new functionality
-- Update documentation
+- Update documentation and iOS integration examples
 - Run fuzzing tests for security-critical code
+- Test with iOS simulator and real devices
 
 ## Support
 
