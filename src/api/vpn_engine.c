@@ -2,29 +2,38 @@
 #include "core/logging.h"
 #include <arpa/inet.h>
 #include <time.h>
-#include "packet/utun.h"
 #include "metrics/ring_buffer.h"
 #include "dns/resolver.h"
 #include "dns/cache.h"
 #include "privacy/guards.h"
-#include "socket_bridge/bridge.h"
 #include "nat64/translator.h"
 #include "tcp_udp/connection_manager.h"
 #include "mtu/discovery.h"
 #include "classifier/tls_quic.h"
-#include "reachability/monitor.h"
-#include "crash/reporter.h"
 #include "packet/buffer_manager.h"
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
 
+// iOS-only includes
+#include "packet/tunnel_provider.h"
+#include "socket_bridge/bridge.h"
+#include "reachability/monitor.h"
+#include "crash/reporter.h"
+
+// iOS has reachability/monitor.mm and crash/reporter.mm compiled in
 #ifdef TARGET_OS_IOS
+#include "reachability/monitor.h"
+#include "crash/reporter.h"
+#endif
+
 #include <dispatch/dispatch.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
-#endif
+#include <mach/vm_statistics.h>
+#include <mach/mach_host.h>
+#include <mach/host_info.h>
 
 // Constants
 #define MAX_DNS_SERVERS 8
@@ -34,10 +43,11 @@ tcp_connection_t *connection_manager_find_tcp_connection(connection_manager_t *m
 
 #ifdef TARGET_OS_IOS
 // iOS Memory pressure handling
-static void ios_memory_pressure_handler(void);
 static bool ios_get_memory_info(uint64_t *memory_used, uint64_t *memory_available);
 // Forward declaration moved after struct definition
 #endif
+
+// Global crash reporter is defined in crash/reporter.mm
 
 // Stub implementations for missing functions
 tcp_connection_t *connection_manager_find_tcp_connection(connection_manager_t *manager, const flow_tuple_t *flow) {
@@ -52,17 +62,19 @@ typedef struct comprehensive_vpn_state {
     bool running;
     vpn_config_t config;
     
-    // Core components
-    utun_handle_t *utun;
+    // Core components (available on all platforms)
     ring_buffer_t *metrics_buffer;
     dns_resolver_t *dns_resolver;
     dns_cache_t *dns_cache;
     privacy_guards_t *privacy_guards;
-    socket_bridge_t *socket_bridge;
     nat64_translator_t *nat64_translator;
     connection_manager_t *connection_manager;
     mtu_discovery_t *mtu_discovery;
     traffic_classifier_t *traffic_classifier;
+    
+    // iOS-only tunnel components
+    tunnel_provider_t *tunnel_provider;
+    socket_bridge_t *socket_bridge;
     reachability_monitor_t *reachability_monitor;
     crash_reporter_t *crash_reporter;
     
@@ -81,12 +93,10 @@ typedef struct comprehensive_vpn_state {
     pthread_t metrics_thread;
     bool processing_active;
     
-#ifdef TARGET_OS_IOS
     // iOS Memory pressure monitoring
     dispatch_source_t memory_pressure_source;
     uint64_t last_memory_warning;
     bool memory_pressure_active;
-#endif
     
     // Packet processing queue
     packet_info_t *packet_queue;
@@ -133,7 +143,8 @@ static void crash_report_callback(const crash_info_t *crash_info, void *user_dat
                     crash_info->custom_data[0] ? crash_info->custom_data : "Unknown reason",
                     crash_info->process_id, crash_info->thread_id, crash_info->timestamp_ns);
         
-        // Set custom crash data with VPN state information
+        // Set custom crash data with VPN state information (iOS only)
+#ifdef TARGET_OS_IOS
         if (state->crash_reporter) {
             crash_reporter_set_custom_data(state->crash_reporter, "vpn.running", 
                                          state->running ? "true" : "false");
@@ -143,12 +154,11 @@ static void crash_report_callback(const crash_info_t *crash_info, void *user_dat
                                          ""); // Would format the actual count
             
             // Add memory pressure info if available
-            #ifdef TARGET_OS_IOS
             if (state->memory_pressure_active) {
                 crash_reporter_set_custom_data(state->crash_reporter, "vpn.memory_pressure", "active");
             }
-            #endif
         }
+#endif
         
         // Perform emergency cleanup if possible
         if (state->running) {
@@ -325,9 +335,17 @@ static void *packet_processing_thread(void *arg) {
             }
         }
         
-        // 6. Socket bridge processing
+        // 6. Platform-specific packet processing
+#ifdef TARGET_OS_IOS
+        // On iOS, packets are sent back through tunnel provider
+        if (state->tunnel_provider && packet.length > 0) {
+            tunnel_provider_send_packet(state->tunnel_provider, packet.data, packet.length);
+        }
+#else
+        // On other platforms, use socket bridge
         socket_bridge_process_packet(state->socket_bridge, &packet);
         socket_bridge_process_events(state->socket_bridge);
+#endif
         
         // 7. Update metrics with overflow protection
         state->current_metrics.total_packets_processed++;
@@ -404,7 +422,8 @@ static void *metrics_thread(void *arg) {
         state->current_metrics.dns_cache_max_size = dns_cache_get_max_size(state->dns_cache);
         state->current_metrics.dns_cache_hit_rate = 0.85f; // Stub value for now
         
-        // Check reachability status
+        // Check reachability status (iOS only)
+#ifdef TARGET_OS_IOS
         if (reachability_monitor_is_connected(state->reachability_monitor)) {
             state->current_metrics.network_status = 1; // Connected
             network_type_t network_type = reachability_monitor_get_network_type(state->reachability_monitor);
@@ -412,11 +431,21 @@ static void *metrics_thread(void *arg) {
         } else {
             state->current_metrics.network_status = 0; // Disconnected
         }
+#endif
         
         nat64_stats_t nat64_stats;
         nat64_get_stats(state->nat64_translator, &nat64_stats);
         state->current_metrics.nat64_translations = nat64_stats.packets_translated_4to6 + nat64_stats.packets_translated_6to4;
         
+        // Platform-specific stats
+#ifdef TARGET_OS_IOS
+        // Get stats from tunnel provider
+        vpn_metrics_t tunnel_metrics;
+        tunnel_provider_get_stats(state->tunnel_provider, &tunnel_metrics);
+        state->current_metrics.bytes_sent = tunnel_metrics.bytes_sent;
+        state->current_metrics.active_connections = tunnel_metrics.tcp_connections + tunnel_metrics.udp_sessions;
+#else
+        // Socket bridge stats (non-iOS)
         vpn_metrics_t bridge_metrics;
         socket_bridge_get_stats(state->socket_bridge, &bridge_metrics);
         state->current_metrics.bytes_sent = bridge_metrics.bytes_sent;
@@ -424,6 +453,7 @@ static void *metrics_thread(void *arg) {
         // Get connection count from socket bridge
         uint32_t connection_count = socket_bridge_get_connection_count(state->socket_bridge);
         state->current_metrics.active_connections = connection_count;
+#endif
         
         // Call user callback if set
         if (state->metrics_callback) {
@@ -440,7 +470,7 @@ static void *metrics_thread(void *arg) {
     return NULL;
 }
 
-// Packet handler from utun interface
+// Packet handler from tunnel interface
 static void comprehensive_packet_handler(const packet_info_t *packet, void *user_data) {
     comprehensive_vpn_state_t *state = (comprehensive_vpn_state_t *)user_data;
     if (!state || !packet) return;
@@ -455,7 +485,8 @@ static void comprehensive_packet_handler(const packet_info_t *packet, void *user
             LOG_WARN("High packet error rate detected (%u errors), activating error recovery", 
                     state->current_metrics.packet_errors);
             
-            // Report potential stability issue to crash reporter
+            // Report potential stability issue to crash reporter (iOS only)
+#ifdef TARGET_OS_IOS
             if (state->crash_reporter) {
                 char error_msg[256];
                 snprintf(error_msg, sizeof(error_msg), 
@@ -463,6 +494,7 @@ static void comprehensive_packet_handler(const packet_info_t *packet, void *user
                         state->current_metrics.packet_errors);
                 crash_reporter_report_crash(state->crash_reporter, CRASH_TYPE_CUSTOM, error_msg);
             }
+#endif
             
             // Reset error counter to prevent spam
             state->current_metrics.packet_errors = 0;
@@ -572,12 +604,23 @@ static bool initialize_components(comprehensive_vpn_state_t *state) {
     // Set up violation callback
     privacy_guards_set_violation_callback(state->privacy_guards, privacy_violation_callback, state);
     
-    // Initialize socket bridge
+    // Initialize platform-specific components
+#ifdef TARGET_OS_IOS
+    state->tunnel_provider = tunnel_provider_create();
+    if (!state->tunnel_provider) {
+        LOG_ERROR("Failed to create tunnel provider");
+        return false;
+    }
+    
+    // Set packet handler
+    tunnel_provider_set_packet_handler(state->tunnel_provider, comprehensive_packet_handler, state);
+#else
     state->socket_bridge = socket_bridge_create(state->connection_manager);
     if (!state->socket_bridge) {
         LOG_ERROR("Failed to create socket bridge");
         return false;
     }
+#endif
     
     // Initialize NAT64 translator if enabled
     if (state->config.enable_nat64) {
@@ -612,7 +655,8 @@ static bool initialize_components(comprehensive_vpn_state_t *state) {
     // Set up traffic classifier callback for advanced classification
     traffic_classifier_set_callback(state->traffic_classifier, traffic_classification_callback, state);
     
-    // Initialize reachability monitor
+    // Initialize reachability monitor (iOS only)
+#ifdef TARGET_OS_IOS
     state->reachability_monitor = reachability_monitor_create();
     if (!state->reachability_monitor) {
         LOG_ERROR("Failed to create reachability monitor");
@@ -627,8 +671,10 @@ static bool initialize_components(comprehensive_vpn_state_t *state) {
         LOG_ERROR("Failed to create crash reporter");
         return false;
     }
+#endif
     
-    // Configure crash reporter with comprehensive monitoring
+    // Configure crash reporter with comprehensive monitoring (iOS only)
+#ifdef TARGET_OS_IOS
     crash_reporter_flags_t crash_flags = CRASH_REPORTER_ENABLE_STACK_TRACES |
                                        CRASH_REPORTER_ENABLE_SYSTEM_INFO |
                                        CRASH_REPORTER_ENABLE_THREAD_INFO |
@@ -654,6 +700,7 @@ static bool initialize_components(comprehensive_vpn_state_t *state) {
     } else {
         LOG_INFO("Crash reporter enabled");
     }
+#endif
     
     return true;
 }
@@ -685,10 +732,17 @@ static void cleanup_components(comprehensive_vpn_state_t *state) {
         state->privacy_guards = NULL;
     }
     
+#ifdef TARGET_OS_IOS
+    if (state->tunnel_provider) {
+        tunnel_provider_destroy(state->tunnel_provider);
+        state->tunnel_provider = NULL;
+    }
+#else
     if (state->socket_bridge) {
         socket_bridge_destroy(state->socket_bridge);
         state->socket_bridge = NULL;
     }
+#endif
     
     if (state->nat64_translator) {
         nat64_translator_destroy(state->nat64_translator);
@@ -710,6 +764,7 @@ static void cleanup_components(comprehensive_vpn_state_t *state) {
         state->traffic_classifier = NULL;
     }
     
+#ifdef TARGET_OS_IOS
     if (state->reachability_monitor) {
         reachability_monitor_destroy(state->reachability_monitor);
         state->reachability_monitor = NULL;
@@ -720,6 +775,7 @@ static void cleanup_components(comprehensive_vpn_state_t *state) {
         crash_reporter_destroy(state->crash_reporter);
         state->crash_reporter = NULL;
     }
+#endif
 }
 
 vpn_result_t vpn_start_comprehensive(const vpn_config_t *config) {
@@ -742,11 +798,13 @@ vpn_result_t vpn_start_comprehensive(const vpn_config_t *config) {
     if (!state) {
         comprehensive_vpn_state_t *new_state = calloc(1, sizeof(comprehensive_vpn_state_t));
         if (!new_state) {
-            // Report critical memory allocation failure
+            // Report critical memory allocation failure (iOS only)
+#ifdef TARGET_OS_IOS
             if (g_crash_reporter) {
                 crash_reporter_report_crash(g_crash_reporter, CRASH_TYPE_OUT_OF_MEMORY, 
                                           "Failed to allocate VPN state structure");
             }
+#endif
             pthread_mutex_unlock(&g_state_mutex);
             return (vpn_result_t){ .status = VPN_ERROR_MEMORY, .handle = VPN_INVALID_HANDLE };
         }
@@ -791,17 +849,13 @@ vpn_result_t vpn_start_comprehensive(const vpn_config_t *config) {
         return (vpn_result_t){ .status = VPN_ERROR_MEMORY, .handle = VPN_INVALID_HANDLE };
     }
     
-    // Create utun interface
-    state->utun = utun_create(config->utun_name, config->tunnel_mtu);
-    if (!state->utun) {
-        pthread_mutex_unlock(&g_state_mutex);
-        return (vpn_result_t){ .status = VPN_ERROR_UTUN_FAILED, .handle = VPN_INVALID_HANDLE };
-    }
+    // Note: On iOS, the tunnel interface is created by NetworkExtension framework
+    // and provided to us via NEPacketTunnelProvider
     
     // Create metrics buffer
     state->metrics_buffer = ring_buffer_create(config->metrics_buffer_size);
     if (!state->metrics_buffer) {
-        utun_destroy(state->utun);
+        free(state->packet_queue);
         pthread_mutex_unlock(&g_state_mutex);
         return (vpn_result_t){ .status = VPN_ERROR_MEMORY, .handle = VPN_INVALID_HANDLE };
     }
@@ -809,7 +863,6 @@ vpn_result_t vpn_start_comprehensive(const vpn_config_t *config) {
     // Initialize all components
     if (!initialize_components(state)) {
         ring_buffer_destroy(state->metrics_buffer);
-        utun_destroy(state->utun);
         free(state->packet_queue);
         pthread_mutex_unlock(&g_state_mutex);
         return (vpn_result_t){ .status = VPN_ERROR_NETWORK, .handle = VPN_INVALID_HANDLE };
@@ -822,7 +875,6 @@ vpn_result_t vpn_start_comprehensive(const vpn_config_t *config) {
                       packet_processing_thread, state) != 0) {
         cleanup_components(state);
         ring_buffer_destroy(state->metrics_buffer);
-        utun_destroy(state->utun);
         free(state->packet_queue);
         pthread_mutex_unlock(&g_state_mutex);
         return (vpn_result_t){ .status = VPN_ERROR_NETWORK, .handle = VPN_INVALID_HANDLE };
@@ -834,24 +886,13 @@ vpn_result_t vpn_start_comprehensive(const vpn_config_t *config) {
         pthread_join(state->packet_processing_thread, NULL);
         cleanup_components(state);
         ring_buffer_destroy(state->metrics_buffer);
-        utun_destroy(state->utun);
         free(state->packet_queue);
         pthread_mutex_unlock(&g_state_mutex);
         return (vpn_result_t){ .status = VPN_ERROR_NETWORK, .handle = VPN_INVALID_HANDLE };
     }
     
-    // Start utun read loop
-    if (!utun_start_read_loop(state->utun, comprehensive_packet_handler, state)) {
-        state->processing_active = false;
-        pthread_join(state->packet_processing_thread, NULL);
-        pthread_join(state->metrics_thread, NULL);
-        cleanup_components(state);
-        ring_buffer_destroy(state->metrics_buffer);
-        utun_destroy(state->utun);
-        free(state->packet_queue);
-        pthread_mutex_unlock(&g_state_mutex);
-        return (vpn_result_t){ .status = VPN_ERROR_NETWORK, .handle = VPN_INVALID_HANDLE };
-    }
+    // Note: On iOS, packet reading is initiated by NEPacketTunnelProvider
+    // through tunnel_provider_configure_packet_flow()
     
     state->running = true;
     
@@ -918,10 +959,7 @@ bool vpn_stop_comprehensive(vpn_handle_t handle) {
     }
 #endif
     
-    // Stop utun read loop
-    if (state->utun) {
-        utun_stop_read_loop(state->utun);
-    }
+    // Note: On iOS, packet flow is stopped by NetworkExtension framework
     
     // Signal processing thread to stop
     pthread_cond_broadcast(&state->queue_cond);
@@ -933,10 +971,6 @@ bool vpn_stop_comprehensive(vpn_handle_t handle) {
     // Cleanup all components
     cleanup_components(state);
     
-    if (state->utun) {
-        utun_destroy(state->utun);
-        state->utun = NULL;
-    }
     
     if (state->metrics_buffer) {
         ring_buffer_destroy(state->metrics_buffer);

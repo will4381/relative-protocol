@@ -1,5 +1,7 @@
+extern "C" {
 #include "reachability/monitor.h"
 #include "core/logging.h"
+}
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
@@ -64,7 +66,7 @@ static void path_update_handler(nw_path_t path) {
 #endif
 
 reachability_monitor_t *reachability_monitor_create(void) {
-    reachability_monitor_t *monitor = calloc(1, sizeof(reachability_monitor_t));
+    reachability_monitor_t *monitor = (reachability_monitor_t *)calloc(1, sizeof(reachability_monitor_t));
     if (!monitor) {
         LOG_ERROR("Failed to allocate reachability monitor");
         return NULL;
@@ -386,16 +388,19 @@ static network_type_t reachability_detect_type(reachability_monitor_t *monitor) 
     switch (status) {
         case NETWORK_STATUS_REACHABLE_VIA_WIFI:
             return NETWORK_TYPE_WIFI;
-        case NETWORK_STATUS_REACHABLE_VIA_CELLULAR:
+        case NETWORK_STATUS_REACHABLE_VIA_CELLULAR: {
 #ifdef TARGET_OS_IOS
             // Try to detect cellular generation
             CTTelephonyNetworkInfo *networkInfo = [[CTTelephonyNetworkInfo alloc] init];
             if (networkInfo.serviceCurrentRadioAccessTechnology) {
                 NSString *radioTech = [networkInfo.serviceCurrentRadioAccessTechnology.allValues firstObject];
-                if ([radioTech isEqualToString:CTRadioAccessTechnologyNR] ||
-                    [radioTech isEqualToString:CTRadioAccessTechnologyNRNSA]) {
-                    return NETWORK_TYPE_CELLULAR_5G;
-                } else if ([radioTech isEqualToString:CTRadioAccessTechnologyLTE]) {
+                if (@available(iOS 14.1, *)) {
+                    if ([radioTech isEqualToString:CTRadioAccessTechnologyNR] ||
+                        [radioTech isEqualToString:CTRadioAccessTechnologyNRNSA]) {
+                        return NETWORK_TYPE_CELLULAR_5G;
+                    }
+                }
+                if ([radioTech isEqualToString:CTRadioAccessTechnologyLTE]) {
                     return NETWORK_TYPE_CELLULAR_4G;
                 } else if ([radioTech containsString:@"WCDMA"] || [radioTech containsString:@"HSDPA"]) {
                     return NETWORK_TYPE_CELLULAR_3G;
@@ -405,6 +410,7 @@ static network_type_t reachability_detect_type(reachability_monitor_t *monitor) 
             }
 #endif
             return NETWORK_TYPE_CELLULAR_4G;
+        }
         case NETWORK_STATUS_REACHABLE_VIA_ETHERNET:
             return NETWORK_TYPE_ETHERNET;
         default:
@@ -413,7 +419,7 @@ static network_type_t reachability_detect_type(reachability_monitor_t *monitor) 
 }
 
 static void reachability_notify_change(reachability_monitor_t *monitor, network_status_t new_status, network_type_t new_type) {
-    reachability_event_t event = {0};
+    reachability_event_t event = {};
     event.old_status = monitor->current_status;
     event.new_status = new_status;
     event.old_type = monitor->current_type;

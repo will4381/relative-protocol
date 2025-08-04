@@ -1,7 +1,9 @@
-# iOS VPN Framework - NetworkExtension compatible components
+# iOS-only VPN Framework - NetworkExtension compatible components
 set(RELATIVE_VPN_SOURCES
     core/logging.c
     packet/buffer_manager.c
+    packet/tunnel_provider.mm
+    socket_bridge/bridge.c
     tcp_udp/connection_manager.c
     dns/resolver.c
     dns/cache.c
@@ -16,10 +18,8 @@ set(RELATIVE_VPN_SOURCES
     crash/reporter.mm
 )
 
-# Note: Excluded macOS-specific files:
-# - packet/utun.c (uses macOS kernel control APIs)
-# - socket_bridge/bridge.c (low-level socket bridging not needed on iOS)
-# On iOS, packet flow is handled via NEPacketTunnelProvider
+# iOS-only VPN framework using NEPacketTunnelProvider and NetworkExtension APIs
+# All platform-specific code paths are handled via TARGET_OS_IOS conditionals
 
 # Core headers that work on all platforms
 set(RELATIVE_VPN_HEADERS
@@ -30,12 +30,11 @@ set(RELATIVE_VPN_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/../include/metrics/ring_buffer.h
 )
 
-# Add platform-specific headers
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
-    list(APPEND RELATIVE_VPN_HEADERS
-        ${CMAKE_CURRENT_SOURCE_DIR}/../include/packet/utun.h
-    )
-endif()
+# iOS-specific headers
+list(APPEND RELATIVE_VPN_HEADERS
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include/packet/tunnel_provider.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include/socket_bridge/bridge.h
+)
 
 if(BUILD_STATIC)
     add_library(relative_vpn STATIC ${RELATIVE_VPN_SOURCES})
@@ -54,6 +53,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
         "-framework NetworkExtension"
         "-framework SystemConfiguration"
         "-framework Security"
+        "-framework CoreTelephony"
     )
 endif()
 

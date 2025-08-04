@@ -509,3 +509,14 @@ void dns_cache_set_eviction_policy(dns_cache_t *cache, cache_eviction_policy_t p
     
     LOG_DEBUG("DNS cache eviction policy set to %d", policy);
 }
+
+// Additional function for vpn_engine.c compatibility
+bool dns_cache_evict_oldest(dns_cache_t *cache) {
+    if (!cache) {
+        return false;
+    }
+    
+    // Use LRU eviction to evict the oldest entry
+    dns_cache_evict_lru(cache);
+    return true;
+}

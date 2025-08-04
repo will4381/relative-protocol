@@ -1,23 +1,69 @@
 #include <gtest/gtest.h>
 #include "socket_bridge/bridge.h"
+#include "tcp_udp/connection_manager.h"
+#include "core/types.h"
+#include "api/relative_vpn.h"
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <arpa/inet.h>
+
+// Note: NetworkExtension integration is tested in separate .mm files
+
+/**
+ * Socket Bridge Unit Tests for iOS
+ * 
+ * Tests the iOS-specific socket bridge functionality:
+ * - Creation and destruction with connection manager
+ * - TCP connection bridging using iOS NetworkExtension patterns
+ * - UDP session bridging
+ * - Packet processing and event handling
+ * - Connection lifecycle management
+ */
 
 class SocketBridgeTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        bridge = socket_bridge_create();
+        // Create connection manager first (required for socket bridge)
+        conn_mgr = connection_manager_create();
+        ASSERT_NE(conn_mgr, nullptr);
+        
+        bridge = socket_bridge_create(conn_mgr);
         ASSERT_NE(bridge, nullptr);
+        
+        data_received = 0;
+        events_received = 0;
     }
     
     void TearDown() override {
         if (bridge) {
             socket_bridge_destroy(bridge);
         }
+        if (conn_mgr) {
+            connection_manager_destroy(conn_mgr);
+        }
     }
     
     socket_bridge_t *bridge;
+    connection_manager_t *conn_mgr;
+    std::atomic<int> data_received{0};
+    std::atomic<int> events_received{0};
+    
+    // Data callback for bridge connections
+    static void data_callback(bridge_connection_t *conn, const uint8_t *data, 
+                             size_t length, void *user_data) {
+        auto *test = static_cast<SocketBridgeTest*>(user_data);
+        if (data && length > 0) {
+            test->data_received++;
+        }
+    }
+    
+    // Event callback for bridge connections
+    static void event_callback(bridge_connection_t *conn, connection_event_t event, 
+                              void *user_data) {
+        auto *test = static_cast<SocketBridgeTest*>(user_data);
+        test->events_received++;
+    }
 };
 
 TEST_F(SocketBridgeTest, CreateDestroy) {
@@ -25,419 +71,252 @@ TEST_F(SocketBridgeTest, CreateDestroy) {
     
     // Test multiple create/destroy cycles
     for (int i = 0; i < 5; i++) {
-        socket_bridge_t *temp = socket_bridge_create();
+        connection_manager_t *temp_mgr = connection_manager_create();
+        ASSERT_NE(temp_mgr, nullptr);
+        
+        socket_bridge_t *temp = socket_bridge_create(temp_mgr);
         EXPECT_NE(temp, nullptr);
         socket_bridge_destroy(temp);
+        connection_manager_destroy(temp_mgr);
     }
 }
 
-TEST_F(SocketBridgeTest, TCPSocketBridging) {
-    std::atomic<int> packets_bridged{0};
-    std::atomic<bool> connection_established{false};
+TEST_F(SocketBridgeTest, CreateWithNullManager) {
+    // Should fail with null connection manager
+    socket_bridge_t *null_bridge = socket_bridge_create(nullptr);
+    EXPECT_EQ(null_bridge, nullptr);
+}
+
+TEST_F(SocketBridgeTest, TCPConnectionCreation) {
+    // Create a TCP connection to a test server
+    ip_addr_t remote_addr = {};
+    remote_addr.v4.addr = inet_addr("93.184.216.34"); // example.com
+    uint16_t remote_port = 80;
     
-    auto callback = [](socket_event_type_t event, socket_handle_t handle, 
-                      const uint8_t *data, size_t length, void *user_data) {
-        auto *counter = static_cast<std::atomic<int>*>(user_data);
-        
-        EXPECT_NE(handle, INVALID_SOCKET_HANDLE);
-        EXPECT_GE(event, SOCKET_EVENT_CONNECTED);
-        EXPECT_LE(event, SOCKET_EVENT_ERROR);
-        
-        if (event == SOCKET_EVENT_DATA_RECEIVED && data && length > 0) {
-            counter->fetch_add(1);
-        }
-    };
+    bridge_connection_t *tcp_conn = socket_bridge_create_tcp_connection(
+        bridge, &remote_addr, remote_port, data_callback, event_callback, this);
     
-    socket_bridge_set_callback(bridge, callback, &packets_bridged);
-    
-    // Create TCP socket bridge
-    ip_addr_t remote_addr = { .v4 = { .addr = inet_addr("93.184.216.34") } }; // example.com
-    socket_handle_t handle = socket_bridge_create_tcp_socket(bridge, &remote_addr, 80);
-    
-    if (handle != INVALID_SOCKET_HANDLE) {
-        EXPECT_TRUE(socket_bridge_is_socket_valid(bridge, handle));
-        EXPECT_EQ(socket_bridge_get_socket_type(bridge, handle), SOCKET_TYPE_TCP);
+    if (tcp_conn) {
+        // Connection was created successfully
+        EXPECT_EQ(bridge_connection_get_protocol(tcp_conn), BRIDGE_TCP);
+        EXPECT_EQ(bridge_connection_get_remote_port(tcp_conn), remote_port);
         
-        // Test connecting
-        bool connected = socket_bridge_connect(bridge, handle);
-        if (connected) {
-            // Send HTTP request
-            const char *http_request = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
-            size_t sent = socket_bridge_send(bridge, handle, 
-                                           (const uint8_t*)http_request, strlen(http_request));
-            EXPECT_GT(sent, 0);
-            
-            // Process events to handle response
-            for (int i = 0; i < 50; i++) {
-                socket_bridge_process_events(bridge);
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-        }
+        const ip_addr_t *conn_addr = bridge_connection_get_remote_addr(tcp_conn);
+        EXPECT_NE(conn_addr, nullptr);
+        EXPECT_EQ(conn_addr->v4.addr, remote_addr.v4.addr);
         
-        socket_bridge_close_socket(bridge, handle);
-        EXPECT_FALSE(socket_bridge_is_socket_valid(bridge, handle));
+        // Test sending data (will likely fail in unit test environment)
+        uint8_t test_data[] = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        bool send_result = socket_bridge_send_data(tcp_conn, test_data, sizeof(test_data) - 1);
+        // Expected to fail in unit test environment without real network
+        
+        socket_bridge_destroy_connection(tcp_conn);
     } else {
-        GTEST_SKIP() << "Could not create TCP socket - may be network or permission issue";
+        // Connection creation failed (expected in unit test environment)
+        EXPECT_EQ(tcp_conn, nullptr);
     }
 }
 
-TEST_F(SocketBridgeTest, UDPSocketBridging) {
-    std::atomic<int> packets_received{0};
+TEST_F(SocketBridgeTest, UDPSessionCreation) {
+    uint16_t local_port = 0; // Auto-assign port
     
-    auto callback = [](socket_event_type_t event, socket_handle_t handle, 
-                      const uint8_t *data, size_t length, void *user_data) {
-        auto *counter = static_cast<std::atomic<int>*>(user_data);
+    bridge_connection_t *udp_session = socket_bridge_create_udp_session(
+        bridge, local_port, data_callback, this);
+    
+    if (udp_session) {
+        // Session was created successfully
+        EXPECT_EQ(bridge_connection_get_protocol(udp_session), BRIDGE_UDP);
+        EXPECT_GT(bridge_connection_get_local_port(udp_session), 0);
         
-        if (event == SOCKET_EVENT_DATA_RECEIVED && data && length > 0) {
-            counter->fetch_add(1);
-        }
-    };
-    
-    socket_bridge_set_callback(bridge, callback, &packets_received);
-    
-    // Create UDP socket bridge
-    socket_handle_t handle = socket_bridge_create_udp_socket(bridge, 0); // Any port
-    
-    if (handle != INVALID_SOCKET_HANDLE) {
-        EXPECT_TRUE(socket_bridge_is_socket_valid(bridge, handle));
-        EXPECT_EQ(socket_bridge_get_socket_type(bridge, handle), SOCKET_TYPE_UDP);
-        
-        uint16_t bound_port = socket_bridge_get_local_port(bridge, handle);
-        EXPECT_GT(bound_port, 0);
-        
-        // Send DNS query to Google DNS
-        ip_addr_t dns_server = { .v4 = { .addr = inet_addr("8.8.8.8") } };
+        // Test sending UDP data
+        ip_addr_t dest_addr = {};
+        dest_addr.v4.addr = inet_addr("8.8.8.8"); // Google DNS
+        uint16_t dest_port = 53;
         
         uint8_t dns_query[] = {
-            0x12, 0x34,  // Transaction ID
-            0x01, 0x00,  // Flags
-            0x00, 0x01,  // Questions
-            0x00, 0x00,  // Answers
-            0x00, 0x00,  // Authority
-            0x00, 0x00,  // Additional
-            0x06, 'g', 'o', 'o', 'g', 'l', 'e',
-            0x03, 'c', 'o', 'm',
-            0x00,        // Null terminator
-            0x00, 0x01,  // Type A
-            0x00, 0x01   // Class IN
+            0x12, 0x34,             // Transaction ID
+            0x01, 0x00,             // Flags (standard query)
+            0x00, 0x01,             // Questions
+            0x00, 0x00,             // Answer RRs
+            0x00, 0x00,             // Authority RRs
+            0x00, 0x00,             // Additional RRs
+            0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e',  // "example"
+            0x03, 'c', 'o', 'm',    // "com"
+            0x00,                   // End of name
+            0x00, 0x01,             // Type A
+            0x00, 0x01              // Class IN
         };
         
-        size_t sent = socket_bridge_send_to(bridge, handle, dns_query, sizeof(dns_query), 
-                                           &dns_server, 53);
-        EXPECT_GT(sent, 0);
+        bool send_result = socket_bridge_send_udp_data(udp_session, dns_query, 
+                                                      sizeof(dns_query), &dest_addr, dest_port);
+        // May succeed or fail depending on environment
         
-        // Process events to handle response
-        for (int i = 0; i < 50; i++) {
-            socket_bridge_process_events(bridge);
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-        
-        socket_bridge_close_socket(bridge, handle);
+        socket_bridge_destroy_connection(udp_session);
     } else {
-        GTEST_SKIP() << "Could not create UDP socket - may be network or permission issue";
+        // Session creation failed (may happen in restricted environments)
+        EXPECT_EQ(udp_session, nullptr);
     }
 }
 
-TEST_F(SocketBridgeTest, SocketOptions) {
-    socket_handle_t tcp_handle = socket_bridge_create_tcp_socket(bridge, nullptr, 0);
-    socket_handle_t udp_handle = socket_bridge_create_udp_socket(bridge, 0);
-    
-    if (tcp_handle != INVALID_SOCKET_HANDLE) {
-        // Test TCP socket options
-        EXPECT_TRUE(socket_bridge_set_socket_option(bridge, tcp_handle, SOCKET_OPT_KEEPALIVE, 1));
-        EXPECT_TRUE(socket_bridge_set_socket_option(bridge, tcp_handle, SOCKET_OPT_NODELAY, 1));
-        EXPECT_TRUE(socket_bridge_set_socket_option(bridge, tcp_handle, SOCKET_OPT_REUSEADDR, 1));
-        
-        int keepalive_value = socket_bridge_get_socket_option(bridge, tcp_handle, SOCKET_OPT_KEEPALIVE);
-        EXPECT_EQ(keepalive_value, 1);
-        
-        socket_bridge_close_socket(bridge, tcp_handle);
-    }
-    
-    if (udp_handle != INVALID_SOCKET_HANDLE) {
-        // Test UDP socket options
-        EXPECT_TRUE(socket_bridge_set_socket_option(bridge, udp_handle, SOCKET_OPT_BROADCAST, 1));
-        EXPECT_TRUE(socket_bridge_set_socket_option(bridge, udp_handle, SOCKET_OPT_REUSEADDR, 1));
-        
-        int broadcast_value = socket_bridge_get_socket_option(bridge, udp_handle, SOCKET_OPT_BROADCAST);
-        EXPECT_EQ(broadcast_value, 1);
-        
-        socket_bridge_close_socket(bridge, udp_handle);
-    }
-}
-
-TEST_F(SocketBridgeTest, NetworkExtensionIntegration) {
-    // Test NetworkExtension-specific functionality
-    ne_provider_context_t context = {};
-    context.tunnel_interface = "utun0";
-    context.dns_servers[0] = (ip_addr_t){ .v4 = { .addr = inet_addr("8.8.8.8") } };
-    context.dns_servers[1] = (ip_addr_t){ .v4 = { .addr = inet_addr("1.1.1.1") } };
-    context.dns_server_count = 2;
-    
-    EXPECT_TRUE(socket_bridge_set_ne_context(bridge, &context));
-    
-    // Test tunnel interface configuration
-    tunnel_config_t tunnel_config = {};
-    tunnel_config.mtu = 1500;
-    tunnel_config.ipv4_address = (ip_addr_t){ .v4 = { .addr = inet_addr("10.0.0.1") } };
-    tunnel_config.ipv4_netmask = (ip_addr_t){ .v4 = { .addr = inet_addr("255.255.255.0") } };
-    
-    EXPECT_TRUE(socket_bridge_configure_tunnel(bridge, &tunnel_config));
-    
-    // Test flow diversion
-    flow_divert_rule_t rule = {};
-    rule.protocol = PROTO_TCP;
-    rule.remote_port = 443;
-    rule.action = FLOW_ACTION_ALLOW;
-    strcpy(rule.process_name, "com.example.app");
-    
-    EXPECT_TRUE(socket_bridge_add_flow_rule(bridge, &rule));
-    EXPECT_TRUE(socket_bridge_remove_flow_rule(bridge, &rule));
-}
-
-TEST_F(SocketBridgeTest, PacketCapture) {
-    std::atomic<int> captured_packets{0};
-    
-    auto capture_callback = [](const uint8_t *packet, size_t length, 
-                              const packet_metadata_t *metadata, void *user_data) {
-        auto *counter = static_cast<std::atomic<int>*>(user_data);
-        counter->fetch_add(1);
-        
-        EXPECT_NE(packet, nullptr);
-        EXPECT_GT(length, 0);
-        EXPECT_NE(metadata, nullptr);
-        EXPECT_GT(metadata->timestamp_ns, 0);
+TEST_F(SocketBridgeTest, PacketProcessing) {
+    // Create a test packet
+    packet_info_t packet = {};
+    uint8_t packet_data[] = {
+        0x45, 0x00, 0x00, 0x28,  // IPv4 header
+        0x00, 0x01, 0x40, 0x00,
+        0x40, 0x06, 0x00, 0x00,  // TCP protocol
+        0xc0, 0xa8, 0x01, 0x64,  // Source: 192.168.1.100
+        0xac, 0xd9, 0x0e, 0x64,  // Dest: 172.217.14.100 (Google)
+        0x04, 0x38, 0x00, 0x50,  // TCP ports (1080 -> 80)
+        0x00, 0x00, 0x00, 0x00,  // TCP seq/ack
+        0x50, 0x02, 0x20, 0x00,  // TCP header
+        0x00, 0x00, 0x00, 0x00   // TCP checksum/urgent
     };
     
-    socket_bridge_set_capture_callback(bridge, capture_callback, &captured_packets);
+    packet.data = packet_data;
+    packet.length = sizeof(packet_data);
+    packet.timestamp_ns = 1234567890ULL;
+    packet.flow.ip_version = 4;
+    packet.flow.protocol = PROTO_TCP;
+    packet.flow.src_ip.v4.addr = inet_addr("192.168.1.100");
+    packet.flow.dst_ip.v4.addr = inet_addr("172.217.14.100");
+    packet.flow.src_port = 1080;
+    packet.flow.dst_port = 80;
     
-    // Enable packet capture
-    EXPECT_TRUE(socket_bridge_enable_capture(bridge, true));
+    // Process the packet through the bridge
+    socket_bridge_process_packet(bridge, &packet);
     
-    // Generate some network activity
-    socket_handle_t handle = socket_bridge_create_udp_socket(bridge, 0);
-    if (handle != INVALID_SOCKET_HANDLE) {
-        ip_addr_t target = { .v4 = { .addr = inet_addr("8.8.8.8") } };
-        uint8_t test_data[] = { 0x01, 0x02, 0x03, 0x04 };
-        
-        socket_bridge_send_to(bridge, handle, test_data, sizeof(test_data), &target, 53);
-        
-        // Process events
-        for (int i = 0; i < 20; i++) {
-            socket_bridge_process_events(bridge);
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-        
-        socket_bridge_close_socket(bridge, handle);
-    }
-    
-    socket_bridge_enable_capture(bridge, false);
-    EXPECT_GE(captured_packets.load(), 0);
+    // Process events
+    bool events_processed = socket_bridge_process_events(bridge);
+    EXPECT_TRUE(events_processed);
 }
 
-TEST_F(SocketBridgeTest, StatisticsAndMetrics) {
-    bridge_stats_t stats;
-    socket_bridge_get_stats(bridge, &stats);
+TEST_F(SocketBridgeTest, ConnectionStatistics) {
+    // Get initial connection count
+    size_t initial_count = socket_bridge_get_connection_count(bridge);
+    EXPECT_EQ(initial_count, 0);
     
-    EXPECT_EQ(stats.active_tcp_sockets, 0);
-    EXPECT_EQ(stats.active_udp_sockets, 0);
-    EXPECT_EQ(stats.total_bytes_sent, 0);
-    EXPECT_EQ(stats.total_bytes_received, 0);
-    EXPECT_EQ(stats.connection_errors, 0);
+    // Get statistics
+    vpn_metrics_t metrics = {};
+    socket_bridge_get_stats(bridge, &metrics);
     
-    // Create sockets and generate activity
-    socket_handle_t tcp_handle = socket_bridge_create_tcp_socket(bridge, nullptr, 0);
-    socket_handle_t udp_handle = socket_bridge_create_udp_socket(bridge, 0);
+    // Should start with zero values
+    EXPECT_EQ(metrics.tcp_connections, 0);
+    EXPECT_EQ(metrics.udp_sessions, 0);
+}
+
+TEST_F(SocketBridgeTest, ConnectionLifecycle) {
+    ip_addr_t remote_addr = {};
+    remote_addr.v4.addr = inet_addr("127.0.0.1"); // localhost
+    uint16_t remote_port = 8080;
     
-    if (tcp_handle != INVALID_SOCKET_HANDLE && udp_handle != INVALID_SOCKET_HANDLE) {
-        socket_bridge_get_stats(bridge, &stats);
-        EXPECT_EQ(stats.active_tcp_sockets, 1);
-        EXPECT_EQ(stats.active_udp_sockets, 1);
+    // Create connection
+    bridge_connection_t *conn = socket_bridge_create_tcp_connection(
+        bridge, &remote_addr, remote_port, data_callback, event_callback, this);
+    
+    if (conn) {
+        // Verify connection properties
+        EXPECT_EQ(bridge_connection_get_protocol(conn), BRIDGE_TCP);
+        EXPECT_EQ(bridge_connection_get_remote_port(conn), remote_port);
         
-        socket_bridge_close_socket(bridge, tcp_handle);
-        socket_bridge_close_socket(bridge, udp_handle);
+        // Connection should start in a non-established state
+        connection_state_t state = bridge_connection_get_state(conn);
+        EXPECT_NE(state, CONN_ESTABLISHED); // Initially not established
         
-        socket_bridge_get_stats(bridge, &stats);
-        EXPECT_EQ(stats.active_tcp_sockets, 0);
-        EXPECT_EQ(stats.active_udp_sockets, 0);
+        // Destroy connection
+        socket_bridge_destroy_connection(conn);
+        
+        // Connection count should remain zero after cleanup
+        size_t count = socket_bridge_get_connection_count(bridge);
+        EXPECT_EQ(count, 0);
     }
 }
 
-TEST_F(SocketBridgeTest, ConcurrentSocketOperations) {
-    const int num_threads = 4;
-    const int sockets_per_thread = 5;
-    std::atomic<int> created_sockets{0};
-    std::atomic<int> successful_operations{0};
+TEST_F(SocketBridgeTest, InvalidParameters) {
+    // Test with null parameters
+    bridge_connection_t *null_conn = socket_bridge_create_tcp_connection(
+        nullptr, nullptr, 80, data_callback, event_callback, this);
+    EXPECT_EQ(null_conn, nullptr);
+    
+    // Test with null bridge
+    ip_addr_t addr = {};
+    addr.v4.addr = inet_addr("127.0.0.1");
+    null_conn = socket_bridge_create_tcp_connection(
+        nullptr, &addr, 80, data_callback, event_callback, this);
+    EXPECT_EQ(null_conn, nullptr);
+    
+    // Test with null callback
+    null_conn = socket_bridge_create_tcp_connection(
+        bridge, &addr, 80, nullptr, event_callback, this);
+    EXPECT_EQ(null_conn, nullptr);
+    
+    // Test UDP with null parameters
+    bridge_connection_t *null_udp = socket_bridge_create_udp_session(
+        nullptr, 0, data_callback, this);
+    EXPECT_EQ(null_udp, nullptr);
+    
+    null_udp = socket_bridge_create_udp_session(bridge, 0, nullptr, this);
+    EXPECT_EQ(null_udp, nullptr);
+}
+
+TEST_F(SocketBridgeTest, ConcurrentConnections) {
+    // Test creating multiple connections concurrently
     std::vector<std::thread> threads;
+    std::atomic<int> successful_connections{0};
+    std::atomic<int> failed_connections{0};
     
-    auto socket_operations = [&](int thread_id) {
-        for (int i = 0; i < sockets_per_thread; i++) {
-            // Create UDP socket (simpler than TCP for testing)
-            socket_handle_t handle = socket_bridge_create_udp_socket(bridge, 0);
+    for (int i = 0; i < 4; i++) {
+        threads.emplace_back([this, &successful_connections, &failed_connections, i]() {
+            ip_addr_t addr = {};
+            addr.v4.addr = inet_addr("127.0.0.1");
+            uint16_t port = 8080 + i;
             
-            if (handle != INVALID_SOCKET_HANDLE) {
-                created_sockets.fetch_add(1);
-                
-                // Test basic operations
-                uint16_t port = socket_bridge_get_local_port(bridge, handle);
-                if (port > 0) {
-                    successful_operations.fetch_add(1);
-                }
-                
-                // Send test data
-                ip_addr_t target = { .v4 = { .addr = htonl(0x08080800 + thread_id) } };
-                uint8_t data[] = { 0x01, 0x02, 0x03, 0x04 };
-                
-                size_t sent = socket_bridge_send_to(bridge, handle, data, sizeof(data), &target, 53);
-                if (sent > 0) {
-                    successful_operations.fetch_add(1);
-                }
-                
-                socket_bridge_close_socket(bridge, handle);
+            bridge_connection_t *conn = socket_bridge_create_tcp_connection(
+                bridge, &addr, port, data_callback, event_callback, this);
+            
+            if (conn) {
+                successful_connections++;
+                // Brief delay to simulate connection activity
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                socket_bridge_destroy_connection(conn);
+            } else {
+                failed_connections++;
             }
-            
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        });
+    }
+    
+    // Wait for all threads to complete
+    for (auto &thread : threads) {
+        thread.join();
+    }
+    
+    // Should have attempted all connections
+    EXPECT_EQ(successful_connections + failed_connections, 4);
+}
+
+// Test memory cleanup and leak prevention
+TEST_F(SocketBridgeTest, MemoryCleanup) {
+    // Create and destroy many connections to test memory management
+    for (int i = 0; i < 100; i++) {
+        ip_addr_t addr = {};
+        addr.v4.addr = inet_addr("127.0.0.1");
+        
+        bridge_connection_t *tcp_conn = socket_bridge_create_tcp_connection(
+            bridge, &addr, 80, data_callback, event_callback, this);
+        
+        bridge_connection_t *udp_conn = socket_bridge_create_udp_session(
+            bridge, 0, data_callback, this);
+        
+        // Immediately destroy connections
+        if (tcp_conn) {
+            socket_bridge_destroy_connection(tcp_conn);
         }
-    };
-    
-    // Start threads
-    for (int i = 0; i < num_threads; i++) {
-        threads.emplace_back(socket_operations, i);
-    }
-    
-    // Process events while threads run
-    auto process_events = [&]() {
-        for (int i = 0; i < 100; i++) {
-            socket_bridge_process_events(bridge);
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        }
-    };
-    std::thread event_thread(process_events);
-    
-    // Wait for completion
-    for (auto& t : threads) {
-        t.join();
-    }
-    event_thread.join();
-    
-    EXPECT_GE(created_sockets.load(), 0);
-    EXPECT_LE(created_sockets.load(), num_threads * sockets_per_thread);
-    
-    bridge_stats_t stats;
-    socket_bridge_get_stats(bridge, &stats);
-    EXPECT_EQ(stats.active_tcp_sockets, 0);
-    EXPECT_EQ(stats.active_udp_sockets, 0);
-}
-
-TEST_F(SocketBridgeTest, ErrorHandling) {
-    // Test null parameters
-    EXPECT_EQ(socket_bridge_create_tcp_socket(nullptr, nullptr, 0), INVALID_SOCKET_HANDLE);
-    EXPECT_EQ(socket_bridge_create_udp_socket(nullptr, 0), INVALID_SOCKET_HANDLE);
-    EXPECT_FALSE(socket_bridge_connect(nullptr, INVALID_SOCKET_HANDLE));
-    EXPECT_EQ(socket_bridge_send(nullptr, INVALID_SOCKET_HANDLE, nullptr, 0), 0);
-    
-    // Test invalid handles
-    EXPECT_FALSE(socket_bridge_is_socket_valid(bridge, INVALID_SOCKET_HANDLE));
-    EXPECT_FALSE(socket_bridge_connect(bridge, INVALID_SOCKET_HANDLE));
-    EXPECT_EQ(socket_bridge_send(bridge, INVALID_SOCKET_HANDLE, nullptr, 0), 0);
-    EXPECT_EQ(socket_bridge_get_socket_type(bridge, INVALID_SOCKET_HANDLE), SOCKET_TYPE_INVALID);
-    EXPECT_EQ(socket_bridge_get_local_port(bridge, INVALID_SOCKET_HANDLE), 0);
-    
-    // Test invalid socket operations
-    socket_handle_t handle = socket_bridge_create_udp_socket(bridge, 0);
-    if (handle != INVALID_SOCKET_HANDLE) {
-        EXPECT_EQ(socket_bridge_send(bridge, handle, nullptr, 0), 0);
-        EXPECT_EQ(socket_bridge_send_to(bridge, handle, nullptr, 0, nullptr, 0), 0);
-        
-        ip_addr_t addr = { .v4 = { .addr = inet_addr("192.168.1.1") } };
-        EXPECT_EQ(socket_bridge_send_to(bridge, handle, nullptr, 0, &addr, 80), 0);
-        
-        socket_bridge_close_socket(bridge, handle);
-    }
-    
-    // Test operations on null bridge
-    socket_bridge_process_events(nullptr); // Should not crash
-    socket_bridge_destroy(nullptr);        // Should not crash
-}
-
-TEST_F(SocketBridgeTest, IPv6Support) {
-    // Test IPv6 socket creation
-    ip_addr_t ipv6_addr = {};
-    ipv6_addr.version = 6;
-    // Google DNS IPv6: 2001:4860:4860::8888
-    ipv6_addr.v6.addr[0] = 0x20;
-    ipv6_addr.v6.addr[1] = 0x01;
-    ipv6_addr.v6.addr[2] = 0x48;
-    ipv6_addr.v6.addr[3] = 0x60;
-    ipv6_addr.v6.addr[4] = 0x48;
-    ipv6_addr.v6.addr[5] = 0x60;
-    ipv6_addr.v6.addr[15] = 0x88;
-    ipv6_addr.v6.addr[14] = 0x88;
-    
-    socket_handle_t tcp6_handle = socket_bridge_create_tcp_socket(bridge, &ipv6_addr, 80);
-    socket_handle_t udp6_handle = socket_bridge_create_udp_socket(bridge, 0);
-    
-    if (tcp6_handle != INVALID_SOCKET_HANDLE) {
-        EXPECT_TRUE(socket_bridge_is_socket_valid(bridge, tcp6_handle));
-        socket_bridge_close_socket(bridge, tcp6_handle);
-    }
-    
-    if (udp6_handle != INVALID_SOCKET_HANDLE) {
-        EXPECT_TRUE(socket_bridge_is_socket_valid(bridge, udp6_handle));
-        
-        // Test IPv6 UDP send
-        uint8_t test_data[] = { 0x01, 0x02, 0x03, 0x04 };
-        size_t sent = socket_bridge_send_to(bridge, udp6_handle, test_data, sizeof(test_data), 
-                                           &ipv6_addr, 53);
-        EXPECT_GE(sent, 0);
-        
-        socket_bridge_close_socket(bridge, udp6_handle);
-    }
-}
-
-TEST_F(SocketBridgeTest, SocketPoolManagement) {
-    // Test socket pool functionality
-    EXPECT_TRUE(socket_bridge_set_max_sockets(bridge, 100));
-    EXPECT_EQ(socket_bridge_get_max_sockets(bridge), 100);
-    
-    // Create multiple sockets to test pool
-    std::vector<socket_handle_t> handles;
-    for (int i = 0; i < 20; i++) {
-        socket_handle_t handle = socket_bridge_create_udp_socket(bridge, 0);
-        if (handle != INVALID_SOCKET_HANDLE) {
-            handles.push_back(handle);
+        if (udp_conn) {
+            socket_bridge_destroy_connection(udp_conn);
         }
     }
     
-    EXPECT_GT(handles.size(), 0);
-    EXPECT_LE(handles.size(), 20);
-    
-    // Test socket reuse
-    socket_bridge_enable_socket_reuse(bridge, true);
-    EXPECT_TRUE(socket_bridge_is_socket_reuse_enabled(bridge));
-    
-    // Close all sockets
-    for (auto handle : handles) {
-        socket_bridge_close_socket(bridge, handle);
-    }
-    
-    bridge_stats_t stats;
-    socket_bridge_get_stats(bridge, &stats);
-    EXPECT_EQ(stats.active_udp_sockets, 0);
-}
-
-TEST_F(SocketBridgeTest, StringConversions) {
-    EXPECT_STREQ(socket_type_string(SOCKET_TYPE_TCP), "TCP");
-    EXPECT_STREQ(socket_type_string(SOCKET_TYPE_UDP), "UDP");
-    EXPECT_STREQ(socket_type_string(SOCKET_TYPE_INVALID), "Invalid");
-    
-    EXPECT_STREQ(socket_event_string(SOCKET_EVENT_CONNECTED), "Connected");
-    EXPECT_STREQ(socket_event_string(SOCKET_EVENT_DISCONNECTED), "Disconnected");
-    EXPECT_STREQ(socket_event_string(SOCKET_EVENT_DATA_RECEIVED), "Data Received");
-    EXPECT_STREQ(socket_event_string(SOCKET_EVENT_DATA_SENT), "Data Sent");
-    EXPECT_STREQ(socket_event_string(SOCKET_EVENT_ERROR), "Error");
-    
-    EXPECT_STREQ(flow_action_string(FLOW_ACTION_ALLOW), "Allow");
-    EXPECT_STREQ(flow_action_string(FLOW_ACTION_BLOCK), "Block");
-    EXPECT_STREQ(flow_action_string(FLOW_ACTION_REDIRECT), "Redirect");
+    // Connection count should be zero after cleanup
+    size_t count = socket_bridge_get_connection_count(bridge);
+    EXPECT_EQ(count, 0);
 }

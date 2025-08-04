@@ -4,17 +4,19 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <errno.h>
-#include <unistd.h>
 #include <time.h>
 
 #ifdef TARGET_OS_IOS
 #import <Foundation/Foundation.h>
 #import <NetworkExtension/NetworkExtension.h>
 #import <Network/Network.h>
+#else
+// Non-iOS platforms still need socket headers
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <unistd.h>
 #endif
 
 #define MAX_BRIDGE_CONNECTIONS 512
@@ -28,7 +30,6 @@ struct bridge_connection {
     uint16_t local_port;
     uint8_t ip_version;
     connection_state_t state;
-    int socket_fd;
     
     tcp_connection_t *tcp_conn;
     udp_session_t *udp_session;
@@ -39,13 +40,16 @@ struct bridge_connection {
     
     uint8_t *read_buffer;
     size_t buffer_size;
-    pthread_t read_thread;
-    bool read_thread_running;
     bool active;
     
 #ifdef TARGET_OS_IOS
     NWTCPConnection *nw_tcp_connection;
     NWUDPSession *nw_udp_session;
+    dispatch_queue_t read_queue;
+#else
+    int socket_fd;
+    pthread_t read_thread;
+    bool read_thread_running;
 #endif
 };
 
@@ -61,7 +65,9 @@ struct socket_bridge {
 #endif
 };
 
+#ifndef TARGET_OS_IOS
 static void *bridge_read_thread(void *arg);
+#endif
 static void bridge_tcp_callback(tcp_connection_t *conn, connection_event_t event, void *data, size_t length, void *user_data);
 static void bridge_udp_callback(udp_session_t *session, const uint8_t *data, size_t length, const ip_addr_t *src_addr, uint16_t src_port, void *user_data);
 
@@ -140,7 +146,9 @@ bridge_connection_t *socket_bridge_create_tcp_connection(socket_bridge_t *bridge
     conn->remote_port = remote_port;
     conn->ip_version = (remote_addr->v4.addr != 0) ? 4 : 6;
     conn->state = CONN_CLOSED;
+#ifndef TARGET_OS_IOS
     conn->socket_fd = -1;
+#endif
     conn->data_callback = data_callback;
     conn->event_callback = event_callback;
     conn->user_data = user_data;
@@ -167,7 +175,25 @@ bridge_connection_t *socket_bridge_create_tcp_connection(socket_bridge_t *bridge
         pthread_mutex_unlock(&bridge->mutex);
         return NULL;
     }
+#ifdef TARGET_OS_IOS
+    // On iOS, we'll use NEPacketTunnelProvider's createTCPConnection instead of raw sockets
+    conn->read_queue = dispatch_queue_create("com.relative.vpn.bridge.read", DISPATCH_QUEUE_SERIAL);
+    if (!conn->read_queue) {
+        LOG_ERROR("Failed to create dispatch queue for bridge connection");
+        tcp_connection_destroy(conn->tcp_conn);
+        conn->tcp_conn = NULL;
+        free(conn->read_buffer);
+        conn->read_buffer = NULL;
+        conn->active = false;
+        memset(conn, 0, sizeof(bridge_connection_t));
+        pthread_mutex_unlock(&bridge->mutex);
+        return NULL;
+    }
     
+    conn->state = CONN_SYN_SENT;
+    // iOS connection will be established through NEPacketTunnelProvider API
+#else
+    // Non-iOS platforms use traditional sockets
     int sock_family = (conn->ip_version == 4) ? AF_INET : AF_INET6;
     conn->socket_fd = socket(sock_family, SOCK_STREAM, 0);
     if (conn->socket_fd < 0) {
@@ -242,14 +268,20 @@ bridge_connection_t *socket_bridge_create_tcp_connection(socket_bridge_t *bridge
         pthread_mutex_unlock(&bridge->mutex);
         return NULL;
     }
+#endif
     
     bridge->stats.tcp_connections++;
     
     pthread_mutex_unlock(&bridge->mutex);
     
+#ifdef TARGET_OS_IOS
+    LOG_DEBUG("Created TCP bridge connection %d to %s:%d (iOS NetworkExtension)", conn->id,
+              conn->ip_version == 4 ? "IPv4" : "IPv6", remote_port);
+#else
     LOG_DEBUG("Created TCP bridge connection %d to %s:%d", conn->id,
               conn->ip_version == 4 ? inet_ntoa(*(struct in_addr*)&remote_addr->v4.addr) : "IPv6",
               remote_port);
+#endif
     
     return conn;
 }
@@ -281,7 +313,9 @@ bridge_connection_t *socket_bridge_create_udp_session(socket_bridge_t *bridge,
     conn->protocol = BRIDGE_UDP;
     conn->local_port = local_port;
     conn->state = CONN_ESTABLISHED;
+#ifndef TARGET_OS_IOS
     conn->socket_fd = -1;
+#endif
     conn->data_callback = data_callback;
     conn->user_data = user_data;
     conn->buffer_size = BRIDGE_BUFFER_SIZE;
@@ -325,7 +359,14 @@ void socket_bridge_destroy_connection(bridge_connection_t *conn) {
     // PRODUCTION FIX: Atomic flag to prevent race conditions
     conn->active = false;
     
-    // PRODUCTION FIX: Proper thread termination with timeout
+#ifdef TARGET_OS_IOS
+    // iOS: Clean up dispatch queue
+    if (conn->read_queue) {
+        dispatch_release(conn->read_queue);
+        conn->read_queue = NULL;
+    }
+#else
+    // Non-iOS: Proper thread termination with timeout
     if (conn->read_thread_running) {
         conn->read_thread_running = false;
         
@@ -368,6 +409,7 @@ void socket_bridge_destroy_connection(bridge_connection_t *conn) {
         close(conn->socket_fd);
         conn->socket_fd = -1;
     }
+#endif
     
     // PRODUCTION FIX: Safe connection cleanup with null checks
     if (conn->tcp_conn) {
@@ -409,7 +451,9 @@ void socket_bridge_destroy_connection(bridge_connection_t *conn) {
 
     // PRODUCTION FIX: Final state cleanup to prevent double-free
     memset(conn, 0, sizeof(bridge_connection_t));
+#ifndef TARGET_OS_IOS
     conn->socket_fd = -1;
+#endif
     
     LOG_DEBUG("Bridge connection %d destroyed successfully", conn->id);
 }
@@ -418,6 +462,20 @@ bool socket_bridge_send_data(bridge_connection_t *conn, const uint8_t *data, siz
     if (!conn || !conn->active || !data || length == 0) return false;
     
     if (conn->protocol == BRIDGE_TCP) {
+#ifdef TARGET_OS_IOS
+        if (conn->nw_tcp_connection) {
+            @autoreleasepool {
+                NSData *nsData = [NSData dataWithBytes:data length:length];
+                [conn->nw_tcp_connection writeData:nsData completionHandler:^(NSError * _Nullable error) {
+                    if (error) {
+                        LOG_ERROR("Failed to send TCP data via NetworkExtension: %s", 
+                                 error.localizedDescription.UTF8String);
+                    }
+                }];
+            }
+            return true;
+        }
+#else
         if (conn->socket_fd >= 0) {
             ssize_t sent = send(conn->socket_fd, data, length, 0);
             if (sent < 0) {
@@ -426,17 +484,6 @@ bool socket_bridge_send_data(bridge_connection_t *conn, const uint8_t *data, siz
             }
             LOG_TRACE("Sent %zd bytes via TCP bridge connection %d", sent, conn->id);
             return sent == (ssize_t)length;
-        }
-#ifdef TARGET_OS_IOS
-        else if (conn->nw_tcp_connection) {
-            NSData *nsData = [NSData dataWithBytes:data length:length];
-            [conn->nw_tcp_connection writeData:nsData completionHandler:^(NSError * _Nullable error) {
-                if (error) {
-                    LOG_ERROR("Failed to send TCP data via NetworkExtension: %s", 
-                             error.localizedDescription.UTF8String);
-                }
-            }];
-            return true;
         }
 #endif
     }
@@ -467,6 +514,8 @@ bool socket_bridge_process_events(socket_bridge_t *bridge) {
     return connection_manager_process_events(bridge->conn_mgr);
 }
 
+#ifndef TARGET_OS_IOS
+// Read thread is only used on non-iOS platforms
 static void *bridge_read_thread(void *arg) {
     bridge_connection_t *conn = (bridge_connection_t *)arg;
     
@@ -502,6 +551,7 @@ static void *bridge_read_thread(void *arg) {
     LOG_DEBUG("Bridge read thread for connection %d finished", conn->id);
     return NULL;
 }
+#endif
 
 static void bridge_tcp_callback(tcp_connection_t *tcp_conn, connection_event_t event, 
                                void *data, size_t length, void *user_data) {

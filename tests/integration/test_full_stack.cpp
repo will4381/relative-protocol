@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 #include "api/relative_vpn.h"
-#include "packet/utun.h"
+#include "packet/tunnel_provider.h"
 #include "dns/resolver.h"
 #include "privacy/guards.h"
 #include "socket_bridge/bridge.h"

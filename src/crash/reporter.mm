@@ -1,5 +1,7 @@
+extern "C" {
 #include "crash/reporter.h"
 #include "core/logging.h"
+}
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
@@ -71,7 +73,7 @@ static void populate_thread_info(crash_info_t *crash_info);
 static void update_crash_stats(crash_reporter_t *reporter, crash_type_t type);
 
 crash_reporter_t *crash_reporter_create(void) {
-    crash_reporter_t *reporter = calloc(1, sizeof(crash_reporter_t));
+    crash_reporter_t *reporter = (crash_reporter_t *)calloc(1, sizeof(crash_reporter_t));
     if (!reporter) {
         LOG_ERROR("Failed to allocate crash reporter");
         return NULL;
@@ -259,14 +261,15 @@ bool crash_reporter_report_crash(crash_reporter_t *reporter, crash_type_t type, 
         return false;
     }
     
-    crash_info_t crash_info = {0};
+    crash_info_t crash_info = {};
     crash_info.type = type;
     crash_info.timestamp_ns = clock_gettime_nsec_np(CLOCK_MONOTONIC);
     crash_info.process_id = getpid();
-    crash_info.thread_id = (uint32_t)pthread_self();
+    crash_info.thread_id = (uint32_t)(uintptr_t)pthread_self();
     
     // Get process name
-    proc_name(crash_info.process_id, crash_info.process_name, sizeof(crash_info.process_name));
+    // proc_name not available on iOS, use alternative
+    strncpy(crash_info.process_name, "RelativeVPN", sizeof(crash_info.process_name) - 1);
     
     // Get thread name
     pthread_getname_np(pthread_self(), crash_info.thread_name, sizeof(crash_info.thread_name));
@@ -374,7 +377,7 @@ static void crash_signal_handler(int sig, siginfo_t *info, void *context) {
         return;
     }
     
-    crash_info_t crash_info = {0};
+    crash_info_t crash_info = {};
     
     // Map signal to crash type
     switch (sig) {
@@ -403,7 +406,7 @@ static void crash_signal_handler(int sig, siginfo_t *info, void *context) {
     crash_info.fault_address = info ? info->si_addr : NULL;
     crash_info.timestamp_ns = clock_gettime_nsec_np(CLOCK_MONOTONIC);
     crash_info.process_id = getpid();
-    crash_info.thread_id = (uint32_t)pthread_self();
+    crash_info.thread_id = (uint32_t)(uintptr_t)pthread_self();
     
     // Capture stack trace (this should be async-signal-safe)
     if (reporter->flags & CRASH_REPORTER_ENABLE_STACK_TRACES) {
@@ -505,7 +508,7 @@ bool crash_reporter_get_memory_info(char *buffer, size_t buffer_size) {
              active_memory / (1024 * 1024),
              inactive_memory / (1024 * 1024),
              wired_memory / (1024 * 1024),
-             page_size);
+             (unsigned long)page_size);
 #else
     strncpy(buffer, "Memory info not available on this platform", buffer_size - 1);
 #endif
@@ -524,7 +527,7 @@ bool crash_reporter_get_thread_info(char *buffer, size_t buffer_size) {
              "  Thread ID: %u\n"
              "  Thread Name: %s\n"
              "  Process ID: %u",
-             (uint32_t)pthread_self(),
+             (uint32_t)(uintptr_t)pthread_self(),
              thread_name[0] ? thread_name : "unnamed",
              getpid());
     

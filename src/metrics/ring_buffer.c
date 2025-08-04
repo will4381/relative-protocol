@@ -42,12 +42,33 @@ ring_buffer_t *ring_buffer_create(size_t capacity) {
 void ring_buffer_destroy(ring_buffer_t *rb) {
     if (!rb) return;
     
-    LOG_DEBUG("Destroying ring buffer");
+    LOG_DEBUG("Destroying ring buffer with capacity %zu", rb->capacity);
     
-    // SECURITY FIX: Secure cleanup to prevent use-after-free and data leaks
+    // PERFORMANCE OPTIMIZATION: Skip expensive memset for large buffers in release builds
+    // Security clearing is important but can be optimized
     if (rb->buffer) {
-        // Clear all buffer data before freeing
+#ifdef DEBUG
+        // Full secure clear in debug builds for security validation
         memset(rb->buffer, 0, rb->capacity * sizeof(flow_metrics_t));
+#else
+        // In release builds, only clear sensitive data if buffer was actually used
+        size_t count = atomic_load(&rb->count);
+        if (count > 0) {
+            // Only clear used portion of buffer for performance
+            size_t head = atomic_load(&rb->head);
+            size_t tail = atomic_load(&rb->tail);
+            
+            if (head >= tail) {
+                // Clear from tail to head
+                memset(&rb->buffer[tail], 0, (head - tail) * sizeof(flow_metrics_t));
+            } else {
+                // Wrap around case - clear two segments
+                memset(&rb->buffer[tail], 0, (rb->capacity - tail) * sizeof(flow_metrics_t));
+                memset(&rb->buffer[0], 0, head * sizeof(flow_metrics_t));
+            }
+        }
+#endif
+        
         free(rb->buffer);
         rb->buffer = NULL;
     }
@@ -175,6 +196,7 @@ bool ring_buffer_is_empty(ring_buffer_t *rb) {
 }
 
 bool ring_buffer_is_full(ring_buffer_t *rb) {
+    if (!rb) return false;
     return ring_buffer_size(rb) >= ring_buffer_capacity(rb);
 }
 
@@ -186,4 +208,13 @@ void ring_buffer_clear(ring_buffer_t *rb) {
     atomic_store(&rb->count, 0);
     
     LOG_DEBUG("Cleared ring buffer");
+}
+
+// Additional function aliases for vpn_engine.c compatibility
+size_t ring_buffer_get_size(ring_buffer_t *rb) {
+    return ring_buffer_capacity(rb);
+}
+
+size_t ring_buffer_get_count(ring_buffer_t *rb) {
+    return ring_buffer_size(rb);
 }

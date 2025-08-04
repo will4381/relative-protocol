@@ -16,22 +16,27 @@ if(NOT GTest_FOUND)
     FetchContent_MakeAvailable(googletest)
 endif()
 
-# Unit tests - temporarily excluding problematic tests
-add_executable(unit_tests
+# iOS-only unit tests - core functionality
+set(UNIT_TEST_SOURCES
     unit/test_ring_buffer.cpp
-    unit/test_utun.cpp
     unit/test_vpn_api.cpp
     unit/test_logging.cpp
     unit/test_dns_resolver.cpp
     unit/test_privacy_guards.cpp
     unit/test_nat64.cpp
     unit/test_connection_manager.cpp
-    # Temporarily excluded due to API mismatches:
+    unit/test_socket_bridge.cpp
+    unit/test_tunnel_provider.cpp
+    # Temporarily disabled due to API mismatches:
     # unit/test_mtu_discovery.cpp
     # unit/test_traffic_classifier.cpp
     # unit/test_reachability_monitor.cpp
-    # unit/test_socket_bridge.cpp
 )
+
+# iOS-specific tests (NetworkExtension framework) - disabled for now
+# list(APPEND UNIT_TEST_SOURCES ios/test_networkextension_integration.mm)
+
+add_executable(unit_tests ${UNIT_TEST_SOURCES})
 
 target_include_directories(unit_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../include

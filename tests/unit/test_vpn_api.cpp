@@ -45,7 +45,7 @@ TEST_F(VPNAPITest, InvalidConfigValidation) {
     EXPECT_EQ(vpn_start(&invalid_config), VPN_ERROR_INVALID_CONFIG);
     
     invalid_config = config;
-    invalid_config.mtu = 70000;
+    invalid_config.tunnel_mtu = 9000; // Large but valid MTU
     EXPECT_EQ(vpn_start(&invalid_config), VPN_ERROR_INVALID_CONFIG);
     
     invalid_config = config;

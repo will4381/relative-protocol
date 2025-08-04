@@ -3,17 +3,16 @@
 [![CI/CD Pipeline](https://github.com/will4381/relative-protocol/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/relative-vpn/actions/workflows/ci.yml)
 [![Security Scan](https://github.com/will4381/relative-protocol/actions/workflows/security.yml/badge.svg)](https://github.com/your-org/relative-vpn/actions/workflows/security.yml)
 [![Release](https://github.com/will4381/relative-protocol/actions/workflows/release.yml/badge.svg)](https://github.com/your-org/relative-vpn/actions/workflows/release.yml)
-[![codecov](https://codecov.io/gh/will4381/relative-protocol/branch/main/graph/badge.svg)](https://codecov.io/gh/your-org/relative-vpn)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A high-performance, privacy-focused VPN implementation for iOS devices, built in C with comprehensive testing and enterprise-grade reliability.
+A high-performance, privacy-focused VPN implementation designed exclusively for iOS devices using NetworkExtension framework, built in C with comprehensive testing and enterprise-grade reliability.
 
 ## Features
 
 ### Core Functionality
-- **Packet I/O Adapter**: Direct integration with iOS `utun` interface for raw IPv4/IPv6 frame processing
-- **Lightweight TCP/UDP Engine**: lwIP-based userspace networking stack for connection management
-- **Socket Bridge**: Seamless connection bridging with `createTCPConnection`/`createUDPSession` APIs
+- **NetworkExtension Integration**: Native iOS NEPacketTunnelProvider integration for packet flow handling
+- **Socket Bridge**: Essential packet forwarding using iOS `createTCPConnection`/`createUDPSession` APIs
+- **Tunnel Provider**: Custom packet flow management optimized for iOS NetworkExtension framework
 - **DNS Resolver**: On-device DNS resolution with intelligent caching for IPv4/IPv6
 
 ### Advanced Capabilities
@@ -28,19 +27,21 @@ A high-performance, privacy-focused VPN implementation for iOS devices, built in
 - **DNS Leak Protection**: Built-in kill switch to prevent DNS leakage
 - **Memory Safety**: Comprehensive AddressSanitizer integration and fuzzing harness
 
-### iOS Integration
-- **Swift Bridging**: Clean C API designed for seamless Swift integration
-- **XCFramework**: Production-ready framework distribution
-- **Battery Optimization**: Efficient power usage with comprehensive energy regression testing
-- **Network Extension**: Full NetworkExtension framework compatibility
+### iOS-Native Features
+- **NEPacketTunnelProvider**: Purpose-built for iOS Network Extension framework
+- **iOS Memory Management**: Optimized for iOS memory pressure handling and low battery impact
+- **Reachability Integration**: Native iOS network transition monitoring (Wi-Fi ↔ Cellular)
+- **XCFramework**: Production-ready iOS framework distribution
+- **Swift Integration**: Clean C API with comprehensive Swift bridging support
 
 ## Quick Start
 
 ### Prerequisites
 - Xcode 14.0+
-- iOS 12.0+ deployment target
+- iOS 14.0+ deployment target (NetworkExtension framework requirements)
 - CMake 3.20+
-- Network Extension entitlements
+- Network Extension entitlements (`com.apple.developer.networking.networkextension`)
+- Valid iOS Developer Program membership for NetworkExtension capabilities
 
 ### Building
 
@@ -66,31 +67,41 @@ A high-performance, privacy-focused VPN implementation for iOS devices, built in
 
 ### Integration
 
-#### Swift Usage
+#### NetworkExtension Integration
 ```swift
+import NetworkExtension
 import RelativeVPN
 
-let config = vpn_config_t(
-    utun_name: nil,
-    mtu: 1500,
-    ipv4_enabled: true,
-    ipv6_enabled: true,
-    nat64_enabled: false,
-    dns_leak_protection: true,
-    dns_cache_size: 1024,
-    metrics_buffer_size: 4096,
-    reachability_monitoring: true,
-    log_level: nil
-)
-
-let result = vpn_start(&config)
-guard result == VPN_SUCCESS else {
-    print("VPN start failed: \\(String(cString: vpn_error_string(result)))")
-    return
+class RelativeVPNProvider: NEPacketTunnelProvider {
+    var tunnelProvider: OpaquePointer?
+    var vpnHandle: vpn_handle_t = VPN_INVALID_HANDLE
+    
+    override func startTunnel(options: [String : NSObject]?, 
+                             completionHandler: @escaping (Error?) -> Void) {
+        
+        // Configure VPN settings
+        var config = vpn_config_t()
+        strncpy(&config.log_level.0, "info", 8)
+        config.tunnel_mtu = 1500
+        config.enable_nat64 = true
+        config.enable_dns_leak_protection = true
+        
+        // Start VPN engine
+        let result = vpn_start_comprehensive(&config)
+        guard result.status == VPN_SUCCESS else {
+            completionHandler(VPNError.startFailed)
+            return
+        }
+        
+        vpnHandle = result.handle
+        
+        // Configure tunnel provider for packet flow
+        tunnelProvider = tunnel_provider_create()
+        tunnel_provider_configure_packet_flow(tunnelProvider, packetFlow)
+        
+        completionHandler(nil)
+    }
 }
-
-// VPN is now running
-print("VPN started successfully")
 ```
 
 #### Metrics Monitoring
@@ -106,27 +117,29 @@ vpn_set_metrics_callback({ metrics, userData in
 
 ### Project Structure
 ```
-├── src/                    # Core implementation
+├── src/                    # iOS-only implementation
 │   ├── api/               # Public C API
 │   ├── core/              # Logging, types, utilities
-│   ├── packet/            # utun interface handling
-│   ├── tcp_udp/           # lwIP integration
-│   ├── socket_bridge/     # Connection bridging
+│   ├── packet/            # NetworkExtension tunnel provider
+│   ├── socket_bridge/     # iOS connection bridging (createTCP/UDP)
+│   ├── tcp_udp/           # Connection management
 │   ├── dns/               # DNS resolution & caching
 │   ├── metrics/           # Performance monitoring
 │   ├── nat64/             # IPv6-to-IPv4 translation
 │   ├── mtu/               # Path MTU discovery
-│   ├── reachability/      # Network state monitoring
+│   ├── reachability/      # iOS network state monitoring
 │   ├── classifier/        # Traffic analysis
-│   └── privacy/           # Security & privacy guards
+│   ├── privacy/           # Security & privacy guards
+│   └── crash/             # iOS crash reporting
 ├── include/               # Public headers
-├── tests/                 # Comprehensive test suite
+├── examples/              # iOS NetworkExtension examples
+├── tests/                 # iOS-focused test suite
 │   ├── unit/             # Unit tests (GoogleTest)
-│   ├── integration/      # Integration tests
+│   ├── integration/      # iOS integration tests
+│   ├── ios/              # NetworkExtension specific tests
 │   ├── fuzz/             # Fuzzing harnesses
 │   └── performance/      # Performance benchmarks
-├── third_party/          # External dependencies
-├── scripts/              # Build & utility scripts
+├── scripts/              # iOS build & utility scripts
 └── cmake/                # CMake modules
 ```
 
@@ -154,9 +167,9 @@ vpn_set_metrics_callback({ metrics, userData in
 Our CI/CD pipeline provides comprehensive automated testing across multiple platforms and configurations:
 
 #### 🏗️ **Build Matrix**
-- **Platforms**: Ubuntu (Linux), macOS, iOS
+- **Platform**: iOS (iPhone/iPad) - NetworkExtension framework
 - **Build Types**: Debug, Release  
-- **Architectures**: x86_64, ARM64, Universal
+- **Architectures**: ARM64 (iOS devices), ARM64 Simulator (iOS Simulator)
 
 #### 🧪 **Test Suites**
 - **Unit Tests**: Individual component testing (GoogleTest)
@@ -351,16 +364,17 @@ curl -L https://github.com/will4381/relative-protocol/releases/latest/download/r
 ### Runtime Configuration
 ```c
 typedef struct vpn_config {
-    char *utun_name;              // Interface name (NULL for auto)
-    uint16_t mtu;                 // Maximum transmission unit
-    bool ipv4_enabled;            // IPv4 support
-    bool ipv6_enabled;            // IPv6 support
-    bool nat64_enabled;           // NAT64 translation
-    bool dns_leak_protection;     // DNS leak prevention
-    uint32_t dns_cache_size;      // DNS cache entries
-    uint32_t metrics_buffer_size; // Metrics ring buffer size
-    bool reachability_monitoring; // Network transition handling
-    char *log_level;             // Logging verbosity
+    char log_level[16];                    // Logging verbosity ("debug", "info", "warn", "error")
+    uint16_t tunnel_mtu;                   // Maximum transmission unit (default: 1500)
+    bool enable_nat64;                     // NAT64 translation for cellular networks
+    bool enable_dns_leak_protection;       // DNS leak prevention
+    bool enable_ipv6_leak_protection;      // IPv6 leak prevention  
+    bool enable_kill_switch;               // Network kill switch
+    bool enable_webrtc_leak_protection;    // WebRTC leak prevention
+    uint32_t dns_cache_size;               // DNS cache entries (default: 500)
+    uint32_t metrics_buffer_size;          // Metrics ring buffer size (default: 1000)
+    uint32_t dns_server_count;             // Number of DNS servers
+    uint32_t dns_servers[8];               // DNS server IP addresses
 } vpn_config_t;
 ```
 

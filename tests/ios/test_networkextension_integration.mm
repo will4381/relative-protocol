@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 #include "api/relative_vpn.h"
-#include "packet/utun.h"
+#include "packet/tunnel_provider.h"
 #include "reachability/monitor.h"
 #include "core/types.h"
 #include <thread>
@@ -20,11 +20,12 @@
  * iOS NetworkExtension Integration Tests
  * 
  * Tests VPN framework integration with iOS NetworkExtension APIs:
- * - UTun interface creation and management
+ * - NEPacketTunnelProvider integration
+ * - Tunnel provider packet flow management
  * - Network reachability monitoring
  * - Memory pressure handling on iOS
  * - Background/foreground transitions
- * - iOS network stack integration
+ * - iOS network stack integration using createTCPConnection/createUDPSession
  * - NetworkExtension lifecycle management
  */
 
@@ -36,16 +37,15 @@ protected:
 #endif
         
         config = {};
-        config.utun_name = nullptr; // Auto-assign
-        config.mtu = 1500;
+        strncpy(config.log_level, "info", sizeof(config.log_level) - 1);
         config.tunnel_mtu = 1500;
-        config.ipv4_enabled = true;
-        config.ipv6_enabled = true;
         config.enable_nat64 = true;
         config.enable_dns_leak_protection = true;
         config.enable_ipv6_leak_protection = true;
         config.enable_kill_switch = true; // Important for iOS
-        config.reachability_monitoring = true; // Critical for iOS
+        config.enable_webrtc_leak_protection = true;
+        config.dns_cache_size = 500;
+        config.metrics_buffer_size = 1000;
         
         // iOS-appropriate DNS servers
         config.dns_servers[0] = inet_addr("8.8.8.8");
@@ -91,35 +91,35 @@ protected:
 
 bool NetworkExtensionIntegrationTest::test_utun_interface_creation() {
 #ifdef __APPLE__
-    // Test UTun interface creation with iOS-specific requirements
-    utun_handle_t* utun = utun_create(nullptr, 1500);
+    // Test tunnel provider creation with iOS-specific NetworkExtension requirements
+    tunnel_provider_t* provider = tunnel_provider_create();
     
-    if (!utun) {
+    if (!provider) {
         return false;
     }
     
-    // Verify interface properties
-    const char* interface_name = utun_get_name(utun);
-    EXPECT_NE(interface_name, nullptr);
-    EXPECT_STRNE(interface_name, "");
+    // Test packet handler configuration
+    bool handler_set = tunnel_provider_set_packet_handler(provider, 
+        [](const packet_info_t *packet, void *user_data) {
+            // Simple test handler
+        }, nullptr);
+    EXPECT_TRUE(handler_set);
     
-    // Should start with "utun"
-    EXPECT_EQ(strncmp(interface_name, "utun", 4), 0);
+    // Test statistics retrieval
+    vpn_metrics_t metrics = {};
+    tunnel_provider_get_stats(provider, &metrics);
     
-    // Verify MTU
-    uint16_t mtu = utun_get_mtu(utun);
-    EXPECT_EQ(mtu, 1500);
+    // Should start with zero values
+    EXPECT_EQ(metrics.bytes_sent, 0);
+    EXPECT_EQ(metrics.bytes_received, 0);
+    EXPECT_EQ(metrics.total_packets_processed, 0);
     
-    // Test MTU modification
-    EXPECT_TRUE(utun_set_mtu(utun, 1280));
-    EXPECT_EQ(utun_get_mtu(utun), 1280);
-    
-    // Get file descriptor (should be valid)
-    int fd = utun_get_fd(utun);
-    EXPECT_GE(fd, 0);
+    // Test packet processing (should handle gracefully without NEPacketTunnelFlow)
+    bool process_result = tunnel_provider_process_packets(provider);
+    EXPECT_TRUE(process_result);
     
     // Clean up
-    utun_destroy(utun);
+    tunnel_provider_destroy(provider);
     
     return true;
 #else

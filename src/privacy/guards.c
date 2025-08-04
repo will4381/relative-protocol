@@ -315,12 +315,16 @@ bool privacy_guards_inspect_packet(privacy_guards_t *guards, const uint8_t *pack
         }
     }
     
-    // Check for unencrypted DNS
+    // Check for unencrypted DNS (only for authorized servers - unauthorized already flagged as leaks)
     if (privacy_is_dns_packet(packet, length, flow) && flow->dst_port == DNS_PORT) {
-        guards->stats.unencrypted_dns_queries++;
+        bool is_authorized = privacy_is_allowed_dns_server(guards, &flow->dst_ip);
         
-        privacy_record_violation(guards, PRIVACY_VIOLATION_UNENCRYPTED_DNS, flow,
-                               "Unencrypted DNS query detected", false);
+        if (is_authorized) {
+            guards->stats.unencrypted_dns_queries++;
+            
+            privacy_record_violation(guards, PRIVACY_VIOLATION_UNENCRYPTED_DNS, flow,
+                                   "Unencrypted DNS query detected", false);
+        }
     }
     
     // SECURITY FIX: Check TLS connections for minimum version compliance
@@ -393,36 +397,47 @@ void privacy_guards_secure_zero(void *ptr, size_t size) {
 bool privacy_guards_validate_tls_connection(privacy_guards_t *guards, const uint8_t *tls_data, size_t length) {
     if (!guards || !tls_data || length < 5) return false;
     
-    if (tls_data[0] == 0x16) { // TLS Handshake
-        uint16_t version = (tls_data[1] << 8) | tls_data[2];
+    // Check if this is a valid TLS record type
+    uint8_t record_type = tls_data[0];
+    if (record_type < 0x14 || record_type > 0x18) {
+        // Invalid TLS record type (valid range: 20-24)
+        LOG_WARN("Invalid TLS record type: 0x%02x", record_type);
+        return false;
+    }
+    
+    // Extract TLS version from all record types
+    uint16_t version = (tls_data[1] << 8) | tls_data[2];
+    
+    // SECURITY FIX: Enforce minimum TLS 1.2 (0x0303) for all TLS traffic
+    if (version < 0x0303) { // Anything below TLS 1.2
+        pthread_mutex_lock(&guards->mutex);
+        guards->stats.weak_encryption_detected++;
+        pthread_mutex_unlock(&guards->mutex);
         
-        // SECURITY FIX: Enforce minimum TLS 1.2 (0x0303)
-        if (version < 0x0303) { // Anything below TLS 1.2
-            pthread_mutex_lock(&guards->mutex);
-            guards->stats.weak_encryption_detected++;
-            pthread_mutex_unlock(&guards->mutex);
-            
-            const char *version_name = "Unknown";
-            switch (version) {
-                case 0x0300: version_name = "SSL 3.0"; break;
-                case 0x0301: version_name = "TLS 1.0"; break;
-                case 0x0302: version_name = "TLS 1.1"; break;
-                default: version_name = "Unknown/Invalid"; break;
-            }
-            
-            LOG_WARN("Weak TLS version detected: %s (0x%04x) - minimum TLS 1.2 required", 
-                    version_name, version);
-            return false;
+        const char *version_name = "Unknown";
+        switch (version) {
+            case 0x0300: version_name = "SSL 3.0"; break;
+            case 0x0301: version_name = "TLS 1.0"; break;
+            case 0x0302: version_name = "TLS 1.1"; break;
+            default: version_name = "Unknown/Invalid"; break;
         }
         
-        // Log acceptable TLS versions for monitoring
-        if (version == 0x0303) {
-            LOG_DEBUG("TLS 1.2 connection accepted");
-        } else if (version == 0x0304) {
-            LOG_DEBUG("TLS 1.3 connection accepted");
-        } else {
-            LOG_WARN("Unknown TLS version: 0x%04x", version);
-        }
+        LOG_WARN("Weak TLS version detected: %s (0x%04x) - minimum TLS 1.2 required", 
+                version_name, version);
+        return false;
+    }
+    
+    // Validate known TLS versions
+    if (version != 0x0303 && version != 0x0304) {
+        LOG_WARN("Unknown/Invalid TLS version: 0x%04x", version);
+        return false;
+    }
+    
+    // Log acceptable TLS versions for monitoring
+    if (version == 0x0303) {
+        LOG_DEBUG("TLS 1.2 connection accepted");
+    } else if (version == 0x0304) {
+        LOG_DEBUG("TLS 1.3 connection accepted");
     }
     
     return true;

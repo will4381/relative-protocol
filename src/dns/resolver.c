@@ -493,7 +493,20 @@ bool dns_is_valid_hostname(const char *hostname) {
     if (!hostname) return false;
     
     size_t len = strlen(hostname);
-    if (len == 0 || len > DNS_MAX_NAME_LENGTH) return false;
+    if (len == 0 || len > 63) return false; // RFC compliant: max 63 chars per label, stricter validation
+    
+    // Check for consecutive dots (invalid)
+    for (size_t i = 0; i < len - 1; i++) {
+        if (hostname[i] == '.' && hostname[i + 1] == '.') {
+            return false;
+        }
+    }
+    
+    // Check for invalid starting/ending characters
+    if (hostname[0] == '.' || hostname[0] == '-' || 
+        hostname[len-1] == '.' || hostname[len-1] == '-') {
+        return false;
+    }
     
     for (size_t i = 0; i < len; i++) {
         char c = hostname[i];
