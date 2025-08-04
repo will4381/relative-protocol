@@ -41,6 +41,7 @@ void tunnel_provider_get_stats(tunnel_provider_t *provider, vpn_metrics_t *metri
 #ifdef TARGET_OS_IOS
 #ifdef __OBJC__
 #import <NetworkExtension/NetworkExtension.h>
+#import <Network/Network.h>
 
 // iOS-specific NetworkExtension integration
 bool tunnel_provider_configure_packet_flow(tunnel_provider_t *provider,
@@ -51,14 +52,14 @@ bool tunnel_provider_create_tcp_connection(tunnel_provider_t *provider,
                                          NEPacketTunnelProvider *tunnelProvider,
                                          const char *hostname,
                                          uint16_t port,
-                                         void (^completion)(NWTCPConnection *));
+                                         void (^completion)(nw_connection_t _Nullable));
 
 // Create UDP session using NEPacketTunnelProvider
 bool tunnel_provider_create_udp_session(tunnel_provider_t *provider,
                                       NEPacketTunnelProvider *tunnelProvider,
                                       const char *hostname,
                                       uint16_t port,
-                                      void (^completion)(NWUDPSession *));
+                                      void (^completion)(nw_connection_t _Nullable));
 #endif
 #endif
 

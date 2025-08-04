@@ -201,6 +201,23 @@ bool dns_cache_put(dns_cache_t *cache, const char *hostname, dns_record_type_t t
     return true;
 }
 
+// Constant-time string comparison to prevent timing attacks
+static bool constant_time_strcmp(const char *a, const char *b, size_t max_len) {
+    size_t i;
+    unsigned char result = 0;
+    
+    for (i = 0; i < max_len; i++) {
+        result |= ((unsigned char)a[i]) ^ ((unsigned char)b[i]);
+        // Continue even if we hit null terminator to maintain constant time
+        if (a[i] == '\0' || b[i] == '\0') {
+            // But still need to check remaining characters
+            continue;
+        }
+    }
+    
+    return result == 0;
+}
+
 bool dns_cache_get(dns_cache_t *cache, const char *hostname, dns_record_type_t type, 
                   dns_record_t *record) {
     if (!cache || !hostname || !record) return false;
@@ -210,38 +227,47 @@ bool dns_cache_get(dns_cache_t *cache, const char *hostname, dns_record_type_t t
     uint32_t hash = dns_cache_hash(cache, hostname, type);
     size_t bucket_index = hash % cache->bucket_count;
     
+    // Variables to track if we found a match (constant-time)
+    bool found = false;
+    dns_record_t found_record = {0};
+    uint64_t found_access_time = 0;
+    dns_cache_entry_t *found_entry = NULL;
+    
+    // Always traverse the entire bucket list (constant time for same bucket)
     struct dns_cache_bucket *bucket = cache->buckets[bucket_index];
     while (bucket) {
-        if (bucket->entry && 
-            strcmp(bucket->entry->hostname, hostname) == 0 && 
-            bucket->entry->type == type) {
+        if (bucket->entry) {
+            // Use constant-time comparison
+            bool hostname_match = constant_time_strcmp(bucket->entry->hostname, hostname, DNS_MAX_NAME_LENGTH);
+            bool type_match = (bucket->entry->type == type);
+            bool not_expired = !dns_cache_is_expired(bucket->entry);
             
-            if (dns_cache_is_expired(bucket->entry)) {
-                LOG_DEBUG("DNS cache entry for %s expired", hostname);
-                cache->stats.cache_misses++;
-                cache->stats.expired_entries++;
-                pthread_mutex_unlock(&cache->mutex);
-                return false;
+            // Only update if all conditions match (branchless)
+            bool is_match = hostname_match & type_match & not_expired;
+            if (is_match) {
+                found = true;
+                found_record = bucket->entry->record;
+                found_access_time = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+                found_entry = bucket->entry;
             }
-            
-            *record = bucket->entry->record;
-            bucket->entry->last_access_ns = clock_gettime_nsec_np(CLOCK_MONOTONIC);
-            bucket->entry->access_count++;
-            
-            cache->stats.cache_hits++;
-            
-            LOG_DEBUG("DNS cache hit for %s (type %d)", hostname, type);
-            pthread_mutex_unlock(&cache->mutex);
-            return true;
         }
         bucket = bucket->next;
     }
     
-    cache->stats.cache_misses++;
+    // Update stats and entry after traversal (constant time)
+    if (found) {
+        *record = found_record;
+        found_entry->last_access_ns = found_access_time;
+        found_entry->access_count++;
+        cache->stats.cache_hits++;
+        LOG_DEBUG("DNS cache hit for %s (type %d)", hostname, type);
+    } else {
+        cache->stats.cache_misses++;
+        LOG_DEBUG("DNS cache miss for %s (type %d)", hostname, type);
+    }
     
-    LOG_DEBUG("DNS cache miss for %s (type %d)", hostname, type);
     pthread_mutex_unlock(&cache->mutex);
-    return false;
+    return found;
 }
 
 bool dns_cache_has_entry(dns_cache_t *cache, const char *hostname, dns_record_type_t type) {
@@ -432,7 +458,6 @@ static void dns_cache_evict_lru(dns_cache_t *cache) {
     
     uint64_t oldest_access = UINT64_MAX;
     struct dns_cache_bucket **oldest_bucket_ptr = NULL;
-    size_t oldest_bucket_index = 0;
     
     for (size_t i = 0; i < cache->bucket_count; i++) {
         struct dns_cache_bucket **bucket_ptr = &cache->buckets[i];
@@ -441,7 +466,6 @@ static void dns_cache_evict_lru(dns_cache_t *cache) {
             if (bucket->entry && bucket->entry->last_access_ns < oldest_access) {
                 oldest_access = bucket->entry->last_access_ns;
                 oldest_bucket_ptr = bucket_ptr;
-                oldest_bucket_index = i;
             }
             bucket_ptr = &bucket->next;
         }

@@ -92,6 +92,60 @@ gmon.out
 # Valgrind output
 *.valgrind
 
+# Additional analysis and debug files
+*.plist
+
+# Swift Package Manager additional patterns
+.swiftpm/xcode/
+.swiftpm/*.xcodeproj
+
+# Additional temporary files
+*.tmp.*
+.tmp/
+tmp/
+
+# XCFramework signing artifacts (keep the framework, ignore signing files)
+*.xcframework/_CodeSignature/
+*.xcframework/*/Headers/module.modulemap
+
+# Testing artifacts
+Testing/
+CTestTestfile.cmake
+DartConfiguration.tcl
+
+# Additional CMake patterns
+CPackConfig.cmake
+CPackSourceConfig.cmake
+
+# Instruments and profiling
+*.trace
+*.dtps
+
+# Additional coverage patterns
+*.info
+htmlcov/
+
+# Dependency directories that might be created
+_deps/
+third-party/
+external/
+
+# Archive files that might be generated
+*.tar.gz
+*.zip
+*.tar.xz
+
+# Additional IDE files
+*.xccheckout
+*.xcscmblueprint
+xcuserdata/
+project.xcworkspace/
+
+# Codesigning
+*.mobileprovision
+*.p12
+*.cer
+
 # Backup files
 *.bak
 *.backup

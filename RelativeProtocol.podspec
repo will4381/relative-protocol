@@ -9,7 +9,7 @@ Pod::Spec.new do |spec|
   DESC
 
   spec.homepage          = "https://github.com/will4381/relative-protocol"
-  spec.license           = { :type => "MIT", :file => "LICENSE" }
+  spec.license           = { :type => "GPL-3.0", :file => "LICENSE" }
   spec.author            = { "RelativeProtocol Team" => "will@relativecompanies.com" }
   spec.social_media_url  = "https://twitter.com/hellakusch"
 

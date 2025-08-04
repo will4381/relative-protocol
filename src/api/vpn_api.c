@@ -3,6 +3,40 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <limits.h>
+
+// Platform-safe timestamp function with overflow protection
+static uint64_t get_safe_timestamp_ns(void) {
+#ifdef __APPLE__
+    // Use clock_gettime_nsec_np on macOS/iOS
+    uint64_t timestamp = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    return timestamp;
+#else
+    // Use clock_gettime on other platforms
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        // Fallback on error
+        return 0;
+    }
+    
+    // Check for overflow when converting to nanoseconds
+    const uint64_t NS_PER_SEC = 1000000000ULL;
+    if (ts.tv_sec > (UINT64_MAX / NS_PER_SEC)) {
+        // Would overflow, return max value
+        return UINT64_MAX;
+    }
+    
+    uint64_t ns = (uint64_t)ts.tv_sec * NS_PER_SEC;
+    
+    // Check if adding nanoseconds would overflow
+    if (ns > UINT64_MAX - ts.tv_nsec) {
+        return UINT64_MAX;
+    }
+    
+    return ns + ts.tv_nsec;
+#endif
+}
 
 // Forward declarations for comprehensive implementation
 vpn_result_t vpn_start_comprehensive(const vpn_config_t *config);
@@ -120,7 +154,8 @@ vpn_status_t vpn_inject(const uint8_t *packet, size_t length) {
     packet_info_t packet_info = {};
     packet_info.data = (uint8_t*)packet;
     packet_info.length = length;
-    packet_info.timestamp_ns = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    // Get timestamp with overflow protection
+    packet_info.timestamp_ns = get_safe_timestamp_ns();
     
     // Basic flow parsing from packet
     if (length >= 20 && (packet[0] >> 4) == 4) { // IPv4

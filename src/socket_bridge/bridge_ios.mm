@@ -17,21 +17,25 @@ ios_tcp_connection_t* ios_create_tcp_connection(const char* host, uint16_t port)
     
     @autoreleasepool {
         NSString *hostString = [NSString stringWithUTF8String:host];
-        NWHostEndpoint *endpoint = [NWHostEndpoint endpointWithHostname:hostString port:[NSString stringWithFormat:@"%d", port]];
+        NSString *portString = [NSString stringWithFormat:@"%d", port];
+        
+        nw_endpoint_t endpoint = nw_endpoint_create_host([hostString UTF8String], [portString UTF8String]);
         
         // Note: In a real NetworkExtension, this would use the packet tunnel provider's createTCPConnection
         // For now, return a placeholder that indicates the connection was created
-        return (ios_tcp_connection_t*)CFBridgingRetain(endpoint);
+        return (ios_tcp_connection_t*)endpoint;
     }
 }
 
 ios_udp_session_t* ios_create_udp_session(uint16_t local_port) {
     @autoreleasepool {
-        NWHostEndpoint *endpoint = [NWHostEndpoint endpointWithHostname:@"0.0.0.0" port:[NSString stringWithFormat:@"%d", local_port]];
+        NSString *portString = [NSString stringWithFormat:@"%d", local_port];
+        
+        nw_endpoint_t endpoint = nw_endpoint_create_host("0.0.0.0", [portString UTF8String]);
         
         // Note: In a real NetworkExtension, this would use the packet tunnel provider's createUDPSession
         // For now, return a placeholder that indicates the session was created
-        return (ios_udp_session_t*)CFBridgingRetain(endpoint);
+        return (ios_udp_session_t*)endpoint;
     }
 }
 
@@ -58,7 +62,8 @@ void ios_close_tcp_connection(ios_tcp_connection_t* conn) {
     if (!conn) return;
     
     @autoreleasepool {
-        CFBridgingRelease(conn);
+        nw_endpoint_t endpoint = (nw_endpoint_t)conn;
+        nw_release(endpoint);
     }
 }
 
@@ -66,7 +71,8 @@ void ios_close_udp_session(ios_udp_session_t* session) {
     if (!session) return;
     
     @autoreleasepool {
-        CFBridgingRelease(session);
+        nw_endpoint_t endpoint = (nw_endpoint_t)session;
+        nw_release(endpoint);
     }
 }
 

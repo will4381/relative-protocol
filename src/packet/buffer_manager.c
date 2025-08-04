@@ -4,6 +4,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <assert.h>
+#include <time.h>
 
 // PRODUCTION FIX: Thread-safe buffer pool implementation
 buffer_pool_t *buffer_pool_create(size_t buffer_size, size_t initial_count) {
@@ -28,6 +29,14 @@ buffer_pool_t *buffer_pool_create(size_t buffer_size, size_t initial_count) {
     pool->total_buffers = initial_count;
     atomic_init(&pool->allocations, 0);
     atomic_init(&pool->deallocations, 0);
+    
+    // Initialize dynamic resize settings
+    pool->auto_resize_enabled = true;
+    pool->low_watermark = DEFAULT_LOW_WATERMARK;
+    pool->high_watermark = DEFAULT_HIGH_WATERMARK;
+    pool->min_size = MIN_POOL_SIZE;
+    pool->max_size = MAX_POOL_SIZE;
+    pool->last_resize_time = 0;
     
     // Pre-allocate buffers
     packet_buffer_t *prev = NULL;
@@ -87,6 +96,30 @@ packet_buffer_t *buffer_pool_acquire(buffer_pool_t *pool) {
         // Reset buffer state
         buffer->length = 0;
         atomic_store(&buffer->ref_count, 1);
+    }
+    
+    // Check if we need to resize the pool
+    if (pool->auto_resize_enabled) {
+        float free_percentage = (float)pool->free_count / pool->total_buffers;
+        time_t now = time(NULL);
+        
+        // Check if we should grow the pool (low on free buffers)
+        if (free_percentage < pool->low_watermark && 
+            pool->total_buffers < pool->max_size &&
+            (now - pool->last_resize_time) > 1) { // Rate limit to once per second
+            
+            size_t grow_by = pool->total_buffers * 0.5; // Grow by 50%
+            size_t target_size = pool->total_buffers + grow_by;
+            if (target_size > pool->max_size) {
+                target_size = pool->max_size;
+            }
+            
+            LOG_INFO("Growing buffer pool from %zu to %zu (free: %.1f%%)", 
+                     pool->total_buffers, target_size, free_percentage * 100);
+            
+            // We'll resize after unlocking to avoid holding lock too long
+            pool->last_resize_time = now;
+        }
     }
     
     pthread_mutex_unlock(&pool->mutex);
@@ -321,4 +354,95 @@ bool packet_buffer_is_valid(const packet_buffer_t *buffer) {
     if (buffer->length > buffer->capacity) return false;
     if (atomic_load(&buffer->ref_count) <= 0) return false;
     return true;
+}
+
+// Dynamic pool resizing implementation
+bool buffer_pool_resize(buffer_pool_t *pool, size_t new_size) {
+    if (!pool || new_size == 0) return false;
+    
+    // Enforce min/max limits
+    if (new_size < pool->min_size) new_size = pool->min_size;
+    if (new_size > pool->max_size) new_size = pool->max_size;
+    
+    pthread_mutex_lock(&pool->mutex);
+    
+    bool success = true;
+    
+    if (new_size > pool->total_buffers) {
+        // Growing the pool - add new buffers
+        size_t to_add = new_size - pool->total_buffers;
+        
+        for (size_t i = 0; i < to_add; i++) {
+            packet_buffer_t *buffer = packet_buffer_create(pool->buffer_size);
+            if (!buffer) {
+                LOG_ERROR("Failed to allocate buffer during pool resize");
+                success = false;
+                break;
+            }
+            
+            // Add to free list
+            buffer->next = pool->free_buffers;
+            pool->free_buffers = buffer;
+            pool->free_count++;
+            pool->total_buffers++;
+        }
+        
+        LOG_INFO("Grew buffer pool from %zu to %zu buffers", 
+                 pool->total_buffers - to_add, pool->total_buffers);
+        
+    } else if (new_size < pool->total_buffers) {
+        // Shrinking the pool - remove excess free buffers
+        size_t to_remove = pool->total_buffers - new_size;
+        size_t removed = 0;
+        
+        while (removed < to_remove && pool->free_buffers) {
+            packet_buffer_t *buffer = pool->free_buffers;
+            pool->free_buffers = buffer->next;
+            pool->free_count--;
+            pool->total_buffers--;
+            
+            // Free the buffer
+            packet_buffer_release(buffer);
+            removed++;
+        }
+        
+        LOG_INFO("Shrunk buffer pool from %zu to %zu buffers (removed %zu)", 
+                 pool->total_buffers + removed, pool->total_buffers, removed);
+    }
+    
+    pool->last_resize_time = time(NULL);
+    pthread_mutex_unlock(&pool->mutex);
+    
+    return success;
+}
+
+void buffer_pool_set_auto_resize(buffer_pool_t *pool, bool enabled) {
+    if (!pool) return;
+    
+    pthread_mutex_lock(&pool->mutex);
+    pool->auto_resize_enabled = enabled;
+    pthread_mutex_unlock(&pool->mutex);
+    
+    LOG_INFO("Buffer pool auto-resize %s", enabled ? "enabled" : "disabled");
+}
+
+void buffer_pool_set_resize_thresholds(buffer_pool_t *pool, float low_watermark, float high_watermark) {
+    if (!pool) return;
+    
+    // Validate thresholds
+    if (low_watermark < 0.0f) low_watermark = 0.0f;
+    if (low_watermark > 1.0f) low_watermark = 1.0f;
+    if (high_watermark < 0.0f) high_watermark = 0.0f;
+    if (high_watermark > 1.0f) high_watermark = 1.0f;
+    if (low_watermark >= high_watermark) {
+        LOG_ERROR("Invalid resize thresholds: low=%.2f >= high=%.2f", low_watermark, high_watermark);
+        return;
+    }
+    
+    pthread_mutex_lock(&pool->mutex);
+    pool->low_watermark = low_watermark;
+    pool->high_watermark = high_watermark;
+    pthread_mutex_unlock(&pool->mutex);
+    
+    LOG_INFO("Buffer pool resize thresholds: low=%.2f, high=%.2f", low_watermark, high_watermark);
 }

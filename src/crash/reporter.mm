@@ -414,15 +414,32 @@ static void crash_signal_handler(int sig, siginfo_t *info, void *context) {
             sizeof(crash_info.stack_trace) / sizeof(crash_info.stack_trace[0]));
     }
     
-    // Write minimal crash info to a file (using async-signal-safe functions)
+    // Write minimal crash info using only async-signal-safe functions
     int fd = open("/tmp/vpn_crash_signal.log", O_CREAT | O_WRONLY | O_APPEND, 0644);
     if (fd >= 0) {
-        char buffer[512];
-        int len = snprintf(buffer, sizeof(buffer), 
-                          "CRASH: sig=%d, pid=%u, tid=%u, addr=%p, time=%llu\n",
-                          sig, crash_info.process_id, crash_info.thread_id, 
-                          crash_info.fault_address, crash_info.timestamp_ns);
-        write(fd, buffer, len);
+        // Use only async-signal-safe functions - no snprintf!
+        const char crash_prefix[] = "CRASH: sig=";
+        write(fd, crash_prefix, sizeof(crash_prefix) - 1);
+        
+        // Write signal number (simple integer to string conversion)
+        char sig_str[12];
+        int sig_len = 0;
+        int sig_copy = sig;
+        do {
+            sig_str[sig_len++] = '0' + (sig_copy % 10);
+            sig_copy /= 10;
+        } while (sig_copy > 0 && sig_len < 11);
+        
+        // Reverse the string
+        for (int i = 0; i < sig_len / 2; i++) {
+            char tmp = sig_str[i];
+            sig_str[i] = sig_str[sig_len - 1 - i];
+            sig_str[sig_len - 1 - i] = tmp;
+        }
+        write(fd, sig_str, sig_len);
+        
+        const char newline[] = "\n";
+        write(fd, newline, 1);
         close(fd);
     }
     
@@ -475,7 +492,7 @@ bool crash_reporter_get_memory_info(char *buffer, size_t buffer_size) {
     if (!buffer || buffer_size == 0) return false;
     
 #ifdef TARGET_OS_IOS
-    // Get iOS memory info
+    // Get iOS memory info - SANITIZED to prevent information disclosure
     vm_statistics64_data_t vm_stat;
     mach_msg_type_number_t host_size = sizeof(vm_statistics64_data_t) / sizeof(natural_t);
     
@@ -492,23 +509,33 @@ bool crash_reporter_get_memory_info(char *buffer, size_t buffer_size) {
         page_size = 4096; // Default page size
     }
     
+    // Calculate memory pressure level instead of exposing exact values
+    uint64_t total_memory = (vm_stat.free_count + vm_stat.active_count + 
+                            vm_stat.inactive_count + vm_stat.wire_count) * page_size;
     uint64_t free_memory = vm_stat.free_count * page_size;
-    uint64_t active_memory = vm_stat.active_count * page_size;
-    uint64_t inactive_memory = vm_stat.inactive_count * page_size;
-    uint64_t wired_memory = vm_stat.wire_count * page_size;
+    uint64_t used_memory = total_memory - free_memory;
+    
+    // Calculate memory pressure percentage (sanitized)
+    int memory_pressure = (int)((used_memory * 100) / total_memory);
+    
+    // Categorize memory pressure instead of exposing exact values
+    const char *pressure_level;
+    if (memory_pressure < 50) {
+        pressure_level = "LOW";
+    } else if (memory_pressure < 75) {
+        pressure_level = "MODERATE";
+    } else if (memory_pressure < 90) {
+        pressure_level = "HIGH";
+    } else {
+        pressure_level = "CRITICAL";
+    }
     
     snprintf(buffer, buffer_size,
-             "Memory Info:\n"
-             "  Free: %llu MB\n"
-             "  Active: %llu MB\n"
-             "  Inactive: %llu MB\n"
-             "  Wired: %llu MB\n"
-             "  Page Size: %lu bytes",
-             free_memory / (1024 * 1024),
-             active_memory / (1024 * 1024),
-             inactive_memory / (1024 * 1024),
-             wired_memory / (1024 * 1024),
-             page_size);
+             "Memory Pressure: %s (%d%%)\n"
+             "Available Memory: %s\n",
+             pressure_level,
+             memory_pressure,
+             (memory_pressure < 75) ? "SUFFICIENT" : "LIMITED");
 #else
     strncpy(buffer, "Memory info not available on this platform", buffer_size - 1);
 #endif

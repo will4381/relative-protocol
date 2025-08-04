@@ -310,15 +310,46 @@ bool tunnel_provider_configure_packet_flow(tunnel_provider_t *provider,
                         packet.flow.dst_port = (transport[2] << 8) | transport[3];
                     }
                 } else if (packet.flow.ip_version == 6 && packet.length >= 40) {
-                    // IPv6 header parsing
+                    // IPv6 header parsing with validation
                     const uint8_t *ip6_header = packet.data;
+                    
+                    // Validate IPv6 header structure
+                    // Check traffic class and flow label (bytes 0-3)
+                    uint8_t traffic_class = ((ip6_header[0] & 0x0F) << 4) | ((ip6_header[1] & 0xF0) >> 4);
+                    uint32_t flow_label = ((ip6_header[1] & 0x0F) << 16) | (ip6_header[2] << 8) | ip6_header[3];
+                    
+                    // Validate payload length
+                    uint16_t payload_length = (ip6_header[4] << 8) | ip6_header[5];
+                    if (payload_length > (packet.length - 40)) {
+                        // Invalid payload length - packet is malformed
+                        LOG_DEBUG("Invalid IPv6 payload length: %u > %zu", 
+                                 payload_length, packet.length - 40);
+                        continue; // Skip this packet
+                    }
+                    
+                    // Get next header (protocol)
                     packet.flow.protocol = ip6_header[6];
+                    
+                    // Validate hop limit (must not be 0)
+                    uint8_t hop_limit = ip6_header[7];
+                    if (hop_limit == 0) {
+                        LOG_DEBUG("IPv6 packet with zero hop limit");
+                        continue; // Skip this packet
+                    }
+                    
+                    // Safe copy of addresses (already bounds-checked)
                     memcpy(&packet.flow.src_ip.v6.addr, &ip6_header[8], 16);
                     memcpy(&packet.flow.dst_ip.v6.addr, &ip6_header[24], 16);
                     
-                    // Parse port information if TCP/UDP
+                    // Validate that source address is not multicast (first byte != 0xFF)
+                    if (ip6_header[8] == 0xFF) {
+                        LOG_DEBUG("IPv6 packet with multicast source address");
+                        continue; // Skip this packet
+                    }
+                    
+                    // Parse port information if TCP/UDP with proper bounds checking
                     if ((packet.flow.protocol == PROTO_TCP || packet.flow.protocol == PROTO_UDP) &&
-                        packet.length >= 44) {
+                        packet.length >= 44 && payload_length >= 4) {
                         const uint8_t *transport = packet.data + 40;
                         packet.flow.src_port = (transport[0] << 8) | transport[1];
                         packet.flow.dst_port = (transport[2] << 8) | transport[3];
