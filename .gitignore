@@ -27,6 +27,9 @@ Makefile
 *.lib
 *.exe
 
+# But allow XCFramework binaries
+!RelativeProtocol.xcframework/**/*.a
+
 # Compiled binaries
 *.bin
 *.app
