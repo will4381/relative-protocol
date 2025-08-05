@@ -17,26 +17,26 @@ typedef struct tunnel_provider tunnel_provider_t;
 typedef void (*tunnel_packet_handler_t)(const packet_info_t * _Nonnull packet, void * _Nullable user_data);
 
 // Create a new tunnel provider instance
-tunnel_provider_t *tunnel_provider_create(void);
+tunnel_provider_t * _Nullable tunnel_provider_create(void);
 
 // Destroy the tunnel provider
-void tunnel_provider_destroy(tunnel_provider_t *provider);
+void tunnel_provider_destroy(tunnel_provider_t * _Nullable provider);
 
 // Set packet handler callback
-bool tunnel_provider_set_packet_handler(tunnel_provider_t *provider,
-                                       tunnel_packet_handler_t handler,
-                                       void *user_data);
+bool tunnel_provider_set_packet_handler(tunnel_provider_t * _Nonnull provider,
+                                       tunnel_packet_handler_t _Nullable handler,
+                                       void * _Nullable user_data);
 
 // Send packet to the tunnel interface
-bool tunnel_provider_send_packet(tunnel_provider_t *provider,
-                                const uint8_t *data,
+bool tunnel_provider_send_packet(tunnel_provider_t * _Nonnull provider,
+                                const uint8_t * _Nonnull data,
                                 size_t length);
 
 // Process packets from the tunnel - call this from NEPacketTunnelProvider
-bool tunnel_provider_process_packets(tunnel_provider_t *provider);
+bool tunnel_provider_process_packets(tunnel_provider_t * _Nonnull provider);
 
 // Get statistics
-void tunnel_provider_get_stats(tunnel_provider_t *provider, vpn_metrics_t *metrics);
+void tunnel_provider_get_stats(tunnel_provider_t * _Nonnull provider, vpn_metrics_t * _Nonnull metrics);
 
 #ifdef TARGET_OS_IOS
 #ifdef __OBJC__
@@ -44,8 +44,8 @@ void tunnel_provider_get_stats(tunnel_provider_t *provider, vpn_metrics_t *metri
 #import <Network/Network.h>
 
 // iOS-specific NetworkExtension integration
-bool tunnel_provider_configure_packet_flow(tunnel_provider_t *provider,
-                                         NEPacketTunnelFlow *packetFlow);
+bool tunnel_provider_configure_packet_flow(tunnel_provider_t * _Nonnull provider,
+                                         NEPacketTunnelFlow * _Nonnull packetFlow);
 
 // Create TCP connection using NEPacketTunnelProvider
 bool tunnel_provider_create_tcp_connection(tunnel_provider_t * _Nonnull provider,

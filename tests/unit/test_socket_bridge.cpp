@@ -83,7 +83,7 @@ TEST_F(SocketBridgeTest, CreateDestroy) {
 
 TEST_F(SocketBridgeTest, CreateWithNullManager) {
     // Should fail with null connection manager
-    socket_bridge_t *null_bridge = socket_bridge_create(nullptr);
+    socket_bridge_t *null_bridge = socket_bridge_create(NULL);
     EXPECT_EQ(null_bridge, nullptr);
 }
 
@@ -235,27 +235,27 @@ TEST_F(SocketBridgeTest, ConnectionLifecycle) {
 TEST_F(SocketBridgeTest, InvalidParameters) {
     // Test with null parameters
     bridge_connection_t *null_conn = socket_bridge_create_tcp_connection(
-        nullptr, nullptr, 80, data_callback, event_callback, this);
+        NULL, NULL, 80, data_callback, event_callback, this);
     EXPECT_EQ(null_conn, nullptr);
     
     // Test with null bridge
     ip_addr_t addr = {};
     addr.v4.addr = inet_addr("127.0.0.1");
     null_conn = socket_bridge_create_tcp_connection(
-        nullptr, &addr, 80, data_callback, event_callback, this);
+        NULL, &addr, 80, data_callback, event_callback, this);
     EXPECT_EQ(null_conn, nullptr);
     
     // Test with null callback
     null_conn = socket_bridge_create_tcp_connection(
-        bridge, &addr, 80, nullptr, event_callback, this);
+        bridge, &addr, 80, NULL, event_callback, this);
     EXPECT_EQ(null_conn, nullptr);
     
     // Test UDP with null parameters
     bridge_connection_t *null_udp = socket_bridge_create_udp_session(
-        nullptr, 0, data_callback, this);
+        NULL, 0, data_callback, this);
     EXPECT_EQ(null_udp, nullptr);
     
-    null_udp = socket_bridge_create_udp_session(bridge, 0, nullptr, this);
+    null_udp = socket_bridge_create_udp_session(bridge, 0, NULL, this);
     EXPECT_EQ(null_udp, nullptr);
 }
 

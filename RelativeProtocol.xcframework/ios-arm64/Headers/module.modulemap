@@ -1,8 +1,6 @@
-module RelativeProtocol {
-  umbrella header "RelativeProtocol/RelativeProtocol.h"
+framework module RelativeProtocol {
+  umbrella header "RelativeProtocol.h"
 
   export *
   module * { export * }
-
-  link "relative_vpn-arm64"
 }

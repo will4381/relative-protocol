@@ -65,10 +65,10 @@ TEST_F(TunnelProviderTest, PacketHandlerConfiguration) {
     EXPECT_TRUE(result);
     
     // Test with null parameters
-    result = tunnel_provider_set_packet_handler(nullptr, packet_handler, this);
+    result = tunnel_provider_set_packet_handler(NULL, packet_handler, this);
     EXPECT_FALSE(result);
     
-    result = tunnel_provider_set_packet_handler(provider, nullptr, this);
+    result = tunnel_provider_set_packet_handler(provider, NULL, this);
     EXPECT_TRUE(result); // Should succeed with null handler
 }
 
@@ -92,10 +92,10 @@ TEST_F(TunnelProviderTest, PacketSending) {
     EXPECT_FALSE(result);
     
     // Test with invalid parameters
-    result = tunnel_provider_send_packet(nullptr, test_packet, sizeof(test_packet));
+    result = tunnel_provider_send_packet(NULL, test_packet, sizeof(test_packet));
     EXPECT_FALSE(result);
     
-    result = tunnel_provider_send_packet(provider, nullptr, sizeof(test_packet));
+    result = tunnel_provider_send_packet(provider, NULL, sizeof(test_packet));
     EXPECT_FALSE(result);
     
     result = tunnel_provider_send_packet(provider, test_packet, 0);
@@ -114,7 +114,7 @@ TEST_F(TunnelProviderTest, PacketProcessing) {
     EXPECT_EQ(packets_received.load(), 0);
     
     // Test with null provider
-    result = tunnel_provider_process_packets(nullptr);
+    result = tunnel_provider_process_packets(NULL);
     EXPECT_FALSE(result);
 }
 
@@ -131,10 +131,10 @@ TEST_F(TunnelProviderTest, Statistics) {
     EXPECT_EQ(metrics.packet_errors, 0);
     
     // Test with null parameters
-    tunnel_provider_get_stats(nullptr, &metrics);
+    tunnel_provider_get_stats(NULL, &metrics);
     // Should not crash
     
-    tunnel_provider_get_stats(provider, nullptr);
+    tunnel_provider_get_stats(provider, NULL);
     // Should not crash
 }
 

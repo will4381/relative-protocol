@@ -12,13 +12,7 @@
 typedef void* vpn_handle_t;
 #define VPN_INVALID_HANDLE ((vpn_handle_t)NULL)
 
-// MTU constants - check if not already defined
-#ifndef MIN_MTU
-#define MIN_MTU 576
-#endif
-#ifndef MAX_MTU
-#define MAX_MTU 9000
-#endif
+// MTU constants are defined in core/types.h
 
 #ifdef __cplusplus
 extern "C" {
