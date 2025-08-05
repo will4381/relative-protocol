@@ -1,5 +1,5 @@
 module RelativeProtocol {
-  umbrella header "RelativeProtocol.h"
+  umbrella header "RelativeProtocol/RelativeProtocol.h"
 
   export *
   module * { export * }
