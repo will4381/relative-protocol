@@ -1,4 +1,4 @@
-framework module RelativeProtocol {
+module RelativeProtocol {
   umbrella header "RelativeProtocol.h"
 
   export *
