@@ -6,7 +6,7 @@
 #include <stddef.h>
 
 // Forward declarations from core types
-#include "core/types.h"
+#include "../core/types.h"
 
 // VPN handle type
 typedef void* vpn_handle_t;
