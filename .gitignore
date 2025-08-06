@@ -63,6 +63,7 @@ core.*
 # But allow src/core and include/core directories
 !src/core/
 !include/core/
+!RelativeProtocol.xcframework/**/core/
 
 # Package managers
 node_modules/
