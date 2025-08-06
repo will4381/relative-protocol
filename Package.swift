@@ -9,7 +9,7 @@ let package = Package(
     products: [
         .library(
             name: "RelativeProtocol", 
-            targets: ["RelativeProtocol"]
+            targets: ["RelativeProtocolWrapper"]
         ),
     ],
     targets: [
@@ -17,5 +17,13 @@ let package = Package(
             name: "RelativeProtocol",
             path: "RelativeProtocol.xcframework"
         ),
+        .target(
+            name: "RelativeProtocolWrapper",
+            dependencies: ["RelativeProtocol"],
+            linkerSettings: [
+                .linkedFramework("CoreTelephony"),
+                .linkedFramework("NetworkExtension")
+            ]
+        )
     ]
 )

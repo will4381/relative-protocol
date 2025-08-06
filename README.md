@@ -1,4 +1,4 @@
-# RelativeVPN
+# Relative Protocol
 
 [![CI/CD Pipeline](https://github.com/will4381/relative-protocol/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/relative-vpn/actions/workflows/ci.yml)
 [![Security Scan](https://github.com/will4381/relative-protocol/actions/workflows/security.yml/badge.svg)](https://github.com/your-org/relative-vpn/actions/workflows/security.yml)
