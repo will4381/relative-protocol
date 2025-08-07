@@ -164,15 +164,64 @@ bool tunnel_provider_set_packet_handler(tunnel_provider_t *provider,
 bool tunnel_provider_send_packet(tunnel_provider_t *provider,
                                 const uint8_t *data,
                                 size_t length) {
-    if (!provider || !data || length == 0) return false;
+    LOG_TRACE("Sending packet to tunnel: length=%zu", length);
+    
+    if (!provider || !data || length == 0) {
+        LOG_ERROR("Invalid parameters for tunnel packet send: provider=%p, data=%p, length=%zu", 
+                  provider, data, length);
+        return false;
+    }
+    
+    if (length > MAX_PACKET_SIZE) {
+        LOG_ERROR("Packet too large for tunnel: %zu bytes (max %d)", length, MAX_PACKET_SIZE);
+        return false;
+    }
     
 #ifdef TARGET_OS_IOS
     if (!provider->packet_flow) {
-        LOG_ERROR("Packet flow not configured");
+        LOG_ERROR("Packet flow not configured - cannot send packet");
         return false;
     }
     
     @autoreleasepool {
+        // Parse and log packet details
+        uint8_t ip_version = 0;
+        const char* protocol_name = "Unknown";
+        if (length >= 20) {
+            ip_version = (data[0] >> 4) & 0x0F;
+            if (ip_version == 4 && length >= 20) {
+                uint8_t protocol = data[9];
+                uint32_t src_ip, dst_ip;
+                memcpy(&src_ip, &data[12], 4);
+                memcpy(&dst_ip, &data[16], 4);
+                
+                uint16_t src_port = 0, dst_port = 0;
+                if ((protocol == 6 || protocol == 17) && length >= 24) {
+                    src_port = (data[20] << 8) | data[21];
+                    dst_port = (data[22] << 8) | data[23];
+                }
+                
+                struct in_addr src_addr = {.s_addr = src_ip};
+                struct in_addr dst_addr = {.s_addr = dst_ip};
+                
+                if (protocol == 6) protocol_name = "TCP";
+                else if (protocol == 17) protocol_name = "UDP";
+                else if (protocol == 1) protocol_name = "ICMP";
+                
+                LOG_TRACE("Sending IPv4 packet: %s:%d -> %s:%d (%s, %zu bytes)",
+                          inet_ntoa(src_addr), src_port,
+                          inet_ntoa(dst_addr), dst_port,
+                          protocol_name, length);
+            } else if (ip_version == 6 && length >= 40) {
+                uint8_t next_header = data[6];
+                if (next_header == 6) protocol_name = "TCP";
+                else if (next_header == 17) protocol_name = "UDP";
+                else if (next_header == 58) protocol_name = "ICMPv6";
+                
+                LOG_TRACE("Sending IPv6 packet: %s (%zu bytes)", protocol_name, length);
+            }
+        }
+        
         NSData *packetData = [NSData dataWithBytes:data length:length];
         NSArray<NSData *> *packets = @[packetData];
         NSArray<NSNumber *> *protocols = @[@(AF_INET)]; // IPv4
@@ -182,9 +231,15 @@ bool tunnel_provider_send_packet(tunnel_provider_t *provider,
             uint8_t version = (data[0] >> 4) & 0x0F;
             if (version == 6) {
                 protocols = @[@(AF_INET6)]; // IPv6
+                LOG_TRACE("Setting protocol family to IPv6");
+            } else if (version == 4) {
+                LOG_TRACE("Setting protocol family to IPv4");
+            } else {
+                LOG_WARN("Unknown IP version: %d", version);
             }
         }
         
+        LOG_DEBUG("Writing packet to tunnel flow: %zu bytes, IP version %d", length, ip_version);
         BOOL success = [provider->packet_flow writePackets:packets 
                                              withProtocols:protocols];
         
@@ -194,9 +249,9 @@ bool tunnel_provider_send_packet(tunnel_provider_t *provider,
             provider->stats.total_packets_processed++;
             pthread_mutex_unlock(&provider->stats_mutex);
             
-            LOG_TRACE("Sent packet of %zu bytes to tunnel", length);
+            LOG_DEBUG("Successfully sent %s packet of %zu bytes to tunnel", protocol_name, length);
         } else {
-            LOG_ERROR("Failed to write packet to tunnel flow");
+            LOG_ERROR("Failed to write %s packet (%zu bytes) to tunnel flow", protocol_name, length);
             
             pthread_mutex_lock(&provider->stats_mutex);
             provider->stats.packet_errors++;
@@ -206,7 +261,7 @@ bool tunnel_provider_send_packet(tunnel_provider_t *provider,
         return success;
     }
 #else
-    LOG_ERROR("Tunnel provider requires iOS platform");
+    LOG_ERROR("Tunnel provider requires iOS platform - cannot send packet");
     return false;
 #endif
 }
@@ -259,14 +314,25 @@ bool tunnel_provider_configure_packet_flow(tunnel_provider_t *provider,
         
         [strongProvider->packet_flow readPacketsWithCompletionHandler:^(NSArray<NSData *> *packets, 
                                                                        NSArray<NSNumber *> *protocols) {
-            if (!strongProvider->running) return;
+            if (!strongProvider->running) {
+                LOG_TRACE("Tunnel provider not running, ignoring received packets");
+                return;
+            }
+            
+            LOG_TRACE("Received %lu packets from tunnel", (unsigned long)packets.count);
             
             // Process each packet
             for (NSUInteger i = 0; i < packets.count; i++) {
                 NSData *packetData = packets[i];
                 NSNumber *protocolFamily = protocols[i];
                 
+                LOG_TRACE("Processing packet %lu: length=%lu, protocol_family=%d", 
+                         (unsigned long)i, (unsigned long)packetData.length, protocolFamily.intValue);
+                
                 if (packetData.length == 0 || packetData.length > MAX_PACKET_SIZE) {
+                    LOG_ERROR("Invalid packet size: %lu bytes (max %d)", 
+                             (unsigned long)packetData.length, MAX_PACKET_SIZE);
+                    
                     pthread_mutex_lock(&strongProvider->stats_mutex);
                     strongProvider->stats.packet_errors++;
                     pthread_mutex_unlock(&strongProvider->stats_mutex);
@@ -280,12 +346,19 @@ bool tunnel_provider_configure_packet_flow(tunnel_provider_t *provider,
                 packet.data = (uint8_t *)packetData.bytes;
                 packet.timestamp_ns = clock_gettime_nsec_np(CLOCK_MONOTONIC);
                 
+                LOG_TRACE("Created packet info: length=%zu, timestamp=%llu", 
+                         packet.length, packet.timestamp_ns);
+                
                 // Determine IP version from protocol family
                 if (protocolFamily.intValue == AF_INET) {
                     packet.flow.ip_version = 4;
+                    LOG_TRACE("Packet is IPv4");
                 } else if (protocolFamily.intValue == AF_INET6) {
                     packet.flow.ip_version = 6;
+                    LOG_TRACE("Packet is IPv6");
                 } else {
+                    LOG_ERROR("Unknown protocol family: %d", protocolFamily.intValue);
+                    
                     pthread_mutex_lock(&strongProvider->stats_mutex);
                     strongProvider->stats.packet_errors++;
                     pthread_mutex_unlock(&strongProvider->stats_mutex);
@@ -294,11 +367,32 @@ bool tunnel_provider_configure_packet_flow(tunnel_provider_t *provider,
                 
                 // Parse basic flow information from packet
                 if (packet.flow.ip_version == 4 && packet.length >= 20) {
+                    LOG_TRACE("Parsing IPv4 header");
                     // IPv4 header parsing
                     const uint8_t *ip_header = packet.data;
+                    
+                    // Validate IPv4 header
+                    uint8_t version = (ip_header[0] >> 4) & 0x0F;
+                    if (version != 4) {
+                        LOG_ERROR("IPv4 packet has invalid version: %d", version);
+                        continue;
+                    }
+                    
                     packet.flow.protocol = ip_header[9];
                     memcpy(&packet.flow.src_ip, &ip_header[12], 4);
                     memcpy(&packet.flow.dst_ip, &ip_header[16], 4);
+                    
+                    struct in_addr src_addr = {.s_addr = packet.flow.src_ip};
+                    struct in_addr dst_addr = {.s_addr = packet.flow.dst_ip};
+                    
+                    const char* protocol_name = "Unknown";
+                    if (packet.flow.protocol == PROTO_TCP) protocol_name = "TCP";
+                    else if (packet.flow.protocol == PROTO_UDP) protocol_name = "UDP";
+                    else if (packet.flow.protocol == 1) protocol_name = "ICMP";
+                    
+                    LOG_TRACE("IPv4: %s -> %s, protocol=%d (%s)", 
+                             inet_ntoa(src_addr), inet_ntoa(dst_addr),
+                             packet.flow.protocol, protocol_name);
                     
                     // Parse port information if TCP/UDP
                     uint8_t ihl = (ip_header[0] & 0x0F) * 4;
@@ -307,6 +401,11 @@ bool tunnel_provider_configure_packet_flow(tunnel_provider_t *provider,
                         const uint8_t *transport = packet.data + ihl;
                         packet.flow.src_port = (transport[0] << 8) | transport[1];
                         packet.flow.dst_port = (transport[2] << 8) | transport[3];
+                        
+                        LOG_TRACE("Ports: %d -> %d", packet.flow.src_port, packet.flow.dst_port);
+                    } else if (packet.flow.protocol == PROTO_TCP || packet.flow.protocol == PROTO_UDP) {
+                        LOG_WARN("Insufficient packet length for %s port parsing: %zu bytes (IHL=%d)", 
+                                protocol_name, packet.length, ihl);
                     }
                 } else if (packet.flow.ip_version == 6 && packet.length >= 40) {
                     // IPv6 header parsing with validation

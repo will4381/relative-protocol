@@ -19,6 +19,9 @@ set(RELATIVE_VPN_SOURCES
     # Main iOS VPN module
     ios_vpn.c
     
+    # VPN API implementation
+    vpn_api.c
+    
     # Metrics and utilities
     metrics/ring_buffer.c
 )
@@ -83,6 +86,7 @@ set_target_properties(relative_vpn PROPERTIES
 target_compile_definitions(relative_vpn PRIVATE
     $<$<CONFIG:Debug>:DEBUG=1>
     $<$<CONFIG:Release>:NDEBUG>
+    $<$<BOOL:${ENABLE_LOGGING}>:ENABLE_LOGGING=1>
 )
 
 # Installation rules

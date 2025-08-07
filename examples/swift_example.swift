@@ -1,3 +1,34 @@
+/**
+ * RelativeProtocol VPN - Swift Example with Extensive Logging
+ * 
+ * This example demonstrates how to use the RelativeProtocol VPN with extensive logging
+ * to debug network connectivity and packet forwarding issues.
+ * 
+ * USAGE:
+ * 1. To enable TRACE logging (most verbose):
+ *    - Set log_level = "TRACE" in tunnel options
+ *    - Or modify logLevel property below
+ * 
+ * 2. To enable DEBUG logging (packet summaries):
+ *    - Set log_level = "DEBUG" in tunnel options
+ * 
+ * 3. Available log levels:
+ *    - TRACE: Every packet detail, header parsing, buffer operations
+ *    - DEBUG: Packet summaries, connection tracking, DNS queries
+ *    - INFO: Component initialization, statistics (default)
+ *    - WARN: Potential issues, recoverable errors
+ *    - ERROR: Actual errors, failed operations
+ *    - CRITICAL: Critical failures only
+ *    - SILENT: No logging
+ * 
+ * The extensive logging will help you identify:
+ * - Where packets are being dropped
+ * - Connection tracking issues
+ * - Header reconstruction problems
+ * - DNS resolution failures  
+ * - NAT64 translation problems
+ */
+
 import NetworkExtension
 import RelativeProtocol
 import os.log
@@ -12,10 +43,23 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var connectionManager: OpaquePointer?
     private var nat64Translator: OpaquePointer?
     
+    // Logging configuration - change this to "TRACE" or "DEBUG" for extensive debugging
+    private var logLevel: String = "DEBUG"
+    
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         logger.info("Starting RelativeProtocol on-device VPN...")
         
-        // Initialize RelativeProtocol core
+        // Configure extensive logging based on options
+        if let logLevelOption = options?["log_level"] as? String {
+            logLevel = logLevelOption
+        }
+        
+        // Enable extensive logging for debugging network issues
+        logger.info("Setting log level to: \(logLevel)")
+        setupExtensiveLogging()
+        
+        // Initialize RelativeProtocol core with logging
+        logger.info("Initializing RelativeProtocol core components...")
         let vpnInitialized = ios_vpn_init()
         guard vpnInitialized else {
             logger.error("Failed to initialize iOS VPN core")
@@ -147,24 +191,43 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             guard let packetPtr = bytes.bindMemory(to: UInt8.self).baseAddress else { return packet }
             let packetLength = packet.count
             
-            // Parse packet using RelativeProtocol
+            // Log packet reception for debugging
+            if logLevel == "TRACE" || logLevel == "DEBUG" {
+                logger.debug("📦 Processing incoming packet: \(packetLength) bytes, protocol family: \(protocolNumber)")
+            }
+            
+            // Parse packet using RelativeProtocol - this will generate extensive logging
             var packetInfo = packet_info_t()
             let parsed = ios_vpn_parse_packet(packetPtr, packetLength, &packetInfo)
             guard parsed else {
-                logger.warning("Failed to parse packet, passing through unchanged")
+                logger.warning("❌ Failed to parse packet (\(packetLength) bytes), passing through unchanged")
                 return packet
             }
             
-            // Track connection for stateful processing
+            // Log successful parsing
+            if logLevel == "DEBUG" {
+                let srcIP = String(cString: ios_vpn_ip_to_string(packetInfo.flow.src_ip))
+                let dstIP = String(cString: ios_vpn_ip_to_string(packetInfo.flow.dst_ip)) 
+                let protocolName = String(cString: ios_vpn_protocol_name(packetInfo.flow.protocol))
+                logger.debug("✅ Parsed \(protocolName) packet: \(srcIP):\(packetInfo.flow.src_port) → \(dstIP):\(packetInfo.flow.dst_port)")
+            }
+            
+            // Track connection for stateful processing - this generates connection tracking logs
             let connectionHandle = ios_vpn_track_connection(&packetInfo.flow)
+            if connectionHandle != nil && (logLevel == "DEBUG" || logLevel == "TRACE") {
+                logger.debug("🔗 Connection tracked for flow")
+            }
             
             // Process DNS queries
             if ios_vpn_is_dns_packet(&packetInfo), let resolver = dnsResolver {
-                logger.debug("🔍 Processing DNS query")
+                logger.debug("🔍 Processing DNS query to \(String(cString: ios_vpn_ip_to_string(packetInfo.flow.dst_ip)))")
                 // Convert uint32_t IP to ip_addr_t for DNS resolver
                 var srcAddr = ip_addr_t()
                 srcAddr.v4.addr = packetInfo.flow.src_ip
                 let processed = dns_resolver_process_packet(resolver, packetPtr, packetLength, &srcAddr, packetInfo.flow.src_port)
+                if processed && logLevel == "DEBUG" {
+                    logger.debug("✅ DNS packet processed successfully")
+                }
                 // Note: DNS processing is asynchronous, so we still forward the original packet
             }
             
@@ -195,10 +258,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             
             // Log flow information periodically
             if Bool.random() && Double.random(in: 0...1) < 0.001 { // 0.1% sampling
-                let srcIP = ios_vpn_ip_to_string(packetInfo.flow.src_ip)
-                let dstIP = ios_vpn_ip_to_string(packetInfo.flow.dst_ip)
-                let protocolName = ios_vpn_protocol_name(packetInfo.flow.protocol)
-                logger.debug("📊 Processing \(String(cString: protocolName)) packet: \(String(cString: srcIP)):\(packetInfo.flow.src_port) → \(String(cString: dstIP)):\(packetInfo.flow.dst_port)")
+                if let srcIP = ios_vpn_ip_to_string(packetInfo.flow.src_ip),
+                   let dstIP = ios_vpn_ip_to_string(packetInfo.flow.dst_ip),
+                   let protocolName = ios_vpn_protocol_name(packetInfo.flow.protocol) {
+                    logger.debug("📊 Processing \(String(cString: protocolName)) packet: \(String(cString: srcIP)):\(packetInfo.flow.src_port) → \(String(cString: dstIP)):\(packetInfo.flow.dst_port)")
+                }
             }
             
             // Forward packet to internet (maintaining connectivity)
@@ -228,7 +292,48 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         
         logger.info("🧹 All RelativeProtocol components cleaned up")
     }
-}
+    
+    // MARK: - Extensive Logging Setup
+    private func setupExtensiveLogging() {
+        // Set up VPN logging with custom callback
+        let logCallback: @convention(c) (UnsafePointer<CChar>?, UnsafeMutableRawPointer?) -> Void = { messagePtr, userDataPtr in
+            guard let messagePtr = messagePtr else { return }
+            let message = String(cString: messagePtr)
+            
+            // Get the logger instance from user data
+            if let userDataPtr = userDataPtr {
+                let loggerPtr = userDataPtr.assumingMemoryBound(to: Logger.self)
+                let logger = loggerPtr.pointee
+                logger.debug("🔧 [VPN-Core] \(message)")
+            } else {
+                // Fallback to print if no logger available
+                print("🔧 [VPN-Core] \(message)")
+            }
+        }
+        
+        // Set the log callback with self.logger as user data
+        withUnsafePointer(to: logger) { loggerPtr in
+            vpn_set_log_callback(logCallback, UnsafeMutableRawPointer(mutating: loggerPtr))
+        }
+        
+        // Set the desired log level for extensive debugging
+        vpn_set_log_level(logLevel)
+        
+        logger.info("✅ Extensive logging configured at level: \(logLevel)")
+        logger.info("📝 Available log levels: TRACE (most verbose), DEBUG, INFO, WARN, ERROR, CRITICAL, SILENT")
+        
+        // Log some examples of what each level shows
+        switch logLevel {
+        case "TRACE":
+            logger.info("🔍 TRACE level will show: Every packet header, checksum calculations, buffer operations")
+        case "DEBUG":
+            logger.info("🔍 DEBUG level will show: Packet summaries, connection tracking, translation events")
+        case "INFO":
+            logger.info("🔍 INFO level will show: Component initialization, configuration changes, statistics")
+        default:
+            logger.info("🔍 Using log level: \(logLevel)")
+        }
+    }
 
 // MARK: - Error Types
 enum PacketTunnelError: Error, LocalizedError {

@@ -6,6 +6,7 @@
  */
 
 #include "ios_vpn.h"
+#include "core/logging.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -31,43 +32,75 @@ static vpn_context_t *g_context = NULL;
 // MARK: - Module Management
 
 bool ios_vpn_init(void) {
+    LOG_INFO("Initializing iOS VPN module");
+    
     if (g_context != NULL) {
+        LOG_WARN("iOS VPN already initialized, returning success");
         return true; // Already initialized
     }
     
+    LOG_DEBUG("Allocating VPN context structure");
     g_context = calloc(1, sizeof(vpn_context_t));
     if (!g_context) {
+        LOG_ERROR("Failed to allocate VPN context memory");
         return false;
     }
     
-    pthread_mutex_init(&g_context->lock, NULL);
+    LOG_DEBUG("Initializing VPN context mutex");
+    if (pthread_mutex_init(&g_context->lock, NULL) != 0) {
+        LOG_ERROR("Failed to initialize VPN context mutex");
+        free(g_context);
+        g_context = NULL;
+        return false;
+    }
+    
+    LOG_INFO("iOS VPN module initialized successfully");
     return true;
 }
 
 void ios_vpn_cleanup(void) {
-    if (!g_context) return;
+    LOG_INFO("Starting iOS VPN cleanup");
     
+    if (!g_context) {
+        LOG_DEBUG("VPN context already null, nothing to cleanup");
+        return;
+    }
+    
+    LOG_DEBUG("Acquiring VPN context lock for cleanup");
     pthread_mutex_lock(&g_context->lock);
     
     // Free all connections
+    LOG_DEBUG("Cleaning up active connections");
     connection_t *conn = g_context->connections;
+    int connection_count = 0;
     while (conn) {
         connection_t *next = conn->next;
+        LOG_TRACE("Freeing connection %d", connection_count++);
         free(conn);
         conn = next;
     }
     
+    LOG_DEBUG("Cleaned up %d connections", connection_count);
+    
     pthread_mutex_unlock(&g_context->lock);
+    LOG_DEBUG("Released VPN context lock");
+    
     pthread_mutex_destroy(&g_context->lock);
+    LOG_DEBUG("Destroyed VPN context mutex");
     
     free(g_context);
     g_context = NULL;
+    
+    LOG_INFO("iOS VPN cleanup completed successfully");
 }
 
 // MARK: - Packet Parsing
 
 bool ios_vpn_parse_packet(const uint8_t *packet_data, size_t packet_length, packet_info_t *info) {
+    LOG_TRACE("Parsing packet: length=%zu", packet_length);
+    
     if (!packet_data || !info || packet_length < 20) {
+        LOG_ERROR("Invalid packet parsing parameters: data=%p, info=%p, length=%zu", packet_data, info, packet_length);
         return false;
     }
     
@@ -75,48 +108,79 @@ bool ios_vpn_parse_packet(const uint8_t *packet_data, size_t packet_length, pack
     
     // Parse IP header
     uint8_t version = (packet_data[0] >> 4) & 0x0F;
+    LOG_TRACE("IP version: %d", version);
+    
     if (version != 4) {
+        LOG_DEBUG("Non-IPv4 packet detected (version %d), use ios_vpn_parse_packet_v6 for IPv6", version);
         return false; // Use ios_vpn_parse_packet_v6 for IPv6
     }
     
     info->flow.ip_version = 4;
     info->header_length = (packet_data[0] & 0x0F) * 4;
+    LOG_TRACE("IPv4 header length: %d bytes", info->header_length);
     
     if (info->header_length < 20 || info->header_length > packet_length) {
+        LOG_ERROR("Invalid IPv4 header length: %d (packet_length=%zu)", info->header_length, packet_length);
         return false;
     }
     
     // Extract protocol
     info->flow.protocol = packet_data[9];
+    LOG_TRACE("Protocol: %d (%s)", info->flow.protocol, ios_vpn_protocol_name(info->flow.protocol));
     
     // Extract IP addresses
     memcpy(&info->flow.src_ip, &packet_data[12], 4);
     memcpy(&info->flow.dst_ip, &packet_data[16], 4);
     
+    LOG_TRACE("Source IP: %s", ios_vpn_ip_to_string(info->flow.src_ip));
+    LOG_TRACE("Destination IP: %s", ios_vpn_ip_to_string(info->flow.dst_ip));
+    
     // Parse TCP/UDP ports if applicable
     if (info->flow.protocol == 6 || info->flow.protocol == 17) { // TCP or UDP
+        LOG_TRACE("Parsing %s header", info->flow.protocol == 6 ? "TCP" : "UDP");
+        
         if (packet_length >= info->header_length + 4) {
             const uint8_t *transport_header = packet_data + info->header_length;
             info->flow.src_port = ntohs(*(uint16_t*)&transport_header[0]);
             info->flow.dst_port = ntohs(*(uint16_t*)&transport_header[2]);
             
+            LOG_TRACE("Source port: %d", info->flow.src_port);
+            LOG_TRACE("Destination port: %d", info->flow.dst_port);
+            
             // Calculate payload offset
             if (info->flow.protocol == 6 && packet_length >= info->header_length + 20) { // TCP
                 uint8_t tcp_header_len = (transport_header[12] >> 4) * 4;
+                LOG_TRACE("TCP header length: %d bytes", tcp_header_len);
+                
                 info->payload = packet_data + info->header_length + tcp_header_len;
                 info->payload_length = packet_length - info->header_length - tcp_header_len;
+                LOG_TRACE("TCP payload length: %zu bytes", info->payload_length);
+                
             } else if (info->flow.protocol == 17 && packet_length >= info->header_length + 8) { // UDP
                 info->payload = packet_data + info->header_length + 8;
                 info->payload_length = packet_length - info->header_length - 8;
+                LOG_TRACE("UDP payload length: %zu bytes", info->payload_length);
             }
+        } else {
+            LOG_WARN("Insufficient packet length for %s header parsing", info->flow.protocol == 6 ? "TCP" : "UDP");
         }
+    } else {
+        LOG_TRACE("Non-TCP/UDP protocol, skipping port extraction");
     }
     
     // Update stats
     if (g_context) {
         g_context->stats.packets_processed++;
         g_context->stats.bytes_processed += packet_length;
+        LOG_TRACE("Updated stats: packets=%llu, bytes=%llu", g_context->stats.packets_processed, g_context->stats.bytes_processed);
+    } else {
+        LOG_WARN("VPN context is null, cannot update packet stats");
     }
+    
+    LOG_DEBUG("Packet parsed successfully: %s:%d -> %s:%d (%s, %zu bytes)", 
+              ios_vpn_ip_to_string(info->flow.src_ip), info->flow.src_port,
+              ios_vpn_ip_to_string(info->flow.dst_ip), info->flow.dst_port,
+              ios_vpn_protocol_name(info->flow.protocol), packet_length);
     
     return true;
 }
@@ -130,23 +194,38 @@ size_t ios_vpn_build_response_packet(
     uint8_t *buffer,
     size_t buffer_size
 ) {
+    LOG_TRACE("Building response packet: response_length=%zu, buffer_size=%zu", response_length, buffer_size);
+    
     if (!original_flow || !response_data || !buffer) {
+        LOG_ERROR("Invalid parameters for response packet building: flow=%p, data=%p, buffer=%p", 
+                  original_flow, response_data, buffer);
         return 0;
     }
+    
+    LOG_TRACE("Original flow: %s:%d -> %s:%d (%s)", 
+              ios_vpn_ip_to_string(original_flow->src_ip), original_flow->src_port,
+              ios_vpn_ip_to_string(original_flow->dst_ip), original_flow->dst_port,
+              ios_vpn_protocol_name(original_flow->protocol));
     
     size_t required_size = 20; // IP header
     if (original_flow->protocol == 6) {
         required_size += 20; // TCP header
+        LOG_TRACE("Adding TCP header (20 bytes)");
     } else if (original_flow->protocol == 17) {
         required_size += 8; // UDP header
+        LOG_TRACE("Adding UDP header (8 bytes)");
     }
     required_size += response_length;
     
+    LOG_TRACE("Required buffer size: %zu bytes", required_size);
+    
     if (buffer_size < required_size) {
+        LOG_ERROR("Buffer too small: need %zu bytes, have %zu bytes", required_size, buffer_size);
         return 0;
     }
     
     memset(buffer, 0, required_size);
+    LOG_TRACE("Buffer cleared, building IP header");
     
     // Build IP header
     buffer[0] = 0x45; // Version 4, header length 5 (20 bytes)
@@ -158,77 +237,122 @@ size_t ios_vpn_build_response_packet(
     buffer[8] = 64; // TTL
     buffer[9] = original_flow->protocol;
     
+    LOG_TRACE("IP header basic fields set: version=4, total_length=%zu, protocol=%d, TTL=64", 
+              required_size, original_flow->protocol);
+    
     // Swap source and destination for response
     memcpy(&buffer[12], &original_flow->dst_ip, 4); // Source = original dest
     memcpy(&buffer[16], &original_flow->src_ip, 4); // Dest = original source
     
+    LOG_TRACE("IP addresses swapped: src=%s, dst=%s", 
+              ios_vpn_ip_to_string(original_flow->dst_ip),
+              ios_vpn_ip_to_string(original_flow->src_ip));
+    
     // Calculate IP checksum
     *(uint16_t*)&buffer[10] = 0;
-    *(uint16_t*)&buffer[10] = ios_vpn_ip_checksum(buffer, 20);
+    uint16_t ip_checksum = ios_vpn_ip_checksum(buffer, 20);
+    *(uint16_t*)&buffer[10] = ip_checksum;
+    LOG_TRACE("IP checksum calculated: 0x%04x", ip_checksum);
     
     // Build transport header
     if (original_flow->protocol == 6) { // TCP
+        LOG_TRACE("Building TCP header");
         uint8_t *tcp = buffer + 20;
         *(uint16_t*)&tcp[0] = htons(original_flow->dst_port); // Source port
         *(uint16_t*)&tcp[2] = htons(original_flow->src_port); // Dest port
-        *(uint32_t*)&tcp[4] = htonl(rand()); // Sequence number
-        *(uint32_t*)&tcp[8] = htonl(rand()); // Acknowledgment number
+        
+        uint32_t seq_num = rand();
+        uint32_t ack_num = rand();
+        *(uint32_t*)&tcp[4] = htonl(seq_num); // Sequence number
+        *(uint32_t*)&tcp[8] = htonl(ack_num); // Acknowledgment number
+        
         tcp[12] = 0x50; // Header length (5 * 4 = 20 bytes)
         tcp[13] = 0x18; // Flags (PSH + ACK)
         *(uint16_t*)&tcp[14] = htons(8192); // Window
         
+        LOG_TRACE("TCP header set: src_port=%d, dst_port=%d, seq=%u, ack=%u, flags=PSH+ACK, window=8192",
+                  original_flow->dst_port, original_flow->src_port, seq_num, ack_num);
+        
         // Copy payload
         memcpy(tcp + 20, response_data, response_length);
+        LOG_TRACE("TCP payload copied: %zu bytes", response_length);
         
         // Calculate TCP checksum
         *(uint16_t*)&tcp[16] = 0;
-        *(uint16_t*)&tcp[16] = ios_vpn_transport_checksum(
+        uint16_t tcp_checksum = ios_vpn_transport_checksum(
             tcp, 20 + response_length,
             original_flow->dst_ip, original_flow->src_ip,
             6
         );
+        *(uint16_t*)&tcp[16] = tcp_checksum;
+        LOG_TRACE("TCP checksum calculated: 0x%04x", tcp_checksum);
         
     } else if (original_flow->protocol == 17) { // UDP
+        LOG_TRACE("Building UDP header");
         uint8_t *udp = buffer + 20;
         *(uint16_t*)&udp[0] = htons(original_flow->dst_port); // Source port
         *(uint16_t*)&udp[2] = htons(original_flow->src_port); // Dest port
         *(uint16_t*)&udp[4] = htons(8 + response_length); // Length
         
+        LOG_TRACE("UDP header set: src_port=%d, dst_port=%d, length=%zu",
+                  original_flow->dst_port, original_flow->src_port, 8 + response_length);
+        
         // Copy payload
         memcpy(udp + 8, response_data, response_length);
+        LOG_TRACE("UDP payload copied: %zu bytes", response_length);
         
         // Calculate UDP checksum (optional but recommended)
         *(uint16_t*)&udp[6] = 0;
-        *(uint16_t*)&udp[6] = ios_vpn_transport_checksum(
+        uint16_t udp_checksum = ios_vpn_transport_checksum(
             udp, 8 + response_length,
             original_flow->dst_ip, original_flow->src_ip,
             17
         );
+        *(uint16_t*)&udp[6] = udp_checksum;
+        LOG_TRACE("UDP checksum calculated: 0x%04x", udp_checksum);
     }
     
+    LOG_DEBUG("Response packet built successfully: %zu bytes total", required_size);
     return required_size;
 }
 
 // MARK: - Connection Tracking
 
 connection_handle_t ios_vpn_track_connection(const flow_info_t *flow) {
-    if (!g_context || !flow) return NULL;
+    LOG_TRACE("Tracking connection for flow");
+    
+    if (!g_context || !flow) {
+        LOG_ERROR("Invalid parameters for connection tracking: context=%p, flow=%p", g_context, flow);
+        return NULL;
+    }
+    
+    LOG_TRACE("Tracking connection: %s:%d -> %s:%d (%s)",
+              ios_vpn_ip_to_string(flow->src_ip), flow->src_port,
+              ios_vpn_ip_to_string(flow->dst_ip), flow->dst_port,
+              ios_vpn_protocol_name(flow->protocol));
     
     pthread_mutex_lock(&g_context->lock);
     
     // Check if connection already exists
+    LOG_TRACE("Searching for existing connection");
     connection_t *conn = g_context->connections;
+    int connection_count = 0;
     while (conn) {
+        connection_count++;
         if (memcmp(&conn->flow, flow, sizeof(flow_info_t)) == 0) {
+            LOG_DEBUG("Found existing connection (searched %d connections)", connection_count);
             pthread_mutex_unlock(&g_context->lock);
             return conn;
         }
         conn = conn->next;
     }
     
+    LOG_DEBUG("No existing connection found (searched %d connections), creating new one", connection_count);
+    
     // Create new connection
     conn = calloc(1, sizeof(connection_t));
     if (!conn) {
+        LOG_ERROR("Failed to allocate memory for new connection");
         pthread_mutex_unlock(&g_context->lock);
         return NULL;
     }
@@ -241,27 +365,48 @@ connection_handle_t ios_vpn_track_connection(const flow_info_t *flow) {
     g_context->connections = conn;
     g_context->stats.active_connections++;
     
+    LOG_INFO("Created new connection: %s:%d -> %s:%d (%s). Total active: %u",
+             ios_vpn_ip_to_string(flow->src_ip), flow->src_port,
+             ios_vpn_ip_to_string(flow->dst_ip), flow->dst_port,
+             ios_vpn_protocol_name(flow->protocol), g_context->stats.active_connections);
+    
     pthread_mutex_unlock(&g_context->lock);
     return conn;
 }
 
 connection_handle_t ios_vpn_find_connection(uint32_t dst_ip, uint16_t dst_port, uint8_t protocol) {
-    if (!g_context) return NULL;
+    LOG_TRACE("Finding connection for: %s:%d (%s)", 
+              ios_vpn_ip_to_string(dst_ip), dst_port, ios_vpn_protocol_name(protocol));
+    
+    if (!g_context) {
+        LOG_ERROR("VPN context is null, cannot find connection");
+        return NULL;
+    }
     
     pthread_mutex_lock(&g_context->lock);
     
     connection_t *conn = g_context->connections;
+    int searched = 0;
     while (conn) {
+        searched++;
         // For responses, the original source becomes the response destination
         if (conn->flow.src_ip == dst_ip &&
             conn->flow.src_port == dst_port &&
             conn->flow.protocol == protocol) {
+            
+            LOG_DEBUG("Found matching connection (searched %d): %s:%d -> %s:%d (%s)",
+                      searched,
+                      ios_vpn_ip_to_string(conn->flow.src_ip), conn->flow.src_port,
+                      ios_vpn_ip_to_string(conn->flow.dst_ip), conn->flow.dst_port,
+                      ios_vpn_protocol_name(conn->flow.protocol));
+            
             pthread_mutex_unlock(&g_context->lock);
             return conn;
         }
         conn = conn->next;
     }
     
+    LOG_DEBUG("No matching connection found (searched %d connections)", searched);
     pthread_mutex_unlock(&g_context->lock);
     return NULL;
 }

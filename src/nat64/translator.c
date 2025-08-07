@@ -120,20 +120,37 @@ void nat64_translator_destroy(nat64_translator_t *translator) {
 
 bool nat64_translate_4to6(nat64_translator_t *translator, const uint8_t *ipv4_packet, size_t ipv4_length,
                          uint8_t *ipv6_packet, size_t *ipv6_length, size_t max_ipv6_length) {
+    LOG_TRACE("NAT64 4to6 translation: ipv4_length=%zu, max_ipv6_length=%zu", ipv4_length, max_ipv6_length);
+    
     if (!translator || !ipv4_packet || !ipv6_packet || !ipv6_length || 
         ipv4_length < sizeof(struct ip) || max_ipv6_length < sizeof(struct ip6_hdr)) {
+        LOG_ERROR("Invalid NAT64 4to6 parameters: translator=%p, ipv4_packet=%p, ipv6_packet=%p, ipv6_length=%p", 
+                  translator, ipv4_packet, ipv6_packet, ipv6_length);
+        LOG_ERROR("Sizes: ipv4_length=%zu (min %zu), max_ipv6_length=%zu (min %zu)", 
+                  ipv4_length, sizeof(struct ip), max_ipv6_length, sizeof(struct ip6_hdr));
         return false;
     }
     
     if (!nat64_validate_ipv4_packet(ipv4_packet, ipv4_length)) {
-        LOG_ERROR("Invalid IPv4 packet for NAT64 translation");
+        LOG_ERROR("Invalid IPv4 packet for NAT64 translation - failed validation");
         translator->stats.translation_errors++;
         return false;
     }
     
-    pthread_mutex_lock(&translator->mutex);
-    
+    // Log source packet details
     const struct ip *ipv4_hdr = (const struct ip *)ipv4_packet;
+    struct in_addr src_addr = {.s_addr = ipv4_hdr->ip_src.s_addr};
+    struct in_addr dst_addr = {.s_addr = ipv4_hdr->ip_dst.s_addr}; 
+    
+    const char* protocol_name = "Unknown";
+    if (ipv4_hdr->ip_p == IPPROTO_TCP) protocol_name = "TCP";
+    else if (ipv4_hdr->ip_p == IPPROTO_UDP) protocol_name = "UDP";
+    else if (ipv4_hdr->ip_p == IPPROTO_ICMP) protocol_name = "ICMP";
+    
+    LOG_DEBUG("NAT64 translating IPv4 -> IPv6: %s -> %s (%s, %zu bytes)",
+              inet_ntoa(src_addr), inet_ntoa(dst_addr), protocol_name, ipv4_length);
+    
+    pthread_mutex_lock(&translator->mutex);
     const uint8_t *payload = ipv4_packet + (ipv4_hdr->ip_hl * 4);
     size_t payload_len = ipv4_length - (ipv4_hdr->ip_hl * 4);
     

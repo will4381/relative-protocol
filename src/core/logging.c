@@ -22,6 +22,19 @@ void log_init(log_level_t level) {
     pthread_mutex_unlock(&log_mutex);
 }
 
+void log_set_level(log_level_t level) {
+    pthread_mutex_lock(&log_mutex);
+    current_log_level = level;
+    pthread_mutex_unlock(&log_mutex);
+}
+
+log_level_t log_get_level(void) {
+    pthread_mutex_lock(&log_mutex);
+    log_level_t level = current_log_level;
+    pthread_mutex_unlock(&log_mutex);
+    return level;
+}
+
 log_level_t log_level_from_string(const char *level_str) {
     if (!level_str) return LOG_INFO;
     
@@ -34,6 +47,13 @@ log_level_t log_level_from_string(const char *level_str) {
     if (strcasecmp(level_str, "TRACE") == 0) return LOG_TRACE;
     
     return LOG_INFO; // Default
+}
+
+const char* log_level_to_string(log_level_t level) {
+    if (level >= LOG_SILENT && level <= LOG_TRACE) {
+        return level_strings[level];
+    }
+    return "UNKNOWN";
 }
 
 void log_set_callback(void (*callback)(const char *message, void *user_data), void *user_data) {
@@ -65,7 +85,7 @@ void log_message(log_level_t level, const char *file, int line, const char *fmt,
     int prefix_len = snprintf(buffer, sizeof(buffer), "[%s] %s %s:%d - ", 
                              timestamp, level_strings[level], filename, line);
     
-    if (prefix_len > 0 && prefix_len < sizeof(buffer)) {
+    if (prefix_len > 0 && (size_t)prefix_len < sizeof(buffer)) {
         vsnprintf(buffer + prefix_len, sizeof(buffer) - prefix_len, fmt, args);
     }
     

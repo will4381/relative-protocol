@@ -29,7 +29,7 @@ option(BUILD_XCFRAMEWORK "Build XCFramework" OFF)
 option(ENABLE_TESTS "Enable test suite" OFF)
 option(ENABLE_FUZZING "Enable fuzzing" OFF)
 option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
-option(ENABLE_LOGGING "Enable debug logging" OFF)
+option(ENABLE_LOGGING "Enable debug logging" ON)
 
 # Map ENABLE_* to BUILD_* for compatibility
 if(ENABLE_TESTS)

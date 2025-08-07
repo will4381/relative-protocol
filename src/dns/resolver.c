@@ -197,7 +197,15 @@ bool dns_resolver_remove_server(dns_resolver_t *resolver, const ip_addr_t *serve
 
 dns_query_t *dns_resolver_query_async(dns_resolver_t *resolver, const char *hostname, 
                                      dns_record_type_t type, dns_query_callback_t callback, void *user_data) {
-    if (!resolver || !hostname || !callback || !dns_is_valid_hostname(hostname)) return NULL;
+    LOG_TRACE("Starting async DNS query for hostname: %s", hostname ? hostname : "NULL");
+    
+    if (!resolver || !hostname || !callback || !dns_is_valid_hostname(hostname)) {
+        LOG_ERROR("Invalid parameters for DNS query: resolver=%p, hostname=%s, callback=%p, valid_hostname=%d", 
+                  resolver, hostname, callback, hostname ? dns_is_valid_hostname(hostname) : 0);
+        return NULL;
+    }
+    
+    LOG_DEBUG("DNS query: %s (type=%d, servers=%zu)", hostname, type, resolver->server_count);
     
     pthread_mutex_lock(&resolver->mutex);
     
@@ -210,7 +218,7 @@ dns_query_t *dns_resolver_query_async(dns_resolver_t *resolver, const char *host
     }
     
     if (!query) {
-        LOG_ERROR("No available query slots");
+        LOG_ERROR("No available query slots (max %d concurrent queries)", MAX_CONCURRENT_QUERIES);
         pthread_mutex_unlock(&resolver->mutex);
         return NULL;
     }
@@ -229,8 +237,11 @@ dns_query_t *dns_resolver_query_async(dns_resolver_t *resolver, const char *host
     query->completed = false;
     query->active = true;
     
+    LOG_TRACE("Created DNS query: hostname=%s, type=%d, transaction_id=%d, timeout=%ums, max_retries=%d", 
+              hostname, type, query->transaction_id, query->timeout_ms, query->max_retries);
+    
     if (!dns_send_query(resolver, query)) {
-        LOG_ERROR("Failed to send DNS query for %s", hostname);
+        LOG_ERROR("Failed to send initial DNS query for %s (transaction_id=%d)", hostname, query->transaction_id);
         query->active = false;
         pthread_mutex_unlock(&resolver->mutex);
         return NULL;

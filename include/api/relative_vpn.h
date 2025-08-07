@@ -87,6 +87,8 @@ vpn_status_t vpn_inject(const uint8_t *packet, size_t length);
 vpn_status_t vpn_get_metrics(vpn_metrics_t *metrics);
 vpn_status_t vpn_set_metrics_callback(vpn_metrics_callback_t callback, void *user_data);
 vpn_status_t vpn_set_log_callback(vpn_log_callback_t callback, void *user_data);
+vpn_status_t vpn_set_log_level(const char *level);
+vpn_status_t vpn_get_log_level(char *level, size_t level_size);
 bool vpn_is_running(void);
 const char *vpn_error_string(vpn_status_t result);
 

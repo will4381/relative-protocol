@@ -82,9 +82,16 @@ void buffer_pool_destroy(buffer_pool_t *pool) {
 }
 
 packet_buffer_t *buffer_pool_acquire(buffer_pool_t *pool) {
-    if (!pool) return NULL;
+    LOG_TRACE("Acquiring buffer from pool");
+    
+    if (!pool) {
+        LOG_ERROR("Buffer pool is NULL");
+        return NULL;
+    }
     
     pthread_mutex_lock(&pool->mutex);
+    
+    LOG_TRACE("Pool status: free_count=%zu, total_buffers=%zu", pool->free_count, pool->total_buffers);
     
     packet_buffer_t *buffer = NULL;
     if (pool->free_buffers) {
@@ -96,6 +103,8 @@ packet_buffer_t *buffer_pool_acquire(buffer_pool_t *pool) {
         // Reset buffer state
         buffer->length = 0;
         atomic_store(&buffer->ref_count, 1);
+        
+        LOG_TRACE("Acquired buffer from pool: capacity=%zu", buffer->capacity);
     }
     
     // Check if we need to resize the pool
@@ -126,13 +135,17 @@ packet_buffer_t *buffer_pool_acquire(buffer_pool_t *pool) {
     
     if (buffer) {
         atomic_fetch_add(&pool->allocations, 1);
-        LOG_TRACE("Acquired buffer from pool (free: %zu/%zu)", pool->free_count, pool->total_buffers);
+        LOG_TRACE("Successfully acquired buffer from pool (remaining free: %zu/%zu)", 
+                  pool->free_count, pool->total_buffers);
     } else {
         // Pool is empty, create new buffer (with warning)
-        LOG_WARN("Buffer pool exhausted, creating new buffer (consider increasing pool size)");
+        LOG_WARN("Buffer pool exhausted (free_count=0), creating new buffer - consider increasing pool size");
         buffer = packet_buffer_create(pool->buffer_size);
         if (buffer) {
             atomic_fetch_add(&pool->allocations, 1);
+            LOG_WARN("Created emergency buffer: capacity=%zu", buffer->capacity);
+        } else {
+            LOG_ERROR("Failed to create emergency buffer");
         }
     }
     

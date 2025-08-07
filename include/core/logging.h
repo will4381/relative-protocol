@@ -27,7 +27,10 @@ typedef enum log_level {
 #define LOG_TRACE_ENABLED 1
 
 void log_init(log_level_t level);
+void log_set_level(log_level_t level);
+log_level_t log_get_level(void);
 log_level_t log_level_from_string(const char *level_str);
+const char* log_level_to_string(log_level_t level);
 void log_set_callback(void (*callback)(const char *message, void *user_data), void *user_data);
 void log_message(log_level_t level, const char *file, int line, const char *fmt, ...);
 
@@ -48,6 +51,10 @@ void log_message(log_level_t level, const char *file, int line, const char *fmt,
 #define LOG_TRACE_ENABLED 0
 
 #define log_init(level) do {} while(0)
+#define log_set_level(level) do {} while(0)
+#define log_get_level() LOG_SILENT
+#define log_level_from_string(str) LOG_SILENT
+#define log_level_to_string(level) "SILENT"
 #define log_set_callback(callback, user_data) do {} while(0)
 #define LOG_CRITICAL(fmt, ...) do {} while(0)
 #define LOG_ERROR(fmt, ...) do {} while(0)

@@ -156,14 +156,38 @@ void connection_manager_destroy(connection_manager_t *manager) {
 }
 
 void connection_manager_process_packet(connection_manager_t *manager, const packet_info_t *packet) {
-    if (!manager || !packet) return;
+    LOG_TRACE("Processing packet in connection manager");
+    
+    if (!manager || !packet) {
+        LOG_ERROR("Invalid parameters for packet processing: manager=%p, packet=%p", manager, packet);
+        return;
+    }
+    
+    // Log packet details for debugging
+    struct in_addr src_addr = {.s_addr = packet->flow.src_ip};
+    struct in_addr dst_addr = {.s_addr = packet->flow.dst_ip};
+    const char* protocol_str = "Unknown";
+    if (packet->flow.protocol == PROTO_TCP) protocol_str = "TCP";
+    else if (packet->flow.protocol == PROTO_UDP) protocol_str = "UDP";
+    else if (packet->flow.protocol == 1) protocol_str = "ICMP";
+    
+    LOG_TRACE("Processing %s packet: %s:%d -> %s:%d (%zu bytes)",
+              protocol_str,
+              inet_ntoa(src_addr), packet->flow.src_port,
+              inet_ntoa(dst_addr), packet->flow.dst_port,
+              packet->length);
     
     pthread_mutex_lock(&manager->mutex);
     
     if (packet->flow.protocol == PROTO_TCP) {
+        LOG_TRACE("Processing TCP packet, searching connections");
+        
+        int searched_connections = 0;
         for (int i = 0; i < MAX_CONNECTIONS; i++) {
             tcp_connection_t *conn = &manager->tcp_connections[i];
             if (!atomic_load(&conn->active)) continue;
+            
+            searched_connections++;
             
             // SECURITY FIX: Enhanced connection validation to prevent state confusion
             bool match = false;
@@ -177,11 +201,16 @@ void connection_manager_process_packet(connection_manager_t *manager, const pack
             }
             
             if (match) {
+                LOG_TRACE("Found matching TCP connection %d (searched %d connections)", 
+                         conn->id, searched_connections);
+                
                 // SECURITY FIX: Atomic state validation and update to prevent TOCTOU race conditions
                 // Create a local copy of critical connection state for atomic validation
                 connection_state_t current_state = (connection_state_t)atomic_load(&conn->state);
                 bool is_active = atomic_load(&conn->active);
-                uint32_t conn_id __attribute__((unused)) = conn->id;
+                uint32_t conn_id = conn->id;
+                
+                LOG_TRACE("Connection %d state: active=%d, state=%d", conn_id, is_active, current_state);
                 
                 // Validate connection state atomically
                 if (!is_active || current_state == CONN_CLOSED || current_state == CONN_TIME_WAIT) {
