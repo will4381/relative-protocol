@@ -126,7 +126,6 @@ void tunnel_provider_destroy(tunnel_provider_t *provider) {
     
 #ifdef TARGET_OS_IOS
     if (provider->packet_queue_dispatch) {
-        dispatch_release(provider->packet_queue_dispatch);
         provider->packet_queue_dispatch = NULL;
     }
     
@@ -298,8 +297,8 @@ bool tunnel_provider_configure_packet_flow(tunnel_provider_t *provider,
                     // IPv4 header parsing
                     const uint8_t *ip_header = packet.data;
                     packet.flow.protocol = ip_header[9];
-                    memcpy(&packet.flow.src_ip.v4.addr, &ip_header[12], 4);
-                    memcpy(&packet.flow.dst_ip.v4.addr, &ip_header[16], 4);
+                    memcpy(&packet.flow.src_ip, &ip_header[12], 4);
+                    memcpy(&packet.flow.dst_ip, &ip_header[16], 4);
                     
                     // Parse port information if TCP/UDP
                     uint8_t ihl = (ip_header[0] & 0x0F) * 4;
@@ -338,8 +337,28 @@ bool tunnel_provider_configure_packet_flow(tunnel_provider_t *provider,
                     }
                     
                     // Safe copy of addresses (already bounds-checked)
-                    memcpy(&packet.flow.src_ip.v6.addr, &ip6_header[8], 16);
-                    memcpy(&packet.flow.dst_ip.v6.addr, &ip6_header[24], 16);
+                    // Get next header (protocol)
+                    packet.flow.protocol = ip6_header[6];
+                    packet.flow.ip_version = 6;
+                    
+                    // For IPv6, we need to handle differently since flow uses uint32_t
+                    // We'll extract the IPv4-mapped portion or use a hash for tracking
+                    // Check if destination is IPv4-mapped IPv6 (::ffff:x.x.x.x)
+                    static const uint8_t ipv4_mapped_prefix[12] = {0,0,0,0,0,0,0,0,0,0,0xFF,0xFF};
+                    if (memcmp(&ip6_header[24], ipv4_mapped_prefix, 12) == 0) {
+                        // IPv4-mapped destination - extract the IPv4 addresses
+                        memcpy(&packet.flow.src_ip, &ip6_header[20], 4);  // Last 4 bytes of src
+                        memcpy(&packet.flow.dst_ip, &ip6_header[36], 4);  // Last 4 bytes of dst  
+                    } else {
+                        // Pure IPv6 - use a hash of the address for tracking
+                        uint32_t src_hash = 0, dst_hash = 0;
+                        for (int i = 0; i < 16; i += 4) {
+                            src_hash ^= *(uint32_t*)&ip6_header[8 + i];
+                            dst_hash ^= *(uint32_t*)&ip6_header[24 + i];
+                        }
+                        packet.flow.src_ip = src_hash;
+                        packet.flow.dst_ip = dst_hash;
+                    }
                     
                     // Validate that source address is not multicast (first byte != 0xFF)
                     if (ip6_header[8] == 0xFF) {
