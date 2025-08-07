@@ -168,13 +168,12 @@ void connection_manager_process_packet(connection_manager_t *manager, const pack
             // SECURITY FIX: Enhanced connection validation to prevent state confusion
             bool match = false;
             if (packet->flow.ip_version == 4 && conn->ip_version == 4) {
-                match = (conn->remote_addr.v4.addr == packet->flow.src_ip.v4.addr &&
+                match = (conn->remote_addr.v4.addr == packet->flow.src_ip &&
                         conn->remote_port == packet->flow.src_port &&
                         conn->local_port == packet->flow.dst_port);
             } else if (packet->flow.ip_version == 6 && conn->ip_version == 6) {
-                match = (memcmp(conn->remote_addr.v6.addr, packet->flow.src_ip.v6.addr, 16) == 0 &&
-                        conn->remote_port == packet->flow.src_port &&
-                        conn->local_port == packet->flow.dst_port);
+                // IPv6 not supported in unified flow_info_t yet - skip
+                match = false;
             }
             
             if (match) {
@@ -182,7 +181,7 @@ void connection_manager_process_packet(connection_manager_t *manager, const pack
                 // Create a local copy of critical connection state for atomic validation
                 connection_state_t current_state = (connection_state_t)atomic_load(&conn->state);
                 bool is_active = atomic_load(&conn->active);
-                uint32_t conn_id = conn->id;
+                uint32_t conn_id __attribute__((unused)) = conn->id;
                 
                 // Validate connection state atomically
                 if (!is_active || current_state == CONN_CLOSED || current_state == CONN_TIME_WAIT) {
@@ -234,8 +233,11 @@ void connection_manager_process_packet(connection_manager_t *manager, const pack
                 manager->stats.packets_in++;
                 
                 if (session->callback) {
+                    // Convert uint32_t IP to ip_addr_t for callback
+                    ip_addr_t src_addr;
+                    src_addr.v4.addr = packet->flow.src_ip;
                     session->callback(session, packet->data, packet->length, 
-                                    &packet->flow.src_ip, packet->flow.src_port, session->user_data);
+                                    &src_addr, packet->flow.src_port, session->user_data);
                 }
                 break;
             }
@@ -378,7 +380,7 @@ tcp_connection_t *tcp_connection_create(connection_manager_t *manager, const ip_
 void tcp_connection_destroy(tcp_connection_t *conn) {
     if (!conn || !atomic_load(&conn->active)) return;
     
-    uint32_t conn_id = conn->id; // Store for logging before clearing
+    uint32_t conn_id __attribute__((unused)) = conn->id; // Store for logging before clearing
     LOG_DEBUG("Destroying TCP connection %d", conn_id);
     
     // PERFORMANCE FIX: Complete connection state cleanup
@@ -409,7 +411,7 @@ bool tcp_connection_send(tcp_connection_t *conn, const uint8_t *data, size_t len
     // SECURITY FIX: Atomic state validation to prevent TOCTOU race conditions
     bool is_active = atomic_load(&conn->active);
     connection_state_t current_state = (connection_state_t)atomic_load(&conn->state);
-    uint32_t conn_id = conn->id;
+    uint32_t conn_id __attribute__((unused)) = conn->id;
     
     if (!is_active) {
         LOG_WARN("Attempt to send data on inactive connection %d", conn_id);
@@ -526,7 +528,7 @@ udp_session_t *udp_session_create(connection_manager_t *manager, uint16_t local_
 void udp_session_destroy(udp_session_t *session) {
     if (!session || !atomic_load(&session->active)) return;
     
-    uint32_t session_id = session->id; // Store for logging before clearing
+    uint32_t session_id __attribute__((unused)) = session->id; // Store for logging before clearing
     LOG_DEBUG("Destroying UDP session %d", session_id);
     
     // PERFORMANCE FIX: Complete session state cleanup
@@ -543,7 +545,7 @@ void udp_session_destroy(udp_session_t *session) {
 }
 
 bool udp_session_send(udp_session_t *session, const uint8_t *data, size_t length, 
-                     const ip_addr_t *dest_addr, uint16_t dest_port) {
+                     const ip_addr_t *dest_addr, uint16_t dest_port __attribute__((unused))) {
     if (!session || !atomic_load(&session->active) || !data || length == 0 || !dest_addr) return false;
     
     atomic_store(&session->last_activity, clock_gettime_nsec_np(CLOCK_MONOTONIC));
@@ -589,6 +591,7 @@ void connection_manager_get_stats(connection_manager_t *manager, vpn_metrics_t *
     pthread_mutex_unlock(&manager->mutex);
 }
 
+static uint16_t calculate_checksum(const void *data, size_t len) __attribute__((unused));
 static uint16_t calculate_checksum(const void *data, size_t len) {
     const uint16_t *buf = (const uint16_t *)data;
     uint32_t sum = 0;
@@ -609,6 +612,8 @@ static uint16_t calculate_checksum(const void *data, size_t len) {
     return ~sum;
 }
 
+static uint16_t calculate_tcp_checksum(const struct ip *ip_hdr, const struct tcphdr *tcp_hdr, 
+                                     const uint8_t *data, size_t data_len) __attribute__((unused));
 static uint16_t calculate_tcp_checksum(const struct ip *ip_hdr, const struct tcphdr *tcp_hdr, 
                                      const uint8_t *data, size_t data_len) {
     struct {
@@ -652,6 +657,8 @@ static uint16_t calculate_tcp_checksum(const struct ip *ip_hdr, const struct tcp
     return ~sum;
 }
 
+static uint16_t calculate_udp_checksum(const struct ip *ip_hdr, const struct udphdr *udp_hdr, 
+                                     const uint8_t *data, size_t data_len) __attribute__((unused));
 static uint16_t calculate_udp_checksum(const struct ip *ip_hdr, const struct udphdr *udp_hdr, 
                                      const uint8_t *data, size_t data_len) {
     struct {

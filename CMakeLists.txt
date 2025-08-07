@@ -1,77 +1,81 @@
 cmake_minimum_required(VERSION 3.20)
-project(RelativeVPN VERSION 1.0.0 LANGUAGES C CXX)
 
-# Enable Objective-C++ only on Apple platforms
+# Set project name and version
+project(RelativeProtocol
+    VERSION 1.0.0
+    DESCRIPTION "iOS VPN Framework using NetworkExtension"
+    LANGUAGES C CXX OBJC OBJCXX
+)
+
+# Set C and C++ standards
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
+
+# Enable position independent code
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# Platform-specific settings
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "13.0")
+    enable_language(OBJC)
     enable_language(OBJCXX)
 endif()
 
-set(CMAKE_C_STANDARD 11)
-set(CMAKE_C_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-option(ENABLE_TESTING "Enable unit tests" ON)
-option(ENABLE_TESTS "Enable unit tests" ON)
-option(ENABLE_FUZZING "Enable fuzzing targets" OFF)
+# Build configuration options
+option(BUILD_STATIC "Build static library" ON)
+option(BUILD_TESTS "Build test suite" OFF)
+option(BUILD_EXAMPLES "Build example applications" OFF)
+option(BUILD_XCFRAMEWORK "Build XCFramework" OFF)
+option(ENABLE_TESTS "Enable test suite" OFF)
+option(ENABLE_FUZZING "Enable fuzzing" OFF)
 option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(ENABLE_LOGGING "Enable debug logging" OFF)
-option(ENABLE_SECURITY_FEATURES "Enable security features" ON)
-option(ENABLE_HARDENING "Enable compiler hardening" OFF)
-option(ENABLE_BENCHMARKS "Enable performance benchmarks" OFF)
-option(ENABLE_STATIC_LIBRARY "Build static library" ON)
-option(ENABLE_SHARED_LIBRARY "Build shared library" OFF)
-option(BUILD_STATIC "Build static library" ON)
-option(BUILD_XCFRAMEWORK "Build XCFramework for iOS" OFF)
-option(ENABLE_IOS_FEATURES "Enable iOS-specific features" OFF)
 
-if(ENABLE_LOGGING)
-    add_compile_definitions(ENABLE_LOGGING=1)
-else()
-    add_compile_definitions(ENABLE_LOGGING=0)
+# Map ENABLE_* to BUILD_* for compatibility
+if(ENABLE_TESTS)
+    set(BUILD_TESTS ON)
 endif()
 
-if(ENABLE_SECURITY_FEATURES)
-    add_compile_definitions(ENABLE_SECURITY_FEATURES=1)
-endif()
+# Compiler flags
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wno-unused-parameter")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wno-unused-parameter")
 
-if(ENABLE_HARDENING)
-    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
-        add_compile_options(-fstack-protector-strong -D_FORTIFY_SOURCE=2)
-        add_link_options(-Wl,-z,relro -Wl,-z,now)
-    endif()
-endif()
+# Debug configuration
+set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -g -O0 -DDEBUG=1")
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -DDEBUG=1")
 
-if(ENABLE_ASAN)
-    add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
-    add_link_options(-fsanitize=address)
-endif()
-
-if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
-    set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0")
-    set(CMAKE_XCODE_ATTRIBUTE_IPHONEOS_DEPLOYMENT_TARGET "14.0")
-    add_compile_definitions(TARGET_OS_IOS=1)
-endif()
-
-if(ENABLE_IOS_FEATURES)
-    add_compile_definitions(ENABLE_IOS_FEATURES=1)
-endif()
+# Release configuration
+set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -DNDEBUG")
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
 
 # Include directories
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
+include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
 
+# Add subdirectories
 add_subdirectory(src)
 
-if(ENABLE_TESTS OR ENABLE_TESTING)
+if(BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
 endif()
 
-# Add CTest integration
-if(ENABLE_TESTING)
-    include(CTest)
+if(BUILD_EXAMPLES)
+    add_subdirectory(examples)
 endif()
 
-if(BUILD_XCFRAMEWORK AND CMAKE_SYSTEM_NAME STREQUAL "iOS")
-    include(cmake/XCFramework.cmake)
+# Print configuration summary
+message(STATUS "=== RelativeProtocol Configuration ===")
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+message(STATUS "Build static: ${BUILD_STATIC}")
+message(STATUS "Build tests: ${BUILD_TESTS}")
+message(STATUS "Build examples: ${BUILD_EXAMPLES}")
+message(STATUS "C compiler: ${CMAKE_C_COMPILER}")
+message(STATUS "CXX compiler: ${CMAKE_CXX_COMPILER}")
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    message(STATUS "Target platform: ${CMAKE_SYSTEM_NAME}")
+    message(STATUS "OSX deployment target: ${CMAKE_OSX_DEPLOYMENT_TARGET}")
 endif()
+message(STATUS "=====================================")

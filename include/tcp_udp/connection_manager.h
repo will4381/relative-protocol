@@ -33,7 +33,15 @@ void connection_manager_destroy(connection_manager_t *manager);
 void connection_manager_process_packet(connection_manager_t *manager, const packet_info_t *packet);
 bool connection_manager_process_events(connection_manager_t *manager);
 
+// Core TCP connection functions
 tcp_connection_t *tcp_connection_create(connection_manager_t *manager, const ip_addr_t *remote_addr, uint16_t remote_port, connection_callback_t callback, void *user_data);
+
+// Unified type wrapper for compatibility with flow_info_t
+static inline tcp_connection_t *tcp_connection_create_from_flow(connection_manager_t *manager, uint32_t remote_ip, uint16_t remote_port, connection_callback_t callback, void *user_data) {
+    ip_addr_t addr = { .v4.addr = remote_ip };
+    return tcp_connection_create(manager, &addr, remote_port, callback, user_data);
+}
+
 void tcp_connection_destroy(tcp_connection_t *conn);
 bool tcp_connection_send(tcp_connection_t *conn, const uint8_t *data, size_t length);
 bool tcp_connection_close(tcp_connection_t *conn);

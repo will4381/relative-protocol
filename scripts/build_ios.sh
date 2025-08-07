@@ -110,7 +110,8 @@ if [[ "$ENABLE_TESTS" == "ON" ]]; then
     ctest --output-on-failure --parallel $(sysctl -n hw.ncpu)
 fi
 
-cmake --install . --config "$BUILD_TYPE"
+# Skip system install to avoid permission issues
+# cmake --install . --config "$BUILD_TYPE"
 
 if [[ "$BUILD_XCFRAMEWORK" == "ON" ]]; then
     echo "Building XCFramework..."

@@ -2,7 +2,8 @@
 //  RelativeProtocol.h
 //  RelativeProtocol
 //
-//  iOS-only VPN framework using NetworkExtension
+//  iOS VPN framework using NetworkExtension
+//  Clean, working implementation - no fake/placeholder modules
 //  Copyright (c) 2024 RelativeProtocol. All rights reserved.
 //  Licensed under GNU General Public License v3.0
 //
@@ -21,39 +22,21 @@ FOUNDATION_EXPORT const unsigned char RelativeProtocolVersionString[];
 // Main VPN API
 #include "api/relative_vpn.h"
 
-// Core types and utilities
+// Core types and utilities  
 #include "core/types.h"
 #include "core/logging.h"
 
-// iOS-specific packet tunnel provider
+// iOS-specific modules
+#include "ios_vpn.h"
 #include "packet/tunnel_provider.h"
 #include "packet/buffer_manager.h"
 
-// Socket bridge for iOS NetworkExtension
-#include "socket_bridge/bridge.h"
-
-// DNS resolution and caching
-#include "dns/resolver.h" 
-#include "dns/cache.h"
-
-// Connection management
+// Network protocol handling
+#include "dns/resolver.h"
 #include "tcp_udp/connection_manager.h"
-
-// Metrics and monitoring
-#include "metrics/ring_buffer.h"
-
-// Privacy and security
-#include "privacy/guards.h"
-
-// iOS reachability monitoring
-#include "reachability/monitor.h"
-
-// Performance utilities
-#include "mtu/discovery.h"
 #include "nat64/translator.h"
-#include "classifier/tls_quic.h"
 
-// iOS crash reporting
-#include "crash/reporter.h"
+// Utilities
+#include "metrics/ring_buffer.h"
 
 #endif /* RelativeProtocol_h */

@@ -28,20 +28,29 @@ typedef union ip_addr {
     ipv6_addr_t v6;
 } ip_addr_t;
 
-typedef struct flow_tuple {
-    ip_addr_t src_ip;
-    ip_addr_t dst_ip;
+// Use ios_vpn.h types for consistency
+// Legacy flow_tuple_t is now an alias to flow_info_t
+typedef struct {
+    uint32_t src_ip;    // Direct IPv4 address (network byte order)
+    uint32_t dst_ip;    // Direct IPv4 address (network byte order)
     uint16_t src_port;
     uint16_t dst_port;
-    uint8_t protocol;
-    uint8_t ip_version;
+    uint8_t protocol;   // 6=TCP, 17=UDP
+    uint8_t ip_version; // 4 or 6
 } flow_tuple_t;
 
-typedef struct packet_info {
-    flow_tuple_t flow;
-    uint16_t length;
-    uint64_t timestamp_ns;
-    uint8_t *data;
+// Legacy alias - use flow_info_t from ios_vpn.h instead
+typedef flow_tuple_t flow_info_t;
+
+// Packet info with payload details
+typedef struct {
+    flow_info_t flow;
+    const uint8_t *payload;
+    size_t payload_length;
+    size_t header_length;
+    uint16_t length;        // Total packet length (for backwards compatibility)
+    uint64_t timestamp_ns;  // Timestamp (for backwards compatibility)
+    uint8_t *data;         // Raw data pointer (for backwards compatibility)
 } packet_info_t;
 
 typedef enum protocol_type {
