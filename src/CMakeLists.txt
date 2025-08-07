@@ -98,6 +98,61 @@ install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../include/ios_vpn.h
     DESTINATION include/relative_vpn
 )
 
+# Create module.modulemap for Swift Package Manager
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(MODULE_MAP_CONTENT "module RelativeProtocol [system] {
+    umbrella header \"RelativeProtocol.h\"
+    
+    // Export all public headers
+    export *
+    module * { export * }
+    
+    // Link required system libraries  
+    link \"pthread\"
+    
+    // iOS-specific frameworks
+    link framework \"NetworkExtension\"
+    link framework \"Network\"
+    link framework \"CoreTelephony\"
+}")
+    
+    # Write module.modulemap to both framework and include directory
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/relative_vpn.framework/Headers/module.modulemap" "${MODULE_MAP_CONTENT}")
+    file(WRITE "${CMAKE_CURRENT_SOURCE_DIR}/../include/module.modulemap" "${MODULE_MAP_CONTENT}")
+    
+    # Create proper Info.plist for the framework
+    set(FRAMEWORK_PLIST_CONTENT "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.relativeprotocol.framework</string>
+    <key>CFBundleName</key>
+    <string>RelativeProtocol</string>
+    <key>CFBundleVersion</key>
+    <string>1.0.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundlePackageType</key>
+    <string>FMWK</string>
+    <key>CFBundleExecutable</key>
+    <string>relative_vpn</string>
+    <key>MinimumOSVersion</key>
+    <string>14.0</string>
+</dict>
+</plist>")
+    
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/relative_vpn.framework/Info.plist" "${FRAMEWORK_PLIST_CONTENT}")
+    
+    # Copy all headers to framework Headers directory for proper Swift exposure
+    add_custom_command(TARGET relative_vpn POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/../include"
+            "${CMAKE_CURRENT_BINARY_DIR}/relative_vpn.framework/Headers"
+        COMMENT "Copying all headers to framework for Swift Package Manager"
+    )
+endif()
+
 # XCFramework target for iOS distribution
 if(BUILD_XCFRAMEWORK AND CMAKE_SYSTEM_NAME STREQUAL "iOS")
     add_custom_target(xcframework
@@ -105,7 +160,7 @@ if(BUILD_XCFRAMEWORK AND CMAKE_SYSTEM_NAME STREQUAL "iOS")
             -framework ${CMAKE_CURRENT_BINARY_DIR}/relative_vpn.framework
             -output ${CMAKE_CURRENT_BINARY_DIR}/../RelativeVPN.xcframework
         DEPENDS relative_vpn
-        COMMENT "Creating XCFramework for iOS distribution"
+        COMMENT "Creating XCFramework for iOS distribution with Swift Package Manager support"
     )
 endif()
 
