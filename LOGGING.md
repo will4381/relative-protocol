@@ -163,11 +163,36 @@ This will demonstrate all logging levels and show you exactly what information i
 
 ## Troubleshooting
 
+### General Issues
+
 If you don't see expected log output:
 
 1. **Check log level**: Ensure you're using the right level (TRACE for maximum detail)
 2. **Verify callback**: Make sure your log callback is properly set
 3. **Check compilation**: Ensure `ENABLE_LOGGING` is defined during compilation  
 4. **Platform support**: Some advanced features require iOS platform (`TARGET_OS_IOS`)
+
+### Swift Package Manager Issues
+
+If you get Swift compilation errors about `vpn_set_log_level` or `vpn_set_log_callback` not being found:
+
+1. **Ensure vpn_api.c is included**: Check that `Package.swift` includes `"vpn_api.c"` in sources
+2. **Enable logging compilation**: Verify `.define("ENABLE_LOGGING", to: "1")` is in `cSettings`
+3. **Check module map**: The module map should export all public headers with `export *`
+4. **Rebuild framework**: If using XCFramework, rebuild with `./scripts/build_ios.sh --logging --xcframework`
+
+### Module Map Verification
+
+To verify the module map is working correctly:
+```bash
+# Check that logging symbols are exported
+nm -g build/RelativeVPN.xcframework/ios-arm64/relative_vpn.framework/relative_vpn | grep vpn_set_log
+```
+
+You should see:
+```
+_vpn_set_log_callback
+_vpn_set_log_level
+```
 
 The extensive logging system will help you identify exactly where packets are being dropped, why connections aren't being tracked, or where header reconstruction is failing.

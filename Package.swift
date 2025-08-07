@@ -25,6 +25,7 @@ let package = Package(
                 "dns/resolver.c",
                 "nat64/translator.c",
                 "ios_vpn.c",
+                "vpn_api.c",
                 "metrics/ring_buffer.c"
             ],
             publicHeadersPath: "include",
@@ -37,6 +38,7 @@ let package = Package(
                 .headerSearchPath("../include/nat64"),
                 .headerSearchPath("../include/metrics"),
                 .define("TARGET_OS_IOS"),
+                .define("ENABLE_LOGGING", to: "1"),
                 .unsafeFlags(["-Wall", "-Wextra"], .when(configuration: .debug))
             ],
             linkerSettings: [
