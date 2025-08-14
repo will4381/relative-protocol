@@ -1,0 +1,1 @@
+https://github.com/lwip-tcpip/lwip @ STABLE-2_2_0_RELEASE

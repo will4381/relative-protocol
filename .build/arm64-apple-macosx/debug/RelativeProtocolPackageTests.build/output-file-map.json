@@ -1,0 +1,11 @@
+{
+  "": {
+    "swift-dependencies": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocolPackageTests.build/master.swiftdeps"
+  },
+  "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocolPackageTests.derived/runner.swift": {
+    "dependencies": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocolPackageTests.build/runner.d",
+    "object": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocolPackageTests.build/runner.swift.o",
+    "swiftmodule": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocolPackageTests.build/runner~partial.swiftmodule",
+    "swift-dependencies": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocolPackageTests.build/runner.swiftdeps"
+  }
+}

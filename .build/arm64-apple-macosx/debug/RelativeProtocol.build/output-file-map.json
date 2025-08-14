@@ -1,0 +1,71 @@
+{
+  "": {
+    "swift-dependencies": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/master.swiftdeps"
+  },
+  "/Users/willkusch/Documents/Projects/relativeProtocol/Sources/RelativeProtocol/Helpers/SocketHelpers.swift": {
+    "dependencies": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/SocketHelpers.d",
+    "object": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/SocketHelpers.swift.o",
+    "swiftmodule": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/SocketHelpers~partial.swiftmodule",
+    "swift-dependencies": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/SocketHelpers.swiftdeps"
+  },
+  "/Users/willkusch/Documents/Projects/relativeProtocol/Sources/RelativeProtocol/Helpers/TCPHelper.swift": {
+    "dependencies": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/TCPHelper.d",
+    "object": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/TCPHelper.swift.o",
+    "swiftmodule": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/TCPHelper~partial.swiftmodule",
+    "swift-dependencies": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/TCPHelper.swiftdeps"
+  },
+  "/Users/willkusch/Documents/Projects/relativeProtocol/Sources/RelativeProtocol/Helpers/UDPHelper.swift": {
+    "dependencies": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/UDPHelper.d",
+    "object": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/UDPHelper.swift.o",
+    "swiftmodule": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/UDPHelper~partial.swiftmodule",
+    "swift-dependencies": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/UDPHelper.swiftdeps"
+  },
+  "/Users/willkusch/Documents/Projects/relativeProtocol/Sources/RelativeProtocol/Observability/Logger.swift": {
+    "dependencies": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/Logger.d",
+    "object": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/Logger.swift.o",
+    "swiftmodule": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/Logger~partial.swiftmodule",
+    "swift-dependencies": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/Logger.swiftdeps"
+  },
+  "/Users/willkusch/Documents/Projects/relativeProtocol/Sources/RelativeProtocol/Observability/Metrics.swift": {
+    "dependencies": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/Metrics.d",
+    "object": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/Metrics.swift.o",
+    "swiftmodule": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/Metrics~partial.swiftmodule",
+    "swift-dependencies": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/Metrics.swiftdeps"
+  },
+  "/Users/willkusch/Documents/Projects/relativeProtocol/Sources/RelativeProtocol/Observability/Observability.swift": {
+    "dependencies": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/Observability.d",
+    "object": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/Observability.swift.o",
+    "swiftmodule": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/Observability~partial.swiftmodule",
+    "swift-dependencies": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/Observability.swiftdeps"
+  },
+  "/Users/willkusch/Documents/Projects/relativeProtocol/Sources/RelativeProtocol/PacketIngestor.swift": {
+    "dependencies": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/PacketIngestor.d",
+    "object": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/PacketIngestor.swift.o",
+    "swiftmodule": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/PacketIngestor~partial.swiftmodule",
+    "swift-dependencies": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/PacketIngestor.swiftdeps"
+  },
+  "/Users/willkusch/Documents/Projects/relativeProtocol/Sources/RelativeProtocol/PacketScheduler.swift": {
+    "dependencies": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/PacketScheduler.d",
+    "object": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/PacketScheduler.swift.o",
+    "swiftmodule": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/PacketScheduler~partial.swiftmodule",
+    "swift-dependencies": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/PacketScheduler.swiftdeps"
+  },
+  "/Users/willkusch/Documents/Projects/relativeProtocol/Sources/RelativeProtocol/RelativeProtocol.swift": {
+    "dependencies": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/RelativeProtocol.d",
+    "object": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/RelativeProtocol.swift.o",
+    "swiftmodule": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/RelativeProtocol~partial.swiftmodule",
+    "swift-dependencies": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/RelativeProtocol.swiftdeps"
+  },
+  "/Users/willkusch/Documents/Projects/relativeProtocol/Sources/RelativeProtocol/SocketBridge.swift": {
+    "dependencies": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/SocketBridge.d",
+    "object": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/SocketBridge.swift.o",
+    "swiftmodule": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/SocketBridge~partial.swiftmodule",
+    "swift-dependencies": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/SocketBridge.swiftdeps"
+  },
+  "/Users/willkusch/Documents/Projects/relativeProtocol/Sources/RelativeProtocol/TagStore.swift": {
+    "dependencies": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/TagStore.d",
+    "object": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/TagStore.swift.o",
+    "swiftmodule": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/TagStore~partial.swiftmodule",
+    "swift-dependencies": "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/TagStore.swiftdeps"
+  }
+}

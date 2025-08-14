@@ -1,0 +1,4 @@
+module RelativeProtocolPackageTests {
+    header "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocolPackageTests.build/RelativeProtocolPackageTests-Swift.h"
+    requires objc
+}

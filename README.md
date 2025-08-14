@@ -1,171 +1,134 @@
-# RelativeProtocol
+RelativeProtocol
+================
 
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+A Swift Package that embeds a userspace TCP/IP stack (lwIP) and a socket bridge to forward TUN packets to the Internet on consumer iOS via NEPacketTunnelProvider. Includes hooks for flow classification and per-tag throttling (UDP and TCP), plus basic metrics.
 
-A clean, production-ready VPN implementation designed exclusively for iOS devices using NetworkExtension framework. Built with verified, working modules - no fake implementations or placeholders.
+Quick start (Packet Tunnel Provider)
+-----------------------------------
 
-## ✨ Clean Architecture (Post-Audit)
+1) Entitlements/extension
+- Add Network Extension entitlement for Packet Tunnel.
+- Create a Packet Tunnel extension target and configure NSExtension in Info.plist.
 
-After comprehensive module audit and cleanup, RelativeProtocol now contains **only working, verified implementations**:
-
-### 🔧 Production-Ready Modules
-- ✅ **Packet Buffer Manager** - Thread-safe memory management with reference counting
-- ✅ **DNS Resolver** - Real UDP networking with actual query/response handling  
-- ✅ **NAT64 Translator** - Full RFC 6052 IPv4/IPv6 translation with checksum adjustment
-- ✅ **Connection Manager** - Comprehensive TCP/UDP tracking with atomic operations
-- ✅ **Tunnel Provider** - Complete iOS NetworkExtension integration
-- ✅ **iOS VPN Module** - Main packet processing and connection handling
-
-### 🗑️ Removed Fake Implementations
-- ❌ Privacy guards (blocking everything)
-- ❌ Crash reporter (placeholder returns)
-- ❌ Traffic classifier (empty implementations) 
-- ❌ MTU discovery (fake measurements)
-- ❌ Reachability monitor (no actual monitoring)
-
-## Features
-
-### Core VPN Functionality
-- **Real Packet Processing**: Actual IPv4/IPv6 packet parsing and validation
-- **Connection Tracking**: Working TCP/UDP flow management with timeouts
-- **DNS Resolution**: Functional DNS queries via `sendto()/recvfrom()` 
-- **Memory Management**: Proper buffer pools with mutex protection and cleanup
-
-### iOS NetworkExtension Integration  
-- **NEPacketTunnelProvider**: Native packet reading/writing via `readPacketsWithCompletionHandler`
-- **Connection Creation**: Real `createTCPConnection`/`createUDPSession` calls
-- **Flow Management**: Comprehensive packet flow handling with queue management
-- **Thread Safety**: Proper GCD integration and mutex locking
-
-### IPv6 & NAT64 Support
-- **Dual-Stack**: Full IPv4/IPv6 packet processing 
-- **NAT64 Translation**: RFC 6052 compliant address synthesis and packet translation
-- **Connection Mapping**: State tracking for bidirectional flows
-- **Checksum Adjustment**: Proper checksum recalculation for translated packets
-
-## Quick Start
-
-### Swift Package Manager Integration
-
-```swift
-dependencies: [
-    .package(url: "path/to/RelativeProtocol", from: "1.0.0")
-]
+Entitlements (in your extension target .entitlements)
+```xml
+<dict>
+  <key>com.apple.developer.networking.networkextension</key>
+  <array>
+    <string>packet-tunnel-provider</string>
+  </array>
+</dict>
 ```
 
-### Basic VPN Setup
+Info.plist (in your extension target)
+```xml
+<key>NSExtension</key>
+<dict>
+  <key>NSExtensionPointIdentifier</key>
+  <string>com.apple.networkextension.packet-tunnel</string>
+  <key>NSExtensionPrincipalClass</key>
+  <string>$(PRODUCT_MODULE_NAME).PacketTunnelProvider</string>
+  <!-- Optional: NSExtensionAttributes for on-demand rules -->
+</dict>
+```
 
+2) Provider wiring
 ```swift
-import RelativeProtocol
 import NetworkExtension
+import RelativeProtocol
 
-class PacketTunnelProvider: NEPacketTunnelProvider {
-    override func startTunnel(options: [String : NSObject]?) async throws {
-        // Initialize VPN
-        ios_vpn_init()
-        
-        // Process packets manually
-        packetFlow.readPacketsWithCompletionHandler { packets, protocols in
-            for (packet, protocolFamily) in zip(packets, protocols) {
-                var info = packet_info_t()
-                if ios_vpn_parse_packet(packet.bytes, packet.length, &info) {
-                    // Process packet...
-                }
-            }
+final class PacketTunnelProvider: NEPacketTunnelProvider, RelativeProtocolEngine.PolicyProvider {
+    private var engine: RelativeProtocolEngine?
+
+    override func startTunnel(options: [String : NSObject]?, completionHandler: @escaping (Error?) -> Void) {
+        let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "100.64.0.1")
+        settings.ipv4Settings = NEIPv4Settings(addresses: ["100.64.0.2"], subnetMasks: ["255.255.255.0"]) 
+        settings.ipv4Settings?.includedRoutes = [NEIPv4Route.default()]
+        settings.ipv6Settings = NEIPv6Settings(addresses: ["fd00::2"], networkPrefixLengths: [64])
+        settings.ipv6Settings?.includedRoutes = [NEIPv6Route.default()]
+        settings.mtu = 1500
+        // DNS servers and match domains
+        let dns = NEDNSSettings(servers: ["1.1.1.1", "2606:4700:4700::1111"]) 
+        dns.matchDomains = [""]
+        settings.dnsSettings = dns
+        // Optional: keep local LAN reachable by excluding private ranges
+        settings.ipv4Settings?.excludedRoutes = [
+            NEIPv4Route(destinationAddress: "10.0.0.0", subnetMask: "255.0.0.0"),
+            NEIPv4Route(destinationAddress: "172.16.0.0", subnetMask: "255.240.0.0"),
+            NEIPv4Route(destinationAddress: "192.168.0.0", subnetMask: "255.255.0.0")
+        ]
+
+        setTunnelNetworkSettings(settings) { [weak self] err in
+            guard let self = self, err == nil else { completionHandler(err); return }
+            let eng = RelativeProtocolEngine(packetFlow: self.packetFlow)
+            eng.policyProvider = self
+            if #available(iOS 12.0, *) { eng.updateMTU(from: settings) }
+            eng.start()
+            self.engine = eng
+            completionHandler(nil)
         }
     }
+
+    override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
+        engine?.stop()
+        completionHandler()
+    }
+
+    // PolicyProvider: classify flows and set throttles
+     func onNewFlow(metadata: RelativeProtocolEngine.FlowMetadata) -> String? {
+        // Example: tag UDP/443 as "quic"
+        if metadata.transport == "UDP" && metadata.destinationPort == 443 { return "quic" }
+        return nil
+    }
+
+    func updateThrottle(tag: String, bytesPerSecond: Int) {
+        engine?.updateThrottle(tag: tag, bytesPerSecond: bytesPerSecond)
+    }
+
+    func shouldDrop(flow: RelativeProtocolEngine.FlowMetadata) -> Bool { false }
 }
 ```
 
-## Architecture
+3) Optional runtime control
+- Call `engine?.updateThrottle(tag: "quic", bytesPerSecond: 200_000)` to slow QUIC.
+- Toggle passthrough (no shaping): `engine?.setPassthroughMode(true)`.
+- Sleep/wake: `engine?.quiesce()` before sleep and `engine?.resume()` on wake.
+- Path changes: engine observes `NWPathMonitor`; adjust MSS with `updateMTU` if provider MTU changes.
 
-```
-┌─────────────────────────────────────────────────┐
-│                iOS App Layer                    │
-├─────────────────────────────────────────────────┤
-│            Swift Package Manager               │
-│         RelativeProtocol.xcframework           │
-├─────────────────────────────────────────────────┤
-│  ios_vpn.c (Main packet processing)           │
-├─────────────────────────────────────────────────┤
-│  ┌─────────────┐ ┌──────────────┐ ┌──────────┐ │
-│  │Buffer Mgr   │ │DNS Resolver  │ │NAT64     │ │
-│  │(Memory)     │ │(UDP queries) │ │(v4↔v6)   │ │
-│  └─────────────┘ └──────────────┘ └──────────┘ │
-├─────────────────────────────────────────────────┤
-│  ┌─────────────┐ ┌──────────────┐            │
-│  │Connection   │ │Tunnel        │             │
-│  │Manager      │ │Provider      │             │
-│  │(TCP/UDP)    │ │(iOS Native)  │             │
-│  └─────────────┘ └──────────────┘             │
-├─────────────────────────────────────────────────┤
-│          iOS NetworkExtension                   │
-└─────────────────────────────────────────────────┘
-```
+Testing notes
+-------------
+- Unit tests run on macOS and stub the lwIP C symbols; on-device builds link the full lwIP core.
+- Use a real device to test the `NEPacketTunnelProvider` flow; Simulator does not support Packet Tunnel.
 
-## Testing
+Capabilities
+------------
+- lwIP host-mode stack with custom netifs: `tunif` (OS side) and `proxynetif` (terminating proxy).
+- Internet egress over Network.framework sockets (TCP/UDP). No raw IP.
+- UDP and TCP return-path synthesis (IPv4/IPv6), incl. ICMP/ICMPv6 for UDP errors.
+- Per-tag throttling (UDP and TCP) via token-bucket limiters.
+- MTU→MSS clamp propagation to reduce fragmentation on cellular paths.
+- Configurable TCP advertised window via `SocketBridge.setTCPWindow(bytes:)`.
+- Basic metrics counters with snapshot API.
 
-Comprehensive test suite for all working modules:
+Notes
+-----
+- This repo targets consumer iOS. Testing must be done on device (Simulator not supported for Packet Tunnel).
+- Start with permissive throttles and iterate; aggressive shaping can impact app UX (especially QUIC video).
+- The TCP bridge implements initial correctness; further tuning for window/close behavior is planned.
+- Provider can configure excluded routes (e.g., local LAN subnets) via `NEPacketTunnelNetworkSettings` as needed.
+- QUIC/HTTP3: For UDP/443, prefer tagging flows (e.g., "quic") via `PolicyProvider` and apply distinct throttling via `updateThrottle(tag:bytesPerSecond:)`. Increase UDP receive buffers in the host app if needed; package pacing remains per-tag.
+- DNS strategy: Choose resolvers in the provider settings (`NEDNSSettings`) and optionally maintain a domain→IP cache in the host app for classification (app side). The package exposes `FlowMetadata` and `FlowID` to correlate.
 
-```bash
-cd tests/ios
-make test
-```
+lwIP updates
+------------
+- To refresh the vendored lwIP sources, use the helper script:
+  - `scripts/fetch_lwip.sh`
+  - Documented to fetch/update the subtree under `third_party/lwip/` in a reproducible way.
 
-Individual module testing:
-```bash
-make test-buffer      # Buffer manager tests
-make test-dns         # DNS resolver tests (includes network I/O)
-make test-nat64       # NAT64 translator tests
-make test-vpn         # iOS VPN module tests
-make test-connection  # Connection manager tests
-```
+Async packet ingestion (optional)
+---------------------------------
+- For push-style consumption of tunnel packets, you can use the async façade:
+  - `for await packet in PacketIngestor.packets(from: packetFlow) { engine.ingestPacket(packet.data, proto: packet.proto) }`
+  - The engine still supports direct `ingestPacket(s)` calls.
 
-## Build System
 
-Dual build system support:
-
-### CMake (Development)
-```bash
-mkdir build && cd build
-cmake .. -DBUILD_TESTS=ON
-make
-```
-
-### Swift Package Manager (Distribution)
-```bash
-swift build
-swift test
-```
-
-## Project Structure
-
-```
-RelativeProtocol/
-├── src/                    # Core implementation
-│   ├── ios_vpn.c          # Main VPN module
-│   ├── packet/            # Buffer & tunnel management
-│   ├── dns/               # DNS resolution 
-│   ├── nat64/             # IPv6 translation
-│   ├── tcp_udp/           # Connection tracking
-│   └── core/              # Logging & utilities
-├── include/               # Public headers
-├── tests/ios/             # Verified test suite
-├── examples/              # Swift integration examples
-└── RelativeProtocol.xcframework/  # iOS distribution
-```
-
-## Contributing
-
-1. All new modules must include comprehensive tests
-2. No fake implementations or placeholder returns
-3. Thread safety required for all shared state
-4. iOS NetworkExtension compatibility mandatory
-
-## License
-
-GNU General Public License v3.0 - see [LICENSE](LICENSE) for details.
-
----
-
-**Production-Ready**: All included modules have been thoroughly audited and verified to contain actual working implementations.
