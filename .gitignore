@@ -1,3 +1,20 @@
+# Build artifacts
+.build/
+.swiftpm/
+DerivedData/
+xcuserdata/
+
+# macOS
+.DS_Store
+
+# Logs and temp
+*.log
+*.temp
+
+# Ignore all Markdown except the root README
+*.md
+!/README.md
+
 # SwiftPM / Build
 .build/
 /.swiftpm/
