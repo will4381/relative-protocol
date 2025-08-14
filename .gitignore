@@ -1,0 +1,23 @@
+# SwiftPM / Build
+.build/
+/.swiftpm/
+Package.pins
+Package.resolved
+
+# Xcode (if opened as a project)
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# Editors / IDEs
+.vscode/
+.idea/
+.DS_Store
+
+# Logs / Temp
+*.log
+*.swp
+*.swo
+*.tmp
+
+
