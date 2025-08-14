@@ -119,6 +119,15 @@ Notes
 - QUIC/HTTP3: For UDP/443, prefer tagging flows (e.g., "quic") via `PolicyProvider` and apply distinct throttling via `updateThrottle(tag:bytesPerSecond:)`. Increase UDP receive buffers in the host app if needed; package pacing remains per-tag.
 - DNS strategy: Choose resolvers in the provider settings (`NEDNSSettings`) and optionally maintain a domain→IP cache in the host app for classification (app side). The package exposes `FlowMetadata` and `FlowID` to correlate.
 
+Roadmap / Future enhancements
+-----------------------------
+- Token bucket unification: internal refactor to share a single `TokenBucketLimiter` for UDP/TCP pacing.
+- Watchdog: detect stalled flows (no activity over N seconds), log, and optionally prune with RST/ICMP.
+- Window tuning: optional faster timer tick under load and adaptive sender window derived from lwIP state.
+- Buffer pooling: small slab/ring buffers for C netifs to reduce malloc/free churn.
+- os_signpost instrumentation: expand spans around critical paths (ingest→parse→bridge→inject) for profiling.
+- Provider docs: NAT64/IPv6-only examples, QUIC heuristics via tagging, and DNS policy patterns.
+
 lwIP updates
 ------------
 - To refresh the vendored lwIP sources, use the helper script:

@@ -58,10 +58,12 @@ public final class RelativeProtocolEngine {
         guard !running else { return }
         logInfo("RelativeProtocolEngine starting")
         let sp = Observability.shared.begin("engine_start")
-        rlwip_set_output(RelativeProtocolEngine.packetOut)
-        rlwip_set_proxy_output(RelativeProtocolEngine.proxynetifOut)
-        RelativeProtocolEngine._packetFlow = packetFlow
-        RelativeProtocolEngine._engineRef = self
+        queue.sync {
+            rlwip_set_output(RelativeProtocolEngine.packetOut)
+            rlwip_set_proxy_output(RelativeProtocolEngine.proxynetifOut)
+            RelativeProtocolEngine._packetFlow = packetFlow
+            RelativeProtocolEngine._engineRef = self
+        }
         SocketBridge.shared.delegate = self
         _ = rlwip_start()
         running = true
@@ -78,7 +80,7 @@ public final class RelativeProtocolEngine {
         rlwip_stop()
         running = false
         scheduler.stop()
-        RelativeProtocolEngine._engineRef = nil
+        queue.sync { RelativeProtocolEngine._engineRef = nil }
         // Stop per-tag schedulers
         for (_, sch) in tagSchedulers { sch.stop() }
         tagSchedulers.removeAll()

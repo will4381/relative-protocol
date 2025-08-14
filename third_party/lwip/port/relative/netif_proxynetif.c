@@ -15,6 +15,7 @@ static err_t proxynetif_emit(struct netif *netif, struct pbuf *p) {
 	if (!p) return ERR_IF;
 
     size_t total = p->tot_len;
+    LWIP_ASSERT("pbuf too large", total <= 0xFFFF);
     uint8_t *buf = (uint8_t *)malloc(total);
     if (!buf) return ERR_MEM;
     u16_t copied = pbuf_copy_partial(p, buf, (u16_t)total, 0);

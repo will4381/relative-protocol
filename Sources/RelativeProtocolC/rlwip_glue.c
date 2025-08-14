@@ -64,6 +64,10 @@ void rlwip_stop(void) {
 
 int rlwip_feed_packet(const uint8_t *data, size_t len) {
     if (!g_running || !data || !len) return 0;
+    if (len > 0xFFFF) {
+        // Defensive: lwIP pbuf lengths are u16_t; reject oversized buffers
+        return 0;
+    }
     struct pbuf *p = pbuf_alloc(PBUF_RAW, (u16_t)len, PBUF_POOL);
     if (!p) return 0;
     pbuf_take(p, data, (u16_t)len);

@@ -1,4 +1,0 @@
-module RelativeProtocol {
-    header "/Users/willkusch/Documents/Projects/relativeProtocol/.build/arm64-apple-macosx/debug/RelativeProtocol.build/RelativeProtocol-Swift.h"
-    requires objc
-}

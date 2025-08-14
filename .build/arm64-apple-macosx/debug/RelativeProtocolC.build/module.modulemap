@@ -1,4 +1,0 @@
-module RelativeProtocolC {
-    umbrella "/Users/willkusch/Documents/Projects/relativeProtocol/Sources/RelativeProtocolC"
-    export *
-}
