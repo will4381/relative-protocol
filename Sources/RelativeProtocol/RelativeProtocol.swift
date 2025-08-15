@@ -138,6 +138,9 @@ public final class RelativeProtocolEngine {
                 strongSelf.readLoopArmed = false
                 return
             }
+            if !packets.isEmpty {
+                logInfo("readPackets: count=\(packets.count)")
+            }
             for pkt in packets {
                 strongSelf.handleInboundTunnelPacket(pkt)
             }

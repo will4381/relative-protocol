@@ -233,6 +233,7 @@ final class SocketBridge {
 		let ihl = Int(packetPtr.pointee & 0x0F) * 4
 		guard length >= ihl + 8 else { return }
 		let proto = packetPtr.advanced(by: 9).pointee
+		logInfo("IPv4 out proto=\(proto) len=\(length)")
 		if proto == 17 { // UDP
 			let srcIP = Data(bytes: packetPtr.advanced(by: 12), count: 4)
 			let dstIP = Data(bytes: packetPtr.advanced(by: 16), count: 4)
@@ -271,6 +272,7 @@ final class SocketBridge {
         let sp = Observability.shared.begin("parse_ipv6")
         guard length >= 40 else { Observability.shared.end("parse_ipv6", sp); return }
 		let nextHeader = packetPtr.advanced(by: 6).pointee
+		logInfo("IPv6 out nextHeader=\(nextHeader) len=\(length)")
 		if nextHeader == 17 { // UDP
 			let srcIP = Data(bytes: packetPtr.advanced(by: 8), count: 16)
 			let dstIP = Data(bytes: packetPtr.advanced(by: 24), count: 16)
