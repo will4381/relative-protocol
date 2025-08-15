@@ -97,9 +97,7 @@ final class SocketBridge {
         }
     }
 
-    #if canImport(NetworkExtension) && os(iOS)
-    weak var provider: NEPacketTunnelProvider?
-    #endif
+    // Intentionally avoid importing NetworkExtension here to keep macOS SPM builds simple.
 
     private init() {}
 
