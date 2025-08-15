@@ -35,6 +35,8 @@ final class SocketBridge {
 	private let lwipQueue = DispatchQueue(label: "com.relativeprotocol.lwip")
     private let flowsQueue = DispatchQueue(label: "com.relativeprotocol.flows", attributes: .concurrent)
     private let limitersQueue = DispatchQueue(label: "com.relativeprotocol.limiters")
+    private let netPathQueue = DispatchQueue(label: "com.relativeprotocol.path")
+    private var preferredInterfaceType: NWInterface.InterfaceType? = nil
     @available(iOS 12.0, macOS 10.14, *)
     private struct UdpFlowMeta {
 		let version: Int // 4 or 6
@@ -99,7 +101,22 @@ final class SocketBridge {
 
     // Intentionally avoid importing NetworkExtension here to keep macOS SPM builds simple.
 
-    private init() {}
+    private init() {
+        let mon = NWPathMonitor()
+        mon.pathUpdateHandler = { [weak self] path in
+            guard let self = self else { return }
+            if path.usesInterfaceType(.wifi) {
+                self.preferredInterfaceType = .wifi
+            } else if path.usesInterfaceType(.cellular) {
+                self.preferredInterfaceType = .cellular
+            } else if path.usesInterfaceType(.wiredEthernet) {
+                self.preferredInterfaceType = .wiredEthernet
+            } else {
+                self.preferredInterfaceType = nil
+            }
+        }
+        mon.start(queue: netPathQueue)
+    }
 
     @available(iOS 12.0, macOS 10.14, *)
     private struct UDPLimiter {
@@ -318,6 +335,11 @@ final class SocketBridge {
 			let params = NWParameters.tcp
 			// Ensure we use the underlying physical network and not the TUN (which is .other)
 			params.prohibitedInterfaceTypes = [.other]
+			if let ifType = self.preferredInterfaceType {
+				params.requiredInterfaceType = ifType
+			}
+			params.allowLocalEndpointReuse = true
+			params.preferNoProxies = true
 			let endpoint: NWEndpoint
 			if version == 4, let ip = IPv4Address(host) {
 				endpoint = NWEndpoint.hostPort(host: .ipv4(ip), port: .init(rawValue: port)!)
@@ -581,6 +603,11 @@ final class SocketBridge {
 			let params = NWParameters.udp
 			// Ensure we use the underlying physical network and not the TUN (which is .other)
 			params.prohibitedInterfaceTypes = [.other]
+			if let ifType = self.preferredInterfaceType {
+				params.requiredInterfaceType = ifType
+			}
+			params.allowLocalEndpointReuse = true
+			params.preferNoProxies = true
 			let endpoint: NWEndpoint
 			if version == 4, let ip = IPv4Address(host) {
 				endpoint = NWEndpoint.hostPort(host: .ipv4(ip), port: .init(rawValue: port)!)
