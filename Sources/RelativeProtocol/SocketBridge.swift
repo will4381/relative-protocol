@@ -1,5 +1,8 @@
 import Foundation
 import Network
+#if canImport(NetworkExtension) && os(iOS)
+import NetworkExtension
+#endif
 
 @available(iOS 12.0, macOS 10.14, *)
 final class SocketBridge {
@@ -38,7 +41,10 @@ final class SocketBridge {
 		let dstIP: Data
 		let srcPort: UInt16
 		let dstPort: UInt16
-		let connection: NWConnection
+		let connection: NWConnection?
+#if canImport(NetworkExtension) && os(iOS)
+		let neSession: NWUDPSession?
+#endif
         let queue: DispatchQueue
 		var lastOutboundHeader: Data
 		var lastActivity: TimeInterval
@@ -53,7 +59,10 @@ final class SocketBridge {
 		let dstIP: Data
 		let srcPort: UInt16
 		let dstPort: UInt16
-		let connection: NWConnection
+		let connection: NWConnection?
+#if canImport(NetworkExtension) && os(iOS)
+		let neConnection: NWTCPConnection?
+#endif
         let queue: DispatchQueue
 		var deviceISN: UInt32
 		var remoteISN: UInt32
@@ -92,6 +101,10 @@ final class SocketBridge {
             self.tcpSenderWindowBytes = max(4096, bytes)
         }
     }
+
+    #if canImport(NetworkExtension) && os(iOS)
+    weak var provider: NEPacketTunnelProvider?
+    #endif
 
     private init() {}
 

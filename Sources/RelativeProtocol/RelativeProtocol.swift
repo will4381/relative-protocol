@@ -73,6 +73,9 @@ public final class RelativeProtocolEngine {
             RelativeProtocolEngine._engineRef = self
         }
         SocketBridge.shared.delegate = self
+#if canImport(NetworkExtension) && os(iOS)
+        SocketBridge.shared.provider = selfProvider()
+#endif
         _ = rlwip_start()
         running = true
         armReadLoopIfNeeded()
@@ -81,6 +84,14 @@ public final class RelativeProtocolEngine {
         enablePathMonitoring()
         Observability.shared.end("engine_start", sp)
     }
+
+#if canImport(NetworkExtension) && os(iOS)
+    private func selfProvider() -> NEPacketTunnelProvider? {
+        // Best-effort: locate provider via packetFlow
+        // There is no direct API from NEPacketTunnelFlow back to provider; rely on static linkage
+        return nil
+    }
+#endif
 
     public func stop() {
         guard running else { return }
