@@ -42,7 +42,7 @@ err_t tunif_init(struct netif *netif) {
     netif->name[0] = 't';
     netif->name[1] = 'n';
     netif->mtu = 1500;
-    netif->flags = NETIF_FLAG_LINK_UP | NETIF_FLAG_UP | NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP;
+    netif->flags = NETIF_FLAG_LINK_UP | NETIF_FLAG_UP | NETIF_FLAG_BROADCAST;
     netif->output = tunif_output_ip4;
 #if LWIP_IPV6
     netif->output_ip6 = tunif_output_ip6;
