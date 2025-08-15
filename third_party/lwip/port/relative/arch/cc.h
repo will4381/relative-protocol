@@ -12,6 +12,8 @@ typedef uint32_t u32_t;
 typedef int32_t  s32_t;
 typedef uintptr_t mem_ptr_t;
 
+typedef unsigned int sys_prot_t;
+
 #define LWIP_PLATFORM_DIAG(x) do { } while(0)
 #define LWIP_PLATFORM_ASSERT(x) do { } while(0)
 
