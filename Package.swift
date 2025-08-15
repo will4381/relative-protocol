@@ -26,6 +26,7 @@ let package = Package(
                 "third_party/lwip/lwip-src/src/core/ip.c",
                 "third_party/lwip/lwip-src/src/core/mem.c",
                 "third_party/lwip/lwip-src/src/core/memp.c",
+                "third_party/lwip/lwip-src/src/core/def.c",
                 "third_party/lwip/lwip-src/src/core/pbuf.c",
                 "third_party/lwip/lwip-src/src/core/netif.c",
                 "third_party/lwip/lwip-src/src/core/raw.c",
@@ -46,10 +47,17 @@ let package = Package(
                 "third_party/lwip/lwip-src/src/core/ipv6/ip6.c",
                 "third_party/lwip/lwip-src/src/core/ipv6/ip6_addr.c",
                 "third_party/lwip/lwip-src/src/core/ipv6/ip6_frag.c",
+                "third_party/lwip/lwip-src/src/core/ipv6/icmp6.c",
+                "third_party/lwip/lwip-src/src/core/ipv6/nd6.c",
+                "third_party/lwip/lwip-src/src/core/ipv6/mld6.c",
+                "third_party/lwip/lwip-src/src/core/ipv6/ethip6.c",
                 // Our port files
                 "third_party/lwip/port/relative/sys_arch.c",
                 "third_party/lwip/port/relative/netif_tunif.c",
-                "third_party/lwip/port/relative/netif_proxynetif.c"
+                "third_party/lwip/port/relative/netif_proxynetif.c",
+                // Netif helpers
+                "third_party/lwip/lwip-src/src/netif/ethernet.c",
+                "third_party/lwip/lwip-src/src/netif/etharp.c"
             ],
             publicHeadersPath: "",
             cSettings: [
