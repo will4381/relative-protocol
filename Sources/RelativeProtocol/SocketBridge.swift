@@ -483,6 +483,22 @@ final class SocketBridge {
                         emit(next)
                         updated.deviceNextSeq = updated.deviceNextSeq &+ UInt32(next.count)
                     }
+                    // Proactively ack bytes we just accepted to keep lwIP window advancing
+                    let ackOnlyFlags: UInt8 = 0x10 // ACK
+                    let seqNum = updated.remoteNextSeq
+                    let ackNum = updated.deviceNextSeq
+                    let ackPkt: Data = (updated.version == 4)
+                        ? self.buildIPv4TCPPacket(srcIP: updated.dstIP, dstIP: updated.srcIP, srcPort: updated.dstPort, dstPort: updated.srcPort, seq: seqNum, ack: ackNum, flags: ackOnlyFlags, payload: Data())
+                        : self.buildIPv6TCPPacket(srcIP: updated.dstIP, dstIP: updated.srcIP, srcPort: updated.dstPort, dstPort: updated.srcPort, seq: seqNum, ack: ackNum, flags: ackOnlyFlags, payload: Data())
+                    #if canImport(NetworkExtension) && os(iOS)
+                    RelativeProtocolEngine.emitToTun(ackPkt)
+                    #else
+                    ackPkt.withUnsafeBytes { bytes in
+                        if let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) {
+                            _ = rlwip_inject_proxynetif(base, ackPkt.count)
+                        }
+                    }
+                    #endif
                 } else {
                     // Future segment: buffer
                     updated.devicePending[segSeq] = segPayload
