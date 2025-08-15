@@ -1,7 +1,8 @@
 import Foundation
 import Network
-#if canImport(NetworkExtension) && os(iOS)
-import NetworkExtension
+#if !os(iOS)
+@_silgen_name("rlwip_inject_proxynetif")
+func rlwip_inject_proxynetif(_ data: UnsafePointer<UInt8>, _ len: Int) -> Int32
 #endif
 
 @available(iOS 12.0, macOS 10.14, *)
@@ -41,10 +42,7 @@ final class SocketBridge {
 		let dstIP: Data
 		let srcPort: UInt16
 		let dstPort: UInt16
-		let connection: NWConnection?
-#if canImport(NetworkExtension) && os(iOS)
-		let neSession: NWUDPSession?
-#endif
+		let connection: NWConnection
         let queue: DispatchQueue
 		var lastOutboundHeader: Data
 		var lastActivity: TimeInterval
@@ -59,10 +57,7 @@ final class SocketBridge {
 		let dstIP: Data
 		let srcPort: UInt16
 		let dstPort: UInt16
-		let connection: NWConnection?
-#if canImport(NetworkExtension) && os(iOS)
-		let neConnection: NWTCPConnection?
-#endif
+		let connection: NWConnection
         let queue: DispatchQueue
 		var deviceISN: UInt32
 		var remoteISN: UInt32
@@ -316,8 +311,10 @@ final class SocketBridge {
 		let syn = (flags & 0x02) != 0
 		let fin = (flags & 0x01) != 0
 		let rst = (flags & 0x04) != 0
-		var meta: TcpFlowMeta = flowsQueue.sync {
-			if let existing = tcpFlows[key] { return existing }
+		var meta: TcpFlowMeta = {
+			if let existing = flowsQueue.sync(execute: { tcpFlows[key] }) {
+				return existing
+			}
 			let params = NWParameters.tcp
 			let endpoint: NWEndpoint
 			if version == 4, let ip = IPv4Address(host) {
@@ -327,26 +324,26 @@ final class SocketBridge {
 			} else {
 				endpoint = NWEndpoint.hostPort(host: .name(host, nil), port: .init(rawValue: port)!)
 			}
-            let flowQueue = DispatchQueue(label: "com.relativeprotocol.flow.tcp.\(key)")
-            let conn = NWConnection(to: endpoint, using: params)
+			let flowQueue = DispatchQueue(label: "com.relativeprotocol.flow.tcp.\(key)")
+			let conn = NWConnection(to: endpoint, using: params)
 			let deviceISN = syn ? seq : 0
 			let remoteISN = arc4random()
 			let flowID = key
 			let id = FlowIdentity(flowID: flowID, isIPv6: version == 6, proto: "TCP", sourceIP: version == 4 ? ipv4String(from: srcIP) : ipv6String(from: srcIP), sourcePort: srcPort, destinationIP: version == 4 ? ipv4String(from: dstIP) : ipv6String(from: dstIP), destinationPort: dstPort)
-        let tag = self.delegate?.classify(flow: id)
-        logInfo("TCP flow new tag=\(tag ?? "-") src=\(id.sourceIP):\(srcPort) dst=\(id.destinationIP):\(dstPort) flags=\(flags)")
-            let meta = TcpFlowMeta(version: version, srcIP: srcIP, dstIP: dstIP, srcPort: srcPort, dstPort: dstPort, connection: conn, queue: flowQueue, deviceISN: deviceISN, remoteISN: remoteISN, deviceNextSeq: deviceISN &+ 1, remoteNextSeq: remoteISN, handshakeComplete: false, lastActivity: Date().timeIntervalSince1970, tag: tag)
-			tcpFlows[key] = meta
+			let tag = self.delegate?.classify(flow: id)
+			logInfo("TCP flow new tag=\(tag ?? "-") src=\(id.sourceIP):\(srcPort) dst=\(id.destinationIP):\(dstPort) flags=\(flags)")
+			let newMeta = TcpFlowMeta(version: version, srcIP: srcIP, dstIP: dstIP, srcPort: srcPort, dstPort: dstPort, connection: conn, queue: flowQueue, deviceISN: deviceISN, remoteISN: remoteISN, deviceNextSeq: deviceISN &+ 1, remoteNextSeq: remoteISN, handshakeComplete: false, lastActivity: Date().timeIntervalSince1970, tag: tag)
+			flowsQueue.async(flags: .barrier) { self.tcpFlows[key] = newMeta }
 			if let tag = tag {
 				TagStore.shared.setTagBothDirections(version: version, srcIP: srcIP, srcPort: srcPort, dstIP: dstIP, dstPort: dstPort, proto: 6, tag: tag)
 			}
-			Metrics.shared.setTcpFlows(tcpFlows.count)
-			installTCPReceive(for: key, meta: meta)
+			Metrics.shared.setTcpFlows(flowsQueue.sync { tcpFlows.count })
+			installTCPReceive(for: key, meta: newMeta)
 			conn.stateUpdateHandler = { [weak self] state in
 				guard let self = self else { return }
 				switch state {
 				case .failed, .cancelled:
-                    self.flowsQueue.async(flags: .barrier) {
+					self.flowsQueue.async(flags: .barrier) {
 						if var m = self.tcpFlows[key] {
 							self.sendTCPRST(meta: &m)
 							Metrics.shared.incRST()
@@ -357,13 +354,13 @@ final class SocketBridge {
 				default: break
 				}
 			}
-			#if DEBUG
+#if DEBUG
 			if !self.debug_disableNetworkSends { conn.start(queue: flowQueue) }
-			#else
+#else
 			conn.start(queue: flowQueue)
-			#endif
-			return meta
-		}
+#endif
+			return newMeta
+		}()
 		if rst {
 			meta.connection.cancel()
 			flowsQueue.async(flags: .barrier) { self.tcpFlows.removeValue(forKey: key) }
@@ -556,10 +553,10 @@ final class SocketBridge {
 	}
 
 	private func sendUDP(key: String, version: Int, srcIP: Data, dstIP: Data, srcPort: UInt16, dstPort: UInt16, host: String, port: UInt16, payload: Data, quotedHeader: Data) {
-		let meta: UdpFlowMeta = flowsQueue.sync {
-			if var existing = udpFlows[key] {
+		let meta: UdpFlowMeta = {
+			if var existing = flowsQueue.sync(execute: { udpFlows[key] }) {
 				existing.lastOutboundHeader = quotedHeader
-				udpFlows[key] = existing
+				flowsQueue.async(flags: .barrier) { self.udpFlows[key] = existing }
 				return existing
 			}
 			let params = NWParameters.udp
@@ -577,20 +574,20 @@ final class SocketBridge {
             let tag = self.delegate?.classify(flow: id)
             logInfo("UDP flow new tag=\(tag ?? "-") src=\(id.sourceIP):\(srcPort) dst=\(id.destinationIP):\(dstPort)")
             let flowQueue = DispatchQueue(label: "com.relativeprotocol.flow.udp.\(key)")
-            let meta = UdpFlowMeta(version: version, srcIP: srcIP, dstIP: dstIP, srcPort: srcPort, dstPort: dstPort, connection: conn, queue: flowQueue, lastOutboundHeader: quotedHeader, lastActivity: Date().timeIntervalSince1970, tag: tag)
-			udpFlows[key] = meta
+            let newMeta = UdpFlowMeta(version: version, srcIP: srcIP, dstIP: dstIP, srcPort: srcPort, dstPort: dstPort, connection: conn, queue: flowQueue, lastOutboundHeader: quotedHeader, lastActivity: Date().timeIntervalSince1970, tag: tag)
+			flowsQueue.async(flags: .barrier) { self.udpFlows[key] = newMeta }
 			if let tag = tag {
 				TagStore.shared.setTagBothDirections(version: version, srcIP: srcIP, srcPort: srcPort, dstIP: dstIP, dstPort: dstPort, proto: 17, tag: tag)
 			}
-			installUDPReceive(for: key, meta: meta)
+			installUDPReceive(for: key, meta: newMeta)
             conn.stateUpdateHandler = { [weak self] state in
 				guard let self = self else { return }
 				if case .failed = state { self.synthesizeICMPForUDPFailure(key: key) }
 				if case .cancelled = state { self.synthesizeICMPForUDPFailure(key: key) }
 			}
             conn.start(queue: flowQueue)
-			return meta
-		}
+			return newMeta
+		}()
         if let tag = meta.tag {
             limitersQueue.async {
                 var limiter = self.udpLimiters[tag] ?? UDPLimiter(rateBytesPerSecond: Int.max, tokens: Int.max, tickMs: 10, backlog: [], timer: nil)

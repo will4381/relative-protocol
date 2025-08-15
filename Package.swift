@@ -55,9 +55,8 @@ let package = Package(
                 "third_party/lwip/port/relative/sys_arch.c",
                 "third_party/lwip/port/relative/netif_tunif.c",
                 "third_party/lwip/port/relative/netif_proxynetif.c",
-                // Netif helpers
-                "third_party/lwip/lwip-src/src/netif/ethernet.c",
-                "third_party/lwip/lwip-src/src/netif/etharp.c"
+                // Netif helpers (ARP disabled in lwipopts.h, so no etharp)
+                "third_party/lwip/lwip-src/src/netif/ethernet.c"
             ],
             publicHeadersPath: "",
             cSettings: [
