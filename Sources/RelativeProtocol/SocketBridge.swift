@@ -496,6 +496,7 @@ final class SocketBridge {
         meta.connection.receive(minimumIncompleteLength: 1, maximumLength: 32 * 1024) { [weak self] data, _, isComplete, error in
 			guard let self = self else { return }
             let sp = Observability.shared.begin("tcp_receive")
+            defer { Observability.shared.end("tcp_receive", sp) }
 			if let data = data, !data.isEmpty {
 				var current = data
 				var m = meta
@@ -548,9 +549,9 @@ final class SocketBridge {
 					pkt.withUnsafeBytes { bytes in
 						if let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) {
 							_ = rlwip_inject_proxynetif(base, pkt.count)
-            }
-            Observability.shared.end("tcp_receive", sp)
+						}
 					}
+					#endif
 				}
 				self.flowsQueue.async(flags: .barrier) {
 					self.tcpFlows.removeValue(forKey: key)
