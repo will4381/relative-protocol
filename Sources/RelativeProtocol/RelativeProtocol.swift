@@ -296,6 +296,24 @@ extension RelativeProtocolEngine {
     }
 }
 
+// Public logging configuration API
+extension RelativeProtocolEngine {
+    /// Enable or disable logging at runtime
+    public static func setLoggingEnabled(_ enabled: Bool) {
+        Logger.shared.setEnabled(enabled)
+    }
+
+    /// Set logging level from string (TRACE, DEBUG, INFO, WARN, ERROR)
+    public static func setLogLevel(from string: String) {
+        Logger.shared.setLevel(from: string)
+    }
+
+    /// Set logging level using enum-like strings for convenience
+    public static func setLogLevel(_ level: String) {
+        setLogLevel(from: level)
+    }
+}
+
 // Static helpers for OS-bound emission (tun path)
 extension RelativeProtocolEngine {
     /// Emit an IP packet directly to the OS via the tunnel flow, bypassing schedulers.
