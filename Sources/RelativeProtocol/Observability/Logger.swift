@@ -20,16 +20,30 @@ final class Logger {
 		return .warn
 		#endif
 	}()
+	private var _enabled: Bool = true
 
 	private init() {}
 
 	func setLevel(_ level: LogLevel) { queue.async { self._level = level } }
+	func setLevel(from string: String) {
+		let lvl: LogLevel
+		switch string.uppercased() {
+		case "TRACE": lvl = .trace
+		case "DEBUG": lvl = .debug
+		case "INFO": lvl = .info
+		case "WARN": lvl = .warn
+		case "ERROR": lvl = .error
+		default: lvl = .info
+		}
+		setLevel(lvl)
+	}
+	func setEnabled(_ enabled: Bool) { queue.async { self._enabled = enabled } }
 
 	func getLevel() -> LogLevel { var l: LogLevel = .warn; queue.sync { l = _level }; return l }
+	func isEnabled() -> Bool { var e = true; queue.sync { e = _enabled }; return e }
 
 	func log(_ level: LogLevel, _ message: @autoclosure () -> String) {
-		let enabled = getLevel() >= level
-		guard enabled else { return }
+		guard isEnabled(), getLevel() >= level else { return }
 		let ts = ISO8601DateFormatter().string(from: Date())
 		print("[RelativeProtocol][\(ts)][\(levelLabel(level))] \(message())")
 	}

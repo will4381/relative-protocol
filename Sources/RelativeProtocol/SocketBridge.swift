@@ -349,7 +349,8 @@ final class SocketBridge {
 							Metrics.shared.setTcpFlows(self.tcpFlows.count)
 						}
 					}
-				default: break
+				default:
+					logInfo("TCP conn state=\(state)")
 				}
 			}
 #if DEBUG
@@ -580,8 +581,16 @@ final class SocketBridge {
 			installUDPReceive(for: key, meta: newMeta)
             conn.stateUpdateHandler = { [weak self] state in
 				guard let self = self else { return }
-				if case .failed = state { self.synthesizeICMPForUDPFailure(key: key) }
-				if case .cancelled = state { self.synthesizeICMPForUDPFailure(key: key) }
+				switch state {
+				case .failed:
+					logInfo("UDP conn state=failed")
+					self.synthesizeICMPForUDPFailure(key: key)
+				case .cancelled:
+					logInfo("UDP conn state=cancelled")
+					self.synthesizeICMPForUDPFailure(key: key)
+				default:
+					logInfo("UDP conn state=\(state)")
+				}
 			}
             conn.start(queue: flowQueue)
 			return newMeta

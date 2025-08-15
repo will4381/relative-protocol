@@ -89,11 +89,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, RelativeProtocolEngine
 }
 ```
 
-3) Optional runtime control
+3) Optional runtime control & logging
 - Call `engine?.updateThrottle(tag: "quic", bytesPerSecond: 200_000)` to slow QUIC.
 - Toggle passthrough (no shaping): `engine?.setPassthroughMode(true)`.
 - Sleep/wake: `engine?.quiesce()` before sleep and `engine?.resume()` on wake.
 - Path changes: engine observes `NWPathMonitor`; adjust MSS with `updateMTU` if provider MTU changes.
+- Logging API (enable/disable and levels):
+  - Set level programmatically: `Logger.shared.setLevel(.trace | .debug | .info | .warn | .error)`
+  - Or from a string (e.g., app message/arguments): `Logger.shared.setLevel(from: "DEBUG")`
+  - Enable/disable all output (useful for perf): `Logger.shared.setEnabled(true/false)`
+  - Logs appear as: `[RelativeProtocol][<ISO8601_Timestamp>][LEVEL] Message`
+  - `SocketBridge` emits connection state transitions for TCP/UDP to help diagnose egress issues
 
 Testing notes
 -------------

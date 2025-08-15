@@ -65,6 +65,7 @@ public final class RelativeProtocolEngine {
     public func start() {
         guard !running else { return }
         logInfo("RelativeProtocolEngine starting")
+        logInfo("log-level=\(Logger.shared.getLevel())")
         let sp = Observability.shared.begin("engine_start")
         queue.sync {
             rlwip_set_output(RelativeProtocolEngine.packetOut)
