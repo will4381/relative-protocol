@@ -10,6 +10,7 @@
 #include "lwip/pbuf.h"
 #include "lwip/ip.h"
 #include "lwip/timeouts.h"
+#include "lwip/ip4_addr.h"
 
 static void (*g_output_cb)(const uint8_t *data, size_t len) = 0;
 static void (*g_proxy_output_cb)(const uint8_t *data, size_t len) = 0;
@@ -47,6 +48,18 @@ int rlwip_start(void) {
     if (!netif_add(&g_tunif, NULL, NULL, NULL, NULL, tunif_init, ip_input)) {
         return 0;
     }
+    // Assign IPv4 addresses so routing/forwarding works (avoid ANY addresses)
+    ip4_addr_t px_addr, px_mask, px_gw;
+    IP4_ADDR(&px_addr, 100, 64, 0, 1);
+    IP4_ADDR(&px_mask, 255, 255, 255, 0);
+    IP4_ADDR(&px_gw, 0, 0, 0, 0);
+    netif_set_addr(&g_proxynetif, &px_addr, &px_mask, &px_gw);
+
+    ip4_addr_t tn_addr, tn_mask, tn_gw;
+    IP4_ADDR(&tn_addr, 100, 64, 0, 2);
+    IP4_ADDR(&tn_mask, 255, 255, 255, 0);
+    IP4_ADDR(&tn_gw, 0, 0, 0, 0);
+    netif_set_addr(&g_tunif, &tn_addr, &tn_mask, &tn_gw);
     // Use proxynetif as default egress (terminating proxy), tunif handles OS-side ingress/egress
     netif_set_default(&g_proxynetif);
     netif_set_up(&g_proxynetif);
