@@ -403,7 +403,7 @@ final class SocketBridge {
 					tcpPacket = buildIPv6TCPPacket(srcIP: dstIP, dstIP: srcIP, srcPort: dstPort, dstPort: srcPort, seq: seqNum, ack: ackNum, flags: synAckFlags, payload: Data(), mssOption: mssClampV6)
 			}
 			#if canImport(NetworkExtension) && os(iOS)
-			RelativeProtocolEngine.emitToTun(tcpPacket)
+			RelativeProtocolEngine.injectProxynetif(tcpPacket)
 			#else
 			tcpPacket.withUnsafeBytes { bytes in
 				if let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) {
@@ -491,7 +491,7 @@ final class SocketBridge {
                         ? self.buildIPv4TCPPacket(srcIP: updated.dstIP, dstIP: updated.srcIP, srcPort: updated.dstPort, dstPort: updated.srcPort, seq: seqNum, ack: ackNum, flags: ackOnlyFlags, payload: Data())
                         : self.buildIPv6TCPPacket(srcIP: updated.dstIP, dstIP: updated.srcIP, srcPort: updated.dstPort, dstPort: updated.srcPort, seq: seqNum, ack: ackNum, flags: ackOnlyFlags, payload: Data())
                     #if canImport(NetworkExtension) && os(iOS)
-                    RelativeProtocolEngine.emitToTun(ackPkt)
+                    RelativeProtocolEngine.injectProxynetif(ackPkt)
                     #else
                     ackPkt.withUnsafeBytes { bytes in
                         if let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) {
@@ -522,7 +522,7 @@ final class SocketBridge {
 			pkt = buildIPv6TCPPacket(srcIP: meta.dstIP, dstIP: meta.srcIP, srcPort: meta.dstPort, dstPort: meta.srcPort, seq: seqNum, ack: ackNum, flags: flags, payload: Data())
 		}
 		#if canImport(NetworkExtension) && os(iOS)
-		RelativeProtocolEngine.emitToTun(pkt)
+		RelativeProtocolEngine.injectProxynetif(pkt)
 		#else
 		pkt.withUnsafeBytes { bytes in
 			if let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) {
@@ -556,7 +556,7 @@ final class SocketBridge {
 						pkt = self.buildIPv6TCPPacket(srcIP: m.dstIP, dstIP: m.srcIP, srcPort: m.dstPort, dstPort: m.srcPort, seq: seqNum, ack: ackNum, flags: flags, payload: chunk)
 					}
 					#if canImport(NetworkExtension) && os(iOS)
-					RelativeProtocolEngine.emitToTun(pkt)
+					RelativeProtocolEngine.injectProxynetif(pkt)
 					#else
 					pkt.withUnsafeBytes { bytes in
 						if let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) {
@@ -584,7 +584,7 @@ final class SocketBridge {
 						pkt = self.buildIPv6TCPPacket(srcIP: m.dstIP, dstIP: m.srcIP, srcPort: m.dstPort, dstPort: m.srcPort, seq: seqNum, ack: ackNum, flags: flags, payload: Data())
 					}
 					#if canImport(NetworkExtension) && os(iOS)
-					RelativeProtocolEngine.emitToTun(pkt)
+					RelativeProtocolEngine.injectProxynetif(pkt)
 					#else
 					pkt.withUnsafeBytes { bytes in
 						if let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) {
@@ -694,7 +694,7 @@ final class SocketBridge {
 					packet = self.buildIPv6UDPPacket(srcIP: meta.dstIP, dstIP: meta.srcIP, srcPort: meta.dstPort, dstPort: meta.srcPort, payload: data)
 				}
 				#if canImport(NetworkExtension) && os(iOS)
-				RelativeProtocolEngine.emitToTun(packet)
+				RelativeProtocolEngine.injectProxynetif(packet)
 				#else
 				packet.withUnsafeBytes { bytes in
 					if let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) {
@@ -1024,7 +1024,7 @@ final class SocketBridge {
 			if meta.version == 4 {
 				let icmp = self.buildIPv4ICMPDestUnreach(srcIP: meta.dstIP, dstIP: meta.srcIP, code: 0, quoted: meta.lastOutboundHeader)
 				#if canImport(NetworkExtension) && os(iOS)
-				RelativeProtocolEngine.emitToTun(icmp)
+				RelativeProtocolEngine.injectProxynetif(icmp)
 				#else
 				icmp.withUnsafeBytes { bytes in
 					if let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) {
@@ -1035,7 +1035,7 @@ final class SocketBridge {
 			} else {
 				let icmp6 = self.buildIPv6ICMPDestUnreach(srcIP: meta.dstIP, dstIP: meta.srcIP, code: 4, quoted: meta.lastOutboundHeader)
 				#if canImport(NetworkExtension) && os(iOS)
-				RelativeProtocolEngine.emitToTun(icmp6)
+				RelativeProtocolEngine.injectProxynetif(icmp6)
 				#else
 				icmp6.withUnsafeBytes { bytes in
 					if let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) {
