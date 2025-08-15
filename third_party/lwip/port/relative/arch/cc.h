@@ -13,7 +13,7 @@ typedef int32_t  s32_t;
 typedef uintptr_t mem_ptr_t;
 
 #define LWIP_PLATFORM_DIAG(x) do { } while(0)
-#define LWIP_PLATFORM_ASSERT(x) do { }
+#define LWIP_PLATFORM_ASSERT(x) do { } while(0)
 
 #endif
 
