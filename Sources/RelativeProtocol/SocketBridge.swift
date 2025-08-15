@@ -378,11 +378,15 @@ final class SocketBridge {
 			} else {
 					tcpPacket = buildIPv6TCPPacket(srcIP: dstIP, dstIP: srcIP, srcPort: dstPort, dstPort: srcPort, seq: seqNum, ack: ackNum, flags: synAckFlags, payload: Data(), mssOption: mssClampV6)
 			}
+			#if canImport(NetworkExtension) && os(iOS)
+			RelativeProtocolEngine.emitToTun(tcpPacket)
+			#else
 			tcpPacket.withUnsafeBytes { bytes in
 				if let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) {
 					_ = rlwip_inject_proxynetif(base, tcpPacket.count)
 				}
 			}
+			#endif
 			meta.remoteNextSeq = seqNum &+ 1
 			meta.handshakeComplete = true
 			flowsQueue.async(flags: .barrier) { self.tcpFlows[key] = meta }
@@ -477,11 +481,15 @@ final class SocketBridge {
 		} else {
 			pkt = buildIPv6TCPPacket(srcIP: meta.dstIP, dstIP: meta.srcIP, srcPort: meta.dstPort, dstPort: meta.srcPort, seq: seqNum, ack: ackNum, flags: flags, payload: Data())
 		}
+		#if canImport(NetworkExtension) && os(iOS)
+		RelativeProtocolEngine.emitToTun(pkt)
+		#else
 		pkt.withUnsafeBytes { bytes in
 			if let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) {
 				_ = rlwip_inject_proxynetif(base, pkt.count)
 			}
 		}
+		#endif
 	}
 
 	private func installTCPReceive(for key: String, meta: TcpFlowMeta) {
@@ -506,11 +514,15 @@ final class SocketBridge {
 					} else {
 						pkt = self.buildIPv6TCPPacket(srcIP: m.dstIP, dstIP: m.srcIP, srcPort: m.dstPort, dstPort: m.srcPort, seq: seqNum, ack: ackNum, flags: flags, payload: chunk)
 					}
+					#if canImport(NetworkExtension) && os(iOS)
+					RelativeProtocolEngine.emitToTun(pkt)
+					#else
 					pkt.withUnsafeBytes { bytes in
 						if let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) {
 							_ = rlwip_inject_proxynetif(base, pkt.count)
 						}
 					}
+					#endif
 					m.remoteNextSeq = m.remoteNextSeq &+ UInt32(chunk.count)
 				}
 				self.flowsQueue.async(flags: .barrier) { self.tcpFlows[key] = m }
@@ -530,6 +542,9 @@ final class SocketBridge {
 					} else {
 						pkt = self.buildIPv6TCPPacket(srcIP: m.dstIP, dstIP: m.srcIP, srcPort: m.dstPort, dstPort: m.srcPort, seq: seqNum, ack: ackNum, flags: flags, payload: Data())
 					}
+					#if canImport(NetworkExtension) && os(iOS)
+					RelativeProtocolEngine.emitToTun(pkt)
+					#else
 					pkt.withUnsafeBytes { bytes in
 						if let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) {
 							_ = rlwip_inject_proxynetif(base, pkt.count)
@@ -630,11 +645,15 @@ final class SocketBridge {
 				} else {
 					packet = self.buildIPv6UDPPacket(srcIP: meta.dstIP, dstIP: meta.srcIP, srcPort: meta.dstPort, dstPort: meta.srcPort, payload: data)
 				}
+				#if canImport(NetworkExtension) && os(iOS)
+				RelativeProtocolEngine.emitToTun(packet)
+				#else
 				packet.withUnsafeBytes { bytes in
 					if let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) {
 						_ = rlwip_inject_proxynetif(base, packet.count)
 					}
 				}
+				#endif
 				Metrics.shared.incNetIngress(bytes: data.count)
 			}
 			if error == nil {
