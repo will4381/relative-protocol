@@ -1,9 +1,6 @@
 import Foundation
 import Network
 
-@_silgen_name("rlwip_inject_proxynetif")
-func rlwip_inject_proxynetif(_ data: UnsafePointer<UInt8>, _ len: Int) -> Int32
-
 @available(iOS 12.0, macOS 10.14, *)
 final class SocketBridge {
 	static let shared = SocketBridge()

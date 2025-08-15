@@ -10,7 +10,7 @@ import Network
 @_silgen_name("rlwip_set_output") private func rlwip_set_output(_ cb: (@convention(c) (UnsafePointer<UInt8>?, Int) -> Void)?)
 @_silgen_name("rlwip_set_proxy_output") private func rlwip_set_proxy_output(_ cb: (@convention(c) (UnsafePointer<UInt8>?, Int) -> Void)?)
 @_silgen_name("rlwip_drive_timeouts") private func rlwip_drive_timeouts()
-@_silgen_name("rlwip_inject_proxynetif") private func rlwip_inject_proxynetif(_ data: UnsafePointer<UInt8>, _ len: Int) -> Int32
+@_silgen_name("rlwip_inject_proxynetif") func rlwip_inject_proxynetif(_ data: UnsafePointer<UInt8>, _ len: Int) -> Int32
 
 public final class RelativeProtocolEngine {
     private let packetFlow: NEPacketTunnelFlow
