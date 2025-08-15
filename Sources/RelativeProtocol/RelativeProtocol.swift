@@ -17,7 +17,21 @@ public final class RelativeProtocolEngine {
     private let queue = DispatchQueue(label: "com.relativeprotocol.engine")
     private var running = false
     private var readLoopArmed = false
-    private let scheduler: PacketScheduler
+    private lazy var scheduler: PacketScheduler = {
+        let scheduler = PacketScheduler(
+            rateBytesPerSecond: Int.max,
+            tickMs: 10,
+            maxEnqueuedBytes: 4 * 1024 * 1024,
+            backpressure: { [weak self] paused in
+                self?.handleBackpressureChange(paused: paused)
+            },
+            emit: { [weak self] packets, protocols in
+                guard let flow = self?.packetFlow else { return }
+                flow.writePackets(packets, withProtocols: protocols)
+            }
+        )
+        return scheduler
+    }()
     private var suppressReadRearm = false
     private var passthroughMode = false
     private var tagSchedulers: [String: PacketScheduler] = [:]
@@ -46,12 +60,6 @@ public final class RelativeProtocolEngine {
 
     public init(packetFlow: NEPacketTunnelFlow) {
         self.packetFlow = packetFlow
-        self.scheduler = PacketScheduler(rateBytesPerSecond: Int.max, tickMs: 10, maxEnqueuedBytes: 4 * 1024 * 1024, backpressure: { [weak self] paused in
-            self?.handleBackpressureChange(paused: paused)
-        }) { [weak packetFlow] packets, protocols in
-            guard let flow = packetFlow else { return }
-            flow.writePackets(packets, withProtocols: protocols)
-        }
     }
 
     public func start() {
