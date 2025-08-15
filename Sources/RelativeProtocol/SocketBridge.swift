@@ -316,6 +316,8 @@ final class SocketBridge {
 				return existing
 			}
 			let params = NWParameters.tcp
+			// Ensure we use the underlying physical network and not the TUN (which is .other)
+			params.prohibitedInterfaceTypes = [.other]
 			let endpoint: NWEndpoint
 			if version == 4, let ip = IPv4Address(host) {
 				endpoint = NWEndpoint.hostPort(host: .ipv4(ip), port: .init(rawValue: port)!)
@@ -577,6 +579,8 @@ final class SocketBridge {
 				return existing
 			}
 			let params = NWParameters.udp
+			// Ensure we use the underlying physical network and not the TUN (which is .other)
+			params.prohibitedInterfaceTypes = [.other]
 			let endpoint: NWEndpoint
 			if version == 4, let ip = IPv4Address(host) {
 				endpoint = NWEndpoint.hostPort(host: .ipv4(ip), port: .init(rawValue: port)!)
