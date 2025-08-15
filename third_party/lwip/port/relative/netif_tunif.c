@@ -1,3 +1,4 @@
+#include <stdlib.h>
 #include "lwip/opt.h"
 #include "lwip/netif.h"
 #include "lwip/pbuf.h"
