@@ -21,7 +21,7 @@
 #define TCP_WND                (64 * 1024)
 #define LWIP_WND_SCALE         1
 #define TCP_RCV_SCALE          2
-#define TCP_QUEUE_OOSEQ        0
+#define TCP_QUEUE_OOSEQ        1
 #define LWIP_TCP_SACK_OUT      1
 #define TCP_MSS                1460
 
