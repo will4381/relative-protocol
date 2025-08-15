@@ -73,9 +73,6 @@ public final class RelativeProtocolEngine {
             RelativeProtocolEngine._engineRef = self
         }
         SocketBridge.shared.delegate = self
-#if canImport(NetworkExtension) && os(iOS)
-        SocketBridge.shared.provider = selfProvider()
-#endif
         _ = rlwip_start()
         running = true
         armReadLoopIfNeeded()
