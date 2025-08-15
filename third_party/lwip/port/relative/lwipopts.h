@@ -7,6 +7,8 @@
 
 #define LWIP_IPV4              1
 #define LWIP_IPV6              1
+#define IP_FORWARD             1
+#define LWIP_IPV6_FORWARD      1
 #define LWIP_ETHERNET          1
 #define LWIP_ARP               0
 #define LWIP_TCP               1
