@@ -57,6 +57,8 @@ public final class RelativeProtocolEngine {
     }
 
     public weak var policyProvider: PolicyProvider?
+    // Optional egress connection factory injected by provider
+    public var connectionFactory: EgressConnectionFactory?
 
     public init(packetFlow: NEPacketTunnelFlow) {
         self.packetFlow = packetFlow
@@ -74,6 +76,7 @@ public final class RelativeProtocolEngine {
             RelativeProtocolEngine._engineRef = self
         }
         SocketBridge.shared.delegate = self
+        SocketBridge.shared.setConnectionFactory(connectionFactory)
         _ = rlwip_start()
         running = true
         armReadLoopIfNeeded()

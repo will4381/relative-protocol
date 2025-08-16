@@ -37,6 +37,13 @@ final class SocketBridge {
     private let limitersQueue = DispatchQueue(label: "com.relativeprotocol.limiters")
     private let netPathQueue = DispatchQueue(label: "com.relativeprotocol.path")
     private var preferredInterfaceType: NWInterface.InterfaceType? = nil
+    private var connectionFactory: EgressConnectionFactory?
+
+    func setConnectionFactory(_ factory: EgressConnectionFactory?) {
+        flowsQueue.async(flags: .barrier) {
+            self.connectionFactory = factory
+        }
+    }
     @available(iOS 12.0, macOS 10.14, *)
     private struct UdpFlowMeta {
 		let version: Int // 4 or 6
@@ -44,7 +51,7 @@ final class SocketBridge {
 		let dstIP: Data
 		let srcPort: UInt16
 		let dstPort: UInt16
-		let connection: NWConnection
+		let connection: UDPTransport
         let queue: DispatchQueue
 		var lastOutboundHeader: Data
 		var lastActivity: TimeInterval
@@ -59,7 +66,7 @@ final class SocketBridge {
 		let dstIP: Data
 		let srcPort: UInt16
 		let dstPort: UInt16
-		let connection: NWConnection
+		let connection: TCPTransport
         let queue: DispatchQueue
 		var deviceISN: UInt32
 		var remoteISN: UInt32
@@ -123,7 +130,7 @@ final class SocketBridge {
         var rateBytesPerSecond: Int
         var tokens: Int
         let tickMs: Int
-        var backlog: [(conn: NWConnection, payload: Data)] = []
+        var backlog: [(conn: UDPTransport, payload: Data)] = []
         var timer: DispatchSourceTimer?
     }
     private var udpLimiters: [String: UDPLimiter] = [:]
@@ -132,7 +139,7 @@ final class SocketBridge {
         var rateBytesPerSecond: Int
         var tokens: Int
         let tickMs: Int
-        var backlog: [(conn: NWConnection, payload: Data)] = []
+        var backlog: [(conn: TCPTransport, payload: Data)] = []
         var timer: DispatchSourceTimer?
     }
     private var tcpLimiters: [String: TCPLimiter] = [:]
@@ -158,7 +165,7 @@ final class SocketBridge {
         if limiter.rateBytesPerSecond == Int.max {
             while !limiter.backlog.isEmpty {
                 let item = limiter.backlog.removeFirst()
-                item.conn.send(content: item.payload, completion: .contentProcessed { _ in })
+                item.conn.send(item.payload)
                 Metrics.shared.incNetEgress(bytes: item.payload.count)
                 // Per-tag egress
                 Metrics.shared.incTagNetEgress(tag: tag, bytes: item.payload.count)
@@ -169,7 +176,7 @@ final class SocketBridge {
         let refill = limiter.rateBytesPerSecond * limiter.tickMs / 1000
         limiter.tokens = min(limiter.tokens + refill, limiter.rateBytesPerSecond)
         var used = 0
-        var sent: [(NWConnection, Data)] = []
+        var sent: [(UDPTransport, Data)] = []
         while let first = limiter.backlog.first, used + first.payload.count <= limiter.tokens {
             used += first.payload.count
             sent.append(first)
@@ -178,7 +185,7 @@ final class SocketBridge {
         limiter.tokens -= used
         udpLimiters[tag] = limiter
         for item in sent {
-            item.0.send(content: item.1, completion: .contentProcessed { _ in })
+            item.0.send(item.1)
             Metrics.shared.incNetEgress(bytes: item.1.count)
             Metrics.shared.incTagNetEgress(tag: tag, bytes: item.1.count)
         }
@@ -205,7 +212,7 @@ final class SocketBridge {
         if limiter.rateBytesPerSecond == Int.max {
             while !limiter.backlog.isEmpty {
                 let item = limiter.backlog.removeFirst()
-                item.conn.send(content: item.payload, completion: .contentProcessed { _ in })
+                item.conn.send(item.payload)
                 Metrics.shared.incNetEgress(bytes: item.payload.count)
             }
             tcpLimiters[tag] = limiter
@@ -214,7 +221,7 @@ final class SocketBridge {
         let refill = limiter.rateBytesPerSecond * limiter.tickMs / 1000
         limiter.tokens = min(limiter.tokens + refill, limiter.rateBytesPerSecond)
         var used = 0
-        var sent: [(NWConnection, Data)] = []
+        var sent: [(TCPTransport, Data)] = []
         while let first = limiter.backlog.first, used + first.payload.count <= limiter.tokens {
             used += first.payload.count
             sent.append(first)
@@ -223,7 +230,7 @@ final class SocketBridge {
         limiter.tokens -= used
         tcpLimiters[tag] = limiter
         for item in sent {
-            item.0.send(content: item.1, completion: .contentProcessed { _ in })
+            item.0.send(item.1)
             Metrics.shared.incNetEgress(bytes: item.1.count)
         }
     }
@@ -349,7 +356,25 @@ final class SocketBridge {
 				endpoint = NWEndpoint.hostPort(host: .name(host, nil), port: .init(rawValue: port)!)
 			}
 			let flowQueue = DispatchQueue(label: "com.relativeprotocol.flow.tcp.\(key)")
-			let conn = NWConnection(to: endpoint, using: params)
+			let conn: TCPTransport = {
+				if let factory = self.connectionFactory {
+					let hostStr: String
+					switch endpoint {
+					case .hostPort(let host, _):
+						switch host {
+						case .ipv4(let ip): hostStr = ip.debugDescription
+						case .ipv6(let ip6): hostStr = ip6.debugDescription
+						case .name(let n, _): hostStr = n
+						@unknown default: hostStr = host.debugDescription
+						}
+						return factory.makeTCP(hostStr, port, params)
+					default:
+						return NWConnectionTCPTransport(endpoint: endpoint, params: params)
+					}
+				} else {
+					return NWConnectionTCPTransport(endpoint: endpoint, params: params)
+				}
+			}()
 			let deviceISN = syn ? seq : 0
 			let remoteISN = arc4random()
 			let flowID = key
@@ -363,10 +388,10 @@ final class SocketBridge {
 			}
 			Metrics.shared.setTcpFlows(flowsQueue.sync { tcpFlows.count })
 			installTCPReceive(for: key, meta: newMeta)
-			conn.stateUpdateHandler = { [weak self] state in
+			conn.stateChanged = { [weak self] state in
 				guard let self = self else { return }
 				switch state {
-				case .failed, .cancelled:
+				case .failed(_), .cancelled:
 					self.flowsQueue.async(flags: .barrier) {
 						if var m = self.tcpFlows[key] {
 							self.sendTCPRST(meta: &m)
@@ -379,11 +404,7 @@ final class SocketBridge {
 					logInfo("TCP conn state=\(state)")
 				}
 			}
-#if DEBUG
-			if !self.debug_disableNetworkSends { conn.start(queue: flowQueue) }
-#else
 			conn.start(queue: flowQueue)
-#endif
 			return newMeta
 		}()
 		if rst {
@@ -461,10 +482,10 @@ final class SocketBridge {
 								self.debug_sentData[key] = arr
 							}
 						} else {
-							updated.connection.send(content: data, completion: .contentProcessed { _ in })
+							updated.connection.send(data)
 						}
 						#else
-						updated.connection.send(content: data, completion: .contentProcessed { _ in })
+						updated.connection.send(data)
 						#endif
                     }
                 }
@@ -507,7 +528,7 @@ final class SocketBridge {
             }
         }
         if fin {
-            meta.queue.async { meta.connection.send(content: nil, completion: .contentProcessed { _ in }) }
+            meta.queue.async { meta.connection.closeWrite() }
         }
 	}
 
@@ -533,7 +554,7 @@ final class SocketBridge {
 	}
 
 	private func installTCPReceive(for key: String, meta: TcpFlowMeta) {
-        meta.connection.receive(minimumIncompleteLength: 1, maximumLength: 32 * 1024) { [weak self] data, _, isComplete, error in
+		meta.connection.receive(minimumIncompleteLength: 1, maximumLength: 32 * 1024) { [weak self] data, isComplete, error in
 			guard let self = self else { return }
             let sp = Observability.shared.begin("tcp_receive")
             defer { Observability.shared.end("tcp_receive", sp) }
@@ -632,7 +653,25 @@ final class SocketBridge {
 			} else {
 				endpoint = NWEndpoint.hostPort(host: .name(host, nil), port: .init(rawValue: port)!)
 			}
-			let conn = NWConnection(to: endpoint, using: params)
+			let conn: UDPTransport = {
+				if let factory = self.connectionFactory {
+					let hostStr: String
+					switch endpoint {
+					case .hostPort(let host, _):
+						switch host {
+						case .ipv4(let ip): hostStr = ip.debugDescription
+						case .ipv6(let ip6): hostStr = ip6.debugDescription
+						case .name(let n, _): hostStr = n
+						@unknown default: hostStr = host.debugDescription
+						}
+						return factory.makeUDP(hostStr, port, params)
+					default:
+						return NWConnectionUDPTransport(endpoint: endpoint, params: params)
+					}
+				} else {
+					return NWConnectionUDPTransport(endpoint: endpoint, params: params)
+				}
+			}()
 			let flowID = key
 			let id = FlowIdentity(flowID: flowID, isIPv6: version == 6, proto: "UDP", sourceIP: version == 4 ? ipv4String(from: srcIP) : ipv6String(from: srcIP), sourcePort: srcPort, destinationIP: version == 4 ? ipv4String(from: dstIP) : ipv6String(from: dstIP), destinationPort: dstPort)
             let tag = self.delegate?.classify(flow: id)
@@ -644,20 +683,10 @@ final class SocketBridge {
 				TagStore.shared.setTagBothDirections(version: version, srcIP: srcIP, srcPort: srcPort, dstIP: dstIP, dstPort: dstPort, proto: 17, tag: tag)
 			}
 			installUDPReceive(for: key, meta: newMeta)
-            conn.stateUpdateHandler = { [weak self] state in
-				guard let self = self else { return }
-				switch state {
-				case .failed:
-					logInfo("UDP conn state=failed")
-					self.synthesizeICMPForUDPFailure(key: key)
-				case .cancelled:
-					logInfo("UDP conn state=cancelled")
-					self.synthesizeICMPForUDPFailure(key: key)
-				default:
-					logInfo("UDP conn state=\(state)")
-				}
+			conn.stateChanged = { state in
+				logInfo("UDP conn state=\(state)")
 			}
-            conn.start(queue: flowQueue)
+			conn.start(queue: flowQueue)
 			return newMeta
 		}()
         if let tag = meta.tag {
@@ -675,15 +704,13 @@ final class SocketBridge {
                 Metrics.shared.setTagQueueDepth(tag: tag, udpDepth: limiter.backlog.count)
             }
         } else {
-            meta.connection.send(content: payload, completion: .contentProcessed { [weak self] error in
-                if error != nil { self?.synthesizeICMPForUDPFailure(key: key) }
-                Metrics.shared.incNetEgress(bytes: payload.count)
-            })
-        }
+			meta.connection.send(payload)
+			Metrics.shared.incNetEgress(bytes: payload.count)
+		}
 	}
 
     private func installUDPReceive(for key: String, meta: UdpFlowMeta) {
-		meta.connection.receiveMessage { [weak self] data, _, _, error in
+		meta.connection.receiveMessage { [weak self] data, error in
 			guard let self = self else { return }
             let sp = Observability.shared.begin("udp_receive")
 			if let data = data, !data.isEmpty {
@@ -1059,7 +1086,7 @@ final class SocketBridge {
 			let endpoint: NWEndpoint = (version == 4 && IPv4Address("127.0.0.1") != nil)
 				? NWEndpoint.hostPort(host: .ipv4(IPv4Address("127.0.0.1")!), port: .init(rawValue: 9)!)
 				: NWEndpoint.hostPort(host: .name("localhost", nil), port: .init(rawValue: 9)!)
-			let conn = NWConnection(to: endpoint, using: params)
+			let conn = NWConnectionUDPTransport(endpoint: endpoint, params: params)
             let q = DispatchQueue(label: "com.relativeprotocol.flow.udp.debug.\(key)")
             let meta = UdpFlowMeta(version: version, srcIP: srcIP, dstIP: dstIP, srcPort: srcPort, dstPort: dstPort, connection: conn, queue: q, lastOutboundHeader: quotedHeader, lastActivity: Date().timeIntervalSince1970, tag: nil)
 			self.udpFlows[key] = meta
