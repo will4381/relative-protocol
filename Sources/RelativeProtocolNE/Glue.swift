@@ -72,10 +72,13 @@ final class BypassTCPTransport: NSObject, TCPTransport {
         let endpoint: Network.NWEndpoint
         if let ipv4 = Network.IPv4Address(host) {
             endpoint = Network.NWEndpoint.hostPort(host: .ipv4(ipv4), port: .init(rawValue: port)!)
+            neLog("DEBUG", "TCP endpoint: IPv4 \(host):\(port)")
         } else if let ipv6 = Network.IPv6Address(host) {
             endpoint = Network.NWEndpoint.hostPort(host: .ipv6(ipv6), port: .init(rawValue: port)!)
+            neLog("DEBUG", "TCP endpoint: IPv6 \(host):\(port)")
         } else {
             endpoint = Network.NWEndpoint.hostPort(host: .name(host, nil), port: .init(rawValue: port)!)
+            neLog("DEBUG", "TCP endpoint: hostname \(host):\(port)")
         }
         
         // Configure TCP parameters with debugging
@@ -90,29 +93,45 @@ final class BypassTCPTransport: NSObject, TCPTransport {
         
         neLog("DEBUG", "Creating TCP connection to \(host):\(port) with params: prohibitedTypes=\(params.prohibitedInterfaceTypes?.count ?? 0) expensive=\(params.prohibitExpensivePaths)")
         
+        // CRITICAL: Create connection and immediately log its state
         self.connection = Network.NWConnection(to: endpoint, using: params)
+        neLog("DEBUG", "TCP connection created, initial state: \(self.connection.state)")
         super.init()
         
         self.connection.stateUpdateHandler = { [weak self] state in
             guard let self = self else { return }
             
-            // Enhanced logging to debug TCP issues
-            let path = self.connection.currentPath
-            let pathInfo = self.describeInterface(path) + " status=\(path?.status ?? .unsatisfied)"
+            neLog("DEBUG", "TCP state change to \(state) for \(self.host):\(self.port)")
             
-            // Additional debugging for path viability
-            if let path = path {
-                let viableInfo = "isExpensive=\(path.isExpensive) isConstrained=\(path.isConstrained) hasIPv4=\(path.supportsIPv4) hasIPv6=\(path.supportsIPv6) hasDNS=\(path.supportsDNS)"
-                neLog("DEBUG", "TCP path viability \(self.host):\(self.port) \(viableInfo)")
-                
-                // Deep dive into why connection might be stuck
-                if path.status == .satisfied {
-                    neLog("DEBUG", "TCP path satisfied but connection stuck in state for \(self.host):\(self.port)")
-                    let interfaceNames = path.availableInterfaces.map { "\($0.name)-\(String(describing: $0.type))" }.joined(separator: ", ")
-                    neLog("DEBUG", "Available interfaces: \(interfaceNames)")
+            // CRITICAL: Safely access currentPath to avoid 'no endpoint handler' errors
+            var pathInfo = "path=unknown"
+            var path: Network.NWPath?
+            
+            // Only access currentPath if connection is in a state where it should be available
+            switch state {
+            case .ready, .waiting(_), .failed(_):
+                path = self.connection.currentPath
+                if let path = path {
+                    pathInfo = self.describeInterface(path) + " status=\(path.status)"
                 } else {
-                    neLog("WARN", "TCP path not satisfied: \(path.status) for \(self.host):\(self.port)")
+                    pathInfo = "path=nil"
+                    neLog("WARN", "TCP connection \(self.host):\(self.port) has nil currentPath in state \(state)")
                 }
+            case .setup, .preparing:
+                pathInfo = "path=not-ready"
+                neLog("DEBUG", "TCP \(self.host):\(self.port) in \(state), path not yet available")
+            case .cancelled:
+                pathInfo = "path=cancelled"
+            @unknown default:
+                pathInfo = "path=unknown-state"
+            }
+            
+            // Additional debugging for viable connections only
+            if let path = path, path.status == .satisfied {
+                let viableInfo = "isExpensive=\(path.isExpensive) isConstrained=\(path.isConstrained) hasIPv4=\(path.supportsIPv4) hasIPv6=\(path.supportsIPv6) hasDNS=\(path.supportsDNS)"
+                neLog("DEBUG", "TCP path details \(self.host):\(self.port) \(viableInfo)")
+                let interfaceNames = path.availableInterfaces.map { "\($0.name)-\(String(describing: $0.type))" }.joined(separator: ", ")
+                neLog("DEBUG", "Available interfaces: \(interfaceNames)")
             }
             
             switch state {
@@ -123,30 +142,33 @@ final class BypassTCPTransport: NSObject, TCPTransport {
                 neLog("DEBUG", "TCP preparing \(self.host):\(self.port) \(pathInfo)")
                 
                 // Set up a timer to detect if we're stuck in preparing
-                DispatchQueue.global().asyncAfter(deadline: .now() + 5.0) {
+                DispatchQueue.global().asyncAfter(deadline: .now() + 3.0) {
                     if case .preparing = self.connection.state {
-                        neLog("WARN", "TCP STUCK in preparing for 5s: \(self.host):\(self.port) - this indicates routing issues")
+                        neLog("WARN", "TCP STUCK in preparing for 3s: \(self.host):\(self.port)")
+                        // Safely check path without causing 'no endpoint handler' errors
                         if let currentPath = self.connection.currentPath {
-                            neLog("WARN", "Stuck path details: status=\(currentPath.status) interfaces=\(currentPath.availableInterfaces.count)")
+                            neLog("WARN", "Stuck path: status=\(currentPath.status) interfaces=\(currentPath.availableInterfaces.count)")
+                        } else {
+                            neLog("ERROR", "TCP stuck with nil currentPath - this may indicate the core issue")
                         }
                     }
                 }
                 
                 self.stateChanged?(.preparing)
             case .ready:
-                neLog("INFO", "TCP READY \(self.host):\(self.port) \(pathInfo)")
+                neLog("INFO", "✅ TCP READY \(self.host):\(self.port) \(pathInfo)")
                 self.stateChanged?(.ready)
             case .waiting(let err):
                 neLog("WARN", "TCP waiting \(self.host):\(self.port) error=\(String(describing: err)) \(pathInfo)")
                 self.stateChanged?(.waiting)
             case .failed(let err):
-                neLog("ERROR", "TCP FAILED \(self.host):\(self.port) error=\(String(describing: err)) \(pathInfo)")
+                neLog("ERROR", "❌ TCP FAILED \(self.host):\(self.port) error=\(String(describing: err)) \(pathInfo)")
                 self.stateChanged?(.failed(err))
             case .cancelled:
-                neLog("INFO", "TCP cancelled \(self.host):\(self.port) \(pathInfo)")
+                neLog("WARN", "🚫 TCP CANCELLED \(self.host):\(self.port) \(pathInfo)")
                 self.stateChanged?(.cancelled)
             @unknown default:
-                neLog("ERROR", "TCP unknown state \(self.host):\(self.port) \(pathInfo)")
+                neLog("ERROR", "❓ TCP unknown state \(self.host):\(self.port) \(pathInfo)")
                 self.stateChanged?(.failed(nil))
             }
         }
@@ -204,6 +226,12 @@ final class BypassTCPTransport: NSObject, TCPTransport {
     }
 
     func cancel() {
+        neLog("WARN", "📍 TCP cancel() called for \(host):\(port) - current state: \(connection.state)")
+        
+        // Print stack trace to see who's calling cancel
+        let stackTrace = Thread.callStackSymbols
+        neLog("DEBUG", "Cancel stack trace: \(stackTrace.prefix(5).joined(separator: " | "))")
+        
         connection.cancel()
     }
 }

@@ -390,18 +390,38 @@ final class SocketBridge {
 			installTCPReceive(for: key, meta: newMeta)
 			conn.stateChanged = { [weak self] state in
 				guard let self = self else { return }
+				logInfo("TCP conn state=\(state) for flow=\(key)")
 				switch state {
-				case .failed(_), .cancelled:
+				case .failed(let error):
+					logWarn("TCP connection FAILED for flow=\(key) error=\(String(describing: error)) - sending RST")
 					self.flowsQueue.async(flags: .barrier) {
 						if var m = self.tcpFlows[key] {
 							self.sendTCPRST(meta: &m)
 							Metrics.shared.incRST()
 							self.tcpFlows.removeValue(forKey: key)
 							Metrics.shared.setTcpFlows(self.tcpFlows.count)
+							logInfo("TCP flow \(key) removed after failure")
 						}
 					}
+				case .cancelled:
+					logWarn("TCP connection CANCELLED for flow=\(key) - sending RST")
+					self.flowsQueue.async(flags: .barrier) {
+						if var m = self.tcpFlows[key] {
+							self.sendTCPRST(meta: &m)
+							Metrics.shared.incRST()
+							self.tcpFlows.removeValue(forKey: key)
+							Metrics.shared.setTcpFlows(self.tcpFlows.count)
+							logInfo("TCP flow \(key) removed after cancellation")
+						}
+					}
+				case .ready:
+					logInfo("✅ TCP connection READY for flow=\(key)")
+				case .preparing:
+					logDebug("TCP connection preparing for flow=\(key)")
+				case .waiting(let error):
+					logInfo("TCP connection waiting for flow=\(key) error=\(String(describing: error))")
 				default:
-					logInfo("TCP conn state=\(state)")
+					logInfo("TCP conn state=\(state) for flow=\(key)")
 				}
 			}
 			conn.start(queue: flowQueue)
