@@ -340,8 +340,9 @@ final class SocketBridge {
 				return existing
 			}
 			let params = NWParameters.tcp
-			// Ensure we use the underlying physical network and not the TUN (which is .other)
-			params.prohibitedInterfaceTypes = [.other]
+			// CRITICAL FIX: Don't prohibit .other interface types as this breaks IPv4 connections in packet tunnel
+			// The NetworkExtension socket protection should handle tunnel bypass automatically
+			// params.prohibitedInterfaceTypes = [.other]  // REMOVED - was causing IPv4 TCP cancellations
 			if let ifType = self.preferredInterfaceType {
 				params.requiredInterfaceType = ifType
 			}
