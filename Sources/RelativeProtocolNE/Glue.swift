@@ -5,6 +5,10 @@ import Network
 import NetworkExtension
 import RelativeProtocol
 
+// Type aliases to disambiguate between Network and NetworkExtension frameworks
+typealias NEEndpoint = NetworkExtension.NWHostEndpoint
+typealias NWEndpoint = Network.NWEndpoint
+
 // Local logging helper (this target cannot access RelativeProtocol's internal logger)
 private func neLog(_ level: String, _ message: String) {
     let ts = ISO8601DateFormatter().string(from: Date())
@@ -15,40 +19,10 @@ public enum RelativeProtocolNE {
     public static func makeFactory(provider: NEPacketTunnelProvider) -> EgressConnectionFactory {
         return EgressConnectionFactory(
             makeTCP: { host, port, _ in
-                let params = Network.NWParameters.tcp
-                params.allowLocalEndpointReuse = true
-                params.preferNoProxies = true
-                // Ensure we use the underlying physical network and not the TUN (which is .other)
-                params.prohibitedInterfaceTypes = [.other]
-                
-                let endpoint: Network.NWEndpoint
-                if let ipv4 = Network.IPv4Address(host) {
-                    endpoint = Network.NWEndpoint.hostPort(host: .ipv4(ipv4), port: .init(rawValue: port)!)
-                } else if let ipv6 = Network.IPv6Address(host) {
-                    endpoint = Network.NWEndpoint.hostPort(host: .ipv6(ipv6), port: .init(rawValue: port)!)
-                } else {
-                    endpoint = Network.NWEndpoint.hostPort(host: .name(host, nil), port: .init(rawValue: port)!)
-                }
-                
-                return BypassTCPTransport(endpoint: endpoint, params: params)
+                return BypassTCPTransport(provider: provider, host: host, port: port)
             },
             makeUDP: { host, port, _ in
-                let params = Network.NWParameters.udp
-                params.allowLocalEndpointReuse = true
-                params.preferNoProxies = true
-                // Ensure we use the underlying physical network and not the TUN (which is .other)
-                params.prohibitedInterfaceTypes = [.other]
-                
-                let endpoint: Network.NWEndpoint
-                if let ipv4 = Network.IPv4Address(host) {
-                    endpoint = Network.NWEndpoint.hostPort(host: .ipv4(ipv4), port: .init(rawValue: port)!)
-                } else if let ipv6 = Network.IPv6Address(host) {
-                    endpoint = Network.NWEndpoint.hostPort(host: .ipv6(ipv6), port: .init(rawValue: port)!)
-                } else {
-                    endpoint = Network.NWEndpoint.hostPort(host: .name(host, nil), port: .init(rawValue: port)!)
-                }
-                
-                return BypassUDPTransport(endpoint: endpoint, params: params)
+                return BypassUDPTransport(provider: provider, host: host, port: port)
             }
         )
     }
@@ -83,63 +57,79 @@ public enum RelativeProtocolNE {
     }
 }
 
-// TCP Transport using regular NWConnection that automatically bypasses tunnel from Network Extension
+// TCP Transport using NEPacketTunnelProvider's createTCPConnectionThroughTunnel for proper bypass
 final class BypassTCPTransport: NSObject, TCPTransport {
-    private let connection: Network.NWConnection
+    private let connection: NWTCPConnection
+    private let host: String
+    private let port: UInt16
     var stateChanged: ((TransportState) -> Void)?
 
-    init(endpoint: Network.NWEndpoint, params: Network.NWParameters) {
-        self.connection = Network.NWConnection(to: endpoint, using: params)
+    init(provider: NEPacketTunnelProvider, host: String, port: UInt16) {
+        self.host = host
+        self.port = port
+        
+        // Create NetworkExtension endpoint
+        let neEndpoint = NetworkExtension.NWHostEndpoint(hostname: host, port: "\(port)")
+        
+        // Use NetworkExtension's bypass API to create connection outside tunnel
+        self.connection = provider.createTCPConnectionThroughTunnel(to: neEndpoint, enableTLS: false, tlsParameters: nil, delegate: nil)
         super.init()
-        self.connection.stateUpdateHandler = { [weak self] state in
-            guard let self = self else { return }
-            switch state {
-            case .setup, .preparing:
+        
+        // Monitor connection state using KVO since NWTCPConnection doesn't have stateUpdateHandler
+        self.connection.addObserver(self, forKeyPath: "state", options: [.new], context: nil)
+    }
+    
+    deinit {
+        self.connection.removeObserver(self, forKeyPath: "state")
+    }
+
+    override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {
+        if keyPath == "state" {
+            switch connection.state {
+            case .invalid:
+                self.stateChanged?(.failed(nil))
+                neLog("WARN", "egress invalid proto=TCP endpoint=\(host):\(port)")
+            case .connecting:
                 self.stateChanged?(.preparing)
-            case .ready:
-                self.stateChanged?(.ready)
-                let path = self.connection.currentPath
-                let ifaceStr: String = {
-                    if let p = path {
-                        if p.usesInterfaceType(.wifi) { return "wifi" }
-                        if p.usesInterfaceType(.cellular) { return "cellular" }
-                        if p.usesInterfaceType(.wiredEthernet) { return "wiredEthernet" }
-                        if p.usesInterfaceType(.loopback) { return "loopback" }
-                        if p.usesInterfaceType(.other) { return "other" }
-                    }
-                    return "unknown"
-                }()
-                neLog("INFO", "egress ready proto=TCP endpoint=\(self.connection.endpoint) iface=\(ifaceStr) v4=\(path?.supportsIPv4 ?? false) v6=\(path?.supportsIPv6 ?? false) expensive=\(path?.isExpensive ?? false) constrained=\(path?.isConstrained ?? false)")
             case .waiting:
                 self.stateChanged?(.waiting)
-                neLog("INFO", "egress waiting proto=TCP endpoint=\(self.connection.endpoint)")
-            case .failed(let err):
-                self.stateChanged?(.failed(err))
-                neLog("WARN", "egress failed proto=TCP endpoint=\(self.connection.endpoint) error=\(String(describing: err))")
+                neLog("INFO", "egress waiting proto=TCP endpoint=\(host):\(port)")
+            case .connected:
+                self.stateChanged?(.ready)
+                neLog("INFO", "egress ready proto=TCP endpoint=\(host):\(port)")
+            case .disconnected:
+                self.stateChanged?(.cancelled)
+                neLog("INFO", "egress disconnected proto=TCP endpoint=\(host):\(port)")
             case .cancelled:
                 self.stateChanged?(.cancelled)
-                neLog("INFO", "egress cancelled proto=TCP endpoint=\(self.connection.endpoint)")
+                neLog("INFO", "egress cancelled proto=TCP endpoint=\(host):\(port)")
             @unknown default:
                 self.stateChanged?(.failed(nil))
+                neLog("WARN", "egress unknown state proto=TCP endpoint=\(host):\(port)")
             }
         }
     }
 
     func start(queue: DispatchQueue) {
-        neLog("INFO", "egress start proto=TCP endpoint=\(connection.endpoint)")
-        connection.start(queue: queue)
+        neLog("INFO", "egress start proto=TCP endpoint=\(host):\(port)")
+        // NWTCPConnection doesn't have explicit start, it connects automatically
     }
 
     func send(_ data: Data) {
-        connection.send(content: data, completion: .contentProcessed { _ in })
+        connection.write(data) { error in
+            if let error = error {
+                neLog("WARN", "tcp send error endpoint=\(self.host):\(self.port) error=\(error)")
+            }
+        }
     }
 
     func closeWrite() {
-        connection.send(content: nil, completion: .contentProcessed { _ in })
+        connection.writeClose()
     }
 
     func receive(minimumIncompleteLength: Int, maximumLength: Int, handler: @escaping (Data?, Bool, Error?) -> Void) {
-        connection.receive(minimumIncompleteLength: minimumIncompleteLength, maximumLength: maximumLength) { data, _, isComplete, error in
+        connection.readMinimumLength(minimumIncompleteLength, maximumLength: maximumLength) { data, error in
+            let isComplete = error != nil || data == nil
             handler(data, isComplete, error)
         }
     }
@@ -149,42 +139,52 @@ final class BypassTCPTransport: NSObject, TCPTransport {
     }
 }
 
-// UDP Transport using regular NWConnection that automatically bypasses tunnel from Network Extension
+// UDP Transport using NEPacketTunnelProvider's createUDPSessionThroughTunnel for proper bypass
 final class BypassUDPTransport: NSObject, UDPTransport {
-    private let connection: Network.NWConnection
+    private let session: NWUDPSession
+    private let host: String
+    private let port: UInt16
     var stateChanged: ((TransportState) -> Void)?
 
-    init(endpoint: Network.NWEndpoint, params: Network.NWParameters) {
-        self.connection = Network.NWConnection(to: endpoint, using: params)
+    init(provider: NEPacketTunnelProvider, host: String, port: UInt16) {
+        self.host = host
+        self.port = port
+        
+        // Create NetworkExtension endpoint
+        let neEndpoint = NetworkExtension.NWHostEndpoint(hostname: host, port: "\(port)")
+        
+        // Use NetworkExtension's bypass API to create UDP session outside tunnel
+        self.session = provider.createUDPSessionThroughTunnel(to: neEndpoint, from: nil)
         super.init()
-        self.connection.stateUpdateHandler = { [weak self] state in
-            guard let self = self else { return }
-            switch state {
-            case .setup, .preparing:
+        
+        // Monitor session state
+        self.session.addObserver(self, forKeyPath: "state", options: [.new], context: nil)
+    }
+    
+    deinit {
+        self.session.removeObserver(self, forKeyPath: "state")
+    }
+
+    override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {
+        if keyPath == "state" {
+            switch session.state {
+            case .invalid:
+                self.stateChanged?(.failed(nil))
+                neLog("WARN", "egress invalid proto=UDP endpoint=\(host):\(port)")
+            case .waiting:
+                self.stateChanged?(.waiting)
+                neLog("INFO", "egress waiting proto=UDP endpoint=\(host):\(port)")
+            case .preparing:
                 self.stateChanged?(.preparing)
             case .ready:
                 self.stateChanged?(.ready)
-                let path = self.connection.currentPath
-                let ifaceStr: String = {
-                    if let p = path {
-                        if p.usesInterfaceType(.wifi) { return "wifi" }
-                        if p.usesInterfaceType(.cellular) { return "cellular" }
-                        if p.usesInterfaceType(.wiredEthernet) { return "wiredEthernet" }
-                        if p.usesInterfaceType(.loopback) { return "loopback" }
-                        if p.usesInterfaceType(.other) { return "other" }
-                    }
-                    return "unknown"
-                }()
-                neLog("INFO", "egress ready proto=UDP endpoint=\(self.connection.endpoint) iface=\(ifaceStr) v4=\(path?.supportsIPv4 ?? false) v6=\(path?.supportsIPv6 ?? false) expensive=\(path?.isExpensive ?? false) constrained=\(path?.isConstrained ?? false)")
-            case .waiting:
-                self.stateChanged?(.waiting)
-                neLog("INFO", "egress waiting proto=UDP endpoint=\(self.connection.endpoint)")
-            case .failed(let err):
-                self.stateChanged?(.failed(err))
-                neLog("WARN", "egress failed proto=UDP endpoint=\(self.connection.endpoint) error=\(String(describing: err))")
+                neLog("INFO", "egress ready proto=UDP endpoint=\(host):\(port)")
             case .cancelled:
                 self.stateChanged?(.cancelled)
-                neLog("INFO", "egress cancelled proto=UDP endpoint=\(self.connection.endpoint)")
+                neLog("INFO", "egress cancelled proto=UDP endpoint=\(host):\(port)")
+            case .failed:
+                self.stateChanged?(.failed(nil))
+                neLog("WARN", "egress failed proto=UDP endpoint=\(host):\(port)")
             @unknown default:
                 self.stateChanged?(.failed(nil))
             }
@@ -192,22 +192,47 @@ final class BypassUDPTransport: NSObject, UDPTransport {
     }
 
     func start(queue: DispatchQueue) {
-        neLog("INFO", "egress start proto=UDP endpoint=\(connection.endpoint)")
-        connection.start(queue: queue)
-    }
-
-    func send(_ data: Data) {
-        connection.send(content: data, completion: .contentProcessed { _ in })
-    }
-
-    func receiveMessage(handler: @escaping (Data?, Error?) -> Void) {
-        connection.receiveMessage { data, _, _, error in
-            handler(data, error)
+        neLog("INFO", "egress start proto=UDP endpoint=\(host):\(port)")
+        // UDP sessions start automatically, no explicit start needed
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            // Give the session a moment to initialize, then check state
+            if let state = self?.session.state {
+                if state == .ready {
+                    self?.stateChanged?(.ready)
+                }
+            }
         }
     }
 
+    func send(_ data: Data) {
+        session.writeDatagram(data) { error in
+            if let error = error {
+                neLog("WARN", "udp send error endpoint=\(self.host):\(self.port) error=\(error)")
+            }
+        }
+    }
+
+    func receiveMessage(handler: @escaping (Data?, Error?) -> Void) {
+        session.setReadHandler({ [weak self] datagrams, error in
+            if let error = error {
+                handler(nil, error)
+                return
+            }
+            
+            // Process first datagram if available
+            if let first = datagrams?.first {
+                handler(first, nil)
+            } else {
+                handler(nil, nil)
+            }
+            
+            // Continue reading
+            self?.receiveMessage(handler: handler)
+        }, maxDatagrams: 1)
+    }
+
     func cancel() {
-        connection.cancel()
+        session.cancel()
     }
 }
 
