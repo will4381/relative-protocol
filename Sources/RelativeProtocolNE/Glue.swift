@@ -65,31 +65,26 @@ public enum RelativeProtocolNE {
     
     // Helper to find available physical interfaces
     private static func getPhysicalInterface(type: Network.NWInterface.InterfaceType) -> Network.NWInterface? {
-        for interface in Network.NWInterface.InterfaceType.allCases {
-            if interface == type {
-                // Check if interface is available via path monitor
-                let pathMonitor = Network.NWPathMonitor(requiredInterfaceType: type)
-                let semaphore = DispatchSemaphore(value: 0)
-                var foundInterface: Network.NWInterface?
-                
-                pathMonitor.pathUpdateHandler = { path in
-                    if path.status == .satisfied {
-                        foundInterface = path.availableInterfaces.first { $0.type == type }
-                    }
-                    semaphore.signal()
-                }
-                
-                let queue = DispatchQueue(label: "interface-check")
-                pathMonitor.start(queue: queue)
-                
-                // Wait briefly for path update
-                _ = semaphore.wait(timeout: .now() + 0.1)
-                pathMonitor.cancel()
-                
-                return foundInterface
+        // Check if interface is available via path monitor
+        let pathMonitor = Network.NWPathMonitor(requiredInterfaceType: type)
+        let semaphore = DispatchSemaphore(value: 0)
+        var foundInterface: Network.NWInterface?
+        
+        pathMonitor.pathUpdateHandler = { path in
+            if path.status == .satisfied {
+                foundInterface = path.availableInterfaces.first { $0.type == type }
             }
+            semaphore.signal()
         }
-        return nil
+        
+        let queue = DispatchQueue(label: "interface-check")
+        pathMonitor.start(queue: queue)
+        
+        // Wait briefly for path update
+        _ = semaphore.wait(timeout: .now() + 0.1)
+        pathMonitor.cancel()
+        
+        return foundInterface
     }
 
     // One-liner helper
