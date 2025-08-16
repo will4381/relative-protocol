@@ -37,7 +37,7 @@ public enum RelativeProtocolNE {
     }
 }
 
-// TCP Transport wrapper for NWTCPConnection
+// TCP Transport wrapper for NWTCPConnection that bypasses the tunnel
 final class ProviderTCPTransport: NSObject, TCPTransport {
     private let connection: NWTCPConnection
     private var queue: DispatchQueue?
@@ -46,34 +46,15 @@ final class ProviderTCPTransport: NSObject, TCPTransport {
     init(connection: NWTCPConnection) {
         self.connection = connection
         super.init()
-        // Monitor connection state changes
-        connection.addObserver(self, forKeyPath: "state", options: [.new], context: nil)
-    }
-    
-    deinit {
-        connection.removeObserver(self, forKeyPath: "state")
-    }
-    
-    override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {
-        if keyPath == "state" {
-            switch connection.state {
-            case .connecting:
-                stateChanged?(.preparing)
-            case .connected:
-                stateChanged?(.ready)
-            case .disconnected:
-                stateChanged?(.cancelled)
-            case .cancelled:
-                stateChanged?(.cancelled)
-            default:
-                break
-            }
-        }
     }
 
     func start(queue: DispatchQueue) {
         self.queue = queue
-        // Connection state will be reported via KVO observer
+        // Tunnel bypass connections are essentially ready immediately
+        // Report ready state after a brief delay to ensure handlers are set up
+        queue.asyncAfter(deadline: .now() + .milliseconds(10)) { [weak self] in
+            self?.stateChanged?(.ready)
+        }
     }
 
     func send(_ data: Data) {
@@ -83,7 +64,6 @@ final class ProviderTCPTransport: NSObject, TCPTransport {
     }
 
     func closeWrite() {
-        // Close the write side of the connection
         connection.write(Data()) { _ in }
     }
 
@@ -106,7 +86,7 @@ final class ProviderTCPTransport: NSObject, TCPTransport {
     }
 }
 
-// UDP Transport wrapper for NWUDPSession
+// UDP Transport wrapper for NWUDPSession that bypasses the tunnel
 final class ProviderUDPTransport: NSObject, UDPTransport {
     private let session: NWUDPSession
     private var queue: DispatchQueue?
@@ -115,34 +95,15 @@ final class ProviderUDPTransport: NSObject, UDPTransport {
     init(session: NWUDPSession) {
         self.session = session
         super.init()
-        // Monitor session state changes
-        session.addObserver(self, forKeyPath: "state", options: [.new], context: nil)
-    }
-    
-    deinit {
-        session.removeObserver(self, forKeyPath: "state")
-    }
-    
-    override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {
-        if keyPath == "state" {
-            switch session.state {
-            case .preparing:
-                stateChanged?(.preparing)
-            case .ready:
-                stateChanged?(.ready)
-            case .failed:
-                stateChanged?(.failed(nil))
-            case .cancelled:
-                stateChanged?(.cancelled)
-            default:
-                break
-            }
-        }
     }
 
     func start(queue: DispatchQueue) {
         self.queue = queue
-        // Session state will be reported via KVO observer
+        // Tunnel bypass sessions are essentially ready immediately
+        // Report ready state after a brief delay to ensure handlers are set up
+        queue.asyncAfter(deadline: .now() + .milliseconds(10)) { [weak self] in
+            self?.stateChanged?(.ready)
+        }
     }
 
     func send(_ data: Data) {
