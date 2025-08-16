@@ -474,19 +474,19 @@ final class SocketBridge {
                             Metrics.shared.setTagQueueDepth(tag: tag, tcpDepth: limiter.backlog.count)
                         }
                     } else {
-						#if DEBUG
-						if self.debug_disableNetworkSends {
-							self.flowsQueue.async(flags: .barrier) {
-								var arr = self.debug_sentData[key] ?? []
-								arr.append(data)
-								self.debug_sentData[key] = arr
-							}
-						} else {
-							updated.connection.send(data)
-						}
-						#else
-						updated.connection.send(data)
-						#endif
+#if DEBUG
+                        if self.debug_disableNetworkSends {
+                            self.flowsQueue.async(flags: .barrier) {
+                                var arr = self.debug_sentData[key] ?? []
+                                arr.append(data)
+                                self.debug_sentData[key] = arr
+                            }
+                        } else {
+                            updated.connection.send(data)
+                        }
+#else
+                        updated.connection.send(data)
+#endif
                     }
                 }
                 // Respect a simple sender window: do not exceed tcpSenderWindowBytes over base seq
@@ -559,6 +559,8 @@ final class SocketBridge {
             let sp = Observability.shared.begin("tcp_receive")
             defer { Observability.shared.end("tcp_receive", sp) }
 			if let data = data, !data.isEmpty {
+                logDebug("tcp first_byte_in flow=\(key) bytes=\(data.count)")
+                Observability.shared.event("tcp_first_byte_in")
 				var current = data
 				var m = meta
 				while !current.isEmpty {
@@ -619,6 +621,9 @@ final class SocketBridge {
 					Metrics.shared.setTcpFlows(self.tcpFlows.count)
 				}
 			}
+            if let err = error {
+                logWarn("tcp receive error flow=\(key) error=\(String(describing: err))")
+            }
 		}
 	}
 
@@ -714,6 +719,8 @@ final class SocketBridge {
 			guard let self = self else { return }
             let sp = Observability.shared.begin("udp_receive")
 			if let data = data, !data.isEmpty {
+                logDebug("udp first_byte_in flow=\(key) bytes=\(data.count)")
+                Observability.shared.event("udp_first_byte_in")
 				let packet: Data
 				if meta.version == 4 {
 					packet = self.buildIPv4UDPPacket(srcIP: meta.dstIP, dstIP: meta.srcIP, srcPort: meta.dstPort, dstPort: meta.srcPort, payload: data)
@@ -734,6 +741,9 @@ final class SocketBridge {
 			if error == nil {
 				self.installUDPReceive(for: key, meta: meta)
 			}
+            if let err = error {
+                logWarn("udp receive error flow=\(key) error=\(String(describing: err))")
+            }
             Observability.shared.end("udp_receive", sp)
 		}
 	}

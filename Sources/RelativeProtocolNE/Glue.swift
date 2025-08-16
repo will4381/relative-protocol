@@ -5,6 +5,12 @@ import Network
 import NetworkExtension
 import RelativeProtocol
 
+// Local logging helper (this target cannot access RelativeProtocol's internal logger)
+private func neLog(_ level: String, _ message: String) {
+    let ts = ISO8601DateFormatter().string(from: Date())
+    print("[RelativeProtocolNE][\(ts)][\(level)] \(message)")
+}
+
 public enum RelativeProtocolNE {
     public static func makeFactory(provider: NEPacketTunnelProvider) -> EgressConnectionFactory {
         return EgressConnectionFactory(
@@ -12,16 +18,8 @@ public enum RelativeProtocolNE {
                 let params = Network.NWParameters.tcp
                 params.allowLocalEndpointReuse = true
                 params.preferNoProxies = true
-                
-                // Force connection onto physical WiFi/Cellular interfaces to bypass tunnel
-                if let wifiInterface = getPhysicalInterface(type: .wifi) {
-                    params.requiredInterface = wifiInterface
-                } else if let cellularInterface = getPhysicalInterface(type: .cellular) {
-                    params.requiredInterface = cellularInterface
-                } else {
-                    // Fallback: prohibit tunnel interface types as last resort
-                    params.prohibitedInterfaceTypes = [.other, .loopback]
-                }
+                // Ensure we use the underlying physical network and not the TUN (which is .other)
+                params.prohibitedInterfaceTypes = [.other]
                 
                 let endpoint: Network.NWEndpoint
                 if let ipv4 = Network.IPv4Address(host) {
@@ -38,16 +36,8 @@ public enum RelativeProtocolNE {
                 let params = Network.NWParameters.udp
                 params.allowLocalEndpointReuse = true
                 params.preferNoProxies = true
-                
-                // Force connection onto physical WiFi/Cellular interfaces to bypass tunnel
-                if let wifiInterface = getPhysicalInterface(type: .wifi) {
-                    params.requiredInterface = wifiInterface
-                } else if let cellularInterface = getPhysicalInterface(type: .cellular) {
-                    params.requiredInterface = cellularInterface
-                } else {
-                    // Fallback: prohibit tunnel interface types as last resort
-                    params.prohibitedInterfaceTypes = [.other, .loopback]
-                }
+                // Ensure we use the underlying physical network and not the TUN (which is .other)
+                params.prohibitedInterfaceTypes = [.other]
                 
                 let endpoint: Network.NWEndpoint
                 if let ipv4 = Network.IPv4Address(host) {
@@ -108,12 +98,27 @@ final class BypassTCPTransport: NSObject, TCPTransport {
                 self.stateChanged?(.preparing)
             case .ready:
                 self.stateChanged?(.ready)
+                let path = self.connection.currentPath
+                let ifaceStr: String = {
+                    if let p = path {
+                        if p.usesInterfaceType(.wifi) { return "wifi" }
+                        if p.usesInterfaceType(.cellular) { return "cellular" }
+                        if p.usesInterfaceType(.wiredEthernet) { return "wiredEthernet" }
+                        if p.usesInterfaceType(.loopback) { return "loopback" }
+                        if p.usesInterfaceType(.other) { return "other" }
+                    }
+                    return "unknown"
+                }()
+                neLog("INFO", "egress ready proto=TCP endpoint=\(self.connection.endpoint) iface=\(ifaceStr) v4=\(path?.supportsIPv4 ?? false) v6=\(path?.supportsIPv6 ?? false) expensive=\(path?.isExpensive ?? false) constrained=\(path?.isConstrained ?? false)")
             case .waiting:
                 self.stateChanged?(.waiting)
+                neLog("INFO", "egress waiting proto=TCP endpoint=\(self.connection.endpoint)")
             case .failed(let err):
                 self.stateChanged?(.failed(err))
+                neLog("WARN", "egress failed proto=TCP endpoint=\(self.connection.endpoint) error=\(String(describing: err))")
             case .cancelled:
                 self.stateChanged?(.cancelled)
+                neLog("INFO", "egress cancelled proto=TCP endpoint=\(self.connection.endpoint)")
             @unknown default:
                 self.stateChanged?(.failed(nil))
             }
@@ -121,6 +126,7 @@ final class BypassTCPTransport: NSObject, TCPTransport {
     }
 
     func start(queue: DispatchQueue) {
+        neLog("INFO", "egress start proto=TCP endpoint=\(connection.endpoint)")
         connection.start(queue: queue)
     }
 
@@ -158,12 +164,27 @@ final class BypassUDPTransport: NSObject, UDPTransport {
                 self.stateChanged?(.preparing)
             case .ready:
                 self.stateChanged?(.ready)
+                let path = self.connection.currentPath
+                let ifaceStr: String = {
+                    if let p = path {
+                        if p.usesInterfaceType(.wifi) { return "wifi" }
+                        if p.usesInterfaceType(.cellular) { return "cellular" }
+                        if p.usesInterfaceType(.wiredEthernet) { return "wiredEthernet" }
+                        if p.usesInterfaceType(.loopback) { return "loopback" }
+                        if p.usesInterfaceType(.other) { return "other" }
+                    }
+                    return "unknown"
+                }()
+                neLog("INFO", "egress ready proto=UDP endpoint=\(self.connection.endpoint) iface=\(ifaceStr) v4=\(path?.supportsIPv4 ?? false) v6=\(path?.supportsIPv6 ?? false) expensive=\(path?.isExpensive ?? false) constrained=\(path?.isConstrained ?? false)")
             case .waiting:
                 self.stateChanged?(.waiting)
+                neLog("INFO", "egress waiting proto=UDP endpoint=\(self.connection.endpoint)")
             case .failed(let err):
                 self.stateChanged?(.failed(err))
+                neLog("WARN", "egress failed proto=UDP endpoint=\(self.connection.endpoint) error=\(String(describing: err))")
             case .cancelled:
                 self.stateChanged?(.cancelled)
+                neLog("INFO", "egress cancelled proto=UDP endpoint=\(self.connection.endpoint)")
             @unknown default:
                 self.stateChanged?(.failed(nil))
             }
@@ -171,6 +192,7 @@ final class BypassUDPTransport: NSObject, UDPTransport {
     }
 
     func start(queue: DispatchQueue) {
+        neLog("INFO", "egress start proto=UDP endpoint=\(connection.endpoint)")
         connection.start(queue: queue)
     }
 
