@@ -83,11 +83,9 @@ final class BypassTCPTransport: NSObject, TCPTransport {
         
         // Disable path restrictions to ensure the connection can use any available interface
         params.prohibitedInterfaceTypes = []
-        params.requiredInterfaceType = nil
         
         // Allow using any available interface including WiFi and cellular
         params.prohibitExpensivePaths = false
-        params.prohibitConstrained = false
         
         // Set service class for better routing
         params.serviceClass = .responsiveData
@@ -209,11 +207,9 @@ final class BypassUDPTransport: NSObject, UDPTransport {
         
         // Disable path restrictions to ensure the connection can use any available interface
         params.prohibitedInterfaceTypes = []
-        params.requiredInterfaceType = nil
         
         // Allow using any available interface
         params.prohibitExpensivePaths = false
-        params.prohibitConstrained = false
         
         self.connection = Network.NWConnection(to: endpoint, using: params)
         super.init()
