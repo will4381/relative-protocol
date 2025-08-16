@@ -418,8 +418,8 @@ final class SocketBridge {
 					logInfo("✅ TCP connection READY for flow=\(key)")
 				case .preparing:
 					logDebug("TCP connection preparing for flow=\(key)")
-				case .waiting(let error):
-					logInfo("TCP connection waiting for flow=\(key) error=\(String(describing: error))")
+				case .waiting:
+					logInfo("TCP connection waiting for flow=\(key)")
 				default:
 					logInfo("TCP conn state=\(state) for flow=\(key)")
 				}
