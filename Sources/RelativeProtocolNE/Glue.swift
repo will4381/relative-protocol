@@ -7,21 +7,26 @@ import RelativeProtocol
 
 public enum RelativeProtocolNE {
     public static func makeFactory(provider: NEPacketTunnelProvider) -> EgressConnectionFactory {
-        // Derive preferred interface type from provider's defaultPath
-        // Keep selection simple and portable across SDK variations
-        let preferredType: NWInterface.InterfaceType? = nil
         return EgressConnectionFactory(
             makeTCP: { host, port, _ in
-                let params = NWParameters.tcp
-                params.prohibitedInterfaceTypes = [.other]
-                if let t = preferredType { params.requiredInterfaceType = t }
-                return GlueTCPTransport(host: host, port: port, params: params)
+                // Use provider's createTCPConnectionThroughTunnel to bypass the VPN tunnel
+                let endpoint = NetworkExtension.NWHostEndpoint(hostname: host, port: String(port))
+                let tcpConnection = provider.createTCPConnectionThroughTunnel(
+                    to: endpoint,
+                    enableTLS: false,
+                    tlsParameters: nil,
+                    delegate: nil
+                )
+                return ProviderTCPTransport(connection: tcpConnection)
             },
             makeUDP: { host, port, _ in
-                let params = NWParameters.udp
-                params.prohibitedInterfaceTypes = [.other]
-                if let t = preferredType { params.requiredInterfaceType = t }
-                return GlueUDPTransport(host: host, port: port, params: params)
+                // Use provider's createUDPSessionThroughTunnel to bypass the VPN tunnel
+                let endpoint = NetworkExtension.NWHostEndpoint(hostname: host, port: String(port))
+                let udpSession = provider.createUDPSessionThroughTunnel(
+                    to: endpoint,
+                    from: nil
+                )
+                return ProviderUDPTransport(session: udpSession)
             }
         )
     }
@@ -32,80 +37,137 @@ public enum RelativeProtocolNE {
     }
 }
 
-// Local NE-backed adapters; hidden behind the factory and not exported in core target
-final class GlueTCPTransport: NSObject, TCPTransport {
-    private let conn: NWConnection
+// TCP Transport wrapper for NWTCPConnection
+final class ProviderTCPTransport: NSObject, TCPTransport {
+    private let connection: NWTCPConnection
+    private var queue: DispatchQueue?
     var stateChanged: ((TransportState) -> Void)?
 
-    init(host: String, port: UInt16, params: NWParameters) {
-        let endpoint = NWEndpoint.hostPort(host: .name(host, nil), port: .init(rawValue: port)!)
-        self.conn = NWConnection(to: endpoint, using: params)
+    init(connection: NWTCPConnection) {
+        self.connection = connection
         super.init()
-        self.conn.stateUpdateHandler = { [weak self] state in
-            guard let self = self else { return }
-            switch state {
-            case .setup, .preparing:
-                self.stateChanged?(.preparing)
-            case .ready:
-                self.stateChanged?(.ready)
-            case .waiting:
-                self.stateChanged?(.waiting)
-            case .failed(let err):
-                self.stateChanged?(.failed(err))
+        // Monitor connection state changes
+        connection.addObserver(self, forKeyPath: "state", options: [.new], context: nil)
+    }
+    
+    deinit {
+        connection.removeObserver(self, forKeyPath: "state")
+    }
+    
+    override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {
+        if keyPath == "state" {
+            switch connection.state {
+            case .connecting:
+                stateChanged?(.preparing)
+            case .connected:
+                stateChanged?(.ready)
+            case .disconnected:
+                stateChanged?(.cancelled)
             case .cancelled:
-                self.stateChanged?(.cancelled)
-            @unknown default:
-                self.stateChanged?(.failed(nil))
+                stateChanged?(.cancelled)
+            default:
+                break
             }
         }
     }
 
-    func start(queue: DispatchQueue) { conn.start(queue: queue) }
-    func send(_ data: Data) { conn.send(content: data, completion: .contentProcessed { _ in }) }
-    func closeWrite() { conn.send(content: nil, completion: .contentProcessed { _ in }) }
-    func receive(minimumIncompleteLength: Int, maximumLength: Int, handler: @escaping (Data?, Bool, Error?) -> Void) {
-        conn.receive(minimumIncompleteLength: minimumIncompleteLength, maximumLength: maximumLength) { data, _, isComplete, error in
-            handler(data, isComplete, error)
+    func start(queue: DispatchQueue) {
+        self.queue = queue
+        // Connection state will be reported via KVO observer
+    }
+
+    func send(_ data: Data) {
+        connection.write(data) { error in
+            // Handle write completion if needed
         }
     }
-    func cancel() { conn.cancel() }
+
+    func closeWrite() {
+        // Close the write side of the connection
+        connection.write(Data()) { _ in }
+    }
+
+    func receive(minimumIncompleteLength: Int, maximumLength: Int, handler: @escaping (Data?, Bool, Error?) -> Void) {
+        connection.readMinimumLength(minimumIncompleteLength, maximumLength: maximumLength) { data, error in
+            if let error = error {
+                handler(nil, true, error)
+            } else {
+                handler(data, false, nil)
+                // Continue reading
+                if data != nil {
+                    self.receive(minimumIncompleteLength: minimumIncompleteLength, maximumLength: maximumLength, handler: handler)
+                }
+            }
+        }
+    }
+
+    func cancel() {
+        connection.cancel()
+    }
 }
 
-final class GlueUDPTransport: NSObject, UDPTransport {
-    private let conn: NWConnection
+// UDP Transport wrapper for NWUDPSession
+final class ProviderUDPTransport: NSObject, UDPTransport {
+    private let session: NWUDPSession
+    private var queue: DispatchQueue?
     var stateChanged: ((TransportState) -> Void)?
 
-    init(host: String, port: UInt16, params: NWParameters) {
-        let endpoint = NWEndpoint.hostPort(host: .name(host, nil), port: .init(rawValue: port)!)
-        self.conn = NWConnection(to: endpoint, using: params)
+    init(session: NWUDPSession) {
+        self.session = session
         super.init()
-        self.conn.stateUpdateHandler = { [weak self] state in
-            guard let self = self else { return }
-            switch state {
-            case .setup, .preparing:
-                self.stateChanged?(.preparing)
+        // Monitor session state changes
+        session.addObserver(self, forKeyPath: "state", options: [.new], context: nil)
+    }
+    
+    deinit {
+        session.removeObserver(self, forKeyPath: "state")
+    }
+    
+    override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {
+        if keyPath == "state" {
+            switch session.state {
+            case .preparing:
+                stateChanged?(.preparing)
             case .ready:
-                self.stateChanged?(.ready)
-            case .waiting:
-                self.stateChanged?(.waiting)
-            case .failed(let err):
-                self.stateChanged?(.failed(err))
+                stateChanged?(.ready)
+            case .failed:
+                stateChanged?(.failed(nil))
             case .cancelled:
-                self.stateChanged?(.cancelled)
-            @unknown default:
-                self.stateChanged?(.failed(nil))
+                stateChanged?(.cancelled)
+            default:
+                break
             }
         }
     }
 
-    func start(queue: DispatchQueue) { conn.start(queue: queue) }
-    func send(_ data: Data) { conn.send(content: data, completion: .contentProcessed { _ in }) }
-    func receiveMessage(handler: @escaping (Data?, Error?) -> Void) {
-        conn.receiveMessage { data, _, _, error in
-            handler(data, error)
+    func start(queue: DispatchQueue) {
+        self.queue = queue
+        // Session state will be reported via KVO observer
+    }
+
+    func send(_ data: Data) {
+        session.writeDatagram(data) { error in
+            // Handle write completion if needed
         }
     }
-    func cancel() { conn.cancel() }
+
+    func receiveMessage(handler: @escaping (Data?, Error?) -> Void) {
+        // NWUDPSession uses setReadHandler for continuous reading
+        session.setReadHandler({ datagrams, error in
+            if let error = error {
+                handler(nil, error)
+            } else if let datagrams = datagrams, !datagrams.isEmpty {
+                // Send first datagram
+                handler(datagrams.first, nil)
+            } else {
+                handler(nil, nil)
+            }
+        }, maxDatagrams: 1)
+    }
+
+    func cancel() {
+        session.cancel()
+    }
 }
 
 // Non-iOS builds: keep an empty shim to satisfy the target
