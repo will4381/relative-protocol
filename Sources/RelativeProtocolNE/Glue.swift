@@ -10,38 +10,38 @@ public enum RelativeProtocolNE {
         return EgressConnectionFactory(
             makeTCP: { host, port, _ in
                 // Use regular NWConnection which automatically bypasses the tunnel when created from within Network Extension
-                let params = NWParameters.tcp
+                let params = Network.NWParameters.tcp
                 // DO NOT prohibit .other interface - that was causing the routing loop
                 // iOS automatically prevents Network Extension connections from routing through the tunnel
                 params.allowLocalEndpointReuse = true
                 params.preferNoProxies = true
                 
-                let endpoint: NWEndpoint
-                if let ipv4 = IPv4Address(host) {
-                    endpoint = NWEndpoint.hostPort(host: .ipv4(ipv4), port: .init(rawValue: port)!)
-                } else if let ipv6 = IPv6Address(host) {
-                    endpoint = NWEndpoint.hostPort(host: .ipv6(ipv6), port: .init(rawValue: port)!)
+                let endpoint: Network.NWEndpoint
+                if let ipv4 = Network.IPv4Address(host) {
+                    endpoint = Network.NWEndpoint.hostPort(host: .ipv4(ipv4), port: .init(rawValue: port)!)
+                } else if let ipv6 = Network.IPv6Address(host) {
+                    endpoint = Network.NWEndpoint.hostPort(host: .ipv6(ipv6), port: .init(rawValue: port)!)
                 } else {
-                    endpoint = NWEndpoint.hostPort(host: .name(host, nil), port: .init(rawValue: port)!)
+                    endpoint = Network.NWEndpoint.hostPort(host: .name(host, nil), port: .init(rawValue: port)!)
                 }
                 
                 return BypassTCPTransport(endpoint: endpoint, params: params)
             },
             makeUDP: { host, port, _ in
                 // Use regular NWConnection which automatically bypasses the tunnel when created from within Network Extension
-                let params = NWParameters.udp
+                let params = Network.NWParameters.udp
                 // DO NOT prohibit .other interface - that was causing the routing loop
                 // iOS automatically prevents Network Extension connections from routing through the tunnel
                 params.allowLocalEndpointReuse = true
                 params.preferNoProxies = true
                 
-                let endpoint: NWEndpoint
-                if let ipv4 = IPv4Address(host) {
-                    endpoint = NWEndpoint.hostPort(host: .ipv4(ipv4), port: .init(rawValue: port)!)
-                } else if let ipv6 = IPv6Address(host) {
-                    endpoint = NWEndpoint.hostPort(host: .ipv6(ipv6), port: .init(rawValue: port)!)
+                let endpoint: Network.NWEndpoint
+                if let ipv4 = Network.IPv4Address(host) {
+                    endpoint = Network.NWEndpoint.hostPort(host: .ipv4(ipv4), port: .init(rawValue: port)!)
+                } else if let ipv6 = Network.IPv6Address(host) {
+                    endpoint = Network.NWEndpoint.hostPort(host: .ipv6(ipv6), port: .init(rawValue: port)!)
                 } else {
-                    endpoint = NWEndpoint.hostPort(host: .name(host, nil), port: .init(rawValue: port)!)
+                    endpoint = Network.NWEndpoint.hostPort(host: .name(host, nil), port: .init(rawValue: port)!)
                 }
                 
                 return BypassUDPTransport(endpoint: endpoint, params: params)
@@ -57,11 +57,11 @@ public enum RelativeProtocolNE {
 
 // TCP Transport using regular NWConnection that automatically bypasses tunnel from Network Extension
 final class BypassTCPTransport: NSObject, TCPTransport {
-    private let connection: NWConnection
+    private let connection: Network.NWConnection
     var stateChanged: ((TransportState) -> Void)?
 
-    init(endpoint: NWEndpoint, params: NWParameters) {
-        self.connection = NWConnection(to: endpoint, using: params)
+    init(endpoint: Network.NWEndpoint, params: Network.NWParameters) {
+        self.connection = Network.NWConnection(to: endpoint, using: params)
         super.init()
         self.connection.stateUpdateHandler = { [weak self] state in
             guard let self = self else { return }
@@ -107,11 +107,11 @@ final class BypassTCPTransport: NSObject, TCPTransport {
 
 // UDP Transport using regular NWConnection that automatically bypasses tunnel from Network Extension
 final class BypassUDPTransport: NSObject, UDPTransport {
-    private let connection: NWConnection
+    private let connection: Network.NWConnection
     var stateChanged: ((TransportState) -> Void)?
 
-    init(endpoint: NWEndpoint, params: NWParameters) {
-        self.connection = NWConnection(to: endpoint, using: params)
+    init(endpoint: Network.NWEndpoint, params: Network.NWParameters) {
+        self.connection = Network.NWConnection(to: endpoint, using: params)
         super.init()
         self.connection.stateUpdateHandler = { [weak self] state in
             guard let self = self else { return }
