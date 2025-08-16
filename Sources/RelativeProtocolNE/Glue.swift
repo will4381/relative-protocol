@@ -78,34 +78,62 @@ final class BypassTCPTransport: NSObject, TCPTransport {
             endpoint = Network.NWEndpoint.hostPort(host: .name(host, nil), port: .init(rawValue: port)!)
         }
         
-        // Use regular TCP parameters - iOS should automatically exclude from tunnel
+        // Configure TCP parameters with explicit options
         let params = Network.NWParameters.tcp
+        
+        // Disable path restrictions to ensure the connection can use any available interface
+        params.prohibitedInterfaceTypes = []
+        params.requiredInterfaceType = nil
+        
+        // Allow using any available interface including WiFi and cellular
+        params.prohibitExpensivePaths = false
+        params.prohibitConstrained = false
+        
+        // Set service class for better routing
+        params.serviceClass = .responsiveData
         
         self.connection = Network.NWConnection(to: endpoint, using: params)
         super.init()
         
         self.connection.stateUpdateHandler = { [weak self] state in
             guard let self = self else { return }
+            
+            // Enhanced logging to debug TCP issues
+            let path = self.connection.currentPath
+            let pathInfo = self.describeInterface(path) + " status=\(path?.status ?? .unsatisfied)"
+            
+            // Additional debugging for path viability
+            if let path = path {
+                let viableInfo = "isExpensive=\(path.isExpensive) isConstrained=\(path.isConstrained) hasIPv4=\(path.supportsIPv4) hasIPv6=\(path.supportsIPv6) hasDNS=\(path.supportsDNS)"
+                neLog("DEBUG", "path viability proto=TCP endpoint=\(self.host):\(self.port) \(viableInfo)")
+            }
+            
             switch state {
-            case .setup, .preparing:
+            case .setup:
+                neLog("DEBUG", "egress setup proto=TCP endpoint=\(self.host):\(self.port) \(pathInfo)")
+                self.stateChanged?(.preparing)
+            case .preparing:
+                neLog("DEBUG", "egress preparing proto=TCP endpoint=\(self.host):\(self.port) \(pathInfo)")
+                // Check if we're stuck in preparing due to path issues
+                if let path = path, path.status != .satisfied {
+                    neLog("WARN", "TCP stuck in preparing due to unsatisfied path: \(path.status)")
+                }
                 self.stateChanged?(.preparing)
             case .ready:
                 self.stateChanged?(.ready)
-                let path = self.connection.currentPath
-                let ifaceInfo = self.describeInterface(path)
-                neLog("INFO", "egress ready proto=TCP endpoint=\(self.host):\(self.port) \(ifaceInfo)")
+                neLog("INFO", "egress ready proto=TCP endpoint=\(self.host):\(self.port) \(pathInfo)")
             case .waiting(let err):
                 self.stateChanged?(.waiting)
-                neLog("INFO", "egress waiting proto=TCP endpoint=\(self.host):\(self.port) error=\(String(describing: err))")
+                neLog("INFO", "egress waiting proto=TCP endpoint=\(self.host):\(self.port) error=\(String(describing: err)) \(pathInfo)")
             case .failed(let err):
                 self.stateChanged?(.failed(err))
-                neLog("WARN", "egress failed proto=TCP endpoint=\(self.host):\(self.port) error=\(String(describing: err))")
+                neLog("WARN", "egress failed proto=TCP endpoint=\(self.host):\(self.port) error=\(String(describing: err)) \(pathInfo)")
             case .cancelled:
                 self.stateChanged?(.cancelled)
-                neLog("INFO", "egress cancelled proto=TCP endpoint=\(self.host):\(self.port)")
+                neLog("INFO", "egress cancelled proto=TCP endpoint=\(self.host):\(self.port) \(pathInfo)")
             @unknown default:
                 self.stateChanged?(.failed(nil))
-                neLog("WARN", "egress unknown state proto=TCP endpoint=\(self.host):\(self.port)")
+                neLog("WARN", "egress unknown state proto=TCP endpoint=\(self.host):\(self.port) \(pathInfo)")
             }
         }
     }
@@ -176,8 +204,16 @@ final class BypassUDPTransport: NSObject, UDPTransport {
             endpoint = Network.NWEndpoint.hostPort(host: .name(host, nil), port: .init(rawValue: port)!)
         }
         
-        // Use regular UDP parameters - iOS should automatically exclude from tunnel
+        // Configure UDP parameters with explicit options (matching what works)
         let params = Network.NWParameters.udp
+        
+        // Disable path restrictions to ensure the connection can use any available interface
+        params.prohibitedInterfaceTypes = []
+        params.requiredInterfaceType = nil
+        
+        // Allow using any available interface
+        params.prohibitExpensivePaths = false
+        params.prohibitConstrained = false
         
         self.connection = Network.NWConnection(to: endpoint, using: params)
         super.init()
