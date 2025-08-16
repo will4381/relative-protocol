@@ -9,7 +9,7 @@ import RelativeProtocol
 typealias NEEndpoint = NetworkExtension.NWHostEndpoint
 typealias NWEndpoint = Network.NWEndpoint
 
-// Local logging helper (this target cannot access RelativeProtocol's internal logger)
+// Enhanced logging function for detailed TCP debugging
 private func neLog(_ level: String, _ message: String) {
     let ts = ISO8601DateFormatter().string(from: Date())
     print("[RelativeProtocolNE][\(ts)][\(level)] \(message)")
@@ -28,7 +28,7 @@ public enum RelativeProtocolNE {
     }
     
     // Helper to find available physical interfaces
-    private static func getPhysicalInterface(type: Network.NWInterface.InterfaceType) -> Network.NWInterface? {
+    static func getPhysicalInterface(type: Network.NWInterface.InterfaceType) -> Network.NWInterface? {
         // Check if interface is available via path monitor
         let pathMonitor = Network.NWPathMonitor(requiredInterfaceType: type)
         let semaphore = DispatchSemaphore(value: 0)
@@ -78,17 +78,17 @@ final class BypassTCPTransport: NSObject, TCPTransport {
             endpoint = Network.NWEndpoint.hostPort(host: .name(host, nil), port: .init(rawValue: port)!)
         }
         
-        // Configure TCP parameters with explicit options
+        // Configure TCP parameters with debugging
         let params = Network.NWParameters.tcp
         
         // Disable path restrictions to ensure the connection can use any available interface
         params.prohibitedInterfaceTypes = []
-        
-        // Allow using any available interface including WiFi and cellular
         params.prohibitExpensivePaths = false
         
         // Set service class for better routing
         params.serviceClass = .responsiveData
+        
+        neLog("DEBUG", "Creating TCP connection to \(host):\(port) with params: prohibitedTypes=\(params.prohibitedInterfaceTypes?.count ?? 0) expensive=\(params.prohibitExpensivePaths)")
         
         self.connection = Network.NWConnection(to: endpoint, using: params)
         super.init()
@@ -103,35 +103,51 @@ final class BypassTCPTransport: NSObject, TCPTransport {
             // Additional debugging for path viability
             if let path = path {
                 let viableInfo = "isExpensive=\(path.isExpensive) isConstrained=\(path.isConstrained) hasIPv4=\(path.supportsIPv4) hasIPv6=\(path.supportsIPv6) hasDNS=\(path.supportsDNS)"
-                neLog("DEBUG", "path viability proto=TCP endpoint=\(self.host):\(self.port) \(viableInfo)")
+                neLog("DEBUG", "TCP path viability \(self.host):\(self.port) \(viableInfo)")
+                
+                // Deep dive into why connection might be stuck
+                if path.status == .satisfied {
+                    neLog("DEBUG", "TCP path satisfied but connection stuck in state for \(self.host):\(self.port)")
+                    let interfaceNames = path.availableInterfaces.map { "\($0.name)-\(String(describing: $0.type))" }.joined(separator: ", ")
+                    neLog("DEBUG", "Available interfaces: \(interfaceNames)")
+                } else {
+                    neLog("WARN", "TCP path not satisfied: \(path.status) for \(self.host):\(self.port)")
+                }
             }
             
             switch state {
             case .setup:
-                neLog("DEBUG", "egress setup proto=TCP endpoint=\(self.host):\(self.port) \(pathInfo)")
+                neLog("DEBUG", "TCP setup \(self.host):\(self.port) \(pathInfo)")
                 self.stateChanged?(.preparing)
             case .preparing:
-                neLog("DEBUG", "egress preparing proto=TCP endpoint=\(self.host):\(self.port) \(pathInfo)")
-                // Check if we're stuck in preparing due to path issues
-                if let path = path, path.status != .satisfied {
-                    neLog("WARN", "TCP stuck in preparing due to unsatisfied path: \(path.status)")
+                neLog("DEBUG", "TCP preparing \(self.host):\(self.port) \(pathInfo)")
+                
+                // Set up a timer to detect if we're stuck in preparing
+                DispatchQueue.global().asyncAfter(deadline: .now() + 5.0) {
+                    if case .preparing = self.connection.state {
+                        neLog("WARN", "TCP STUCK in preparing for 5s: \(self.host):\(self.port) - this indicates routing issues")
+                        if let currentPath = self.connection.currentPath {
+                            neLog("WARN", "Stuck path details: status=\(currentPath.status) interfaces=\(currentPath.availableInterfaces.count)")
+                        }
+                    }
                 }
+                
                 self.stateChanged?(.preparing)
             case .ready:
+                neLog("INFO", "TCP READY \(self.host):\(self.port) \(pathInfo)")
                 self.stateChanged?(.ready)
-                neLog("INFO", "egress ready proto=TCP endpoint=\(self.host):\(self.port) \(pathInfo)")
             case .waiting(let err):
+                neLog("WARN", "TCP waiting \(self.host):\(self.port) error=\(String(describing: err)) \(pathInfo)")
                 self.stateChanged?(.waiting)
-                neLog("INFO", "egress waiting proto=TCP endpoint=\(self.host):\(self.port) error=\(String(describing: err)) \(pathInfo)")
             case .failed(let err):
+                neLog("ERROR", "TCP FAILED \(self.host):\(self.port) error=\(String(describing: err)) \(pathInfo)")
                 self.stateChanged?(.failed(err))
-                neLog("WARN", "egress failed proto=TCP endpoint=\(self.host):\(self.port) error=\(String(describing: err)) \(pathInfo)")
             case .cancelled:
+                neLog("INFO", "TCP cancelled \(self.host):\(self.port) \(pathInfo)")
                 self.stateChanged?(.cancelled)
-                neLog("INFO", "egress cancelled proto=TCP endpoint=\(self.host):\(self.port) \(pathInfo)")
             @unknown default:
+                neLog("ERROR", "TCP unknown state \(self.host):\(self.port) \(pathInfo)")
                 self.stateChanged?(.failed(nil))
-                neLog("WARN", "egress unknown state proto=TCP endpoint=\(self.host):\(self.port) \(pathInfo)")
             }
         }
     }
@@ -158,8 +174,19 @@ final class BypassTCPTransport: NSObject, TCPTransport {
     }
 
     func start(queue: DispatchQueue) {
+        neLog("INFO", "Starting TCP connection to \(host):\(port)")
         neLog("INFO", "egress start proto=TCP endpoint=\(host):\(port)")
+        
+        // Add better error handling
         connection.start(queue: queue)
+        
+        // Set up a watchdog to detect connection hangs
+        DispatchQueue.global().asyncAfter(deadline: .now() + 10.0) {
+            if case .preparing = self.connection.state {
+                neLog("ERROR", "TCP connection HUNG for 10s: \(self.host):\(self.port) - connection never established")
+                // Don't cancel automatically, just log the issue
+            }
+        }
     }
 
     func send(_ data: Data) {
