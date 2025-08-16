@@ -22,8 +22,8 @@ public enum PacketIngestor {
 					for i in 0..<count {
 						let pkt = packets[i]
 						let proto: sa_family_t
-						if i < protocols.count, let v = protocols[i] as? NSNumber {
-							proto = sa_family_t(truncating: v)
+						if i < protocols.count {
+							proto = sa_family_t(truncating: protocols[i])
 						} else {
 							// Fallback: infer from header nibble
 							let ver = pkt.first.map { $0 >> 4 } ?? 4

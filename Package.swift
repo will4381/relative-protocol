@@ -12,6 +12,10 @@ let package = Package(
             name: "RelativeProtocol", 
             targets: ["RelativeProtocol"]
         ),
+        .library(
+            name: "RelativeProtocolNE",
+            targets: ["RelativeProtocolNE"]
+        ),
     ],
     targets: [
         // Pure C lwIP glue
@@ -77,8 +81,21 @@ let package = Package(
             resources: [],
             linkerSettings: [
                 .linkedFramework("CoreTelephony", .when(platforms: [.iOS])),
-                .linkedFramework("NetworkExtension", .when(platforms: [.iOS])),
                 .linkedFramework("Network", .when(platforms: [.iOS, .macOS]))
+            ]
+        ),
+        // iOS-only glue that wires NE provider into the core engine
+        .target(
+            name: "RelativeProtocolNE",
+            dependencies: [
+                .target(name: "RelativeProtocol")
+            ],
+            path: "Sources/RelativeProtocolNE",
+            exclude: [],
+            resources: [],
+            linkerSettings: [
+                .linkedFramework("NetworkExtension", .when(platforms: [.iOS])),
+                .linkedFramework("Network", .when(platforms: [.iOS]))
             ]
         ),
         .testTarget(
