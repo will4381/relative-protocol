@@ -30,6 +30,7 @@ xcuserdata/
 .vscode/
 .idea/
 .DS_Store
+.claude/
 
 # Logs / Temp
 *.log

@@ -9,24 +9,42 @@ public enum RelativeProtocolNE {
     public static func makeFactory(provider: NEPacketTunnelProvider) -> EgressConnectionFactory {
         return EgressConnectionFactory(
             makeTCP: { host, port, _ in
-                // Use provider's createTCPConnectionThroughTunnel to bypass the VPN tunnel
-                let endpoint = NetworkExtension.NWHostEndpoint(hostname: host, port: String(port))
-                let tcpConnection = provider.createTCPConnectionThroughTunnel(
-                    to: endpoint,
-                    enableTLS: false,
-                    tlsParameters: nil,
-                    delegate: nil
-                )
-                return ProviderTCPTransport(connection: tcpConnection)
+                // Use regular NWConnection which automatically bypasses the tunnel when created from within Network Extension
+                let params = NWParameters.tcp
+                // DO NOT prohibit .other interface - that was causing the routing loop
+                // iOS automatically prevents Network Extension connections from routing through the tunnel
+                params.allowLocalEndpointReuse = true
+                params.preferNoProxies = true
+                
+                let endpoint: NWEndpoint
+                if let ipv4 = IPv4Address(host) {
+                    endpoint = NWEndpoint.hostPort(host: .ipv4(ipv4), port: .init(rawValue: port)!)
+                } else if let ipv6 = IPv6Address(host) {
+                    endpoint = NWEndpoint.hostPort(host: .ipv6(ipv6), port: .init(rawValue: port)!)
+                } else {
+                    endpoint = NWEndpoint.hostPort(host: .name(host, nil), port: .init(rawValue: port)!)
+                }
+                
+                return BypassTCPTransport(endpoint: endpoint, params: params)
             },
             makeUDP: { host, port, _ in
-                // Use provider's createUDPSessionThroughTunnel to bypass the VPN tunnel
-                let endpoint = NetworkExtension.NWHostEndpoint(hostname: host, port: String(port))
-                let udpSession = provider.createUDPSessionThroughTunnel(
-                    to: endpoint,
-                    from: nil
-                )
-                return ProviderUDPTransport(session: udpSession)
+                // Use regular NWConnection which automatically bypasses the tunnel when created from within Network Extension
+                let params = NWParameters.udp
+                // DO NOT prohibit .other interface - that was causing the routing loop
+                // iOS automatically prevents Network Extension connections from routing through the tunnel
+                params.allowLocalEndpointReuse = true
+                params.preferNoProxies = true
+                
+                let endpoint: NWEndpoint
+                if let ipv4 = IPv4Address(host) {
+                    endpoint = NWEndpoint.hostPort(host: .ipv4(ipv4), port: .init(rawValue: port)!)
+                } else if let ipv6 = IPv6Address(host) {
+                    endpoint = NWEndpoint.hostPort(host: .ipv6(ipv6), port: .init(rawValue: port)!)
+                } else {
+                    endpoint = NWEndpoint.hostPort(host: .name(host, nil), port: .init(rawValue: port)!)
+                }
+                
+                return BypassUDPTransport(endpoint: endpoint, params: params)
             }
         )
     }
@@ -37,47 +55,48 @@ public enum RelativeProtocolNE {
     }
 }
 
-// TCP Transport wrapper for NWTCPConnection that bypasses the tunnel
-final class ProviderTCPTransport: NSObject, TCPTransport {
-    private let connection: NWTCPConnection
-    private var queue: DispatchQueue?
+// TCP Transport using regular NWConnection that automatically bypasses tunnel from Network Extension
+final class BypassTCPTransport: NSObject, TCPTransport {
+    private let connection: NWConnection
     var stateChanged: ((TransportState) -> Void)?
 
-    init(connection: NWTCPConnection) {
-        self.connection = connection
+    init(endpoint: NWEndpoint, params: NWParameters) {
+        self.connection = NWConnection(to: endpoint, using: params)
         super.init()
+        self.connection.stateUpdateHandler = { [weak self] state in
+            guard let self = self else { return }
+            switch state {
+            case .setup, .preparing:
+                self.stateChanged?(.preparing)
+            case .ready:
+                self.stateChanged?(.ready)
+            case .waiting:
+                self.stateChanged?(.waiting)
+            case .failed(let err):
+                self.stateChanged?(.failed(err))
+            case .cancelled:
+                self.stateChanged?(.cancelled)
+            @unknown default:
+                self.stateChanged?(.failed(nil))
+            }
+        }
     }
 
     func start(queue: DispatchQueue) {
-        self.queue = queue
-        // Tunnel bypass connections are essentially ready immediately
-        // Report ready state after a brief delay to ensure handlers are set up
-        queue.asyncAfter(deadline: .now() + .milliseconds(10)) { [weak self] in
-            self?.stateChanged?(.ready)
-        }
+        connection.start(queue: queue)
     }
 
     func send(_ data: Data) {
-        connection.write(data) { error in
-            // Handle write completion if needed
-        }
+        connection.send(content: data, completion: .contentProcessed { _ in })
     }
 
     func closeWrite() {
-        connection.write(Data()) { _ in }
+        connection.send(content: nil, completion: .contentProcessed { _ in })
     }
 
     func receive(minimumIncompleteLength: Int, maximumLength: Int, handler: @escaping (Data?, Bool, Error?) -> Void) {
-        connection.readMinimumLength(minimumIncompleteLength, maximumLength: maximumLength) { data, error in
-            if let error = error {
-                handler(nil, true, error)
-            } else {
-                handler(data, false, nil)
-                // Continue reading
-                if data != nil {
-                    self.receive(minimumIncompleteLength: minimumIncompleteLength, maximumLength: maximumLength, handler: handler)
-                }
-            }
+        connection.receive(minimumIncompleteLength: minimumIncompleteLength, maximumLength: maximumLength) { data, _, isComplete, error in
+            handler(data, isComplete, error)
         }
     }
 
@@ -86,48 +105,49 @@ final class ProviderTCPTransport: NSObject, TCPTransport {
     }
 }
 
-// UDP Transport wrapper for NWUDPSession that bypasses the tunnel
-final class ProviderUDPTransport: NSObject, UDPTransport {
-    private let session: NWUDPSession
-    private var queue: DispatchQueue?
+// UDP Transport using regular NWConnection that automatically bypasses tunnel from Network Extension
+final class BypassUDPTransport: NSObject, UDPTransport {
+    private let connection: NWConnection
     var stateChanged: ((TransportState) -> Void)?
 
-    init(session: NWUDPSession) {
-        self.session = session
+    init(endpoint: NWEndpoint, params: NWParameters) {
+        self.connection = NWConnection(to: endpoint, using: params)
         super.init()
+        self.connection.stateUpdateHandler = { [weak self] state in
+            guard let self = self else { return }
+            switch state {
+            case .setup, .preparing:
+                self.stateChanged?(.preparing)
+            case .ready:
+                self.stateChanged?(.ready)
+            case .waiting:
+                self.stateChanged?(.waiting)
+            case .failed(let err):
+                self.stateChanged?(.failed(err))
+            case .cancelled:
+                self.stateChanged?(.cancelled)
+            @unknown default:
+                self.stateChanged?(.failed(nil))
+            }
+        }
     }
 
     func start(queue: DispatchQueue) {
-        self.queue = queue
-        // Tunnel bypass sessions are essentially ready immediately
-        // Report ready state after a brief delay to ensure handlers are set up
-        queue.asyncAfter(deadline: .now() + .milliseconds(10)) { [weak self] in
-            self?.stateChanged?(.ready)
-        }
+        connection.start(queue: queue)
     }
 
     func send(_ data: Data) {
-        session.writeDatagram(data) { error in
-            // Handle write completion if needed
-        }
+        connection.send(content: data, completion: .contentProcessed { _ in })
     }
 
     func receiveMessage(handler: @escaping (Data?, Error?) -> Void) {
-        // NWUDPSession uses setReadHandler for continuous reading
-        session.setReadHandler({ datagrams, error in
-            if let error = error {
-                handler(nil, error)
-            } else if let datagrams = datagrams, !datagrams.isEmpty {
-                // Send first datagram
-                handler(datagrams.first, nil)
-            } else {
-                handler(nil, nil)
-            }
-        }, maxDatagrams: 1)
+        connection.receiveMessage { data, _, _, error in
+            handler(data, error)
+        }
     }
 
     func cancel() {
-        session.cancel()
+        connection.cancel()
     }
 }
 
