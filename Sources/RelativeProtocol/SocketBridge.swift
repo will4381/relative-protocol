@@ -239,8 +239,14 @@ final class SocketBridge {
 	func handleOutgoingIPPacket(packetPtr: UnsafePointer<UInt8>, length: Int) {
 		// Parse minimal header fields to decide TCP vs UDP
         let sp = Observability.shared.begin("bridge_outgoing")
-		guard length >= 1 else { return }
+		guard length >= 1 else { 
+			logWarn("Received packet with invalid length: \(length)")
+			return 
+		}
+		
 		let version = packetPtr.pointee >> 4
+		logTrace("Incoming packet: version=IPv\(version) length=\(length) bytes")
+		
 		if version == 4 {
 			handleIPv4(packetPtr: packetPtr, length: length)
 		} else if version == 6 {
@@ -253,11 +259,25 @@ final class SocketBridge {
 
 	private func handleIPv4(packetPtr: UnsafePointer<UInt8>, length: Int) {
         let sp = Observability.shared.begin("parse_ipv4")
-        guard length >= 20 else { Observability.shared.end("parse_ipv4", sp); return }
+        guard length >= 20 else { 
+			logWarn("IPv4 packet too short: \(length) bytes, minimum 20 required")
+			Observability.shared.end("parse_ipv4", sp); return 
+		}
 		let ihl = Int(packetPtr.pointee & 0x0F) * 4
-		guard length >= ihl + 8 else { return }
+		guard length >= ihl + 8 else { 
+			logWarn("IPv4 packet too short for protocol header: \(length) bytes, need \(ihl + 8)")
+			return 
+		}
 		let proto = packetPtr.advanced(by: 9).pointee
-		logInfo("IPv4 out proto=\(proto) len=\(length)")
+		
+		// Extract source and destination for detailed logging
+		let srcIP = Data(bytes: packetPtr.advanced(by: 12), count: 4)
+		let dstIP = Data(bytes: packetPtr.advanced(by: 16), count: 4)
+		let srcStr = ipv4String(from: srcIP)
+		let dstStr = ipv4String(from: dstIP)
+		
+		logInfo("IPv4 packet: proto=\(proto) len=\(length) src=\(srcStr) dst=\(dstStr)")
+		logDebug("IPv4 packet routing check: destination=\(dstStr) should_be_excluded_from_tunnel")
 		if proto == 17 { // UDP
 			let srcIP = Data(bytes: packetPtr.advanced(by: 12), count: 4)
 			let dstIP = Data(bytes: packetPtr.advanced(by: 16), count: 4)
@@ -416,19 +436,41 @@ final class SocketBridge {
 						}
 					}
 				case .ready:
-					logInfo("✅ TCP connection READY for flow=\(key)")
+					logInfo("TCP connection READY for flow=\(key)")
 				case .preparing:
 					logDebug("TCP connection preparing for flow=\(key)")
 				case .waiting:
 					logInfo("TCP connection waiting for flow=\(key)")
-				default:
-					logInfo("TCP conn state=\(state) for flow=\(key)")
 				}
 			}
 			conn.start(queue: flowQueue)
 			return newMeta
 		}()
+		
+		// Log all TCP packet details for debugging
+		logDebug("TCP packet received: version=\(version) src=\(version == 4 ? ipv4String(from: srcIP) : ipv6String(from: srcIP)):\(srcPort) dst=\(host):\(dstPort) flags=0x\(String(flags, radix: 16)) seq=\(seq) ack=\(ack) payload=\(payload.count)bytes")
+		
+		// Parse additional flags for logging (syn, fin, rst already declared above)
+		let ackFlag = (flags & 0x10) != 0
+		let psh = (flags & 0x08) != 0
+		let urg = (flags & 0x20) != 0
+		
+		var flagNames: [String] = []
+		if syn { flagNames.append("SYN") }
+		if ackFlag { flagNames.append("ACK") }
+		if fin { flagNames.append("FIN") }
+		if rst { flagNames.append("RST") }
+		if psh { flagNames.append("PSH") }
+		if urg { flagNames.append("URG") }
+		
+		logDebug("TCP flags parsed: \(flagNames.joined(separator: "|")) for flow=\(key)")
+		
 		if rst {
+			logError("RST flag detected - cancelling TCP connection")
+			logError("Connection details: version=\(version) source=\(version == 4 ? ipv4String(from: srcIP) : ipv6String(from: srcIP)):\(srcPort) destination=\(host):\(dstPort)")
+			logError("Packet details: seq=\(seq) ack=\(ack) payload_length=\(payload.count) flags=0x\(String(flags, radix: 16))")
+			logError("Flow key: \(key)")
+			
 			meta.connection.cancel()
 			flowsQueue.async(flags: .barrier) { self.tcpFlows.removeValue(forKey: key) }
 			return

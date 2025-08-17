@@ -156,19 +156,19 @@ final class BypassTCPTransport: NSObject, TCPTransport {
                 
                 self.stateChanged?(.preparing)
             case .ready:
-                neLog("INFO", "✅ TCP READY \(self.host):\(self.port) \(pathInfo)")
+                neLog("INFO", "TCP connection established successfully for \(self.host):\(self.port) \(pathInfo)")
                 self.stateChanged?(.ready)
             case .waiting(let err):
                 neLog("WARN", "TCP waiting \(self.host):\(self.port) error=\(String(describing: err)) \(pathInfo)")
                 self.stateChanged?(.waiting)
             case .failed(let err):
-                neLog("ERROR", "❌ TCP FAILED \(self.host):\(self.port) error=\(String(describing: err)) \(pathInfo)")
+                neLog("ERROR", "TCP connection failed for \(self.host):\(self.port) error=\(String(describing: err)) \(pathInfo)")
                 self.stateChanged?(.failed(err))
             case .cancelled:
-                neLog("WARN", "🚫 TCP CANCELLED \(self.host):\(self.port) \(pathInfo)")
+                neLog("WARN", "TCP connection cancelled for \(self.host):\(self.port) \(pathInfo)")
                 self.stateChanged?(.cancelled)
             @unknown default:
-                neLog("ERROR", "❓ TCP unknown state \(self.host):\(self.port) \(pathInfo)")
+                neLog("ERROR", "TCP connection unknown state for \(self.host):\(self.port) \(pathInfo)")
                 self.stateChanged?(.failed(nil))
             }
         }
@@ -226,11 +226,18 @@ final class BypassTCPTransport: NSObject, TCPTransport {
     }
 
     func cancel() {
-        neLog("WARN", "📍 TCP cancel() called for \(host):\(port) - current state: \(connection.state)")
+        neLog("WARN", "TCP connection cancel requested for \(host):\(port) current_state=\(connection.state)")
         
         // Print stack trace to see who's calling cancel
         let stackTrace = Thread.callStackSymbols
-        neLog("DEBUG", "Cancel stack trace: \(stackTrace.prefix(5).joined(separator: " | "))")
+        neLog("DEBUG", "TCP cancel stack trace: \(stackTrace.prefix(5).joined(separator: " -> "))")
+        
+        // Log connection details at cancellation time
+        if let path = connection.currentPath {
+            neLog("INFO", "TCP cancel connection path: status=\(path.status) interface=\(path.availableInterfaces.first?.name ?? "unknown") expensive=\(path.isExpensive)")
+        } else {
+            neLog("WARN", "TCP cancel no current path available for \(host):\(port)")
+        }
         
         connection.cancel()
     }
