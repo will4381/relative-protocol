@@ -55,9 +55,9 @@ int rlwip_start(void) {
     IP4_ADDR(&px_gw, 0, 0, 0, 0);
     netif_set_addr(&g_proxynetif, &px_addr, &px_mask, &px_gw);
 
-    // CRITICAL FIX: Configure tunif with actual tunnel address so routing works
+    // CRITICAL FIX: Configure tunif with exact tunnel interface address to fix routing loops
     ip4_addr_t tn_addr, tn_mask, tn_gw;
-    IP4_ADDR(&tn_addr, 127, 0, 0, 1);      // Match tunnel network 127.0.0.0/24
+    IP4_ADDR(&tn_addr, 127, 0, 0, 2);      // Use exact tunnel interface IP 127.0.0.2
     IP4_ADDR(&tn_mask, 255, 255, 255, 0);  // /24 netmask for tunnel network  
     IP4_ADDR(&tn_gw, 0, 0, 0, 0);
     netif_set_addr(&g_tunif, &tn_addr, &tn_mask, &tn_gw);
