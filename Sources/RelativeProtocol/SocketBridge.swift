@@ -525,11 +525,12 @@ final class SocketBridge {
 					logError("INJECT_TRACE: Built IPv6 SYN-ACK packet size=\(tcpPacket.count)")
 			}
 			
-			// CRITICAL: Log the packet injection
-			logError("INJECT_TRACE: Injecting SYN-ACK packet into proxynetif")
+			// CRITICAL: Send SYN-ACK directly back to the tunnel, NOT into proxynetif!
+			logError("INJECT_TRACE: Sending SYN-ACK directly back through tunnel")
 			#if canImport(NetworkExtension) && os(iOS)
-			RelativeProtocolEngine.injectProxynetif(tcpPacket)
-			logError("INJECT_TRACE: Packet injected via NetworkExtension")
+			// The SYN-ACK must go back to the iOS app through the tunnel
+			RelativeProtocolEngine.sendPacketToTunnel(tcpPacket)
+			logError("INJECT_TRACE: SYN-ACK sent directly to tunnel")
 			#else
 			tcpPacket.withUnsafeBytes { bytes in
 				if let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) {

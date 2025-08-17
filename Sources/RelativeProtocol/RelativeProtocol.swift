@@ -237,10 +237,15 @@ extension RelativeProtocolEngine {
     private static var _packetFlow: NEPacketTunnelFlow?
     private static weak var _engineRef: RelativeProtocolEngine?
     static let packetOut: @convention(c) (UnsafePointer<UInt8>?, Int) -> Void = { pkt, len in
-        guard let pkt = pkt, len > 0, let flow = _packetFlow else { return }
+        guard let pkt = pkt, len > 0, let flow = _packetFlow else { 
+            logError("PACKET_OUT_ERROR: pkt=\(pkt != nil) len=\(len) flow=\(_packetFlow != nil)")
+            return 
+        }
         let version = pkt.pointee >> 4
         let proto: NSNumber = (version == 6) ? NSNumber(value: AF_INET6) : NSNumber(value: AF_INET)
         let data = Data(bytes: pkt, count: len)
+        // DEBUG: This should be sending packets back to the iOS app through the tunnel
+        logError("PACKET_OUT: sending packet back to tunnel, size=\(len)bytes version=\(version)")
         if let engine = _engineRef, !engine.passthroughMode {
             if let tag = TagStore.shared.tagForPacket(bytes: pkt, length: len) {
                 engine.schedulerForTag(tag).enqueue(data, proto: proto)
@@ -256,6 +261,8 @@ extension RelativeProtocolEngine {
     // Outbound from lwIP proxynetif → Swift socket bridge
     static let proxynetifOut: @convention(c) (UnsafePointer<UInt8>?, Int) -> Void = { pkt, len in
         guard let pkt = pkt, len > 0 else { return }
+        // DEBUG: This should only be called for packets going TO the Internet
+        logError("PROXYNETIF_OUT: packet going to Internet, size=\(len)bytes")
         SocketBridge.shared.handleOutgoingIPPacket(packetPtr: pkt, length: len)
     }
 }
@@ -347,6 +354,19 @@ extension RelativeProtocolEngine {
                 }
             }
         }
+    }
+    
+    /// Send packet directly back to the tunnel (iOS app) without going through lwIP
+    static func sendPacketToTunnel(_ data: Data) {
+        guard let flow = _packetFlow, !data.isEmpty else { 
+            logError("SEND_TO_TUNNEL_ERROR: flow=\(_packetFlow != nil) data_size=\(data.count)")
+            return 
+        }
+        let version = data.first.map { $0 >> 4 } ?? 4
+        let proto: NSNumber = (version == 6) ? NSNumber(value: AF_INET6) : NSNumber(value: AF_INET)
+        logError("SEND_TO_TUNNEL: Sending packet directly to tunnel, size=\(data.count) version=\(version)")
+        flow.writePackets([data], withProtocols: [proto])
+        Metrics.shared.incPacketsOut(bytes: data.count)
     }
 }
 
