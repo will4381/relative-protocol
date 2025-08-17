@@ -246,6 +246,8 @@ final class SocketBridge {
 		
 		let version = packetPtr.pointee >> 4
 		logTrace("Incoming packet: version=IPv\(version) length=\(length) bytes")
+		// DEBUG: Log proxy entry point
+		logError("PROXY_ENTRY: packet_size=\(length)bytes version=\(version)")
 		
 		if version == 4 {
 			handleIPv4(packetPtr: packetPtr, length: length)
@@ -278,6 +280,8 @@ final class SocketBridge {
 		
 		logInfo("IPv4 packet: proto=\(proto) len=\(length) src=\(srcStr) dst=\(dstStr)")
 		logDebug("IPv4 packet routing check: destination=\(dstStr) should_be_excluded_from_tunnel")
+		// DEBUG: Log flow details
+		logError("PROXY_FLOW: src=\(srcStr) dst=\(dstStr) proto=\(proto == 6 ? "TCP" : proto == 17 ? "UDP" : "OTHER")")
 		if proto == 17 { // UDP
 			let srcIP = Data(bytes: packetPtr.advanced(by: 12), count: 4)
 			let dstIP = Data(bytes: packetPtr.advanced(by: 16), count: 4)
@@ -298,6 +302,8 @@ final class SocketBridge {
 			let srcPort = readBE16(packetPtr.advanced(by: ihl + 0))
 			let dstPort = readBE16(packetPtr.advanced(by: ihl + 2))
 			let key = flowKeyV4(srcIP: srcIP, srcPort: srcPort, dstIP: dstIP, dstPort: dstPort, proto: 6)
+			// DEBUG: Log TCP flow details with ports
+			logError("PROXY_FLOW: src=\(ipv4String(from: srcIP)):\(srcPort) dst=\(ipv4String(from: dstIP)):\(dstPort) proto=TCP")
 			let tcpHdrOffset = ihl
 			let dataOffsetWords = Int(packetPtr.advanced(by: tcpHdrOffset + 12).pointee >> 4)
 			let tcpHdrLen = dataOffsetWords * 4
@@ -402,6 +408,8 @@ final class SocketBridge {
 			let id = FlowIdentity(flowID: flowID, isIPv6: version == 6, proto: "TCP", sourceIP: version == 4 ? ipv4String(from: srcIP) : ipv6String(from: srcIP), sourcePort: srcPort, destinationIP: version == 4 ? ipv4String(from: dstIP) : ipv6String(from: dstIP), destinationPort: dstPort)
 			let tag = self.delegate?.classify(flow: id)
 			logInfo("TCP flow new tag=\(tag ?? "-") src=\(id.sourceIP):\(srcPort) dst=\(id.destinationIP):\(dstPort) flags=\(flags)")
+			// DEBUG: Log TCP flow creation
+			logError("TCP_FLOW_CREATE: key=\(key) attempting_connection to \(id.destinationIP):\(dstPort)")
 			let newMeta = TcpFlowMeta(version: version, srcIP: srcIP, dstIP: dstIP, srcPort: srcPort, dstPort: dstPort, connection: conn, queue: flowQueue, deviceISN: deviceISN, remoteISN: remoteISN, deviceNextSeq: deviceISN &+ 1, remoteNextSeq: remoteISN, handshakeComplete: false, lastActivity: Date().timeIntervalSince1970, tag: tag)
 			flowsQueue.async(flags: .barrier) { self.tcpFlows[key] = newMeta }
 			if let tag = tag {
@@ -582,9 +590,13 @@ final class SocketBridge {
                                 self.debug_sentData[key] = arr
                             }
                         } else {
+                            // DEBUG: Log TCP data send
+                            logError("TCP_SEND: flow=\(key) payload_size=\(data.count)bytes")
                             updated.connection.send(data)
                         }
 #else
+                        // DEBUG: Log TCP data send
+                        logError("TCP_SEND: flow=\(key) payload_size=\(data.count)bytes")
                         updated.connection.send(data)
 #endif
                     }
@@ -660,6 +672,8 @@ final class SocketBridge {
             defer { Observability.shared.end("tcp_receive", sp) }
 			if let data = data, !data.isEmpty {
                 logDebug("tcp first_byte_in flow=\(key) bytes=\(data.count)")
+                // DEBUG: Log TCP data receive
+                logError("TCP_RECV: flow=\(key) data_size=\(data.count)bytes complete=\(isComplete)")
                 Observability.shared.event("tcp_first_byte_in")
 				var current = data
 				var m = meta
@@ -695,6 +709,10 @@ final class SocketBridge {
 				self.installTCPReceive(for: key, meta: meta)
 			} else {
 				// Remote side closed or error: synthesize FIN|ACK if complete, then remove
+				if let error = error {
+					// DEBUG: Log receive error
+					logError("TCP_RECV_ERROR: flow=\(key) error=\(error)")
+				}
 				if isComplete {
 					let m = meta
 					let flags: UInt8 = 0x11 // FIN|ACK

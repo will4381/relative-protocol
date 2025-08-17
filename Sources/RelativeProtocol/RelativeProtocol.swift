@@ -143,6 +143,11 @@ public final class RelativeProtocolEngine {
             }
             if !packets.isEmpty {
                 logInfo("readPackets: count=\(packets.count)")
+                // DEBUG: Log packet ingress details
+                logError("PACKET_INGRESS: packet_count=\(packets.count) engine_active=true")
+                for (i, packet) in packets.enumerated().prefix(5) {  // Log first 5 packets
+                    logError("PACKET_INGRESS[\(i)]: size=\(packet.count)bytes")
+                }
             }
             for pkt in packets {
                 strongSelf.handleInboundTunnelPacket(pkt)

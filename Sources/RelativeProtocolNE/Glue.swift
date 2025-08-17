@@ -173,12 +173,16 @@ final class BypassTCPTransport: NSObject, TCPTransport {
                 self.stateChanged?(.preparing)
             case .ready:
                 neLog("INFO", "TCP connection established successfully for \(self.host):\(self.port) \(pathInfo)")
+                // DEBUG: Log successful connection with more details
+                neLog("ERROR", "TCP_CONNECTION_RESULT: endpoint=\(self.host):\(self.port) state=READY viable=true \(pathInfo)")
                 self.stateChanged?(.ready)
             case .waiting(let err):
                 neLog("WARN", "TCP waiting \(self.host):\(self.port) error=\(String(describing: err)) \(pathInfo)")
                 self.stateChanged?(.waiting)
             case .failed(let err):
                 neLog("ERROR", "TCP connection failed for \(self.host):\(self.port) error=\(String(describing: err)) \(pathInfo)")
+                // DEBUG: Log connection failure details
+                neLog("ERROR", "TCP_CONNECTION_RESULT: endpoint=\(self.host):\(self.port) state=FAILED viable=false error=\(String(describing: err))")
                 self.stateChanged?(.failed(err))
             case .cancelled:
                 neLog("WARN", "TCP connection cancelled for \(self.host):\(self.port) \(pathInfo)")
