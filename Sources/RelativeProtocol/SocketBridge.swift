@@ -469,12 +469,10 @@ final class SocketBridge {
 		if ece { flagNames.append("ECE") }
 		if cwr { flagNames.append("CWR") }
 		
-		logError("PACKET_TRACE: TCP_FLAGS \(flagNames.joined(separator: "|")) flow=\(key) meta_exists=\(meta != nil)")
+		logError("PACKET_TRACE: TCP_FLAGS \(flagNames.joined(separator: "|")) flow=\(key) meta_exists=true")
 		
-		// Log connection state if meta exists
-		if let meta = meta {
-			logError("PACKET_TRACE: CONNECTION_STATE flow=\(key) connection_state=\(meta.connection.stateChanged) handshake_complete=\(meta.handshakeComplete)")
-		}
+		// Log connection state 
+		logError("PACKET_TRACE: CONNECTION_STATE flow=\(key) handshake_complete=\(meta.handshakeComplete)")
 		
 		if rst {
 			logError("RST_CRITICAL: RST packet received - analyzing source")
@@ -489,12 +487,8 @@ final class SocketBridge {
 			}
 			
 			// Log current connection state before cancelling
-			if let meta = meta {
-				logError("RST_CRITICAL: connection_exists=true handshake_complete=\(meta.handshakeComplete)")
-				logError("RST_CRITICAL: device_isn=\(meta.deviceISN) remote_isn=\(meta.remoteISN)")
-			} else {
-				logError("RST_CRITICAL: connection_exists=false - RST for unknown flow")
-			}
+			logError("RST_CRITICAL: connection_exists=true handshake_complete=\(meta.handshakeComplete)")
+			logError("RST_CRITICAL: device_isn=\(meta.deviceISN) remote_isn=\(meta.remoteISN)")
 			
 			// CRITICAL: Log stack trace to see who sent this RST
 			let stackTrace = Thread.callStackSymbols
