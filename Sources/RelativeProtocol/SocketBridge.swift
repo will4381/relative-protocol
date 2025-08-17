@@ -447,13 +447,17 @@ final class SocketBridge {
 			return newMeta
 		}()
 		
-		// Log all TCP packet details for debugging
-		logDebug("TCP packet received: version=\(version) src=\(version == 4 ? ipv4String(from: srcIP) : ipv6String(from: srcIP)):\(srcPort) dst=\(host):\(dstPort) flags=0x\(String(flags, radix: 16)) seq=\(seq) ack=\(ack) payload=\(payload.count)bytes")
+		// COMPREHENSIVE PACKET LOGGING for RST debugging
+		let srcAddr = version == 4 ? ipv4String(from: srcIP) : ipv6String(from: srcIP)
+		let dstAddr = version == 4 ? ipv4String(from: dstIP) : ipv6String(from: dstIP)
+		logError("PACKET_TRACE: TCP_RECV version=\(version) src=\(srcAddr):\(srcPort) dst=\(dstAddr):\(dstPort) flags=0x\(String(flags, radix: 16)) seq=\(seq) ack=\(ack) payload=\(payload.count)bytes")
 		
-		// Parse additional flags for logging (syn, fin, rst already declared above)
+		// Parse additional flags for detailed logging
 		let ackFlag = (flags & 0x10) != 0
 		let psh = (flags & 0x08) != 0
 		let urg = (flags & 0x20) != 0
+		let ece = (flags & 0x40) != 0
+		let cwr = (flags & 0x80) != 0
 		
 		var flagNames: [String] = []
 		if syn { flagNames.append("SYN") }
@@ -462,14 +466,39 @@ final class SocketBridge {
 		if rst { flagNames.append("RST") }
 		if psh { flagNames.append("PSH") }
 		if urg { flagNames.append("URG") }
+		if ece { flagNames.append("ECE") }
+		if cwr { flagNames.append("CWR") }
 		
-		logDebug("TCP flags parsed: \(flagNames.joined(separator: "|")) for flow=\(key)")
+		logError("PACKET_TRACE: TCP_FLAGS \(flagNames.joined(separator: "|")) flow=\(key) meta_exists=\(meta != nil)")
+		
+		// Log connection state if meta exists
+		if let meta = meta {
+			logError("PACKET_TRACE: CONNECTION_STATE flow=\(key) connection_state=\(meta.connection.stateChanged) handshake_complete=\(meta.handshakeComplete)")
+		}
 		
 		if rst {
-			logError("RST flag detected - cancelling TCP connection")
-			logError("Connection details: version=\(version) source=\(version == 4 ? ipv4String(from: srcIP) : ipv6String(from: srcIP)):\(srcPort) destination=\(host):\(dstPort)")
-			logError("Packet details: seq=\(seq) ack=\(ack) payload_length=\(payload.count) flags=0x\(String(flags, radix: 16))")
-			logError("Flow key: \(key)")
+			logError("RST_CRITICAL: RST packet received - analyzing source")
+			logError("RST_CRITICAL: version=\(version) src=\(srcAddr):\(srcPort) dst=\(dstAddr):\(dstPort)")
+			logError("RST_CRITICAL: seq=\(seq) ack=\(ack) payload_length=\(payload.count) flags=0x\(String(flags, radix: 16))")
+			logError("RST_CRITICAL: flow_key=\(key)")
+			
+			// CRITICAL: Log if this is a loopback RST (tunnel IP responding to itself)
+			if srcAddr == "100.64.0.2" || dstAddr == "100.64.0.2" {
+				logError("RST_CRITICAL: TUNNEL_IP_DETECTED - packet involves tunnel IP 100.64.0.2")
+				logError("RST_CRITICAL: This indicates a routing loop or source IP issue")
+			}
+			
+			// Log current connection state before cancelling
+			if let meta = meta {
+				logError("RST_CRITICAL: connection_exists=true handshake_complete=\(meta.handshakeComplete)")
+				logError("RST_CRITICAL: device_isn=\(meta.deviceISN) remote_isn=\(meta.remoteISN)")
+			} else {
+				logError("RST_CRITICAL: connection_exists=false - RST for unknown flow")
+			}
+			
+			// CRITICAL: Log stack trace to see who sent this RST
+			let stackTrace = Thread.callStackSymbols
+			logError("RST_CRITICAL: stack_trace=\(stackTrace.prefix(3).joined(separator: " -> "))")
 			
 			meta.connection.cancel()
 			flowsQueue.async(flags: .barrier) { self.tcpFlows.removeValue(forKey: key) }
@@ -480,24 +509,38 @@ final class SocketBridge {
 			let ackNum = meta.deviceISN &+ 1
 			let seqNum = meta.remoteISN
 			let synAckFlags: UInt8 = 0x12 // SYN|ACK
+			
+			logError("INJECT_TRACE: Synthesizing SYN-ACK for handshake")
+			logError("INJECT_TRACE: version=\(version) src=\(dstAddr):\(dstPort) dst=\(srcAddr):\(srcPort)")
+			logError("INJECT_TRACE: seq=\(seqNum) ack=\(ackNum) flags=SYN|ACK flow=\(key)")
+			
 			let tcpPacket: Data
 			if version == 4 {
 					tcpPacket = buildIPv4TCPPacket(srcIP: dstIP, dstIP: srcIP, srcPort: dstPort, dstPort: srcPort, seq: seqNum, ack: ackNum, flags: synAckFlags, payload: Data(), mssOption: mssClampV4)
+					logError("INJECT_TRACE: Built IPv4 SYN-ACK packet size=\(tcpPacket.count)")
 			} else {
 					tcpPacket = buildIPv6TCPPacket(srcIP: dstIP, dstIP: srcIP, srcPort: dstPort, dstPort: srcPort, seq: seqNum, ack: ackNum, flags: synAckFlags, payload: Data(), mssOption: mssClampV6)
+					logError("INJECT_TRACE: Built IPv6 SYN-ACK packet size=\(tcpPacket.count)")
 			}
+			
+			// CRITICAL: Log the packet injection
+			logError("INJECT_TRACE: Injecting SYN-ACK packet into proxynetif")
 			#if canImport(NetworkExtension) && os(iOS)
 			RelativeProtocolEngine.injectProxynetif(tcpPacket)
+			logError("INJECT_TRACE: Packet injected via NetworkExtension")
 			#else
 			tcpPacket.withUnsafeBytes { bytes in
 				if let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) {
-					_ = rlwip_inject_proxynetif(base, tcpPacket.count)
+					let result = rlwip_inject_proxynetif(base, tcpPacket.count)
+					logError("INJECT_TRACE: Packet injected via rlwip result=\(result)")
 				}
 			}
 			#endif
+			
 			meta.remoteNextSeq = seqNum &+ 1
 			meta.handshakeComplete = true
 			flowsQueue.async(flags: .barrier) { self.tcpFlows[key] = meta }
+			logError("INJECT_TRACE: Handshake marked complete for flow=\(key)")
 		}
         if !payload.isEmpty {
             meta.queue.async {

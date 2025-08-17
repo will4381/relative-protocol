@@ -101,7 +101,7 @@ final class BypassTCPTransport: NSObject, TCPTransport {
         self.connection.stateUpdateHandler = { [weak self] state in
             guard let self = self else { return }
             
-            neLog("DEBUG", "TCP state change to \(state) for \(self.host):\(self.port)")
+            neLog("ERROR", "CONNECTION_TRACE: TCP state change to \(state) for \(self.host):\(self.port)")
             
             // CRITICAL: Safely access currentPath to avoid 'no endpoint handler' errors
             var pathInfo = "path=unknown"
@@ -113,17 +113,33 @@ final class BypassTCPTransport: NSObject, TCPTransport {
                 path = self.connection.currentPath
                 if let path = path {
                     pathInfo = self.describeInterface(path) + " status=\(path.status)"
+                    
+                    // CRITICAL: Log detailed path information for debugging
+                    neLog("ERROR", "CONNECTION_TRACE: PATH_DETAILS \(self.host):\(self.port) status=\(path.status) expensive=\(path.isExpensive) constrained=\(path.isConstrained)")
+                    neLog("ERROR", "CONNECTION_TRACE: INTERFACES \(self.host):\(self.port) available=\(path.availableInterfaces.count) types=\(path.availableInterfaces.map { $0.type }.description)")
+                    
+                    // Log each interface in detail
+                    for (index, iface) in path.availableInterfaces.enumerated() {
+                        neLog("ERROR", "CONNECTION_TRACE: INTERFACE[\(index)] name=\(iface.name) type=\(iface.type) index=\(iface.index)")
+                    }
+                    
+                    // Check for tunnel interface usage
+                    let usingTunnel = path.usesInterfaceType(.other)
+                    neLog("ERROR", "CONNECTION_TRACE: ROUTING \(self.host):\(self.port) uses_tunnel=\(usingTunnel) uses_wifi=\(path.usesInterfaceType(.wifi)) uses_cellular=\(path.usesInterfaceType(.cellular))")
+                    
                 } else {
                     pathInfo = "path=nil"
-                    neLog("WARN", "TCP connection \(self.host):\(self.port) has nil currentPath in state \(state)")
+                    neLog("ERROR", "CONNECTION_TRACE: NIL_PATH \(self.host):\(self.port) has nil currentPath in state \(state)")
                 }
             case .setup, .preparing:
                 pathInfo = "path=not-ready"
-                neLog("DEBUG", "TCP \(self.host):\(self.port) in \(state), path not yet available")
+                neLog("ERROR", "CONNECTION_TRACE: PREPARING \(self.host):\(self.port) in \(state), path not yet available")
             case .cancelled:
                 pathInfo = "path=cancelled"
+                neLog("ERROR", "CONNECTION_TRACE: CANCELLED \(self.host):\(self.port)")
             @unknown default:
                 pathInfo = "path=unknown-state"
+                neLog("ERROR", "CONNECTION_TRACE: UNKNOWN_STATE \(self.host):\(self.port) state=\(state)")
             }
             
             // Additional debugging for viable connections only
@@ -226,20 +242,31 @@ final class BypassTCPTransport: NSObject, TCPTransport {
     }
 
     func cancel() {
-        neLog("WARN", "TCP connection cancel requested for \(host):\(port) current_state=\(connection.state)")
+        neLog("ERROR", "CANCEL_TRACE: TCP connection cancel requested for \(host):\(port) current_state=\(connection.state)")
         
-        // Print stack trace to see who's calling cancel
+        // Print detailed stack trace to see who's calling cancel
         let stackTrace = Thread.callStackSymbols
-        neLog("DEBUG", "TCP cancel stack trace: \(stackTrace.prefix(5).joined(separator: " -> "))")
+        neLog("ERROR", "CANCEL_TRACE: STACK_TRACE \(host):\(port)")
+        for (index, frame) in stackTrace.prefix(8).enumerated() {
+            neLog("ERROR", "CANCEL_TRACE: FRAME[\(index)] \(frame)")
+        }
         
-        // Log connection details at cancellation time
+        // Log detailed connection state at cancellation time
         if let path = connection.currentPath {
-            neLog("INFO", "TCP cancel connection path: status=\(path.status) interface=\(path.availableInterfaces.first?.name ?? "unknown") expensive=\(path.isExpensive)")
+            neLog("ERROR", "CANCEL_TRACE: PATH_INFO \(host):\(port) status=\(path.status) expensive=\(path.isExpensive) constrained=\(path.isConstrained)")
+            neLog("ERROR", "CANCEL_TRACE: INTERFACES \(host):\(port) count=\(path.availableInterfaces.count)")
+            
+            for (index, iface) in path.availableInterfaces.enumerated() {
+                neLog("ERROR", "CANCEL_TRACE: INTERFACE[\(index)] name=\(iface.name) type=\(iface.type)")
+            }
+            
+            neLog("ERROR", "CANCEL_TRACE: ROUTING \(host):\(port) tunnel=\(path.usesInterfaceType(.other)) wifi=\(path.usesInterfaceType(.wifi)) cellular=\(path.usesInterfaceType(.cellular))")
         } else {
-            neLog("WARN", "TCP cancel no current path available for \(host):\(port)")
+            neLog("ERROR", "CANCEL_TRACE: NO_PATH \(host):\(port) - no current path available")
         }
         
         connection.cancel()
+        neLog("ERROR", "CANCEL_TRACE: COMPLETED \(host):\(port) - connection.cancel() called")
     }
 }
 
