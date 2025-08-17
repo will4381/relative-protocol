@@ -1,4 +1,4 @@
-RelativeProtocol
+RelativeProtocol *Not Working Currently (May return at later date)
 ================
 
 A Swift Package that embeds a userspace TCP/IP stack (lwIP) and a socket bridge to forward TUN packets to the Internet on consumer iOS via NEPacketTunnelProvider. Includes hooks for flow classification and per-tag throttling (UDP and TCP), plus basic metrics.
