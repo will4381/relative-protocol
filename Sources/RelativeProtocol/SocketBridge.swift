@@ -525,11 +525,11 @@ final class SocketBridge {
 					logError("INJECT_TRACE: Built IPv6 SYN-ACK packet size=\(tcpPacket.count)")
 			}
 			
-			// CRITICAL: SYN-ACK needs to go back to iOS app - bypass lwIP routing
-			logError("INJECT_TRACE: Sending SYN-ACK directly to tunnel to bypass lwIP routing issues")
+			// SYN-ACK response goes through lwIP for symmetric routing
+			logError("INJECT_TRACE: Sending SYN-ACK through lwIP proxynetif")
 			#if canImport(NetworkExtension) && os(iOS)
-			RelativeProtocolEngine.sendPacketToTunnel(tcpPacket)
-			logError("INJECT_TRACE: SYN-ACK sent directly to tunnel")
+			RelativeProtocolEngine.injectProxynetif(tcpPacket)
+			logError("INJECT_TRACE: SYN-ACK sent through lwIP")
 			#else
 			tcpPacket.withUnsafeBytes { bytes in
 				if let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) {
@@ -624,9 +624,9 @@ final class SocketBridge {
                         ? self.buildIPv4TCPPacket(srcIP: updated.dstIP, dstIP: updated.srcIP, srcPort: updated.dstPort, dstPort: updated.srcPort, seq: seqNum, ack: ackNum, flags: ackOnlyFlags, payload: Data())
                         : self.buildIPv6TCPPacket(srcIP: updated.dstIP, dstIP: updated.srcIP, srcPort: updated.dstPort, dstPort: updated.srcPort, seq: seqNum, ack: ackNum, flags: ackOnlyFlags, payload: Data())
                     #if canImport(NetworkExtension) && os(iOS)
-                    // CRITICAL: ACK packets also need direct tunnel delivery to ensure proper flow control
-                    logError("TCP_ACK: Sending ACK directly to tunnel to bypass lwIP routing")
-                    RelativeProtocolEngine.sendPacketToTunnel(ackPkt)
+                    // ACK packets go through lwIP for symmetric routing
+                    logError("TCP_ACK: Sending ACK through lwIP proxynetif")
+                    RelativeProtocolEngine.injectProxynetif(ackPkt)
                     #else
                     ackPkt.withUnsafeBytes { bytes in
                         if let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) {
@@ -695,9 +695,9 @@ final class SocketBridge {
 						pkt = self.buildIPv6TCPPacket(srcIP: m.dstIP, dstIP: m.srcIP, srcPort: m.dstPort, dstPort: m.srcPort, seq: seqNum, ack: ackNum, flags: flags, payload: chunk)
 					}
 					#if canImport(NetworkExtension) && os(iOS)
-					// CRITICAL: Data response packets need direct tunnel delivery like SYN-ACK packets
-					logError("TCP_RESPONSE: Sending data response directly to tunnel to bypass lwIP routing")
-					RelativeProtocolEngine.sendPacketToTunnel(pkt)
+					// Data response packets go through lwIP for symmetric routing
+					logError("TCP_RESPONSE: Sending data response through lwIP proxynetif")
+					RelativeProtocolEngine.injectProxynetif(pkt)
 					#else
 					pkt.withUnsafeBytes { bytes in
 						if let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) {
@@ -729,9 +729,9 @@ final class SocketBridge {
 						pkt = self.buildIPv6TCPPacket(srcIP: m.dstIP, dstIP: m.srcIP, srcPort: m.dstPort, dstPort: m.srcPort, seq: seqNum, ack: ackNum, flags: flags, payload: Data())
 					}
 					#if canImport(NetworkExtension) && os(iOS)
-					// CRITICAL: FIN|ACK packets need direct tunnel delivery to properly close connections
-					logError("TCP_FIN_ACK: Sending FIN|ACK directly to tunnel to bypass lwIP routing")
-					RelativeProtocolEngine.sendPacketToTunnel(pkt)
+					// FIN|ACK packets go through lwIP for symmetric routing
+					logError("TCP_FIN_ACK: Sending FIN|ACK through lwIP proxynetif")
+					RelativeProtocolEngine.injectProxynetif(pkt)
 					#else
 					pkt.withUnsafeBytes { bytes in
 						if let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) {
