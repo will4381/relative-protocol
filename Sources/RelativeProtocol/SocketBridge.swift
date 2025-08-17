@@ -525,11 +525,11 @@ final class SocketBridge {
 					logError("INJECT_TRACE: Built IPv6 SYN-ACK packet size=\(tcpPacket.count)")
 			}
 			
-			// CRITICAL: SYN-ACK needs to go back to iOS app
-			logError("INJECT_TRACE: Injecting SYN-ACK - this should route back to tunnel via lwIP")
+			// CRITICAL: SYN-ACK needs to go back to iOS app - bypass lwIP routing
+			logError("INJECT_TRACE: Sending SYN-ACK directly to tunnel to bypass lwIP routing issues")
 			#if canImport(NetworkExtension) && os(iOS)
-			RelativeProtocolEngine.injectProxynetif(tcpPacket)
-			logError("INJECT_TRACE: SYN-ACK injected into proxynetif for lwIP routing")
+			RelativeProtocolEngine.sendPacketToTunnel(tcpPacket)
+			logError("INJECT_TRACE: SYN-ACK sent directly to tunnel")
 			#else
 			tcpPacket.withUnsafeBytes { bytes in
 				if let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) {
