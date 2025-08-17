@@ -481,8 +481,8 @@ final class SocketBridge {
 			logError("RST_CRITICAL: flow_key=\(key)")
 			
 			// CRITICAL: Log if this is a loopback RST (tunnel IP responding to itself)
-			if srcAddr == "100.64.0.2" || dstAddr == "100.64.0.2" {
-				logError("RST_CRITICAL: TUNNEL_IP_DETECTED - packet involves tunnel IP 100.64.0.2")
+			if srcAddr == "127.0.0.2" || dstAddr == "127.0.0.2" {
+				logError("RST_CRITICAL: TUNNEL_IP_DETECTED - packet involves tunnel IP 127.0.0.2")
 				logError("RST_CRITICAL: This indicates a routing loop or source IP issue")
 			}
 			
