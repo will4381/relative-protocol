@@ -1,0 +1,3 @@
+module RelativeProtocolCore {
+    header "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolCore.build/include/RelativeProtocolCore-Swift.h"
+}

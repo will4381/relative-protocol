@@ -1,0 +1,40 @@
+{
+  "": {
+    "swift-dependencies": "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolTunnel.build/master.swiftdeps"
+  },
+  "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/Sources/RelativeProtocolTunnel/GoTun2SocksEngine.swift": {
+    "dependencies": "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolTunnel.build/GoTun2SocksEngine.d",
+    "object": "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolTunnel.build/GoTun2SocksEngine.swift.o",
+    "swiftmodule": "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolTunnel.build/GoTun2SocksEngine~partial.swiftmodule",
+    "swift-dependencies": "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolTunnel.build/GoTun2SocksEngine.swiftdeps",
+    "diagnostics": "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolTunnel.build/GoTun2SocksEngine.dia"
+  },
+  "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/Sources/RelativeProtocolTunnel/MetricsCollector.swift": {
+    "dependencies": "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolTunnel.build/MetricsCollector.d",
+    "object": "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolTunnel.build/MetricsCollector.swift.o",
+    "swiftmodule": "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolTunnel.build/MetricsCollector~partial.swiftmodule",
+    "swift-dependencies": "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolTunnel.build/MetricsCollector.swiftdeps",
+    "diagnostics": "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolTunnel.build/MetricsCollector.dia"
+  },
+  "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/Sources/RelativeProtocolTunnel/PacketTunnelSupport.swift": {
+    "dependencies": "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolTunnel.build/PacketTunnelSupport.d",
+    "object": "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolTunnel.build/PacketTunnelSupport.swift.o",
+    "swiftmodule": "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolTunnel.build/PacketTunnelSupport~partial.swiftmodule",
+    "swift-dependencies": "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolTunnel.build/PacketTunnelSupport.swiftdeps",
+    "diagnostics": "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolTunnel.build/PacketTunnelSupport.dia"
+  },
+  "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/Sources/RelativeProtocolTunnel/Tun2SocksAdapter.swift": {
+    "dependencies": "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolTunnel.build/Tun2SocksAdapter.d",
+    "object": "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolTunnel.build/Tun2SocksAdapter.swift.o",
+    "swiftmodule": "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolTunnel.build/Tun2SocksAdapter~partial.swiftmodule",
+    "swift-dependencies": "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolTunnel.build/Tun2SocksAdapter.swiftdeps",
+    "diagnostics": "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolTunnel.build/Tun2SocksAdapter.dia"
+  },
+  "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/Sources/RelativeProtocolTunnel/TunnelProvider.swift": {
+    "dependencies": "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolTunnel.build/TunnelProvider.d",
+    "object": "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolTunnel.build/TunnelProvider.swift.o",
+    "swiftmodule": "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolTunnel.build/TunnelProvider~partial.swiftmodule",
+    "swift-dependencies": "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolTunnel.build/TunnelProvider.swiftdeps",
+    "diagnostics": "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolTunnel.build/TunnelProvider.dia"
+  }
+}
