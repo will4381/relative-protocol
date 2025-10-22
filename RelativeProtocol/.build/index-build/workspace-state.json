@@ -1,0 +1,31 @@
+{
+  "object" : {
+    "artifacts" : [
+      {
+        "kind" : {
+          "xcframework" : {
+
+          }
+        },
+        "packageRef" : {
+          "identity" : "relativeprotocol",
+          "kind" : "root",
+          "location" : "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol",
+          "name" : "RelativeProtocol"
+        },
+        "path" : "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/Binary/Tun2Socks.xcframework",
+        "source" : {
+          "type" : "local"
+        },
+        "targetName" : "Tun2SocksBinary"
+      }
+    ],
+    "dependencies" : [
+
+    ],
+    "prebuilts" : [
+
+    ]
+  },
+  "version" : 7
+}
