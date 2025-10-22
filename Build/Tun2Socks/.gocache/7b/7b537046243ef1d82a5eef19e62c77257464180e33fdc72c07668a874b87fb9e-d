@@ -1,0 +1,9 @@
+./bind.go
+./gen.go
+./genclasses.go
+./gengo.go
+./genjava.go
+./genobjc.go
+./genobjcw.go
+./printer.go
+./types.go

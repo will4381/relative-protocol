@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>SchemeUserState</key>
+	<dict>
+		<key>PacketTunnel.xcscheme_^#shared#^_</key>
+		<dict>
+			<key>orderHint</key>
+			<integer>1</integer>
+		</dict>
+		<key>VPN Bridge.xcscheme_^#shared#^_</key>
+		<dict>
+			<key>orderHint</key>
+			<integer>0</integer>
+		</dict>
+	</dict>
+	<key>SuppressBuildableAutocreation</key>
+	<dict>
+		<key>A5B06E092EA7E6E800D51D86</key>
+		<dict>
+			<key>primary</key>
+			<true/>
+		</dict>
+		<key>A5B06E162EA7E6E900D51D86</key>
+		<dict>
+			<key>primary</key>
+			<true/>
+		</dict>
+		<key>A5B06E202EA7E6E900D51D86</key>
+		<dict>
+			<key>primary</key>
+			<true/>
+		</dict>
+		<key>A5B06E5B2EA7FD9F00D51D86</key>
+		<dict>
+			<key>primary</key>
+			<true/>
+		</dict>
+	</dict>
+</dict>
+</plist>
