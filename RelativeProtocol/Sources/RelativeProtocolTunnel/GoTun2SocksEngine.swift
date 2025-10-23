@@ -2,7 +2,12 @@
 //  GoTun2SocksEngine.swift
 //  RelativeProtocolTunnel
 //
-//  Bridges the gomobile-generated Tun2Socks bindings into the adapter.
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 10/20/2025.
+//
+//  Bridges the gomobile-generated Tun2Socks bindings into the adapter by
+//  translating callbacks between Swift and Go while keeping the generated
+//  framework isolated from the rest of the package.
 //
 
 #if canImport(Tun2Socks)
@@ -23,12 +28,15 @@ final class GoTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
     private var networkAdapter: NetworkAdapter?
     private let stateQueue = DispatchQueue(label: "RelativeProtocolTunnel.GoTun2SocksEngine")
     private var running = false
+    private let debugLoggingEnabled: Bool
 
     init(configuration: RelativeProtocol.Configuration, logger: Logger) {
         self.configuration = configuration
         self.logger = logger
+        self.debugLoggingEnabled = configuration.logging.enableDebug
     }
 
+    /// Boots the gomobile engine and wires its callbacks into Swift.
     func start(callbacks: Tun2SocksCallbacks) throws {
         try stateQueue.sync {
             guard !running else { return }
@@ -36,12 +44,13 @@ final class GoTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
             let config = BridgeConfig()
             config.mtu = configuration.provider.mtu
 
-            let emitter = PacketEmitterAdapter(callbacks: callbacks)
-            let network = NetworkAdapter(
-                callbacks: callbacks,
-                logger: logger,
-                mtu: configuration.provider.mtu
-            )
+        let emitter = PacketEmitterAdapter(callbacks: callbacks)
+        let network = NetworkAdapter(
+            callbacks: callbacks,
+            logger: logger,
+            mtu: configuration.provider.mtu,
+            debugLoggingEnabled: debugLoggingEnabled
+        )
 
             var creationError: NSError?
             guard let engine = BridgeNewEngine(config, emitter, network, &creationError) else {
@@ -80,6 +89,7 @@ final class GoTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
         }
     }
 
+    /// Stops the gomobile engine and releases associated resources.
     func stop() {
         stateQueue.sync {
             guard running else { return }
@@ -97,6 +107,7 @@ final class GoTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
 
 // MARK: - Packet emission
 
+/// Bridges packet emission from the Go bridge back into Swift callbacks.
 private final class PacketEmitterAdapter: NSObject, BridgePacketEmitterProtocol {
     private let callbacks: Tun2SocksCallbacks
 
@@ -114,20 +125,23 @@ private final class PacketEmitterAdapter: NSObject, BridgePacketEmitterProtocol 
 
 // MARK: - Network plumbing
 
+/// Handles TCP/UDP lifecycle requests originating from the Go bridge.
 private final class NetworkAdapter: NSObject, BridgeNetworkProtocol {
     private let callbacks: Tun2SocksCallbacks
     private let logger: Logger
     private let mtu: Int
+    private let debugLoggingEnabled: Bool
     private let lock = DispatchQueue(label: "RelativeProtocolTunnel.NetworkAdapter.lock")
     private var nextHandle: Int64 = 1
     private var tcpConnections: [Int64: ManagedTCPConnection] = [:]
     private var udpConnections: [Int64: ManagedUDPConnection] = [:]
     private weak var engine: BridgeEngine?
 
-    init(callbacks: Tun2SocksCallbacks, logger: Logger, mtu: Int) {
+    init(callbacks: Tun2SocksCallbacks, logger: Logger, mtu: Int, debugLoggingEnabled: Bool) {
         self.callbacks = callbacks
         self.logger = logger
         self.mtu = mtu
+        self.debugLoggingEnabled = debugLoggingEnabled
     }
 
     func bind(engine: BridgeEngine) {
@@ -172,6 +186,7 @@ private final class NetworkAdapter: NSObject, BridgeNetworkProtocol {
             logger: logger,
             mtu: mtu,
             timeoutMillis: timeoutMillis,
+            debugLoggingEnabled: debugLoggingEnabled,
             onClosed: { [weak self] identifier in
                 _ = self?.removeTCP(handle: identifier)
             }
@@ -296,6 +311,7 @@ private final class NetworkAdapter: NSObject, BridgeNetworkProtocol {
 
 // Remaining ManagedTCPConnection and ManagedUDPConnection classes unchanged…
 
+/// Wraps an `NWConnection` and forwards events back to the Go engine.
 private final class ManagedTCPConnection: @unchecked Sendable {
     private let handle: Int64
     private let connection: Network.NWConnection
@@ -310,6 +326,7 @@ private final class ManagedTCPConnection: @unchecked Sendable {
     private let readySemaphore = DispatchSemaphore(value: 0)
     private var readyResult: Result<Void, Error>?
     private let onClosed: (Int64) -> Void
+    private let debugLoggingEnabled: Bool
 
     init(
         handle: Int64,
@@ -318,6 +335,7 @@ private final class ManagedTCPConnection: @unchecked Sendable {
         logger: Logger,
         mtu: Int,
         timeoutMillis: Int64,
+        debugLoggingEnabled: Bool,
         onClosed: @escaping (Int64) -> Void
     ) {
         self.handle = handle
@@ -328,6 +346,7 @@ private final class ManagedTCPConnection: @unchecked Sendable {
         self.timeoutMillis = timeoutMillis
         self.queue = DispatchQueue(label: "RelativeProtocolTunnel.ManagedTCPConnection.\(handle)")
         self.onClosed = onClosed
+        self.debugLoggingEnabled = debugLoggingEnabled
     }
 
     func activate() {
@@ -410,7 +429,9 @@ private final class ManagedTCPConnection: @unchecked Sendable {
             signalReady(result: .failure(NSError(domain: "GoTun2SocksEngine", code: -9, userInfo: [NSLocalizedDescriptionKey: "connection cancelled"])))
             notifyClose(reason: nil)
         case .waiting(let error):
-            self.logger.debug("Relative Protocol: tcp \(self.handle) waiting – \(error.localizedDescription, privacy: .public)")
+            if debugLoggingEnabled {
+                logger.debug("Relative Protocol: tcp \(self.handle) waiting – \(error.localizedDescription, privacy: .public)")
+            }
         default:
             break
         }
@@ -462,6 +483,8 @@ private final class ManagedTCPConnection: @unchecked Sendable {
     }
 }
 
+/// Wraps an `NWConnection` representing a UDP session and forwards events to
+/// the Go engine.
 private final class ManagedUDPConnection: @unchecked Sendable {
     private let handle: Int64
     private let connection: Network.NWConnection

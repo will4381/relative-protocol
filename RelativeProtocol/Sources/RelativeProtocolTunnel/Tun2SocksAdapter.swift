@@ -2,7 +2,12 @@
 //  Tun2SocksAdapter.swift
 //  RelativeProtocolTunnel
 //
-//  Bridges NEPacketTunnelProvider packet flow into the tun2socks core.
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 10/20/2025.
+//
+//  Bridges `NEPacketTunnelProvider` packet flow into the tun2socks core. The
+//  adapter owns the read loop, metrics accounting, and hook invocation logic
+//  while delegating actual packet processing to the gomobile engine.
 //
 
 import Foundation
@@ -10,11 +15,15 @@ import Network
 import os.log
 import RelativeProtocolCore
 
+/// Minimal interface adopted by both the real gomobile bridge and the noop
+/// stub. Keeps the adapter decoupled from generated bindings.
 protocol Tun2SocksEngine {
     func start(callbacks: Tun2SocksCallbacks) throws
     func stop()
 }
 
+/// Callback set passed into the engine so it can interact with the adapter
+/// without a hard dependency on `NEPacketTunnelProvider`.
 struct Tun2SocksCallbacks {
     let startPacketReadLoop: (@escaping @Sendable (_ packets: [Data], _ protocols: [NSNumber]) -> Void) -> Void
     let emitPackets: (_ packets: [Data], _ protocols: [NSNumber]) -> Void
@@ -22,14 +31,17 @@ struct Tun2SocksCallbacks {
     let makeUDPConnection: (_ endpoint: Network.NWEndpoint) -> Network.NWConnection
 }
 
-/// Shim used prior to wiring up the gomobile-generated bindings. Keeps the tunnel alive and logs activity.
+/// Shim used when the gomobile-generated bindings are unavailable. It simply
+/// reflects packets back through the tunnel so the provider remains responsive.
 final class NoOpTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
     private let logger: Logger
     private let queue = DispatchQueue(label: "RelativeProtocolTunnel.NoOpEngine")
     private var isRunning = false
+    private let debugLoggingEnabled: Bool
 
-    init(logger: Logger) {
+    init(logger: Logger, debugLoggingEnabled: Bool) {
         self.logger = logger
+        self.debugLoggingEnabled = debugLoggingEnabled
     }
 
     func start(callbacks: Tun2SocksCallbacks) throws {
@@ -38,7 +50,9 @@ final class NoOpTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
             guard let self else { return }
             callbacks.startPacketReadLoop { [weak self] packets, protocols in
                 guard let self else { return }
-                self.logger.debug("Relative Protocol: Stub engine dropping \(packets.count, privacy: .public) packets")
+                if self.debugLoggingEnabled {
+                    self.logger.debug("Relative Protocol: Stub engine dropping \(packets.count, privacy: .public) packets")
+                }
                 if self.isRunning {
                     callbacks.emitPackets(packets, protocols)
                 }
@@ -51,7 +65,8 @@ final class NoOpTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
     }
 }
 
-/// Coordinating object that keeps the packet loop readable from the provider.
+/// Coordinates packet I/O between `NEPacketTunnelProvider` and the tun2socks
+/// core, enforcing hooks and metrics along the way.
 final class Tun2SocksAdapter: @unchecked Sendable {
     private let provider: PacketTunnelProviding
     private let configuration: RelativeProtocol.Configuration
@@ -59,9 +74,17 @@ final class Tun2SocksAdapter: @unchecked Sendable {
     private let logger: Logger
     private let engine: Tun2SocksEngine
     private let hooks: RelativeProtocol.Configuration.Hooks
+    private let debugLoggingEnabled: Bool
     private let ioQueue = DispatchQueue(label: "RelativeProtocolTunnel.Tun2SocksAdapter", qos: .userInitiated)
     private var isRunning = false
 
+    /// - Parameters:
+    ///   - provider: The packet tunnel provider backing the virtual interface.
+    ///   - configuration: Runtime configuration describing block lists and
+    ///     other policies.
+    ///   - metrics: Optional collector that records packet statistics.
+    ///   - engine: Concrete engine implementation (gomobile or noop).
+    ///   - hooks: Caller-supplied hooks for telemetry and policy decisions.
     init(
         provider: PacketTunnelProviding,
         configuration: RelativeProtocol.Configuration,
@@ -74,9 +97,11 @@ final class Tun2SocksAdapter: @unchecked Sendable {
         self.metrics = metrics
         self.engine = engine
         self.hooks = hooks
+        self.debugLoggingEnabled = configuration.logging.enableDebug
         logger = Logger(subsystem: "RelativeProtocolTunnel", category: "Tun2SocksAdapter")
     }
 
+    /// Boots the engine and begins draining packets from `packetFlow`.
     func start() throws {
         hooks.eventSink?(.willStart)
         let callbacks = Tun2SocksCallbacks(
@@ -98,6 +123,7 @@ final class Tun2SocksAdapter: @unchecked Sendable {
         hooks.eventSink?(.didStart)
     }
 
+    /// Halts packet processing and tears down engine resources.
     func stop() {
         guard isRunning else { return }
         engine.stop()
@@ -105,10 +131,12 @@ final class Tun2SocksAdapter: @unchecked Sendable {
         hooks.eventSink?(.didStop)
     }
 
+    /// Continuously reads from the provider and forwards packets to the engine.
     private func scheduleRead(handler: @escaping @Sendable (_ packets: [Data], _ protocols: [NSNumber]) -> Void) {
         ioQueue.async { [weak self] in
             guard let self else { return }
             self.provider.flow.readPackets { packets, protocols in
+                guard self.isRunning else { return }
                 self.metrics?.record(direction: .inbound, packets: packets.count, bytes: packets.reduce(0) { $0 + $1.count })
                 packets.enumerated().forEach { index, packet in
                     let proto = protocols[safe: index]?.int32Value ?? packet.afValue
@@ -121,8 +149,10 @@ final class Tun2SocksAdapter: @unchecked Sendable {
         }
     }
 
+    /// Writes packets emitted by the engine back to the provider.
     private func writePackets(_ packets: [Data], protocols: [NSNumber]) {
         guard !packets.isEmpty else { return }
+        guard isRunning else { return }
         metrics?.record(direction: .outbound, packets: packets.count, bytes: packets.reduce(0) { $0 + $1.count })
         packets.enumerated().forEach { index, packet in
             let proto = protocols[safe: index]?.int32Value ?? packet.afValue
@@ -131,6 +161,7 @@ final class Tun2SocksAdapter: @unchecked Sendable {
         provider.flow.writePackets(packets, protocols: protocols)
     }
 
+    /// Consults block policies and establishes TCP connections when permitted.
     private func makeTCPConnection(endpoint: Network.NWEndpoint) -> Network.NWConnection? {
         guard case let .hostPort(host, port) = endpoint else {
             return provider.makeTCPConnection(to: endpoint)
@@ -145,10 +176,13 @@ final class Tun2SocksAdapter: @unchecked Sendable {
             return connection
         }
 
-        logger.debug("Relative Protocol: Opening TCP connection to \(hostString, privacy: .public):\(port.rawValue, privacy: .public)")
+        if debugLoggingEnabled {
+            logger.debug("Relative Protocol: Opening TCP connection to \(hostString, privacy: .public):\(port.rawValue, privacy: .public)")
+        }
         return provider.makeTCPConnection(to: endpoint)
     }
 
+    /// Consults block policies and establishes UDP sessions when permitted.
     private func makeUDPConnection(endpoint: Network.NWEndpoint) -> Network.NWConnection? {
         guard case let .hostPort(host, port) = endpoint else {
             return provider.makeUDPConnection(to: endpoint, from: nil)
@@ -163,7 +197,9 @@ final class Tun2SocksAdapter: @unchecked Sendable {
             return connection
         }
 
-        logger.debug("Relative Protocol: Opening UDP session to \(hostString, privacy: .public):\(port.rawValue, privacy: .public)")
+        if debugLoggingEnabled {
+            logger.debug("Relative Protocol: Opening UDP session to \(hostString, privacy: .public):\(port.rawValue, privacy: .public)")
+        }
         return provider.makeUDPConnection(to: endpoint, from: nil)
     }
 }

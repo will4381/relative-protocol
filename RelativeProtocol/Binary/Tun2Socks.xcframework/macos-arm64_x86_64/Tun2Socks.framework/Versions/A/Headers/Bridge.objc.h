@@ -25,7 +25,7 @@
 - (BOOL)tcpClose:(int64_t)handle error:(NSError* _Nullable* _Nullable)error;
 /**
  * TCPDial establishes a TCP session to the destination host/port and
-returns an opaque handle understood by the Swift layer.
+returns an opaque handle understood by Swift.
  */
 - (BOOL)tcpDial:(NSString* _Nullable)host port:(int32_t)port timeoutMillis:(int64_t)timeoutMillis ret0_:(int64_t* _Nullable)ret0_ error:(NSError* _Nullable* _Nullable)error;
 /**
@@ -38,7 +38,7 @@ returns an opaque handle understood by the Swift layer.
 - (BOOL)udpClose:(int64_t)handle error:(NSError* _Nullable* _Nullable)error;
 /**
  * UDPDial establishes a UDP session to the destination host/port and
-returns an opaque handle understood by the Swift layer.
+returns an opaque handle understood by Swift.
  */
 - (BOOL)udpDial:(NSString* _Nullable)host port:(int32_t)port ret0_:(int64_t* _Nullable)ret0_ error:(NSError* _Nullable* _Nullable)error;
 /**
@@ -52,7 +52,7 @@ returns an opaque handle understood by the Swift layer.
 @end
 
 /**
- * Config captures the tun2socks runtime options surfaced to the Swift side.
+ * Config captures the runtime options surfaced to the Swift layer.
  */
 @interface BridgeConfig : NSObject <goSeqRefInterface> {
 }
@@ -122,8 +122,8 @@ FOUNDATION_EXPORT BridgeEngine* _Nullable BridgeNewEngine(BridgeConfig* _Nullabl
 @class BridgePacketEmitter;
 
 /**
- * Network abstracts the Network Extension plumbing that powers TCP and UDP
-sessions. Each method is bridged into Swift via gomobile.
+ * Network abstracts the Network Extension plumbing behind TCP and UDP sessions.
+Each method is bridged into Swift via gomobile.
  */
 @interface BridgeNetwork : NSObject <goSeqRefInterface, BridgeNetwork> {
 }
@@ -136,7 +136,7 @@ sessions. Each method is bridged into Swift via gomobile.
 - (BOOL)tcpClose:(int64_t)handle error:(NSError* _Nullable* _Nullable)error;
 /**
  * TCPDial establishes a TCP session to the destination host/port and
-returns an opaque handle understood by the Swift layer.
+returns an opaque handle understood by Swift.
  */
 - (BOOL)tcpDial:(NSString* _Nullable)host port:(int32_t)port timeoutMillis:(int64_t)timeoutMillis ret0_:(int64_t* _Nullable)ret0_ error:(NSError* _Nullable* _Nullable)error;
 /**
@@ -149,7 +149,7 @@ returns an opaque handle understood by the Swift layer.
 - (BOOL)udpClose:(int64_t)handle error:(NSError* _Nullable* _Nullable)error;
 /**
  * UDPDial establishes a UDP session to the destination host/port and
-returns an opaque handle understood by the Swift layer.
+returns an opaque handle understood by Swift.
  */
 - (BOOL)udpDial:(NSString* _Nullable)host port:(int32_t)port ret0_:(int64_t* _Nullable)ret0_ error:(NSError* _Nullable* _Nullable)error;
 /**
@@ -159,8 +159,8 @@ returns an opaque handle understood by the Swift layer.
 @end
 
 /**
- * PacketEmitter is satisfied by Swift code that reflects outbound packets back
-into the Network Extension packetFlow.
+ * PacketEmitter is implemented by Swift code to reflect outbound packets back
+into the Network Extension packet flow.
  */
 @interface BridgePacketEmitter : NSObject <goSeqRefInterface, BridgePacketEmitter> {
 }

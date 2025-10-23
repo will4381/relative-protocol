@@ -2,8 +2,13 @@
 //  TunnelProvider.swift
 //  RelativeProtocolTunnel
 //
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 10/21/2025.
+//
 //  High-level façade that coordinates the Network Extension tunnel using
-//  RelativeProtocol configuration and the tun2socks engine.
+//  Relative Protocol configuration and the embedded tun2socks engine. The
+//  controller encapsulates all glue necessary to bridge Apple’s
+//  `NEPacketTunnelProvider` APIs with the gomobile-generated bindings.
 //
 
 import Foundation
@@ -14,6 +19,9 @@ import RelativeProtocolCore
 public enum RelativeProtocolTunnel {}
 
 public extension RelativeProtocolTunnel {
+    /// Production-ready orchestrator for an `NEPacketTunnelProvider`. Host code
+    /// delegates lifecycle events to this controller instead of re-implementing
+    /// gomobile wiring or packet plumbing.
     final class ProviderController {
         private unowned let provider: NEPacketTunnelProvider
         private let logger: Logger
@@ -21,11 +29,16 @@ public extension RelativeProtocolTunnel {
         private var adapter: Tun2SocksAdapter?
         private var configuration: RelativeProtocol.Configuration?
 
+        /// - Parameters:
+        ///   - provider: The Network Extension provider the controller manages.
+        ///   - logger: Optional custom logger for diagnostics.
         public init(provider: NEPacketTunnelProvider, logger: Logger = Logger(subsystem: "RelativeProtocolTunnel", category: "Provider")) {
             self.provider = provider
             self.logger = logger
         }
 
+        /// Starts the tunnel by validating configuration, applying network
+        /// settings, and spinning up the tun2socks engine.
         public func start(configuration: RelativeProtocol.Configuration, completion: @escaping (Error?) -> Void) {
             do {
                 let messages = try configuration.validateOrThrow()
@@ -82,6 +95,7 @@ public extension RelativeProtocolTunnel {
             }
         }
 
+        /// Stops the tunnel and releases engine resources.
         public func stop(reason: NEProviderStopReason, completion: @escaping () -> Void) {
             logger.notice("Relative Protocol: Stopping tunnel (reason=\(reason.rawValue, privacy: .public))")
             adapter?.stop()
@@ -90,6 +104,7 @@ public extension RelativeProtocolTunnel {
             completion()
         }
 
+        /// Handles messages received from the host app.
         public func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
             guard !messageData.isEmpty else {
                 completionHandler?(nil)
@@ -100,6 +115,7 @@ public extension RelativeProtocolTunnel {
 
         // MARK: - Private
 
+        /// Applies IP addressing, MTU, and DNS settings to the virtual interface.
         private func applyNetworkSettings(configuration: RelativeProtocol.Configuration, completion: @escaping (Error?) -> Void) {
             let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: configuration.provider.ipv4.remoteAddress)
             settings.mtu = NSNumber(value: configuration.provider.mtu)
@@ -123,6 +139,8 @@ public extension RelativeProtocolTunnel {
             provider.setTunnelNetworkSettings(settings, completionHandler: completion)
         }
 
+        /// Constructs the tun2socks engine/adapter pair and starts processing
+        /// packets.
         private func bootBridge(configuration: RelativeProtocol.Configuration, metrics: MetricsCollector?) throws {
             let engine: Tun2SocksEngine
             #if canImport(Tun2Socks)
@@ -130,9 +148,12 @@ public extension RelativeProtocolTunnel {
                 configuration: configuration,
                 logger: Logger(subsystem: "RelativeProtocolTunnel", category: "GoTun2Socks")
             )
-            #else
-            engine = NoOpTun2SocksEngine(logger: Logger(subsystem: "RelativeProtocolTunnel", category: "NoOpTun2Socks"))
-            #endif
+#else
+        engine = NoOpTun2SocksEngine(
+            logger: Logger(subsystem: "RelativeProtocolTunnel", category: "NoOpTun2Socks"),
+            debugLoggingEnabled: configuration.logging.enableDebug
+        )
+#endif
 
             let adapter = Tun2SocksAdapter(
                 provider: provider,

@@ -2,9 +2,13 @@
 //  Configuration.swift
 //  RelativeProtocolCore
 //
-//  Defines the public configuration surface for the RelativeProtocol bridge.
-//  This mirrors the existing PacketTunnel prototype while expanding to support
-//  the planned hooks and metrics APIs.
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 10/21/2025.
+//
+//  Defines the public configuration and error surfaces used to drive the
+//  Relative Protocol tunnel. These types are intentionally lightweight data
+//  containers so they can be persisted and transported between the host app
+//  and the Network Extension target.
 //
 
 import Foundation
@@ -46,13 +50,16 @@ public extension RelativeProtocol {
     struct Configuration: Sendable {
         public var provider: Provider
         public var hooks: Hooks
+        public var logging: LoggingOptions
 
         public init(
             provider: Provider = .default,
-            hooks: Hooks = .init()
+            hooks: Hooks = .init(),
+            logging: LoggingOptions = .default
         ) {
             self.provider = provider
             self.hooks = hooks
+            self.logging = logging
         }
 
         /// Canonical default configuration used when a host application has not
@@ -79,7 +86,8 @@ public extension RelativeProtocol {
         /// format expected by `NETunnelProviderProtocol.providerConfiguration`.
         public func providerConfigurationDictionary() -> [String: NSObject] {
             do {
-                let data = try JSONEncoder().encode(provider)
+                let payload = WirePayload(provider: provider, logging: logging)
+                let data = try JSONEncoder().encode(payload)
                 let object = try JSONSerialization.jsonObject(with: data)
                 if let dictionary = object as? [String: AnyObject] {
                     return dictionary as NSDictionary as? [String: NSObject] ?? [:]
@@ -100,9 +108,12 @@ public extension RelativeProtocol {
                 return Configuration()
             }
             do {
-                let provider = try JSONDecoder().decode(Provider.self, from: data)
-                return Configuration(provider: provider)
+                let payload = try JSONDecoder().decode(WirePayload.self, from: data)
+                return Configuration(provider: payload.provider, logging: payload.logging)
             } catch {
+                if let provider = try? JSONDecoder().decode(Provider.self, from: data) {
+                    return Configuration(provider: provider)
+                }
                 return Configuration()
             }
         }
@@ -115,11 +126,18 @@ public extension RelativeProtocol {
             }
         }
     }
+
+    private struct WirePayload: Codable {
+        var provider: RelativeProtocol.Configuration.Provider
+        var logging: RelativeProtocol.Configuration.LoggingOptions
+    }
 }
 
 // MARK: - Configuration Models
 
 public extension RelativeProtocol.Configuration {
+    /// Concrete tunnel-facing options. Everything maps directly to Network
+    /// Extension primitives such as MTU, IPv4 routes, and DNS settings.
     struct Provider: Codable, Equatable, Sendable {
         public var mtu: Int
         public var ipv4: IPv4
@@ -145,7 +163,8 @@ public extension RelativeProtocol.Configuration {
             Provider()
         }
 
-        /// Performs lightweight validation of the configuration.
+        /// Performs lightweight validation and returns warnings or errors that
+        /// describe issues which might prevent the tunnel from starting.
         public func validate() -> [ValidationMessage] {
             var messages: [ValidationMessage] = []
             if !(576...9_000).contains(mtu) {
@@ -167,6 +186,7 @@ public extension RelativeProtocol.Configuration {
         }
     }
 
+    /// Tunnel interface addressing and optional static routes.
     struct IPv4: Codable, Equatable, Sendable {
         public var address: String
         public var subnetMask: String
@@ -194,6 +214,7 @@ public extension RelativeProtocol.Configuration {
         }
     }
 
+    /// Description of a single IPv4 route to include inside the tunnel.
     struct Route: Codable, Equatable, Sendable {
         public var destinationAddress: String
         public var subnetMask: String
@@ -208,6 +229,7 @@ public extension RelativeProtocol.Configuration {
         }
     }
 
+    /// DNS resolver configuration applied to the virtual interface.
     struct DNS: Codable, Equatable, Sendable {
         public var servers: [String]
         public var searchDomains: [String]
@@ -285,6 +307,16 @@ public extension RelativeProtocol.Configuration {
         case warning(String)
         case error(String)
     }
+
+    struct LoggingOptions: Codable, Equatable, Sendable {
+        public var enableDebug: Bool
+
+        public init(enableDebug: Bool = false) {
+            self.enableDebug = enableDebug
+        }
+
+        public static let `default` = LoggingOptions()
+    }
 }
 
 public extension RelativeProtocol.Configuration.ValidationMessage {
@@ -360,6 +392,8 @@ public extension RelativeProtocol {
 // MARK: - Hooks & Runtime Extensions
 
 public extension RelativeProtocol.Configuration {
+    /// Aggregates optional closures that allow the host to observe or
+    /// influence runtime behaviour without subclassing package types.
     struct Hooks: Sendable {
         public var packetTap: PacketTap?
         public var dnsResolver: DNSResolver?
@@ -382,6 +416,7 @@ public extension RelativeProtocol.Configuration {
         }
     }
 
+    /// Metadata accompanying packets delivered to the packet tap hook.
     struct PacketContext: Sendable {
         public var direction: RelativeProtocol.Direction
         public var payload: Data
@@ -394,6 +429,7 @@ public extension RelativeProtocol.Configuration {
         }
     }
 
+    /// Describes a remote endpoint the engine intends to contact.
     struct Endpoint: Sendable {
         public enum Transport: String, Sendable {
             case tcp
@@ -411,12 +447,14 @@ public extension RelativeProtocol.Configuration {
         }
     }
 
+    /// Policy decision returned by a connection policy hook.
     enum ConnectionDecision: Sendable {
         case allow
         case block(reason: String?)
         case deferToDefault
     }
 
+    /// Lifecycle events surfaced to the host through the event sink hook.
     enum Event: Sendable {
         case willStart
         case didStart
@@ -424,10 +462,17 @@ public extension RelativeProtocol.Configuration {
         case didFail(String)
     }
 
+    /// Invoked whenever packets traverse the tunnel in either direction.
     typealias PacketTap = @Sendable (_ context: PacketContext) -> Void
+    /// Resolves hostnames prior to establishing outbound connections.
     typealias DNSResolver = @Sendable (_ host: String) async throws -> [String]
+    /// Determines whether an outbound connection should proceed, be blocked,
+    /// or fall back to default handling.
     typealias ConnectionPolicy = @Sendable (_ endpoint: Endpoint) async -> ConnectionDecision
+    /// Returns an artificial latency budget (milliseconds) to apply to the
+    /// specified endpoint.
     typealias LatencyInjector = @Sendable (_ endpoint: Endpoint) async -> Int?
+    /// Receives lifecycle events as the tunnel transitions between states.
     typealias EventSink = @Sendable (_ event: Event) -> Void
 }
 
@@ -448,6 +493,6 @@ private extension String {
 
 extension RelativeProtocol.Configuration: Equatable {
     public static func == (lhs: RelativeProtocol.Configuration, rhs: RelativeProtocol.Configuration) -> Bool {
-        lhs.provider == rhs.provider
+        lhs.provider == rhs.provider && lhs.logging == rhs.logging
     }
 }

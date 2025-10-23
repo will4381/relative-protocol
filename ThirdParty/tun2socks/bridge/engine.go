@@ -1,3 +1,12 @@
+//  Engine.go
+//  RelativeProtocol Bridge
+//
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 10/19/2025.
+//
+//  Wires the Go tun2socks core to the Swift-based Network Extension host,
+//  translating callbacks and connection lifecycles between the two runtimes.
+
 package bridge
 
 import (

@@ -1,3 +1,12 @@
+//  tunio.go
+//  RelativeProtocol Bridge
+//
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 10/19/2025.
+//
+//  Provides a channel-backed conduit between Swift packet emission/ingestion
+//  and the Go tun device abstraction.
+
 package bridge
 
 import (
