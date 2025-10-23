@@ -272,7 +272,16 @@ public extension RelativeProtocol.Configuration {
 
     struct Policies: Codable, Equatable, Sendable {
         public var blockedHosts: [String] {
-            didSet { rebuildBlockedHostCache() }
+            didSet {
+                if skipNextBlockedHostsRebuild, let last = blockedHosts.last {
+                    // Incremental update when appended via API to avoid O(n) rebuilds.
+                    skipNextBlockedHostsRebuild = false
+                    let normalized = Self.normalizeBlockedHost(last)
+                    if !normalized.isEmpty { blockedHostExactMatches.insert(normalized) }
+                } else {
+                    rebuildBlockedHostCache()
+                }
+            }
         }
         public var latencyRules: [LatencyRule]
 
@@ -287,29 +296,32 @@ public extension RelativeProtocol.Configuration {
         }
 
         public mutating func appendBlockedHost(_ host: String) {
+            // Signal didSet to skip full rebuild and apply incremental insert instead.
+            skipNextBlockedHostsRebuild = true
             blockedHosts.append(host)
         }
 
         fileprivate func containsBlockedHost(_ host: String) -> Bool {
             guard !blockedHosts.isEmpty else { return false }
             let normalizedHost = Self.normalizeBlockedHost(host)
+            guard !normalizedHost.isEmpty else { return false }
             if blockedHostExactMatches.contains(normalizedHost) {
                 return true
             }
-            for suffix in blockedHostSuffixMatches {
-                if normalizedHost.hasSuffix(suffix) {
+            // Walk label boundaries (after each '.') and check for suffix matches in the set.
+            var searchStart = normalizedHost.startIndex
+            while let dot = normalizedHost[searchStart...].firstIndex(of: ".") {
+                let next = normalizedHost.index(after: dot)
+                if blockedHostExactMatches.contains(String(normalizedHost[next...])) {
                     return true
                 }
+                searchStart = next
             }
             return false
         }
 
-        private var blockedHostExactMatches: Set<String> = [] {
-            didSet {
-                blockedHostSuffixMatches = blockedHostExactMatches.map { "." + $0 }
-            }
-        }
-        private var blockedHostSuffixMatches: [String] = []
+        private var blockedHostExactMatches: Set<String> = []
+        private var skipNextBlockedHostsRebuild = false
 
         private mutating func rebuildBlockedHostCache() {
             var exact = Set<String>(minimumCapacity: blockedHosts.count)
@@ -463,6 +475,7 @@ public extension RelativeProtocol.Configuration {
     /// influence runtime behaviour without subclassing package types.
     struct Hooks: Sendable {
         public var packetTap: PacketTap?
+        public var packetTapBatch: PacketTapBatch?
         public var dnsResolver: DNSResolver?
         public var connectionPolicy: ConnectionPolicy?
         public var latencyInjector: LatencyInjector?
@@ -470,12 +483,14 @@ public extension RelativeProtocol.Configuration {
 
         public init(
             packetTap: PacketTap? = nil,
+            packetTapBatch: PacketTapBatch? = nil,
             dnsResolver: DNSResolver? = nil,
             connectionPolicy: ConnectionPolicy? = nil,
             latencyInjector: LatencyInjector? = nil,
             eventSink: EventSink? = nil
         ) {
             self.packetTap = packetTap
+            self.packetTapBatch = packetTapBatch
             self.dnsResolver = dnsResolver
             self.connectionPolicy = connectionPolicy
             self.latencyInjector = latencyInjector
@@ -531,6 +546,8 @@ public extension RelativeProtocol.Configuration {
 
     /// Invoked whenever packets traverse the tunnel in either direction.
     typealias PacketTap = @Sendable (_ context: PacketContext) -> Void
+    /// Batched variant to minimize per-packet closure and dispatch overhead.
+    typealias PacketTapBatch = @Sendable (_ contexts: [PacketContext]) -> Void
     /// Resolves hostnames prior to establishing outbound connections.
     typealias DNSResolver = @Sendable (_ host: String) async throws -> [String]
     /// Determines whether an outbound connection should proceed, be blocked,

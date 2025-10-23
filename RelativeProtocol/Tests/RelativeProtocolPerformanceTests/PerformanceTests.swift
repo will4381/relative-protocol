@@ -26,6 +26,55 @@ final class RelativeProtocolPerformanceTests: XCTestCase {
         }
     }
 
+#if canImport(Tun2Socks)
+    func testGoBridgeHandlePacketPerformance() throws {
+        // Measures Swift -> Go bridge overhead by driving handlePacket via
+        // the adapter using the real Go engine (if available on this platform).
+        let flow = MockPacketFlow()
+        let provider = MockProvider(flow: flow)
+
+        var configuration = makeTestConfiguration()
+        configuration.hooks = .init() // disable taps to minimize overhead
+        configuration.logging = .init(enableDebug: false)
+        configuration.provider.metrics = .init(isEnabled: false, reportingInterval: 5)
+
+        let engine = GoTun2SocksEngine(
+            configuration: configuration,
+            logger: Logger(subsystem: "RelativeProtocolTests", category: "GoTun2Socks")
+        )
+        let adapter = Tun2SocksAdapter(
+            provider: provider,
+            configuration: configuration,
+            metrics: nil,
+            engine: engine,
+            hooks: configuration.hooks
+        )
+
+        try adapter.start()
+        XCTAssertTrue(flow.waitForHandler(timeout: 2), "Adapter did not register read handler in time")
+        addTeardownBlock {
+            adapter.stop()
+            flow.drain()
+        }
+
+        // Prepare a small burst so we measure per-packet cross-boundary cost.
+        let one = Data(repeating: 0, count: 128)
+        let proto: NSNumber = .init(value: AF_INET)
+        let burst = 64
+        let packets = Array(repeating: one, count: burst)
+        let protocols = Array(repeating: proto, count: burst)
+
+        let iterations = 100
+
+        measure {
+            for _ in 0..<iterations {
+                flow.trigger(packets: packets, protocols: protocols)
+            }
+            flow.drain()
+        }
+    }
+#endif
+
     func testMetricsCollectorRecordPerformance() {
         _ = makeTestConfiguration() // exercise hook construction path
 
