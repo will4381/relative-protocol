@@ -152,8 +152,7 @@ func (e *Engine) HandlePacket(packet []byte, protocolNumber int32) error {
 	if !e.IsRunning() {
 		return errors.New("engine not running")
 	}
-	_ = protocolNumber
-	return e.tun.Inject(packet)
+	return e.tun.Inject(packet, protocolNumber)
 }
 
 // IsRunning reports whether Start has been called successfully.

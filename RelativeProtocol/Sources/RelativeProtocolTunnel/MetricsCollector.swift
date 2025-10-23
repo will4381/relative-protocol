@@ -5,12 +5,14 @@
 //  Copyright (c) 2025 Relative Companies, Inc.
 //  Personal, non-commercial use only. Created by Will Kusch on 10/21/2025.
 //
-//  Captures lightweight instrumentation around the tunnel. The collector runs
-//  on a private serial queue so log emission and sink callbacks never block the
-//  Network Extension packet loop.
+//  Captures lightweight instrumentation around the tunnel. A lightweight unfair
+//  lock keeps aggregation fast without bouncing work onto additional queues so
+//  the Network Extension packet loop stays responsive.
 //
 
 import Foundation
+import Dispatch
+import os.lock
 import os.log
 import RelativeProtocolCore
 
@@ -28,11 +30,12 @@ final class MetricsCollector {
     }
 
     private let logger: Logger
-    private let queue = DispatchQueue(label: "RelativeProtocolTunnel.MetricsCollector")
     private var inbound = Counter()
     private var outbound = Counter()
-    private var lastReport = Date()
+    private var lastReportTick: UInt64
+    private var lock = os_unfair_lock_s()
     private let interval: TimeInterval
+    private let intervalNanoseconds: UInt64
     private let sink: (@Sendable (RelativeProtocol.MetricsSnapshot) -> Void)?
 
     /// - Parameters:
@@ -42,58 +45,88 @@ final class MetricsCollector {
     init(subsystem: String, interval: TimeInterval, sink: (@Sendable (RelativeProtocol.MetricsSnapshot) -> Void)?) {
         logger = Logger(subsystem: subsystem, category: "Metrics")
         self.interval = interval
+        if interval <= 0 {
+            intervalNanoseconds = 0
+        } else {
+            intervalNanoseconds = UInt64((interval * 1_000_000_000).rounded())
+        }
         self.sink = sink
+        lastReportTick = DispatchTime.now().uptimeNanoseconds
     }
 
     /// Records a batch of packets and schedules a flush when necessary.
     func record(direction: Direction, packets: Int, bytes: Int) {
         guard packets > 0 && bytes >= 0 else { return }
-        queue.async { [self] in
-            switch direction {
-            case .inbound:
-                self.inbound.packets += packets
-                self.inbound.bytes += bytes
-            case .outbound:
-                self.outbound.packets += packets
-                self.outbound.bytes += bytes
-            }
-            self.emitIfNeeded()
+        let emission = accumulate(direction: direction, packets: packets, bytes: bytes)
+        if let emission {
+            logger.log(
+                level: .info,
+                "Relative Protocol: metrics packets_in=\(emission.inboundPackets, privacy: .public) bytes_in=\(emission.inboundBytes, privacy: .public) packets_out=\(emission.outboundPackets, privacy: .public) bytes_out=\(emission.outboundBytes, privacy: .public)"
+            )
+            sink?(emission.snapshot)
         }
     }
 
     /// Resets counters and reporting window. Use when a new tunnel session
     /// begins.
     func reset() {
-        queue.async { [self] in
-            self.inbound = Counter()
-            self.outbound = Counter()
-            self.lastReport = Date()
-        }
+        os_unfair_lock_lock(&lock)
+        inbound = Counter()
+        outbound = Counter()
+        lastReportTick = DispatchTime.now().uptimeNanoseconds
+        os_unfair_lock_unlock(&lock)
     }
 
-    /// Emits a metrics snapshot if the configured interval has elapsed.
-    private func emitIfNeeded() {
-        guard Date().timeIntervalSince(lastReport) >= interval else { return }
-        defer {
-            lastReport = Date()
-            self.inbound = Counter()
-            self.outbound = Counter()
+    /// Aggregates counters under the unfair lock and returns an emission payload when ready.
+    private func accumulate(direction: Direction, packets: Int, bytes: Int) -> Emission? {
+        let nowTick = DispatchTime.now().uptimeNanoseconds
+        var emission: Emission?
+
+        os_unfair_lock_lock(&lock)
+        switch direction {
+        case .inbound:
+            inbound.packets += packets
+            inbound.bytes += bytes
+        case .outbound:
+            outbound.packets += packets
+            outbound.bytes += bytes
         }
 
-        guard inbound.packets > 0 || outbound.packets > 0 else { return }
+        let elapsed = nowTick &- lastReportTick
+        let shouldEmit = intervalNanoseconds == 0 || elapsed >= intervalNanoseconds
+        if shouldEmit, (inbound.packets > 0 || outbound.packets > 0) {
+            let timestamp = Date()
+            let snapshot = RelativeProtocol.MetricsSnapshot(
+                timestamp: timestamp,
+                inbound: .init(packets: inbound.packets, bytes: inbound.bytes),
+                outbound: .init(packets: outbound.packets, bytes: outbound.bytes),
+                activeTCP: 0,
+                activeUDP: 0,
+                errors: []
+            )
+            emission = Emission(
+                snapshot: snapshot,
+                inboundPackets: inbound.packets,
+                inboundBytes: inbound.bytes,
+                outboundPackets: outbound.packets,
+                outboundBytes: outbound.bytes
+            )
+            inbound = Counter()
+            outbound = Counter()
+            lastReportTick = nowTick
+        }
+        os_unfair_lock_unlock(&lock)
 
-        let snapshot = RelativeProtocol.MetricsSnapshot(
-            timestamp: Date(),
-            inbound: .init(packets: inbound.packets, bytes: inbound.bytes),
-            outbound: .init(packets: outbound.packets, bytes: outbound.bytes),
-            activeTCP: 0,
-            activeUDP: 0,
-            errors: []
-        )
+        return emission
+    }
+}
 
-        logger.notice(
-            "Relative Protocol: metrics packets_in=\(self.inbound.packets, privacy: .public) bytes_in=\(self.inbound.bytes, privacy: .public) packets_out=\(self.outbound.packets, privacy: .public) bytes_out=\(self.outbound.bytes, privacy: .public)"
-        )
-        sink?(snapshot)
+private extension MetricsCollector {
+    struct Emission {
+        var snapshot: RelativeProtocol.MetricsSnapshot
+        var inboundPackets: Int
+        var inboundBytes: Int
+        var outboundPackets: Int
+        var outboundBytes: Int
     }
 }

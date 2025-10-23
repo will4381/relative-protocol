@@ -73,16 +73,26 @@ final class GoTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
             callbacks.startPacketReadLoop { [weak self] packets, protocols in
                 guard
                     let self,
-                    let engine = self.goEngine
+                    let engine = self.goEngine,
+                    !packets.isEmpty
                 else { return }
 
-                for (index, packet) in packets.enumerated() {
-                    let proto = protocols[safe: index]?.uint32Value ?? packet.afValue
-                    let intProto = Int32(truncatingIfNeeded: proto)
-                    do {
-                        try engine.handlePacket(packet, protocolNumber: intProto)
-                    } catch {
-                        self.logger.error("Relative Protocol: handlePacket failed – \(error.localizedDescription, privacy: .public)")
+                withUnsafeTemporaryAllocation(of: Int32.self, capacity: packets.count) { buffer in
+                    let protocolCount = protocols.count
+                    for index in 0..<packets.count {
+                        if index < protocolCount {
+                            buffer[index] = protocols[index].int32Value
+                        } else {
+                            buffer[index] = Int32(truncatingIfNeeded: packets[index].afValue)
+                        }
+                    }
+
+                    for index in 0..<packets.count {
+                        do {
+                            try engine.handlePacket(packets[index], protocolNumber: buffer[index])
+                        } catch {
+                            self.logger.error("Relative Protocol: handlePacket failed – \(error.localizedDescription, privacy: .public)")
+                        }
                     }
                 }
             }
@@ -110,6 +120,8 @@ final class GoTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
 /// Bridges packet emission from the Go bridge back into Swift callbacks.
 private final class PacketEmitterAdapter: NSObject, BridgePacketEmitterProtocol {
     private let callbacks: Tun2SocksCallbacks
+    private var singlePacket: [Data] = []
+    private var singleProtocol: [NSNumber] = []
 
     init(callbacks: Tun2SocksCallbacks) {
         self.callbacks = callbacks
@@ -119,7 +131,11 @@ private final class PacketEmitterAdapter: NSObject, BridgePacketEmitterProtocol 
         guard let packet else {
             throw NSError(domain: "GoTun2SocksEngine", code: -3, userInfo: [NSLocalizedDescriptionKey: "packet is nil"])
         }
-        callbacks.emitPackets([packet], [NSNumber(value: protocolNumber)])
+        singlePacket.removeAll(keepingCapacity: true)
+        singleProtocol.removeAll(keepingCapacity: true)
+        singlePacket.append(packet)
+        singleProtocol.append(NSNumber(value: protocolNumber))
+        callbacks.emitPackets(singlePacket, singleProtocol)
     }
 }
 

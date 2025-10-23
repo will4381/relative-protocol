@@ -77,6 +77,54 @@ final class RelativeProtocolPerformanceTests: XCTestCase {
         }
     }
 
+    func testBlockedHostMatchingPerformance() {
+        var configuration = makeTestConfiguration()
+        configuration.provider.policies.blockedHosts = (0..<256).map { "blocked-domain-\($0).example" } + ["example.com"]
+        let host = "subdomain.service.example.com"
+        _ = configuration.matchesBlockedHost(host) // Warm-up cache
+
+        measure {
+            for _ in 0..<10_000 {
+                _ = configuration.matchesBlockedHost(host)
+            }
+        }
+    }
+
+    func testProviderConfigurationDictionaryPerformance() {
+        let configuration = makeTestConfiguration()
+        _ = configuration.providerConfigurationDictionary() // Warm-up cache
+
+        measure {
+            for _ in 0..<1_000 {
+                _ = configuration.providerConfigurationDictionary()
+            }
+        }
+    }
+
+    func testBlockedHostCacheRebuildPerformance() {
+        let baselineHosts = (0..<320).map { "baseline-\($0).example" }
+        let additionalHosts = (320..<384).map { "baseline-\($0).example" }
+        let baselinePolicies = RelativeProtocol.Configuration.Policies(blockedHosts: baselineHosts)
+
+        measure {
+            var workingCopy = baselinePolicies
+            for host in additionalHosts {
+                workingCopy.appendBlockedHost(host)
+            }
+        }
+    }
+
+    func testConfigurationLoadPerformance() {
+        let configuration = makeTestConfiguration()
+        let dictionary = configuration.providerConfigurationDictionary()
+
+        measure {
+            for _ in 0..<1_000 {
+                _ = RelativeProtocol.Configuration.load(from: dictionary)
+            }
+        }
+    }
+
     private func makeTestConfiguration() -> RelativeProtocol.Configuration {
         let provider = RelativeProtocol.Configuration.Provider(
             mtu: 1500,
@@ -129,8 +177,11 @@ private final class MockPacketFlow: PacketFlowing {
     private let handlerSemaphore = DispatchSemaphore(value: 0)
 
     func readPackets(_ handler: @escaping @Sendable ([Data], [NSNumber]) -> Void) {
-        self.handler = handler
-        handlerSemaphore.signal()
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.handler = handler
+            handlerSemaphore.signal()
+        }
     }
 
     func writePackets(_ packets: [Data], protocols: [NSNumber]) {
