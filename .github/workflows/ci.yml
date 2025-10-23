@@ -45,10 +45,34 @@ jobs:
         with:
           go-version: '1.22'
 
+      - name: Add Go bin to PATH
+        run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Go modules and build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
       - name: Install gomobile
         run: |
           go install golang.org/x/mobile/cmd/gomobile@latest
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Initialize gomobile (installs gobind)
+        run: gomobile init -v
+
+      - name: Cache gomobile artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/gomobile
+          key: ${{ runner.os }}-gomobile-${{ hashFiles('ThirdParty/tun2socks/**') }}
+          restore-keys: |
+            ${{ runner.os }}-gomobile-
 
       - name: Prepare build script
         run: chmod +x Scripts/build.sh
