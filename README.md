@@ -8,9 +8,13 @@ When running on-device VPN-style proxies it’s imperative that the tunnel remai
 
 | Benchmark | Avg Time | Relative Std. Dev. | Notes |
 |-----------|----------|--------------------|-------|
-| `testAdapterReadLoopPerformance` | ~6 ms | ~8% | NoOp engine, hooks + debug logging enabled, 200 burst iterations. |
-| `testConfigurationValidationPerformance` | ~4 ms | ~20% | Repeated validation of full configuration payload. |
-| `testMetricsCollectorRecordPerformance` | ~23 ms (10k ops) | ~14% | Aggregation and log emission every 5k in/out records. |
+| `testAdapterReadLoopPerformance` | 6.0 ms | 5.0% | NoOp engine, hooks + debug logging enabled, 200 burst iterations. |
+| `testBlockedHostCacheRebuildPerformance` | 9.0 ms | 34.0% | Rebuild blocked-host cache after appending 64 entries to a 320-entry baseline. |
+| `testBlockedHostMatchingPerformance` | 67 ms | 12.9% | 10k hostname checks against 256-entry block list, post-cache warm-up. |
+| `testConfigurationLoadPerformance` | 20 ms | 41.1% | 1k loads from cached provider configuration dictionary (initial decode dominates). |
+| `testConfigurationValidationPerformance` | 4.0 ms | 21.1% | Repeated validation of full configuration payload (variable cache warm-up). |
+| `testMetricsCollectorRecordPerformance` | 3.0 ms (10k records) | 21.5% | Aggregates inbound/outbound counters with unfair-lock accumulator. |
+| `testProviderConfigurationDictionaryPerformance` | 0.0010 s | 13.6% | 1k serialisations to `providerConfigurationDictionary()` with warm-up. |
 
 ## Modules
 

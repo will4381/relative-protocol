@@ -16,14 +16,14 @@ import (
 type tunIO struct {
 	emitter PacketEmitter
 
-	inbound chan []byte
+	inbound chan packetBuffer
 	closed  chan struct{}
 }
 
 func newTunIO(emitter PacketEmitter) *tunIO {
 	return &tunIO{
 		emitter: emitter,
-		inbound: make(chan []byte, 512),
+		inbound: make(chan packetBuffer, 1024),
 		closed:  make(chan struct{}),
 	}
 }
@@ -34,22 +34,23 @@ func (t *tunIO) Read(p []byte) (int, error) {
 		if !ok {
 			return 0, errors.New("tun closed")
 		}
-		if len(packet) > len(p) {
-			copy(p, packet[:len(p)])
-			return len(p), nil
-		}
-		copy(p, packet)
-		return len(packet), nil
+		n := copy(p, packet.buf)
+		packet.release()
+		return n, nil
 	case <-t.closed:
 		return 0, errors.New("tun closed")
 	}
 }
 
 func (t *tunIO) Write(p []byte) (int, error) {
-	packet := append([]byte(nil), p...)
-	if err := t.emitter.EmitPacket(packet, inferProtocol(packet)); err != nil {
+	buffer := newPooledPacketBuffer(len(p))
+	copy(buffer.buf, p)
+	buffer.proto = inferProtocol(buffer.buf)
+	if err := t.emitter.EmitPacket(buffer.buf, buffer.proto); err != nil {
+		buffer.release()
 		return 0, err
 	}
+	buffer.release()
 	return len(p), nil
 }
 
@@ -63,11 +64,11 @@ func (t *tunIO) Close() {
 	}
 }
 
-func (t *tunIO) Inject(packet []byte) error {
+func (t *tunIO) Inject(packet []byte, proto int32) error {
 	select {
 	case <-t.closed:
 		return errors.New("tun closed")
-	case t.inbound <- append([]byte(nil), packet...):
+	case t.inbound <- adoptPacketBuffer(packet, proto):
 		return nil
 	}
 }

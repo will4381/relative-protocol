@@ -135,28 +135,66 @@ final class Tun2SocksAdapter: @unchecked Sendable {
     private func scheduleRead(handler: @escaping @Sendable (_ packets: [Data], _ protocols: [NSNumber]) -> Void) {
         ioQueue.async { [weak self] in
             guard let self else { return }
-            self.provider.flow.readPackets { packets, protocols in
-                guard self.isRunning else { return }
-                self.metrics?.record(direction: .inbound, packets: packets.count, bytes: packets.reduce(0) { $0 + $1.count })
-                packets.enumerated().forEach { index, packet in
-                    let proto = protocols[safe: index]?.int32Value ?? packet.afValue
-                    self.hooks.packetTap?(.init(direction: .inbound, payload: packet, protocolNumber: proto))
-                }
-                handler(packets, protocols)
-                // Reschedule the loop.
-                self.scheduleRead(handler: handler)
+            self.startReadLoop(handler: handler)
+        }
+    }
+
+    private func startReadLoop(handler: @escaping @Sendable (_ packets: [Data], _ protocols: [NSNumber]) -> Void) {
+        provider.flow.readPackets { [weak self] packets, protocols in
+            guard let self else { return }
+            guard self.isRunning else { return }
+            self.processInboundPackets(packets, protocols: protocols, handler: handler)
+            self.startReadLoop(handler: handler)
+        }
+    }
+
+    private func processInboundPackets(
+        _ packets: [Data],
+        protocols: [NSNumber],
+        handler: @escaping @Sendable (_ packets: [Data], _ protocols: [NSNumber]) -> Void
+    ) {
+        guard !packets.isEmpty else {
+            handler(packets, protocols)
+            return
+        }
+
+        var totalBytes = 0
+        if let packetTap = hooks.packetTap {
+            forEachPacket(packets, protocols: protocols) { packet, proto in
+                totalBytes += packet.count
+                packetTap(.init(direction: .inbound, payload: packet, protocolNumber: proto))
             }
         }
+
+        if let metrics {
+            if totalBytes == 0 {
+                totalBytes = totalByteCount(for: packets)
+            }
+            metrics.record(direction: .inbound, packets: packets.count, bytes: totalBytes)
+        }
+
+        handler(packets, protocols)
     }
 
     /// Writes packets emitted by the engine back to the provider.
     private func writePackets(_ packets: [Data], protocols: [NSNumber]) {
         guard !packets.isEmpty else { return }
         guard isRunning else { return }
-        metrics?.record(direction: .outbound, packets: packets.count, bytes: packets.reduce(0) { $0 + $1.count })
-        packets.enumerated().forEach { index, packet in
-            let proto = protocols[safe: index]?.int32Value ?? packet.afValue
-            hooks.packetTap?(.init(direction: .outbound, payload: packet, protocolNumber: proto))
+
+        let packetTap = hooks.packetTap
+        var totalBytes = 0
+        if let packetTap {
+            forEachPacket(packets, protocols: protocols) { packet, proto in
+                totalBytes += packet.count
+                packetTap(.init(direction: .outbound, payload: packet, protocolNumber: proto))
+            }
+        }
+
+        if let metrics {
+            if totalBytes == 0 {
+                totalBytes = totalByteCount(for: packets)
+            }
+            metrics.record(direction: .outbound, packets: packets.count, bytes: totalBytes)
         }
         provider.flow.writePackets(packets, protocols: protocols)
     }
@@ -215,5 +253,38 @@ private extension Data {
     var afValue: Int32 {
         guard let firstByte = first else { return Int32(AF_INET) }
         return (firstByte >> 4) == 6 ? Int32(AF_INET6) : Int32(AF_INET)
+    }
+}
+
+private func totalByteCount(for packets: [Data]) -> Int {
+    packets.reduce(into: 0) { $0 += $1.count }
+}
+
+private func forEachPacket(
+    _ packets: [Data],
+    protocols: [NSNumber],
+    _ body: (_ packet: Data, _ proto: Int32) -> Void
+) {
+    let count = packets.count
+    guard count > 0 else { return }
+    let protocolCount = protocols.count
+    if protocolCount == 0 {
+        for packet in packets {
+            body(packet, packet.afValue)
+        }
+        return
+    }
+
+    withUnsafeTemporaryAllocation(of: Int32.self, capacity: count) { buffer in
+        for index in 0..<count {
+            if index < protocolCount {
+                buffer[index] = protocols[index].int32Value
+            } else {
+                buffer[index] = packets[index].afValue
+            }
+        }
+        for index in 0..<count {
+            body(packets[index], buffer[index])
+        }
     }
 }

@@ -24,7 +24,7 @@ type swiftUDPSession struct {
 	remote net.Addr
 
 	mu        sync.Mutex
-	recvQueue chan []byte
+	recvQueue chan packetBuffer
 	closed    bool
 }
 
@@ -41,7 +41,7 @@ func newSwiftUDPSession(handle int64, metadata *M.Metadata, engine *Engine) *swi
 		handle:    handle,
 		engine:    engine,
 		remote:    remote,
-		recvQueue: make(chan []byte, 64),
+		recvQueue: make(chan packetBuffer, 128),
 	}
 }
 
@@ -50,7 +50,8 @@ func (s *swiftUDPSession) ReadFrom(p []byte) (int, net.Addr, error) {
 	if !ok {
 		return 0, s.remote, errors.New("udp session closed")
 	}
-	n := copy(p, payload)
+	n := copy(p, payload.buf)
+	payload.release()
 	return n, s.remote, nil
 }
 
@@ -94,7 +95,7 @@ func (s *swiftUDPSession) enqueue(payload []byte) {
 		return
 	}
 	s.mu.Unlock()
-	s.recvQueue <- append([]byte(nil), payload...)
+	s.recvQueue <- adoptPacketBuffer(payload, 0)
 }
 
 func (s *swiftUDPSession) close() {

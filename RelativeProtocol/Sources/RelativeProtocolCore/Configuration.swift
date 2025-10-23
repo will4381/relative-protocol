@@ -12,6 +12,7 @@
 //
 
 import Foundation
+import os.lock
 
 public enum RelativeProtocol {}
 
@@ -51,6 +52,7 @@ public extension RelativeProtocol {
         public var provider: Provider
         public var hooks: Hooks
         public var logging: LoggingOptions
+        private let providerConfigurationCache = ProviderConfigurationCacheBox()
 
         public init(
             provider: Provider = .default,
@@ -85,6 +87,12 @@ public extension RelativeProtocol {
         /// Serialises the provider-facing configuration into the dictionary
         /// format expected by `NETunnelProviderProtocol.providerConfiguration`.
         public func providerConfigurationDictionary() -> [String: NSObject] {
+            providerConfigurationCache.dictionary(provider: provider, logging: logging) {
+                buildProviderConfigurationDictionary()
+            }
+        }
+
+        private func buildProviderConfigurationDictionary() -> [String: NSObject] {
             do {
                 let payload = WirePayload(provider: provider, logging: logging)
                 let data = try JSONEncoder().encode(payload)
@@ -121,9 +129,7 @@ public extension RelativeProtocol {
         /// Returns `true` when the supplied host matches the configured block
         /// list rules.
         public func matchesBlockedHost(_ host: String) -> Bool {
-            provider.policies.blockedHosts.contains {
-                host.localizedCaseInsensitiveContains($0)
-            }
+            provider.policies.containsBlockedHost(host)
         }
     }
 
@@ -265,16 +271,77 @@ public extension RelativeProtocol.Configuration {
     }
 
     struct Policies: Codable, Equatable, Sendable {
-        public var blockedHosts: [String]
+        public var blockedHosts: [String] {
+            didSet { rebuildBlockedHostCache() }
+        }
         public var latencyRules: [LatencyRule]
 
         public init(blockedHosts: [String] = [], latencyRules: [LatencyRule] = []) {
             self.blockedHosts = blockedHosts
             self.latencyRules = latencyRules
+            rebuildBlockedHostCache()
         }
 
         public static var `default`: Policies {
             Policies()
+        }
+
+        public mutating func appendBlockedHost(_ host: String) {
+            blockedHosts.append(host)
+        }
+
+        fileprivate func containsBlockedHost(_ host: String) -> Bool {
+            guard !blockedHosts.isEmpty else { return false }
+            let normalizedHost = Self.normalizeBlockedHost(host)
+            if blockedHostExactMatches.contains(normalizedHost) {
+                return true
+            }
+            for suffix in blockedHostSuffixMatches {
+                if normalizedHost.hasSuffix(suffix) {
+                    return true
+                }
+            }
+            return false
+        }
+
+        private var blockedHostExactMatches: Set<String> = [] {
+            didSet {
+                blockedHostSuffixMatches = blockedHostExactMatches.map { "." + $0 }
+            }
+        }
+        private var blockedHostSuffixMatches: [String] = []
+
+        private mutating func rebuildBlockedHostCache() {
+            var exact = Set<String>(minimumCapacity: blockedHosts.count)
+            for entry in blockedHosts {
+                let normalized = Self.normalizeBlockedHost(entry)
+                guard !normalized.isEmpty else { continue }
+                exact.insert(normalized)
+            }
+            blockedHostExactMatches = exact
+        }
+
+        private static func normalizeBlockedHost(_ host: String) -> String {
+            host.trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case blockedHosts
+            case latencyRules
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            blockedHosts = try container.decodeIfPresent([String].self, forKey: .blockedHosts) ?? []
+            latencyRules = try container.decodeIfPresent([LatencyRule].self, forKey: .latencyRules) ?? []
+            rebuildBlockedHostCache()
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(blockedHosts, forKey: .blockedHosts)
+            try container.encode(latencyRules, forKey: .latencyRules)
         }
     }
 
@@ -494,5 +561,59 @@ private extension String {
 extension RelativeProtocol.Configuration: Equatable {
     public static func == (lhs: RelativeProtocol.Configuration, rhs: RelativeProtocol.Configuration) -> Bool {
         lhs.provider == rhs.provider && lhs.logging == rhs.logging
+    }
+}
+
+// MARK: - Provider Configuration Cache
+
+private final class ProviderConfigurationCacheBox: @unchecked Sendable {
+    private var cachedProvider: RelativeProtocol.Configuration.Provider?
+    private var cachedLogging: RelativeProtocol.Configuration.LoggingOptions?
+    private var cachedDictionary: [String: NSObject]?
+    private var lock = os_unfair_lock_s()
+
+    func dictionary(
+        provider: RelativeProtocol.Configuration.Provider,
+        logging: RelativeProtocol.Configuration.LoggingOptions,
+        builder: () -> [String: NSObject]
+    ) -> [String: NSObject] {
+        if let cached = load(provider: provider, logging: logging) {
+            return cached
+        }
+
+        let dictionary = builder()
+        store(provider: provider, logging: logging, dictionary: dictionary)
+        return dictionary
+    }
+
+    private func load(
+        provider: RelativeProtocol.Configuration.Provider,
+        logging: RelativeProtocol.Configuration.LoggingOptions
+    ) -> [String: NSObject]? {
+        os_unfair_lock_lock(&lock)
+        defer { os_unfair_lock_unlock(&lock) }
+        guard
+            let cachedProvider,
+            let cachedLogging,
+            let cachedDictionary
+        else {
+            return nil
+        }
+        guard cachedProvider == provider && cachedLogging == logging else {
+            return nil
+        }
+        return cachedDictionary
+    }
+
+    private func store(
+        provider: RelativeProtocol.Configuration.Provider,
+        logging: RelativeProtocol.Configuration.LoggingOptions,
+        dictionary: [String: NSObject]
+    ) {
+        os_unfair_lock_lock(&lock)
+        cachedProvider = provider
+        cachedLogging = logging
+        cachedDictionary = dictionary
+        os_unfair_lock_unlock(&lock)
     }
 }
