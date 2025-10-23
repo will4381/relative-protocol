@@ -2,14 +2,21 @@
 //  MetricsCollector.swift
 //  RelativeProtocolTunnel
 //
-//  Captures lightweight instrumentation hooks around the bridge.
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 10/21/2025.
+//
+//  Captures lightweight instrumentation around the tunnel. The collector runs
+//  on a private serial queue so log emission and sink callbacks never block the
+//  Network Extension packet loop.
 //
 
 import Foundation
 import os.log
 import RelativeProtocolCore
 
+/// Serialises metrics aggregation and emission.
 final class MetricsCollector {
+    /// Direction the sampled packets travelled.
     enum Direction {
         case inbound
         case outbound
@@ -28,12 +35,17 @@ final class MetricsCollector {
     private let interval: TimeInterval
     private let sink: (@Sendable (RelativeProtocol.MetricsSnapshot) -> Void)?
 
+    /// - Parameters:
+    ///   - subsystem: OSLog subsystem used for diagnostics.
+    ///   - interval: Minimum interval between emissions.
+    ///   - sink: Optional consumer that receives aggregated snapshots.
     init(subsystem: String, interval: TimeInterval, sink: (@Sendable (RelativeProtocol.MetricsSnapshot) -> Void)?) {
         logger = Logger(subsystem: subsystem, category: "Metrics")
         self.interval = interval
         self.sink = sink
     }
 
+    /// Records a batch of packets and schedules a flush when necessary.
     func record(direction: Direction, packets: Int, bytes: Int) {
         guard packets > 0 && bytes >= 0 else { return }
         queue.async { [self] in
@@ -49,6 +61,8 @@ final class MetricsCollector {
         }
     }
 
+    /// Resets counters and reporting window. Use when a new tunnel session
+    /// begins.
     func reset() {
         queue.async { [self] in
             self.inbound = Counter()
@@ -57,6 +71,7 @@ final class MetricsCollector {
         }
     }
 
+    /// Emits a metrics snapshot if the configured interval has elapsed.
     private func emitIfNeeded() {
         guard Date().timeIntervalSince(lastReport) >= interval else { return }
         defer {

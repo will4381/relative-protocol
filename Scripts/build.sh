@@ -1,5 +1,5 @@
 #!/bin/bash
-# Builds the gomobile-based Tun2Socks.xcframework for iOS + macOS.
+# Builds the gomobile-based Tun2Socks.xcframework for iOS, iOS Simulator, and macOS.
 
 set -euo pipefail
 
@@ -21,9 +21,7 @@ else
   exit 1
 fi
 
-mkdir -p "${OUTPUT_DIR}"
-mkdir -p "${LOCAL_GOPATH}"
-mkdir -p "${LOCAL_GOMOBILE_CACHE}"
+mkdir -p "${OUTPUT_DIR}" "${LOCAL_GOPATH}" "${LOCAL_GOMOBILE_CACHE}"
 
 export GOPATH="${LOCAL_GOPATH}"
 export GOMOBILECACHE="${LOCAL_GOMOBILE_CACHE}"
@@ -31,24 +29,25 @@ export GOMODCACHE="${LOCAL_GOPATH}/pkg/mod"
 
 pushd "${ROOT_DIR}/ThirdParty/tun2socks" >/dev/null
 
-echo "Skipping go mod tidy to preserve tool dependencies..."
+START_TIME=$(date +%s)
 
-echo "Initializing gomobile..."
-"${GOMOBILE_BIN}" init
+"${GOMOBILE_BIN}" init >/dev/null 2>&1
 
-echo "Producing xcframework output in ${OUTPUT_DIR}..."
 mkdir -p "${OUTPUT_DIR}"
 
 "${GOMOBILE_BIN}" bind \
-  -target=ios,macos \
+  -target=ios,iossimulator,macos \
   -o "${OUTPUT_DIR}/${MODULE_NAME}.xcframework" \
   ./bridge
 
 popd >/dev/null
 
-echo "Framework generated at ${OUTPUT_DIR}/${MODULE_NAME}.xcframework"
-
-echo "Syncing xcframework into package binary directory..."
 mkdir -p "${PACKAGE_BINARY_DIR}"
 rsync -a --delete "${OUTPUT_DIR}/${MODULE_NAME}.xcframework" "${PACKAGE_BINARY_DIR}/"
-echo "Updated ${PACKAGE_BINARY_DIR}/${MODULE_NAME}.xcframework"
+END_TIME=$(date +%s)
+TOTAL=$(( END_TIME - START_TIME ))
+if (( TOTAL < 60 )); then
+  printf 'Built in %ds → %s\n' "$TOTAL" "${PACKAGE_BINARY_DIR}/${MODULE_NAME}.xcframework"
+else
+  printf 'Built in %dm %02ds → %s\n' "$((TOTAL / 60))" "$((TOTAL % 60))" "${PACKAGE_BINARY_DIR}/${MODULE_NAME}.xcframework"
+fi

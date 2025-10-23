@@ -31,6 +31,11 @@ let package = Package(
                 .linkedFramework("NetworkExtension"),
                 .linkedFramework("Network")
             ]
+        ),
+        .testTarget(
+            name: "RelativeProtocolPerformanceTests",
+            dependencies: ["RelativeProtocolCore", "RelativeProtocolTunnel"],
+            path: "Tests/RelativeProtocolPerformanceTests"
         )
     ]
 )
