@@ -111,6 +111,42 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 }
 ```
 
+
+
+## Add via Swift Package Manager
+
+You can consume Relative Protocol as an SPM dependency.
+
+- Xcode
+  - File → Add Package Dependencies…
+  - Enter URL: `https://github.com/will4381/relative-protocol`
+  - Choose the latest release tag (v1.0 or newer)
+  - Add products you need: `RelativeProtocolCore` and/or `RelativeProtocolTunnel`
+
+- Package.swift
+
+```swift
+// swift-tools-version: 5.9
+import PackageDescription
+
+let package = Package(
+    name: "YourApp",
+    platforms: [ .iOS(.v15), .macOS(.v14) ],
+    dependencies: [
+        .package(url: "https://github.com/will4381/relative-protocol", from: "1.0.0"),
+    ],
+    targets: [
+        .target(
+            name: "YourApp",
+            dependencies: [
+                .product(name: "RelativeProtocolCore", package: "relative-protocol"),
+                .product(name: "RelativeProtocolTunnel", package: "relative-protocol"),
+            ]
+        ),
+    ]
+)
+```
+
 ## Rebuilding Tun2Socks
 
 Run `./Scripts/build.sh` after modifying the Go sources in `ThirdParty/tun2socks/`. The script regenerates `RelativeProtocol/Binary/Tun2Socks.xcframework` using local Go caches; commit the refreshed binary.
