@@ -4,3 +4,4 @@
 
 # SwiftPM build outputs
 /RelativeProtocol/.build/
+.build
