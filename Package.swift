@@ -14,19 +14,20 @@ let package = Package(
     ],
     dependencies: [],
     targets: [
+        // Vendored binary (gomobile) relative to repo root
         .binaryTarget(
             name: "Tun2SocksBinary",
-            path: "Binary/Tun2Socks.xcframework"
+            path: "RelativeProtocol/Binary/Tun2Socks.xcframework"
         ),
         .target(
             name: "RelativeProtocolCore",
             dependencies: [],
-            path: "Sources/RelativeProtocolCore"
+            path: "RelativeProtocol/Sources/RelativeProtocolCore"
         ),
         .target(
             name: "RelativeProtocolTunnel",
             dependencies: ["RelativeProtocolCore", "Tun2SocksBinary"],
-            path: "Sources/RelativeProtocolTunnel",
+            path: "RelativeProtocol/Sources/RelativeProtocolTunnel",
             linkerSettings: [
                 .linkedFramework("NetworkExtension"),
                 .linkedFramework("Network")
@@ -35,7 +36,8 @@ let package = Package(
         .testTarget(
             name: "RelativeProtocolPerformanceTests",
             dependencies: ["RelativeProtocolCore", "RelativeProtocolTunnel"],
-            path: "Tests/RelativeProtocolPerformanceTests"
+            path: "RelativeProtocol/Tests/RelativeProtocolPerformanceTests"
         )
     ]
 )
+

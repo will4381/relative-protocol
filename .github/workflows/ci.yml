@@ -34,11 +34,11 @@ jobs:
       - name: Ensure Tun2Socks binary is present
         run: ls -R RelativeProtocol/Binary/Tun2Socks.xcframework
 
-      - name: Build RelativeProtocol package (Debug)
-        run: swift build --package-path RelativeProtocol
+      - name: Build package (Debug)
+        run: swift build
 
-      - name: Build RelativeProtocol package (Release)
-        run: swift build --configuration release --package-path RelativeProtocol
+      - name: Build package (Release)
+        run: swift build --configuration release
 
   release:
     needs: build
