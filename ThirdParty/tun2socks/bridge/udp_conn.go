@@ -1,3 +1,11 @@
+//  udp_conn.go
+//  RelativeProtocol Bridge
+//
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 10/19/2025.
+//
+//  Implements the Swift-facing UDP session wrapper used by the bridge.
+
 package bridge
 
 import (
