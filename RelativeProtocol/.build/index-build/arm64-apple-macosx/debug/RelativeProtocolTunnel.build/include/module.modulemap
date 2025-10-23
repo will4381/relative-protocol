@@ -1,3 +1,0 @@
-module RelativeProtocolTunnel {
-    header "/Users/willkusch/Documents/Projects/VPN Bridge/RelativeProtocol/.build/index-build/arm64-apple-macosx/debug/RelativeProtocolTunnel.build/include/RelativeProtocolTunnel-Swift.h"
-}
