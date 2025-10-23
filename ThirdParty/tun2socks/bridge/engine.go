@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -48,6 +49,7 @@ type Engine struct {
 
 	mu      sync.Mutex
 	running bool
+	runFlag atomic.Bool
 
 	tcpConns map[int64]*swiftTCPConn
 	udpConns map[int64]*swiftUDPSession
@@ -118,6 +120,7 @@ func (e *Engine) Start() error {
 	}()
 
 	e.running = true
+	e.runFlag.Store(true)
 	return nil
 }
 
@@ -129,6 +132,7 @@ func (e *Engine) Stop() {
 		return
 	}
 	e.running = false
+	e.runFlag.Store(false)
 	close(e.closing)
 	e.mu.Unlock()
 
@@ -157,9 +161,7 @@ func (e *Engine) HandlePacket(packet []byte, protocolNumber int32) error {
 
 // IsRunning reports whether Start has been called successfully.
 func (e *Engine) IsRunning() bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.running
+	return e.runFlag.Load()
 }
 
 // TCPDidReceive delivers data produced by Swift for a given TCP handle.

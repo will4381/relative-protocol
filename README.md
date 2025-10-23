@@ -4,17 +4,18 @@ Portable tunnel components for iOS Network Extension projects. Built to deliver 
 
 ## Performance
 
-When running on-device VPN-style proxies it’s imperative that the tunnel remains lightweight so battery life and latency stay acceptable. Baselines collected on October 22nd 2025:
+When running on-device VPN-style proxies it’s imperative that the tunnel remains lightweight so battery life and latency stay acceptable. Latest results (October 23, 2025):
 
 | Benchmark | Avg Time | Relative Std. Dev. | Notes |
 |-----------|----------|--------------------|-------|
-| `testAdapterReadLoopPerformance` | 6.0 ms | 5.0% | NoOp engine, hooks + debug logging enabled, 200 burst iterations. |
-| `testBlockedHostCacheRebuildPerformance` | 9.0 ms | 34.0% | Rebuild blocked-host cache after appending 64 entries to a 320-entry baseline. |
-| `testBlockedHostMatchingPerformance` | 67 ms | 12.9% | 10k hostname checks against 256-entry block list, post-cache warm-up. |
-| `testConfigurationLoadPerformance` | 20 ms | 41.1% | 1k loads from cached provider configuration dictionary (initial decode dominates). |
-| `testConfigurationValidationPerformance` | 4.0 ms | 21.1% | Repeated validation of full configuration payload (variable cache warm-up). |
-| `testMetricsCollectorRecordPerformance` | 3.0 ms (10k records) | 21.5% | Aggregates inbound/outbound counters with unfair-lock accumulator. |
-| `testProviderConfigurationDictionaryPerformance` | 0.0010 s | 13.6% | 1k serialisations to `providerConfigurationDictionary()` with warm-up. |
+| `testAdapterReadLoopPerformance` | 0.005 s (≈5 ms) | 14.1% | NoOp engine; 200 iterations of 1×128B packet reads. |
+| `testBlockedHostCacheRebuildPerformance` | 0.000 s (≈0.03 ms) | 59.0% | Append 64 hosts to a 320-host baseline; incremental cache update. |
+| `testBlockedHostMatchingPerformance` | 0.013 s (≈13 ms) | 25.6% | 10k hostname checks against a 256-entry block list (warm cache). |
+| `testConfigurationLoadPerformance` | 0.019 s (≈19 ms) | 42.0% | 1k loads from `providerConfigurationDictionary()` (JSON round-trip). |
+| `testConfigurationValidationPerformance` | 0.004 s (≈4 ms) | 21.9% | Re-validate full configuration repeatedly. |
+| `testGoBridgeHandlePacketPerformance` | 0.100 s (≈100 ms) | 32.1% | Swift→Go path using Tun2Socks; 100 iterations of 64×128B packet bursts. |
+| `testMetricsCollectorRecordPerformance` | 0.003 s (≈3 ms) | 18.4% | ~10k `record` calls under unfair lock (in/out). |
+| `testProviderConfigurationDictionaryPerformance` | 0.001 s (≈1 ms) | 14.6% | 1k serialisations to `providerConfigurationDictionary()` (warm cache). |
 
 ## Modules
 

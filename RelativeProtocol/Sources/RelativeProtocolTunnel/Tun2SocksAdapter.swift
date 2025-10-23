@@ -159,7 +159,15 @@ final class Tun2SocksAdapter: @unchecked Sendable {
         }
 
         var totalBytes = 0
-        if let packetTap = hooks.packetTap {
+        if let batchTap = hooks.packetTapBatch {
+            var contexts: [RelativeProtocol.Configuration.PacketContext] = []
+            contexts.reserveCapacity(packets.count)
+            forEachPacket(packets, protocols: protocols) { packet, proto in
+                totalBytes += packet.count
+                contexts.append(.init(direction: .inbound, payload: packet, protocolNumber: proto))
+            }
+            if !contexts.isEmpty { batchTap(contexts) }
+        } else if let packetTap = hooks.packetTap {
             forEachPacket(packets, protocols: protocols) { packet, proto in
                 totalBytes += packet.count
                 packetTap(.init(direction: .inbound, payload: packet, protocolNumber: proto))
@@ -181,9 +189,16 @@ final class Tun2SocksAdapter: @unchecked Sendable {
         guard !packets.isEmpty else { return }
         guard isRunning else { return }
 
-        let packetTap = hooks.packetTap
         var totalBytes = 0
-        if let packetTap {
+        if let batchTap = hooks.packetTapBatch {
+            var contexts: [RelativeProtocol.Configuration.PacketContext] = []
+            contexts.reserveCapacity(packets.count)
+            forEachPacket(packets, protocols: protocols) { packet, proto in
+                totalBytes += packet.count
+                contexts.append(.init(direction: .outbound, payload: packet, protocolNumber: proto))
+            }
+            if !contexts.isEmpty { batchTap(contexts) }
+        } else if let packetTap = hooks.packetTap {
             forEachPacket(packets, protocols: protocols) { packet, proto in
                 totalBytes += packet.count
                 packetTap(.init(direction: .outbound, payload: packet, protocolNumber: proto))
@@ -274,17 +289,8 @@ private func forEachPacket(
         }
         return
     }
-
-    withUnsafeTemporaryAllocation(of: Int32.self, capacity: count) { buffer in
-        for index in 0..<count {
-            if index < protocolCount {
-                buffer[index] = protocols[index].int32Value
-            } else {
-                buffer[index] = packets[index].afValue
-            }
-        }
-        for index in 0..<count {
-            body(packets[index], buffer[index])
-        }
+    for index in 0..<count {
+        let proto: Int32 = index < protocolCount ? protocols[index].int32Value : packets[index].afValue
+        body(packets[index], proto)
     }
 }

@@ -49,6 +49,12 @@ returns an opaque handle understood by Swift.
 
 @protocol BridgePacketEmitter <NSObject>
 - (BOOL)emitPacket:(NSData* _Nullable)packet protocolNumber:(int32_t)protocolNumber error:(NSError* _Nullable* _Nullable)error;
+/**
+ * EmitPacketBatch concatenates variable-length packets and provides
+per-packet sizes and protocol numbers as byte slices containing
+little-endian int32 values. This signature binds cleanly via gomobile.
+ */
+- (BOOL)emitPacketBatch:(NSData* _Nullable)packed sizes:(NSData* _Nullable)sizes protocols:(NSData* _Nullable)protocols error:(NSError* _Nullable* _Nullable)error;
 @end
 
 /**
@@ -168,6 +174,12 @@ into the Network Extension packet flow.
 
 - (nonnull instancetype)initWithRef:(_Nonnull id)ref;
 - (BOOL)emitPacket:(NSData* _Nullable)packet protocolNumber:(int32_t)protocolNumber error:(NSError* _Nullable* _Nullable)error;
+/**
+ * EmitPacketBatch concatenates variable-length packets and provides
+per-packet sizes and protocol numbers as byte slices containing
+little-endian int32 values. This signature binds cleanly via gomobile.
+ */
+- (BOOL)emitPacketBatch:(NSData* _Nullable)packed sizes:(NSData* _Nullable)sizes protocols:(NSData* _Nullable)protocols error:(NSError* _Nullable* _Nullable)error;
 @end
 
 #endif

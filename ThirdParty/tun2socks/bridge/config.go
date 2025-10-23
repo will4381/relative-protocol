@@ -18,7 +18,11 @@ type Config struct {
 // PacketEmitter is implemented by Swift code to reflect outbound packets back
 // into the Network Extension packet flow.
 type PacketEmitter interface {
-	EmitPacket(packet []byte, protocolNumber int32) error
+    EmitPacket(packet []byte, protocolNumber int32) error
+    // EmitPacketBatch concatenates variable-length packets and provides
+    // per-packet sizes and protocol numbers as byte slices containing
+    // little-endian int32 values. This signature binds cleanly via gomobile.
+    EmitPacketBatch(packed []byte, sizes []byte, protocols []byte) error
 }
 
 // Network abstracts the Network Extension plumbing behind TCP and UDP sessions.
