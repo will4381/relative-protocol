@@ -12,7 +12,7 @@
 //
 
 import Foundation
-import os.lock
+import Dispatch
 
 public enum RelativeProtocol {}
 
@@ -52,7 +52,6 @@ public extension RelativeProtocol {
         public var provider: Provider
         public var hooks: Hooks
         public var logging: LoggingOptions
-        private let providerConfigurationCache = ProviderConfigurationCacheBox()
 
         public init(
             provider: Provider = .default,
@@ -87,12 +86,6 @@ public extension RelativeProtocol {
         /// Serialises the provider-facing configuration into the dictionary
         /// format expected by `NETunnelProviderProtocol.providerConfiguration`.
         public func providerConfigurationDictionary() -> [String: NSObject] {
-            providerConfigurationCache.dictionary(provider: provider, logging: logging) {
-                buildProviderConfigurationDictionary()
-            }
-        }
-
-        private func buildProviderConfigurationDictionary() -> [String: NSObject] {
             do {
                 let payload = WirePayload(provider: provider, logging: logging)
                 let data = try JSONEncoder().encode(payload)
@@ -129,7 +122,9 @@ public extension RelativeProtocol {
         /// Returns `true` when the supplied host matches the configured block
         /// list rules.
         public func matchesBlockedHost(_ host: String) -> Bool {
-            provider.policies.containsBlockedHost(host)
+            guard !provider.policies.blockedHosts.isEmpty else { return false }
+            let matcher = BlockedHostMatcher.lookup(for: provider.policies.blockedHosts)
+            return matcher.contains(host: host)
         }
     }
 
@@ -271,89 +266,16 @@ public extension RelativeProtocol.Configuration {
     }
 
     struct Policies: Codable, Equatable, Sendable {
-        public var blockedHosts: [String] {
-            didSet {
-                if skipNextBlockedHostsRebuild, let last = blockedHosts.last {
-                    // Incremental update when appended via API to avoid O(n) rebuilds.
-                    skipNextBlockedHostsRebuild = false
-                    let normalized = Self.normalizeBlockedHost(last)
-                    if !normalized.isEmpty { blockedHostExactMatches.insert(normalized) }
-                } else {
-                    rebuildBlockedHostCache()
-                }
-            }
-        }
+        public var blockedHosts: [String]
         public var latencyRules: [LatencyRule]
 
         public init(blockedHosts: [String] = [], latencyRules: [LatencyRule] = []) {
             self.blockedHosts = blockedHosts
             self.latencyRules = latencyRules
-            rebuildBlockedHostCache()
         }
 
         public static var `default`: Policies {
             Policies()
-        }
-
-        public mutating func appendBlockedHost(_ host: String) {
-            // Signal didSet to skip full rebuild and apply incremental insert instead.
-            skipNextBlockedHostsRebuild = true
-            blockedHosts.append(host)
-        }
-
-        fileprivate func containsBlockedHost(_ host: String) -> Bool {
-            guard !blockedHosts.isEmpty else { return false }
-            let normalizedHost = Self.normalizeBlockedHost(host)
-            guard !normalizedHost.isEmpty else { return false }
-            if blockedHostExactMatches.contains(normalizedHost) {
-                return true
-            }
-            // Walk label boundaries (after each '.') and check for suffix matches in the set.
-            var searchStart = normalizedHost.startIndex
-            while let dot = normalizedHost[searchStart...].firstIndex(of: ".") {
-                let next = normalizedHost.index(after: dot)
-                if blockedHostExactMatches.contains(String(normalizedHost[next...])) {
-                    return true
-                }
-                searchStart = next
-            }
-            return false
-        }
-
-        private var blockedHostExactMatches: Set<String> = []
-        private var skipNextBlockedHostsRebuild = false
-
-        private mutating func rebuildBlockedHostCache() {
-            var exact = Set<String>(minimumCapacity: blockedHosts.count)
-            for entry in blockedHosts {
-                let normalized = Self.normalizeBlockedHost(entry)
-                guard !normalized.isEmpty else { continue }
-                exact.insert(normalized)
-            }
-            blockedHostExactMatches = exact
-        }
-
-        private static func normalizeBlockedHost(_ host: String) -> String {
-            host.trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased()
-        }
-
-        private enum CodingKeys: String, CodingKey {
-            case blockedHosts
-            case latencyRules
-        }
-
-        public init(from decoder: Decoder) throws {
-            let container = try decoder.container(keyedBy: CodingKeys.self)
-            blockedHosts = try container.decodeIfPresent([String].self, forKey: .blockedHosts) ?? []
-            latencyRules = try container.decodeIfPresent([LatencyRule].self, forKey: .latencyRules) ?? []
-            rebuildBlockedHostCache()
-        }
-
-        public func encode(to encoder: Encoder) throws {
-            var container = encoder.container(keyedBy: CodingKeys.self)
-            try container.encode(blockedHosts, forKey: .blockedHosts)
-            try container.encode(latencyRules, forKey: .latencyRules)
         }
     }
 
@@ -475,7 +397,6 @@ public extension RelativeProtocol.Configuration {
     /// influence runtime behaviour without subclassing package types.
     struct Hooks: Sendable {
         public var packetTap: PacketTap?
-        public var packetTapBatch: PacketTapBatch?
         public var dnsResolver: DNSResolver?
         public var connectionPolicy: ConnectionPolicy?
         public var latencyInjector: LatencyInjector?
@@ -483,14 +404,12 @@ public extension RelativeProtocol.Configuration {
 
         public init(
             packetTap: PacketTap? = nil,
-            packetTapBatch: PacketTapBatch? = nil,
             dnsResolver: DNSResolver? = nil,
             connectionPolicy: ConnectionPolicy? = nil,
             latencyInjector: LatencyInjector? = nil,
             eventSink: EventSink? = nil
         ) {
             self.packetTap = packetTap
-            self.packetTapBatch = packetTapBatch
             self.dnsResolver = dnsResolver
             self.connectionPolicy = connectionPolicy
             self.latencyInjector = latencyInjector
@@ -546,8 +465,6 @@ public extension RelativeProtocol.Configuration {
 
     /// Invoked whenever packets traverse the tunnel in either direction.
     typealias PacketTap = @Sendable (_ context: PacketContext) -> Void
-    /// Batched variant to minimize per-packet closure and dispatch overhead.
-    typealias PacketTapBatch = @Sendable (_ contexts: [PacketContext]) -> Void
     /// Resolves hostnames prior to establishing outbound connections.
     typealias DNSResolver = @Sendable (_ host: String) async throws -> [String]
     /// Determines whether an outbound connection should proceed, be blocked,
@@ -573,64 +490,94 @@ private extension String {
     }
 }
 
+// MARK: - Blocked host matcher cache
+
+private enum BlockedHostMatcher {
+    private static let queue = DispatchQueue(label: "RelativeProtocolCore.BlockedHostMatcher", attributes: .concurrent)
+    private static var cache: [BlockedHostCacheKey: Lookup] = [:]
+
+    struct Lookup {
+        private let patterns: Set<String>
+
+        init(patterns: Set<String>) {
+            self.patterns = patterns
+        }
+
+        func contains(host: String) -> Bool {
+            guard !patterns.isEmpty else { return false }
+            var normalized = host
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+                .lowercased()
+            if patterns.contains(normalized) {
+                return true
+            }
+            while let separator = normalized.firstIndex(of: ".") {
+                normalized = String(normalized[normalized.index(after: separator)...])
+                if patterns.contains(normalized) {
+                    return true
+                }
+            }
+            return false
+        }
+    }
+
+    static func lookup(for hosts: [String]) -> Lookup {
+        guard !hosts.isEmpty else { return Lookup(patterns: []) }
+        let key = BlockedHostCacheKey(hosts: hosts)
+
+        var cached: Lookup?
+        queue.sync {
+            cached = cache[key]
+        }
+        if let cached {
+            return cached
+        }
+
+        let normalized = Set(
+            hosts.compactMap { host -> String? in
+                let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+                    .lowercased()
+                return trimmed.isEmpty ? nil : trimmed
+            }
+        )
+        let lookup = Lookup(patterns: normalized)
+
+        queue.async(flags: .barrier) {
+            cache[key] = lookup
+        }
+        return lookup
+    }
+}
+
+private struct BlockedHostCacheKey: Hashable {
+    private let hosts: [String]
+    private let cachedHash: Int
+
+    init(hosts: [String]) {
+        self.hosts = hosts
+        var hasher = Hasher()
+        hasher.combine(hosts.count)
+        for host in hosts {
+            hasher.combine(host)
+        }
+        cachedHash = hasher.finalize()
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(cachedHash)
+    }
+
+    static func == (lhs: BlockedHostCacheKey, rhs: BlockedHostCacheKey) -> Bool {
+        lhs.cachedHash == rhs.cachedHash && lhs.hosts == rhs.hosts
+    }
+}
+
 // MARK: - Equatable
 
 extension RelativeProtocol.Configuration: Equatable {
     public static func == (lhs: RelativeProtocol.Configuration, rhs: RelativeProtocol.Configuration) -> Bool {
         lhs.provider == rhs.provider && lhs.logging == rhs.logging
-    }
-}
-
-// MARK: - Provider Configuration Cache
-
-private final class ProviderConfigurationCacheBox: @unchecked Sendable {
-    private var cachedProvider: RelativeProtocol.Configuration.Provider?
-    private var cachedLogging: RelativeProtocol.Configuration.LoggingOptions?
-    private var cachedDictionary: [String: NSObject]?
-    private var lock = os_unfair_lock_s()
-
-    func dictionary(
-        provider: RelativeProtocol.Configuration.Provider,
-        logging: RelativeProtocol.Configuration.LoggingOptions,
-        builder: () -> [String: NSObject]
-    ) -> [String: NSObject] {
-        if let cached = load(provider: provider, logging: logging) {
-            return cached
-        }
-
-        let dictionary = builder()
-        store(provider: provider, logging: logging, dictionary: dictionary)
-        return dictionary
-    }
-
-    private func load(
-        provider: RelativeProtocol.Configuration.Provider,
-        logging: RelativeProtocol.Configuration.LoggingOptions
-    ) -> [String: NSObject]? {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
-        guard
-            let cachedProvider,
-            let cachedLogging,
-            let cachedDictionary
-        else {
-            return nil
-        }
-        guard cachedProvider == provider && cachedLogging == logging else {
-            return nil
-        }
-        return cachedDictionary
-    }
-
-    private func store(
-        provider: RelativeProtocol.Configuration.Provider,
-        logging: RelativeProtocol.Configuration.LoggingOptions,
-        dictionary: [String: NSObject]
-    ) {
-        os_unfair_lock_lock(&lock)
-        cachedProvider = provider
-        cachedLogging = logging
-        cachedDictionary = dictionary
-        os_unfair_lock_unlock(&lock)
     }
 }

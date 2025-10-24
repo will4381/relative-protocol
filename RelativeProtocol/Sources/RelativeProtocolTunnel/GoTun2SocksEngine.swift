@@ -44,13 +44,13 @@ final class GoTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
             let config = BridgeConfig()
             config.mtu = configuration.provider.mtu
 
-        let emitter = PacketEmitterAdapter(callbacks: callbacks)
-        let network = NetworkAdapter(
-            callbacks: callbacks,
-            logger: logger,
-            mtu: configuration.provider.mtu,
-            debugLoggingEnabled: debugLoggingEnabled
-        )
+            let emitter = PacketEmitterAdapter(callbacks: callbacks)
+            let network = NetworkAdapter(
+                callbacks: callbacks,
+                logger: logger,
+                mtu: configuration.provider.mtu,
+                debugLoggingEnabled: debugLoggingEnabled
+            )
 
             var creationError: NSError?
             guard let engine = BridgeNewEngine(config, emitter, network, &creationError) else {
@@ -73,17 +73,14 @@ final class GoTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
             callbacks.startPacketReadLoop { [weak self] packets, protocols in
                 guard
                     let self,
-                    let engine = self.goEngine,
-                    !packets.isEmpty
+                    let engine = self.goEngine
                 else { return }
 
-                let protocolCount = protocols.count
-                for index in 0..<packets.count {
-                    let proto: Int32 = index < protocolCount
-                        ? protocols[index].int32Value
-                        : Int32(truncatingIfNeeded: packets[index].afValue)
+                for (index, packet) in packets.enumerated() {
+                    let proto = protocols[safe: index]?.uint32Value ?? packet.afValue
+                    let intProto = Int32(truncatingIfNeeded: proto)
                     do {
-                        try engine.handlePacket(packets[index], protocolNumber: proto)
+                        try engine.handlePacket(packet, protocolNumber: intProto)
                     } catch {
                         self.logger.error("Relative Protocol: handlePacket failed – \(error.localizedDescription, privacy: .public)")
                     }
@@ -113,8 +110,6 @@ final class GoTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
 /// Bridges packet emission from the Go bridge back into Swift callbacks.
 private final class PacketEmitterAdapter: NSObject, BridgePacketEmitterProtocol {
     private let callbacks: Tun2SocksCallbacks
-    private var singlePacket: [Data] = []
-    private var singleProtocol: [NSNumber] = []
 
     init(callbacks: Tun2SocksCallbacks) {
         self.callbacks = callbacks
@@ -124,47 +119,41 @@ private final class PacketEmitterAdapter: NSObject, BridgePacketEmitterProtocol 
         guard let packet else {
             throw NSError(domain: "GoTun2SocksEngine", code: -3, userInfo: [NSLocalizedDescriptionKey: "packet is nil"])
         }
-        singlePacket.removeAll(keepingCapacity: true)
-        singleProtocol.removeAll(keepingCapacity: true)
-        singlePacket.append(packet)
-        singleProtocol.append(NSNumber(value: protocolNumber))
-        callbacks.emitPackets(singlePacket, singleProtocol)
+        callbacks.emitPackets([packet], [NSNumber(value: protocolNumber)])
     }
 
-    // After regenerating the bridge with batch support, gomobile will add a
-    // selector for emitting packet batches. Implement it here to forward to
-    // the adapter in a single callback to minimize overhead.
     @objc
     func emitPacketBatch(_ packed: Data?, sizes: Data?, protocols: Data?) throws {
         guard let packed, let sizes, let protocols else { return }
-        // Decode little-endian int32 arrays
+
         var lengths: [Int] = []
         lengths.reserveCapacity(sizes.count / 4)
-        sizes.withUnsafeBytes { raw in
-            let ptr = raw.bindMemory(to: Int32.self)
-            for i in 0..<(ptr.count) {
-                lengths.append(Int(Int32(littleEndian: ptr[i])))
+        sizes.withUnsafeBytes { rawBuffer in
+            let pointer = rawBuffer.bindMemory(to: Int32.self)
+            for index in 0..<pointer.count {
+                lengths.append(Int(Int32(littleEndian: pointer[index])))
             }
         }
+
         var protos: [NSNumber] = []
         protos.reserveCapacity(protocols.count / 4)
-        protocols.withUnsafeBytes { raw in
-            let ptr = raw.bindMemory(to: Int32.self)
-            for i in 0..<(ptr.count) {
-                protos.append(NSNumber(value: Int32(littleEndian: ptr[i])))
+        protocols.withUnsafeBytes { rawBuffer in
+            let pointer = rawBuffer.bindMemory(to: Int32.self)
+            for index in 0..<pointer.count {
+                protos.append(NSNumber(value: Int32(littleEndian: pointer[index])))
             }
         }
-        // Split packed into sub-datas.
+
         var packets: [Data] = []
         packets.reserveCapacity(lengths.count)
         var offset = 0
-        for len in lengths {
-            guard len > 0, offset + len <= packed.count else { break }
-            let start = offset
-            let end = offset + len
-            packets.append(packed.subdata(in: start..<end))
+        for length in lengths {
+            guard length > 0, offset + length <= packed.count else { break }
+            let end = offset + length
+            packets.append(Data(packed[offset..<end]))
             offset = end
         }
+
         guard !packets.isEmpty, packets.count == protos.count else { return }
         callbacks.emitPackets(packets, protos)
     }
@@ -374,11 +363,6 @@ private final class ManagedTCPConnection: @unchecked Sendable {
     private var readyResult: Result<Void, Error>?
     private let onClosed: (Int64) -> Void
     private let debugLoggingEnabled: Bool
-    // Nonblocking write pipeline
-    private var pendingWrites: [Data] = []
-    private var isWriting: Bool = false
-    private var pendingBytes: Int = 0
-    private let maxPendingBytes: Int
 
     init(
         handle: Int64,
@@ -399,7 +383,6 @@ private final class ManagedTCPConnection: @unchecked Sendable {
         self.queue = DispatchQueue(label: "RelativeProtocolTunnel.ManagedTCPConnection.\(handle)")
         self.onClosed = onClosed
         self.debugLoggingEnabled = debugLoggingEnabled
-        self.maxPendingBytes = max(256 * 1024, mtu * 64)
     }
 
     func activate() {
@@ -434,42 +417,31 @@ private final class ManagedTCPConnection: @unchecked Sendable {
     }
 
     func write(data: Data) throws -> Int {
-        // Copy to ensure lifetime independent of Go memory after return.
-        let owned = Data(data)
-        queue.async { [weak self] in
-            guard let self else { return }
-            if self.closed { return }
-            self.pendingWrites.append(owned)
-            self.pendingBytes &+= owned.count
-            if !self.isWriting {
-                self.drainWrites()
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: Result<Int, Error> = .success(data.count)
+        connection.send(content: data, completion: .contentProcessed { error in
+            if let error {
+                result = .failure(error)
             }
-            if self.pendingBytes > self.maxPendingBytes {
-                if self.debugLoggingEnabled {
-                    self.logger.debug("Relative Protocol: tcp \(self.handle) backpressure pending=\(self.pendingBytes, privacy: .public)")
-                }
-            }
-        }
-        return owned.count
-    }
-
-    private func drainWrites() {
-        guard !isWriting else { return }
-        guard !pendingWrites.isEmpty else { return }
-        isWriting = true
-        let next = pendingWrites.removeFirst()
-        connection.send(content: next, completion: .contentProcessed { [weak self] error in
-            guard let self else { return }
-            self.queue.async {
-                if let error {
-                    self.notifyClose(reason: error)
-                    return
-                }
-                self.pendingBytes &-= next.count
-                self.isWriting = false
-                self.drainWrites()
-            }
+            semaphore.signal()
         })
+
+        if timeoutMillis > 0 {
+            let timeout = DispatchTime.now() + .milliseconds(Int(timeoutMillis))
+            if semaphore.wait(timeout: timeout) == .timedOut {
+                cancel()
+                throw NSError(domain: "GoTun2SocksEngine", code: -7, userInfo: [NSLocalizedDescriptionKey: "tcp write timeout"])
+            }
+        } else {
+            semaphore.wait()
+        }
+
+        switch result {
+        case .success(let count):
+            return count
+        case .failure(let error):
+            throw error
+        }
     }
 
     func cancel() {
@@ -591,8 +563,16 @@ private final class ManagedUDPConnection: @unchecked Sendable {
     }
 
     func write(data: Data) throws -> Int {
-        // Fire-and-forget datagram send; errors are surfaced via state handler.
-        connection.send(content: Data(data), contentContext: .defaultMessage, isComplete: true, completion: .contentProcessed { _ in })
+        let semaphore = DispatchSemaphore(value: 0)
+        var writeError: Error?
+        connection.send(content: data, contentContext: .defaultMessage, isComplete: true, completion: .contentProcessed { error in
+            writeError = error
+            semaphore.signal()
+        })
+        semaphore.wait()
+        if let writeError {
+            throw writeError
+        }
         return data.count
     }
 

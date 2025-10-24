@@ -20,6 +20,7 @@ final class VPNManager: ObservableObject {
     @Published private(set) var configurationReady = false
     @Published private(set) var lastErrorMessage: String?
     @Published private(set) var lastProbeResult: String?
+    @Published private(set) var lastHTTPProbeResult: String?
 
     private var manager: NETunnelProviderManager?
     private var statusObserver: NSObjectProtocol?
@@ -29,6 +30,38 @@ final class VPNManager: ObservableObject {
 
     deinit {
         if let statusObserver { NotificationCenter.default.removeObserver(statusObserver) }
+    }
+
+    func probeHTTP() async {
+        guard await ensureManager(), let manager else {
+            lastHTTPProbeResult = "error: manager unavailable"
+            return
+        }
+        guard manager.connection.status == .connected else {
+            lastHTTPProbeResult = "VPN not connected"
+            return
+        }
+
+        lastHTTPProbeResult = "Running…"
+        guard let url = URL(string: "https://www.apple.com/library/test/success.html") else {
+            lastHTTPProbeResult = "error: invalid URL"
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 10
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            if let http = response as? HTTPURLResponse {
+                lastHTTPProbeResult = "HTTP \(http.statusCode)"
+            } else {
+                lastHTTPProbeResult = "non-HTTP response"
+            }
+        } catch {
+            lastHTTPProbeResult = "error: \(error.localizedDescription)"
+        }
     }
 
     func prepare() async {
@@ -188,7 +221,7 @@ final class VPNManager: ObservableObject {
                     subnetMask: "255.255.255.0",
                     remoteAddress: "10.0.0.1"
                 ),
-                dns: .init(servers: ["1.1.1.1", "8.8.8.8"]),
+                dns: .init(servers: ["1.1.1.1"]),
                 metrics: .init(isEnabled: true, reportingInterval: 1.0),
                 policies: .init(blockedHosts: [])
             ),

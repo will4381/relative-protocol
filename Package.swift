@@ -37,7 +37,11 @@ let package = Package(
             name: "RelativeProtocolPerformanceTests",
             dependencies: ["RelativeProtocolCore", "RelativeProtocolTunnel"],
             path: "RelativeProtocol/Tests/RelativeProtocolPerformanceTests"
+        ),
+        .testTarget(
+            name: "RelativeProtocolTunnelTests",
+            dependencies: ["RelativeProtocolCore", "RelativeProtocolTunnel"],
+            path: "RelativeProtocol/Tests/RelativeProtocolTunnelTests"
         )
     ]
 )
-

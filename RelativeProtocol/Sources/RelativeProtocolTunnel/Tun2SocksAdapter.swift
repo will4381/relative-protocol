@@ -50,9 +50,6 @@ final class NoOpTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
             guard let self else { return }
             callbacks.startPacketReadLoop { [weak self] packets, protocols in
                 guard let self else { return }
-                if self.debugLoggingEnabled {
-                    self.logger.notice("Relative Protocol: Stub engine dropping \(packets.count, privacy: .public) packets")
-                }
                 if self.isRunning {
                     callbacks.emitPackets(packets, protocols)
                 }
@@ -103,6 +100,7 @@ final class Tun2SocksAdapter: @unchecked Sendable {
 
     /// Boots the engine and begins draining packets from `packetFlow`.
     func start() throws {
+        guard !isRunning else { return }
         hooks.eventSink?(.willStart)
         let callbacks = Tun2SocksCallbacks(
             startPacketReadLoop: { [weak self] handler in
@@ -118,8 +116,13 @@ final class Tun2SocksAdapter: @unchecked Sendable {
                 self?.makeUDPConnection(endpoint: endpoint) ?? self!.provider.makeUDPConnection(to: endpoint, from: nil)
             }
         )
-        try engine.start(callbacks: callbacks)
         isRunning = true
+        do {
+            try engine.start(callbacks: callbacks)
+        } catch {
+            isRunning = false
+            throw error
+        }
         hooks.eventSink?(.didStart)
     }
 
@@ -135,94 +138,28 @@ final class Tun2SocksAdapter: @unchecked Sendable {
     private func scheduleRead(handler: @escaping @Sendable (_ packets: [Data], _ protocols: [NSNumber]) -> Void) {
         ioQueue.async { [weak self] in
             guard let self else { return }
-            self.startReadLoop(handler: handler)
-        }
-    }
-
-    private func startReadLoop(handler: @escaping @Sendable (_ packets: [Data], _ protocols: [NSNumber]) -> Void) {
-        provider.flow.readPackets { [weak self] packets, protocols in
-            guard let self else { return }
-            guard self.isRunning else { return }
-            self.processInboundPackets(packets, protocols: protocols, handler: handler)
-            self.startReadLoop(handler: handler)
-        }
-    }
-
-    private func processInboundPackets(
-        _ packets: [Data],
-        protocols: [NSNumber],
-        handler: @escaping @Sendable (_ packets: [Data], _ protocols: [NSNumber]) -> Void
-    ) {
-        guard !packets.isEmpty else {
-            handler(packets, protocols)
-            return
-        }
-
-        var totalBytes = 0
-        if let batchTap = hooks.packetTapBatch {
-            var contexts: [RelativeProtocol.Configuration.PacketContext] = []
-            contexts.reserveCapacity(packets.count)
-            forEachPacket(packets, protocols: protocols) { packet, proto in
-                totalBytes += packet.count
-                contexts.append(.init(direction: .inbound, payload: packet, protocolNumber: proto))
-            }
-            if !contexts.isEmpty { batchTap(contexts) }
-        } else if let packetTap = hooks.packetTap {
-            forEachPacket(packets, protocols: protocols) { packet, proto in
-                totalBytes += packet.count
-                packetTap(.init(direction: .inbound, payload: packet, protocolNumber: proto))
+            self.provider.flow.readPackets { packets, protocols in
+                guard self.isRunning else { return }
+                self.metrics?.record(direction: .inbound, packets: packets.count, bytes: packets.reduce(0) { $0 + $1.count })
+                packets.enumerated().forEach { index, packet in
+                    let proto = protocols[safe: index]?.int32Value ?? packet.afValue
+                    self.hooks.packetTap?(.init(direction: .inbound, payload: packet, protocolNumber: proto))
+                }
+                handler(packets, protocols)
+                // Reschedule the loop.
+                self.scheduleRead(handler: handler)
             }
         }
-
-        if let metrics {
-            if totalBytes == 0 {
-                totalBytes = totalByteCount(for: packets)
-            }
-            metrics.record(direction: .inbound, packets: packets.count, bytes: totalBytes)
-        }
-
-        if debugLoggingEnabled {
-            // Log a concise batch summary with a sample packet header to verify
-            // packets are reaching the extension.
-            let sample = packets.first.flatMap { summarizeIPPacket($0) } ?? "<no-sample>"
-            logger.notice("Relative Protocol: Inbound batch packets=\(packets.count, privacy: .public) bytes=\(totalBytes, privacy: .public) sample=\(sample, privacy: .public)")
-        }
-
-        handler(packets, protocols)
     }
 
     /// Writes packets emitted by the engine back to the provider.
     private func writePackets(_ packets: [Data], protocols: [NSNumber]) {
         guard !packets.isEmpty else { return }
         guard isRunning else { return }
-
-        var totalBytes = 0
-        if let batchTap = hooks.packetTapBatch {
-            var contexts: [RelativeProtocol.Configuration.PacketContext] = []
-            contexts.reserveCapacity(packets.count)
-            forEachPacket(packets, protocols: protocols) { packet, proto in
-                totalBytes += packet.count
-                contexts.append(.init(direction: .outbound, payload: packet, protocolNumber: proto))
-            }
-            if !contexts.isEmpty { batchTap(contexts) }
-        } else if let packetTap = hooks.packetTap {
-            forEachPacket(packets, protocols: protocols) { packet, proto in
-                totalBytes += packet.count
-                packetTap(.init(direction: .outbound, payload: packet, protocolNumber: proto))
-            }
-        }
-
-        if let metrics {
-            if totalBytes == 0 {
-                totalBytes = totalByteCount(for: packets)
-            }
-            metrics.record(direction: .outbound, packets: packets.count, bytes: totalBytes)
-        }
-        if debugLoggingEnabled {
-            // Log a concise batch summary with a sample packet header to verify
-            // packets are being emitted out of the extension.
-            let sample = packets.first.flatMap { summarizeIPPacket($0) } ?? "<no-sample>"
-            logger.notice("Relative Protocol: Outbound batch packets=\(packets.count, privacy: .public) bytes=\(totalBytes, privacy: .public) sample=\(sample, privacy: .public)")
+        metrics?.record(direction: .outbound, packets: packets.count, bytes: packets.reduce(0) { $0 + $1.count })
+        packets.enumerated().forEach { index, packet in
+            let proto = protocols[safe: index]?.int32Value ?? packet.afValue
+            hooks.packetTap?(.init(direction: .outbound, payload: packet, protocolNumber: proto))
         }
         provider.flow.writePackets(packets, protocols: protocols)
     }
@@ -243,7 +180,7 @@ final class Tun2SocksAdapter: @unchecked Sendable {
         }
 
         if debugLoggingEnabled {
-            logger.notice("Relative Protocol: Opening TCP connection to \(hostString, privacy: .public):\(port.rawValue, privacy: .public)")
+            logger.debug("Relative Protocol: Opening TCP connection to \(hostString, privacy: .public):\(port.rawValue, privacy: .public)")
         }
         return provider.makeTCPConnection(to: endpoint)
     }
@@ -264,7 +201,7 @@ final class Tun2SocksAdapter: @unchecked Sendable {
         }
 
         if debugLoggingEnabled {
-            logger.notice("Relative Protocol: Opening UDP session to \(hostString, privacy: .public):\(port.rawValue, privacy: .public)")
+            logger.debug("Relative Protocol: Opening UDP session to \(hostString, privacy: .public):\(port.rawValue, privacy: .public)")
         }
         return provider.makeUDPConnection(to: endpoint, from: nil)
     }
@@ -282,110 +219,4 @@ private extension Data {
         guard let firstByte = first else { return Int32(AF_INET) }
         return (firstByte >> 4) == 6 ? Int32(AF_INET6) : Int32(AF_INET)
     }
-}
-
-private func totalByteCount(for packets: [Data]) -> Int {
-    packets.reduce(into: 0) { $0 += $1.count }
-}
-
-private func forEachPacket(
-    _ packets: [Data],
-    protocols: [NSNumber],
-    _ body: (_ packet: Data, _ proto: Int32) -> Void
-) {
-    let count = packets.count
-    guard count > 0 else { return }
-    let protocolCount = protocols.count
-    if protocolCount == 0 {
-        for packet in packets {
-            body(packet, packet.afValue)
-        }
-        return
-    }
-    for index in 0..<count {
-        let proto: Int32 = index < protocolCount ? protocols[index].int32Value : packets[index].afValue
-        body(packets[index], proto)
-    }
-}
-
-// MARK: - Packet summary logging
-
-private func summarizeIPPacket(_ packet: Data) -> String {
-    guard let first = packet.first else { return "empty" }
-    let version = first >> 4
-    if version == 4 {
-        return summarizeIPv4(packet)
-    } else if version == 6 {
-        return summarizeIPv6(packet)
-    } else {
-        return "v\(version) len=\(packet.count)"
-    }
-}
-
-private func summarizeIPv4(_ packet: Data) -> String {
-    // Minimal IPv4 header is 20 bytes
-    guard packet.count >= 20 else { return "ipv4(truncated len=\(packet.count))" }
-    let ihl = Int(packet[0] & 0x0F) * 4
-    guard ihl >= 20, packet.count >= ihl else { return "ipv4(bad ihl=\(ihl))" }
-    let proto = packet[9]
-    let src = formatIPv4(packet, start: 12)
-    let dst = formatIPv4(packet, start: 16)
-    var sport: UInt16? = nil
-    var dport: UInt16? = nil
-    if packet.count >= ihl + 4, (proto == 6 || proto == 17) { // TCP or UDP
-        sport = readBE16(packet, offset: ihl)
-        dport = readBE16(packet, offset: ihl + 2)
-    }
-    let l4 = (proto == 6 ? "tcp" : (proto == 17 ? "udp" : "p\(proto)"))
-    if let sp = sport, let dp = dport {
-        return "ipv4 \(l4) \(src):\(sp) -> \(dst):\(dp)"
-    } else {
-        return "ipv4 \(l4) \(src) -> \(dst)"
-    }
-}
-
-private func summarizeIPv6(_ packet: Data) -> String {
-    // IPv6 header is 40 bytes
-    guard packet.count >= 40 else { return "ipv6(truncated len=\(packet.count))" }
-    let nextHeader = packet[6]
-    let src = formatIPv6(packet, start: 8)
-    let dst = formatIPv6(packet, start: 24)
-    var sport: UInt16? = nil
-    var dport: UInt16? = nil
-    // Simplification: assume no extension headers when extracting ports
-    if packet.count >= 40 + 4, (nextHeader == 6 || nextHeader == 17) {
-        sport = readBE16(packet, offset: 40)
-        dport = readBE16(packet, offset: 42)
-    }
-    let l4 = (nextHeader == 6 ? "tcp" : (nextHeader == 17 ? "udp" : "nh\(nextHeader)"))
-    if let sp = sport, let dp = dport {
-        return "ipv6 \(l4) \(src):\(sp) -> \(dst):\(dp)"
-    } else {
-        return "ipv6 \(l4) \(src) -> \(dst)"
-    }
-}
-
-private func readBE16(_ data: Data, offset: Int) -> UInt16? {
-    guard offset + 1 < data.count else { return nil }
-    return (UInt16(data[offset]) << 8) | UInt16(data[offset + 1])
-}
-
-private func formatIPv4(_ data: Data, start: Int) -> String {
-    guard start + 3 < data.count else { return "?.?.?.?" }
-    return "\(data[start]).\(data[start+1]).\(data[start+2]).\(data[start+3])"
-}
-
-private func formatIPv6(_ data: Data, start: Int) -> String {
-    guard start + 15 < data.count else { return "?" }
-    // Format as 8 groups of 2 bytes in hex
-    var parts: [String] = []
-    parts.reserveCapacity(8)
-    var idx = start
-    for _ in 0..<8 {
-        let hi = data[idx]
-        let lo = data[idx + 1]
-        parts.append(String(format: "%02x%02x", hi, lo))
-        idx += 2
-    }
-    return parts.joined(separator: ":")
 }
