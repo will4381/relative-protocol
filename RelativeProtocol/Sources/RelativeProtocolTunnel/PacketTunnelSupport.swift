@@ -13,7 +13,6 @@
 import Foundation
 import Network
 import NetworkExtension
-import os.log
 
 /// Abstraction over `NEPacketTunnelFlow`.
 protocol PacketFlowing: AnyObject {
@@ -48,7 +47,8 @@ extension NEPacketTunnelProvider: PacketTunnelProviding {
 
     func makeTCPConnection(to remoteEndpoint: Network.NWEndpoint) -> Network.NWConnection {
         let parameters = Network.NWParameters(tls: nil, tcp: Network.NWProtocolTCP.Options())
-        configureBypassingTunnel(parameters)
+        parameters.allowLocalEndpointReuse = true
+        parameters.prohibitedInterfaceTypes = [.loopback, .other]
         return Network.NWConnection(to: remoteEndpoint, using: parameters)
     }
 
@@ -57,34 +57,11 @@ extension NEPacketTunnelProvider: PacketTunnelProviding {
         from localEndpoint: Network.NWEndpoint?
     ) -> Network.NWConnection {
         let parameters = Network.NWParameters(dtls: nil, udp: Network.NWProtocolUDP.Options())
-        configureBypassingTunnel(parameters)
+        parameters.allowLocalEndpointReuse = true
+        parameters.prohibitedInterfaceTypes = [.loopback, .other]
         if let localEndpoint {
             parameters.requiredLocalEndpoint = localEndpoint
         }
         return Network.NWConnection(to: remoteEndpoint, using: parameters)
-    }
-
-    /// Configure NWParameters so provider-originated connections avoid the
-    /// utun (tunnel) interface and use a physical interface (Wi‑Fi/cellular).
-    private func configureBypassingTunnel(_ parameters: Network.NWParameters) {
-        parameters.allowLocalEndpointReuse = true
-        // Avoid recursion by prohibiting utun/loopback.
-        parameters.prohibitedInterfaceTypes = [.loopback, .other]
-
-        // Prefer a concrete physical interface if available.
-        if let path = defaultPath {
-            if let iface = path.availableInterfaces.first(where: { $0.type == .wifi || $0.type == .cellular || $0.type == .wiredEthernet }) {
-                parameters.requiredInterface = iface
-            } else {
-                // Fallback to the active interface type on the current path.
-                if path.usesInterfaceType(.wifi) {
-                    parameters.requiredInterfaceType = .wifi
-                } else if path.usesInterfaceType(.cellular) {
-                    parameters.requiredInterfaceType = .cellular
-                } else if path.usesInterfaceType(.wiredEthernet) {
-                    parameters.requiredInterfaceType = .wiredEthernet
-                }
-            }
-        }
     }
 }

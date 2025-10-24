@@ -25,9 +25,8 @@ type swiftTCPConn struct {
 	remote net.Addr
 
 	mu        sync.Mutex
-	recvQueue chan packetBuffer
-	current   packetBuffer
-	offset    int
+	recvQueue chan []byte
+	buffer    []byte
 	closed    bool
 	closeErr  error
 }
@@ -45,28 +44,19 @@ func newSwiftTCPConn(handle int64, metadata *M.Metadata, engine *Engine) *swiftT
 		handle:    handle,
 		engine:    engine,
 		remote:    remote,
-		recvQueue: make(chan packetBuffer, 128),
+		recvQueue: make(chan []byte, 64),
 	}
 }
 
 func (c *swiftTCPConn) Read(p []byte) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-
 	c.mu.Lock()
-	if len(c.current.buf) > 0 {
-		n := copy(p, c.current.buf[c.offset:])
-		c.offset += n
-		if c.offset >= len(c.current.buf) {
-			c.current.release()
-			c.current = packetBuffer{}
-			c.offset = 0
-		}
+	if len(c.buffer) > 0 {
+		n := copy(p, c.buffer)
+		c.buffer = c.buffer[n:]
 		c.mu.Unlock()
 		return n, nil
 	}
-	if c.closed {
+	if c.closed && len(c.buffer) == 0 {
 		err := c.closeErr
 		if err == nil {
 			err = io.EOF
@@ -87,15 +77,12 @@ func (c *swiftTCPConn) Read(p []byte) (int, error) {
 		return 0, err
 	}
 
-	n := copy(p, payload.buf)
-	if n < len(payload.buf) {
+	n := copy(p, payload)
+	if n < len(payload) {
 		c.mu.Lock()
-		c.current = payload
-		c.offset = n
+		c.buffer = append(c.buffer, payload[n:]...)
 		c.mu.Unlock()
-		return n, nil
 	}
-	payload.release()
 	return n, nil
 }
 
@@ -142,7 +129,7 @@ func (c *swiftTCPConn) enqueue(payload []byte) {
 		return
 	}
 	c.mu.Unlock()
-	c.recvQueue <- adoptPacketBuffer(payload, 0)
+	c.recvQueue <- append([]byte(nil), payload...)
 }
 
 func (c *swiftTCPConn) closeWithError(err error) {
@@ -165,10 +152,5 @@ func (c *swiftTCPConn) markClosed(err error) bool {
 	}
 	c.closed = true
 	c.closeErr = err
-	if len(c.current.buf) > 0 {
-		c.current.release()
-		c.current = packetBuffer{}
-		c.offset = 0
-	}
 	return true
 }

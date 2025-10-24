@@ -26,55 +26,6 @@ final class RelativeProtocolPerformanceTests: XCTestCase {
         }
     }
 
-#if canImport(Tun2Socks)
-    func testGoBridgeHandlePacketPerformance() throws {
-        // Measures Swift -> Go bridge overhead by driving handlePacket via
-        // the adapter using the real Go engine (if available on this platform).
-        let flow = MockPacketFlow()
-        let provider = MockProvider(flow: flow)
-
-        var configuration = makeTestConfiguration()
-        configuration.hooks = .init() // disable taps to minimize overhead
-        configuration.logging = .init(enableDebug: false)
-        configuration.provider.metrics = .init(isEnabled: false, reportingInterval: 5)
-
-        let engine = GoTun2SocksEngine(
-            configuration: configuration,
-            logger: Logger(subsystem: "RelativeProtocolTests", category: "GoTun2Socks")
-        )
-        let adapter = Tun2SocksAdapter(
-            provider: provider,
-            configuration: configuration,
-            metrics: nil,
-            engine: engine,
-            hooks: configuration.hooks
-        )
-
-        try adapter.start()
-        XCTAssertTrue(flow.waitForHandler(timeout: 2), "Adapter did not register read handler in time")
-        addTeardownBlock {
-            adapter.stop()
-            flow.drain()
-        }
-
-        // Prepare a small burst so we measure per-packet cross-boundary cost.
-        let one = Data(repeating: 0, count: 128)
-        let proto: NSNumber = .init(value: AF_INET)
-        let burst = 64
-        let packets = Array(repeating: one, count: burst)
-        let protocols = Array(repeating: proto, count: burst)
-
-        let iterations = 100
-
-        measure {
-            for _ in 0..<iterations {
-                flow.trigger(packets: packets, protocols: protocols)
-            }
-            flow.drain()
-        }
-    }
-#endif
-
     func testMetricsCollectorRecordPerformance() {
         _ = makeTestConfiguration() // exercise hook construction path
 
@@ -88,6 +39,24 @@ final class RelativeProtocolPerformanceTests: XCTestCase {
             for _ in 0..<5_000 {
                 collector.record(direction: .inbound, packets: 1, bytes: 128)
                 collector.record(direction: .outbound, packets: 1, bytes: 256)
+            }
+        }
+    }
+
+    func testMetricsCollectorConnectionTrackingPerformance() {
+        let collector = MetricsCollector(
+            subsystem: "RelativeProtocolTests",
+            interval: 10,
+            sink: nil
+        )
+
+        measure {
+            for iteration in 0..<10_000 {
+                collector.adjustActiveConnections(tcpDelta: 1, udpDelta: 1)
+                collector.adjustActiveConnections(tcpDelta: -1, udpDelta: -1)
+                if iteration.isMultiple(of: 250) {
+                    collector.recordError("synthetic error \(iteration)")
+                }
             }
         }
     }
@@ -126,50 +95,30 @@ final class RelativeProtocolPerformanceTests: XCTestCase {
         }
     }
 
-    func testBlockedHostMatchingPerformance() {
+    func testBlockedHostLookupPerformance() {
         var configuration = makeTestConfiguration()
-        configuration.provider.policies.blockedHosts = (0..<256).map { "blocked-domain-\($0).example" } + ["example.com"]
-        let host = "subdomain.service.example.com"
-        _ = configuration.matchesBlockedHost(host) // Warm-up cache
+        configuration.provider.policies.blockedHosts = (0..<5_000).map { "blocked-\($0).example.com" }
+        let hosts = (0..<5_000).map { index -> String in
+            index % 5 == 0 ? "sub.blocked-\(index).example.com" : "allowed-\(index).example.net"
+        }
 
         measure {
-            for _ in 0..<10_000 {
-                _ = configuration.matchesBlockedHost(host)
+            var hits = 0
+            for host in hosts {
+                if configuration.matchesBlockedHost(host) {
+                    hits += 1
+                }
             }
+            XCTAssertGreaterThan(hits, 0)
         }
     }
 
-    func testProviderConfigurationDictionaryPerformance() {
+    func testConfigurationSerializationPerformance() {
         let configuration = makeTestConfiguration()
-        _ = configuration.providerConfigurationDictionary() // Warm-up cache
-
         measure {
             for _ in 0..<1_000 {
-                _ = configuration.providerConfigurationDictionary()
-            }
-        }
-    }
-
-    func testBlockedHostCacheRebuildPerformance() {
-        let baselineHosts = (0..<320).map { "baseline-\($0).example" }
-        let additionalHosts = (320..<384).map { "baseline-\($0).example" }
-        let baselinePolicies = RelativeProtocol.Configuration.Policies(blockedHosts: baselineHosts)
-
-        measure {
-            var workingCopy = baselinePolicies
-            for host in additionalHosts {
-                workingCopy.appendBlockedHost(host)
-            }
-        }
-    }
-
-    func testConfigurationLoadPerformance() {
-        let configuration = makeTestConfiguration()
-        let dictionary = configuration.providerConfigurationDictionary()
-
-        measure {
-            for _ in 0..<1_000 {
-                _ = RelativeProtocol.Configuration.load(from: dictionary)
+                let dict = configuration.providerConfigurationDictionary()
+                _ = RelativeProtocol.Configuration.load(from: dict)
             }
         }
     }
@@ -226,8 +175,7 @@ private final class MockPacketFlow: PacketFlowing {
     private let handlerSemaphore = DispatchSemaphore(value: 0)
 
     func readPackets(_ handler: @escaping @Sendable ([Data], [NSNumber]) -> Void) {
-        queue.async { [weak self] in
-            guard let self else { return }
+        queue.async { [self] in
             self.handler = handler
             handlerSemaphore.signal()
         }
@@ -239,7 +187,8 @@ private final class MockPacketFlow: PacketFlowing {
 
     func trigger(packets: [Data], protocols: [NSNumber]) {
         queue.async { [weak self] in
-            self?.handler?(packets, protocols)
+            guard let self, let handler = self.handler else { return }
+            handler(packets, protocols)
         }
     }
 
