@@ -83,6 +83,8 @@ public extension RelativeProtocolTunnel {
                     return
                 }
 
+                self.logger.notice("Relative Protocol: Network settings applied (IPv4 \(configuration.provider.ipv4.address)/\(configuration.provider.ipv4.subnetMask), DNS: \(configuration.provider.dns.servers.joined(separator: ", "), privacy: .public))")
+
                 do {
                     try self.bootBridge(configuration: configuration, metrics: metricsCollector)
                     completion(nil)
@@ -144,15 +146,17 @@ public extension RelativeProtocolTunnel {
         private func bootBridge(configuration: RelativeProtocol.Configuration, metrics: MetricsCollector?) throws {
             let engine: Tun2SocksEngine
             #if canImport(Tun2Socks)
+            logger.notice("Relative Protocol: Using GoTun2Socks engine")
             engine = GoTun2SocksEngine(
                 configuration: configuration,
                 logger: Logger(subsystem: "RelativeProtocolTunnel", category: "GoTun2Socks")
             )
 #else
-        engine = NoOpTun2SocksEngine(
-            logger: Logger(subsystem: "RelativeProtocolTunnel", category: "NoOpTun2Socks"),
-            debugLoggingEnabled: configuration.logging.enableDebug
-        )
+            logger.warning("Relative Protocol: Tun2Socks framework unavailable; falling back to NoOp engine")
+            engine = NoOpTun2SocksEngine(
+                logger: Logger(subsystem: "RelativeProtocolTunnel", category: "NoOpTun2Socks"),
+                debugLoggingEnabled: configuration.logging.enableDebug
+            )
 #endif
 
             let adapter = Tun2SocksAdapter(
