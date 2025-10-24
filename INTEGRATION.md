@@ -82,15 +82,36 @@ func makeConfiguration() -> RelativeProtocol.Configuration {
         policies: .init(blockedHosts: ["example.com"]) // optional
     )
 
-    var hooks = RelativeProtocol.Configuration.Hooks()
-    hooks.packetTapBatch = { contexts in
-        // Observe bursts with low overhead (optional)
-        _ = contexts.count
-    }
-
     let configuration = RelativeProtocol.Configuration(
         provider: provider,
-        hooks: hooks,
+        hooks: .init(
+            packetTap: { context in
+                // Inspect individual packets (direction, payload, protocol number).
+                if context.direction == .inbound {
+                    print("Inbound packet bytes: \(context.payload.count)")
+                }
+            },
+            dnsResolver: { host in
+                // Provide dual-stack responses when local DNS is unavailable.
+                [host, "2001:db8::1"]
+            },
+            connectionPolicy: { endpoint in
+                // Block HTTP, allow everything else.
+                endpoint.transport == .tcp && endpoint.port == 80
+                    ? .block(reason: "HTTP blocked for policy reasons")
+                    : .allow
+            },
+            latencyInjector: { endpoint in
+                // Inject latency on selected UDP hosts.
+                endpoint.transport == .udp && endpoint.host.hasSuffix(".test.false-positive")
+                    ? 150
+                    : nil
+            },
+            eventSink: { event in
+                // React to tunnel lifecycle events.
+                print("Tunnel event: \(event)")
+            }
+        ),
         logging: .init(enableDebug: false)
     )
 
@@ -134,7 +155,8 @@ func installAndStartTunnel(completion: @escaping (Error?) -> Void) {
 ## 6) Optional Hooks & Metrics
 
 - Packet taps
-  - Prefer `packetTapBatch` to reduce overhead for high packet rates.
+  - `packetTap` receives individual packets with direction, payload, and protocol metadata.
+  - Use `dnsResolver`, `connectionPolicy`, and `latencyInjector` to override network behaviour; these closures can perform async work.
 - Event sink
   - Receive `.willStart`, `.didStart`, `.didStop`, `.didFail` from the tunnel.
 - Policies
@@ -168,4 +190,3 @@ func pingExtension(_ manager: NETunnelProviderManager) throws {
   - Verify `providerBundleIdentifier` matches the extension’s bundle identifier and that `serverAddress` is non-empty.
 - SPM import fails
   - Ensure you reference the repository URL and pick a tagged release.
-
