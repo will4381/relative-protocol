@@ -4,18 +4,16 @@ Portable tunnel components for iOS Network Extension projects. Built to deliver 
 
 ## Performance
 
-When running on-device VPN-style proxies it’s imperative that the tunnel remains lightweight so battery life and latency stay acceptable. Latest results (October 23, 2025):
+When running on-device VPN-style proxies it’s imperative that the tunnel remains lightweight so battery life and latency stay acceptable. Latest results (October 24, 2025):
 
 | Benchmark | Avg Time | Relative Std. Dev. | Notes |
 |-----------|----------|--------------------|-------|
-| `testAdapterReadLoopPerformance` | 0.005 s (≈5 ms) | 14.1% | NoOp engine; 200 iterations of 1×128B packet reads. |
-| `testBlockedHostCacheRebuildPerformance` | 0.000 s (≈0.03 ms) | 59.0% | Append 64 hosts to a 320-host baseline; incremental cache update. |
-| `testBlockedHostMatchingPerformance` | 0.013 s (≈13 ms) | 25.6% | 10k hostname checks against a 256-entry block list (warm cache). |
-| `testConfigurationLoadPerformance` | 0.019 s (≈19 ms) | 42.0% | 1k loads from `providerConfigurationDictionary()` (JSON round-trip). |
-| `testConfigurationValidationPerformance` | 0.004 s (≈4 ms) | 21.9% | Re-validate full configuration repeatedly. |
-| `testGoBridgeHandlePacketPerformance` | 0.100 s (≈100 ms) | 32.1% | Swift→Go path using Tun2Socks; 100 iterations of 64×128B packet bursts. |
-| `testMetricsCollectorRecordPerformance` | 0.003 s (≈3 ms) | 18.4% | ~10k `record` calls under unfair lock (in/out). |
-| `testProviderConfigurationDictionaryPerformance` | 0.001 s (≈1 ms) | 14.6% | 1k serialisations to `providerConfigurationDictionary()` (warm cache). |
+| `testAdapterReadLoopPerformance` | 0.0012 s (≈1.2 ms) | 6.6% | NoOp engine; 200 iterations of single 128 B packet reads. |
+| `testBlockedHostLookupPerformance` | 1.283 s | 1.7% | 5k blocked-host patterns evaluated against 5k candidate hostnames. |
+| `testConfigurationSerializationPerformance` | 0.0370 s (≈37 ms) | 32.6% | 1k round-trips through `providerConfigurationDictionary()`. |
+| `testConfigurationValidationPerformance` | 0.0044 s (≈4.4 ms) | 22.6% | 500 calls to `validateOrThrow()` on a warm configuration. |
+| `testMetricsCollectorConnectionTrackingPerformance` | 0.0100 s (≈10 ms) | 20.3% | 10k TCP/UDP adjustments with periodic synthetic error logging. |
+| `testMetricsCollectorRecordPerformance` | 0.0232 s (≈23 ms) | 13.7% | 5k inbound/outbound record pairs on the metrics queue. |
 
 ## Modules
 
@@ -32,9 +30,9 @@ When running on-device VPN-style proxies it’s imperative that the tunnel remai
     - **Use when**: enabling verbose diagnostics for development or performance testing.
   - `RelativeProtocol.Configuration.Hooks`
     - **Purpose**: inject custom behaviour.
-    - **Inputs**: optional closures `packetTap(context)`, `dnsResolver(host) async -> [String]`, `connectionPolicy(endpoint) async -> ConnectionDecision`, `latencyInjector(endpoint) async -> Int?`, `eventSink(event)`.
-    - **Output**: callbacks invoked by the tunnel runtime.
-    - **Use when**: observing packet flow, implementing DNS overrides, enforcing block/latency policies, or tracking lifecycle events.
+    - **Inputs**: optional closures `packetTap(context)`, `dnsResolver(host) async throws -> [String]`, `connectionPolicy(endpoint) async -> ConnectionDecision`, `latencyInjector(endpoint) async -> Int?`, `eventSink(event)`.
+    - **Output**: callbacks invoked by the tunnel runtime (packet inspection, DNS overrides, connection policy decisions, latency shaping, lifecycle reporting).
+    - **Use when**: you need to observe packet flow, provide custom DNS answers, enforce allow/deny lists, inject synthetic latency, or surface tunnel state changes to the host app.
   - `RelativeProtocol.Configuration.ValidationMessage`
     - **Properties**: `message: String`, `isError: Bool`, `severityLabel: "warning" | "error"`.
     - **Use when**: presenting validation results to the caller.
@@ -69,17 +67,25 @@ let configuration = RelativeProtocol.Configuration(
     ),
     hooks: .init(
         packetTap: { context in
-            // observe packets in/out of the tunnel
+            // Observe packets in/out of the tunnel (context.direction, payload, protocolNumber).
+        },
+        dnsResolver: { host in
+            // Optionally supply synthetic DNS answers.
+            [host, "2001:db8::1"]
+        },
+        connectionPolicy: { endpoint in
+            // Block clear-text HTTP, allow everything else.
+            endpoint.transport == .tcp && endpoint.port == 80
+                ? .block(reason: "HTTP disallowed")
+                : .allow
         },
         latencyInjector: { endpoint in
-            // Inject 200 ms latency for specific hosts, else nil
-            if endpoint.transport == .tcp && endpoint.host.hasSuffix(".slow.example") {
-                return 200
-            }
-            return nil
+            // Inject 200 ms latency for a specific domain.
+            endpoint.host.hasSuffix(".slow.example") ? 200 : nil
         },
         eventSink: { event in
             // lifecycle: willStart/didStart/didStop/didFail
+            print("Tunnel event: \(event)")
         }
     ),
     logging: .init(enableDebug: true)
