@@ -1,14 +1,10 @@
 import XCTest
 import Network
-import os.log
 @testable import RelativeProtocolTunnel
 
 final class NoOpTun2SocksEngineTests: XCTestCase {
     func testEchoesPacketsWhileRunning() throws {
-        let engine = NoOpTun2SocksEngine(
-            logger: Logger(subsystem: "RelativeProtocolTests", category: "NoOp"),
-            debugLoggingEnabled: true
-        )
+        let engine = NoOpTun2SocksEngine()
 
         let readLoopInstalled = expectation(description: "read loop installed")
         let firstEmission = expectation(description: "first packet echoed")

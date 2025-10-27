@@ -21,19 +21,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         // Respect the host application's logging preference; do not force debug logs on.
         var hooks = configuration.hooks
-        hooks.eventSink = { [weak self] (event: RelativeProtocol.Configuration.Event) in
-            switch event {
-            case .willStart: self?.logger.notice("Tunnel willStart")
-            case .didStart: self?.logger.notice("Tunnel didStart")
-            case .didStop: self?.logger.notice("Tunnel didStop")
-            case .didFail(let message): self?.logger.error("Tunnel didFail: \(message, privacy: .public)")
-            }
+        hooks.eventSink = { [weak self] event in
+            guard case let .didFail(message) = event else { return }
+            self?.logger.error("Tunnel didFail: \(message, privacy: .public)")
         }
-        hooks.packetTap = { [weak self] context in
-            guard let self else { return }
-            let direction = context.direction == .inbound ? "inbound" : "outbound"
-            self.logger.debug("PacketTap \(direction, privacy: .public) bytes=\(context.payload.count, privacy: .public) proto=\(context.protocolNumber, privacy: .public)")
-        }
+        hooks.packetTap = nil
         configuration.hooks = hooks
 
         controller.start(configuration: configuration, completion: completionHandler)

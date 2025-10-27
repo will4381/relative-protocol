@@ -28,12 +28,10 @@ final class GoTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
     private var networkAdapter: NetworkAdapter?
     private let stateQueue = DispatchQueue(label: "RelativeProtocolTunnel.GoTun2SocksEngine")
     private var running = false
-    private let debugLoggingEnabled: Bool
 
     init(configuration: RelativeProtocol.Configuration, logger: Logger) {
         self.configuration = configuration
         self.logger = logger
-        self.debugLoggingEnabled = configuration.logging.enableDebug
     }
 
     /// Boots the gomobile engine and wires its callbacks into Swift.
@@ -48,8 +46,7 @@ final class GoTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
             let network = NetworkAdapter(
                 callbacks: callbacks,
                 logger: logger,
-                mtu: configuration.provider.mtu,
-                debugLoggingEnabled: debugLoggingEnabled
+                mtu: configuration.provider.mtu
             )
 
             var creationError: NSError?
@@ -166,18 +163,16 @@ private final class NetworkAdapter: NSObject, BridgeNetworkProtocol {
     private let callbacks: Tun2SocksCallbacks
     private let logger: Logger
     private let mtu: Int
-    private let debugLoggingEnabled: Bool
     private let lock = DispatchQueue(label: "RelativeProtocolTunnel.NetworkAdapter.lock")
     private var nextHandle: Int64 = 1
     private var tcpConnections: [Int64: ManagedTCPConnection] = [:]
     private var udpConnections: [Int64: ManagedUDPConnection] = [:]
     private weak var engine: BridgeEngine?
 
-    init(callbacks: Tun2SocksCallbacks, logger: Logger, mtu: Int, debugLoggingEnabled: Bool) {
+    init(callbacks: Tun2SocksCallbacks, logger: Logger, mtu: Int) {
         self.callbacks = callbacks
         self.logger = logger
         self.mtu = mtu
-        self.debugLoggingEnabled = debugLoggingEnabled
     }
 
     func bind(engine: BridgeEngine) {
@@ -222,7 +217,6 @@ private final class NetworkAdapter: NSObject, BridgeNetworkProtocol {
             logger: logger,
             mtu: mtu,
             timeoutMillis: timeoutMillis,
-            debugLoggingEnabled: debugLoggingEnabled,
             onClosed: { [weak self] identifier in
                 _ = self?.removeTCP(handle: identifier)
             }
@@ -362,7 +356,6 @@ private final class ManagedTCPConnection: @unchecked Sendable {
     private let readySemaphore = DispatchSemaphore(value: 0)
     private var readyResult: Result<Void, Error>?
     private let onClosed: (Int64) -> Void
-    private let debugLoggingEnabled: Bool
 
     init(
         handle: Int64,
@@ -371,7 +364,6 @@ private final class ManagedTCPConnection: @unchecked Sendable {
         logger: Logger,
         mtu: Int,
         timeoutMillis: Int64,
-        debugLoggingEnabled: Bool,
         onClosed: @escaping (Int64) -> Void
     ) {
         self.handle = handle
@@ -382,7 +374,6 @@ private final class ManagedTCPConnection: @unchecked Sendable {
         self.timeoutMillis = timeoutMillis
         self.queue = DispatchQueue(label: "RelativeProtocolTunnel.ManagedTCPConnection.\(handle)")
         self.onClosed = onClosed
-        self.debugLoggingEnabled = debugLoggingEnabled
     }
 
     func activate() {
@@ -464,10 +455,6 @@ private final class ManagedTCPConnection: @unchecked Sendable {
         case .cancelled:
             signalReady(result: .failure(NSError(domain: "GoTun2SocksEngine", code: -9, userInfo: [NSLocalizedDescriptionKey: "connection cancelled"])))
             notifyClose(reason: nil)
-        case .waiting(let error):
-            if debugLoggingEnabled {
-                logger.debug("Relative Protocol: tcp \(self.handle) waiting – \(error.localizedDescription, privacy: .public)")
-            }
         default:
             break
         }

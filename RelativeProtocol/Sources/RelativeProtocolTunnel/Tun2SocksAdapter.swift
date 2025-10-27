@@ -12,7 +12,6 @@
 
 import Foundation
 import Network
-import os.log
 import RelativeProtocolCore
 
 /// Minimal interface adopted by both the real gomobile bridge and the noop
@@ -34,15 +33,10 @@ struct Tun2SocksCallbacks {
 /// Shim used when the gomobile-generated bindings are unavailable. It simply
 /// reflects packets back through the tunnel so the provider remains responsive.
 final class NoOpTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
-    private let logger: Logger
     private let queue = DispatchQueue(label: "RelativeProtocolTunnel.NoOpEngine")
     private var isRunning = false
-    private let debugLoggingEnabled: Bool
 
-    init(logger: Logger, debugLoggingEnabled: Bool) {
-        self.logger = logger
-        self.debugLoggingEnabled = debugLoggingEnabled
-    }
+    init() {}
 
     func start(callbacks: Tun2SocksCallbacks) throws {
         isRunning = true
@@ -68,10 +62,8 @@ final class Tun2SocksAdapter: @unchecked Sendable {
     private let provider: PacketTunnelProviding
     private let configuration: RelativeProtocol.Configuration
     private let metrics: MetricsCollector?
-    private let logger: Logger
     private let engine: Tun2SocksEngine
     private let hooks: RelativeProtocol.Configuration.Hooks
-    private let debugLoggingEnabled: Bool
     private let ioQueue = DispatchQueue(label: "RelativeProtocolTunnel.Tun2SocksAdapter", qos: .userInitiated)
     private var isRunning = false
 
@@ -94,8 +86,6 @@ final class Tun2SocksAdapter: @unchecked Sendable {
         self.metrics = metrics
         self.engine = engine
         self.hooks = hooks
-        self.debugLoggingEnabled = configuration.logging.enableDebug
-        logger = Logger(subsystem: "RelativeProtocolTunnel", category: "Tun2SocksAdapter")
     }
 
     /// Boots the engine and begins draining packets from `packetFlow`.
@@ -166,43 +156,35 @@ final class Tun2SocksAdapter: @unchecked Sendable {
 
     /// Consults block policies and establishes TCP connections when permitted.
     private func makeTCPConnection(endpoint: Network.NWEndpoint) -> Network.NWConnection? {
-        guard case let .hostPort(host, port) = endpoint else {
+        guard case let .hostPort(host, _) = endpoint else {
             return provider.makeTCPConnection(to: endpoint)
         }
         let hostString = host.debugDescription
 
         if configuration.matchesBlockedHost(hostString) {
-            logger.warning("Relative Protocol: Blocking TCP connection to \(hostString, privacy: .public)")
             let connection = provider.makeTCPConnection(to: endpoint)
             connection.cancel()
             hooks.eventSink?(.didFail("Relative Protocol: Blocked TCP host \(hostString)"))
             return connection
         }
 
-        if debugLoggingEnabled {
-            logger.debug("Relative Protocol: Opening TCP connection to \(hostString, privacy: .public):\(port.rawValue, privacy: .public)")
-        }
         return provider.makeTCPConnection(to: endpoint)
     }
 
     /// Consults block policies and establishes UDP sessions when permitted.
     private func makeUDPConnection(endpoint: Network.NWEndpoint) -> Network.NWConnection? {
-        guard case let .hostPort(host, port) = endpoint else {
+        guard case let .hostPort(host, _) = endpoint else {
             return provider.makeUDPConnection(to: endpoint, from: nil)
         }
         let hostString = host.debugDescription
 
         if configuration.matchesBlockedHost(hostString) {
-            logger.warning("Relative Protocol: Blocking UDP session to \(hostString, privacy: .public)")
             let connection = provider.makeUDPConnection(to: endpoint, from: nil)
             connection.cancel()
             hooks.eventSink?(.didFail("Relative Protocol: Blocked UDP host \(hostString)"))
             return connection
         }
 
-        if debugLoggingEnabled {
-            logger.debug("Relative Protocol: Opening UDP session to \(hostString, privacy: .public):\(port.rawValue, privacy: .public)")
-        }
         return provider.makeUDPConnection(to: endpoint, from: nil)
     }
 }

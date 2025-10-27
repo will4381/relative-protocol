@@ -74,7 +74,6 @@ final class VPNManager: ObservableObject {
 
         switch manager.connection.status {
         case .connected, .connecting, .reasserting:
-            logger.debug("Connect ignored; status=\(manager.connection.status.displayTitle)")
             return
         default: break
         }
@@ -100,7 +99,6 @@ final class VPNManager: ObservableObject {
         guard await ensureManager(), let manager else { return }
         switch manager.connection.status {
         case .disconnected, .disconnecting, .invalid:
-            logger.debug("Disconnect ignored; status=\(manager.connection.status.displayTitle)")
             return
         default: break
         }

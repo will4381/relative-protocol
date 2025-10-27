@@ -11,7 +11,6 @@
 //
 
 import Foundation
-import os.log
 import RelativeProtocolCore
 
 /// Serialises metrics aggregation and emission.
@@ -27,7 +26,6 @@ final class MetricsCollector {
         var bytes: Int = 0
     }
 
-    private let logger: Logger
     private let queue = DispatchQueue(label: "RelativeProtocolTunnel.MetricsCollector")
     private var inbound = Counter()
     private var outbound = Counter()
@@ -50,7 +48,6 @@ final class MetricsCollector {
         maxErrorEvents: Int = 20,
         sink: (@Sendable (RelativeProtocol.MetricsSnapshot) -> Void)?
     ) {
-        logger = Logger(subsystem: subsystem, category: "Metrics")
         self.interval = interval
         self.maxErrorEvents = maxErrorEvents
         self.sink = sink
@@ -143,9 +140,6 @@ final class MetricsCollector {
             errors: snapshotErrors
         )
 
-        logger.notice(
-            "Relative Protocol: metrics packets_in=\(self.inbound.packets, privacy: .public) bytes_in=\(self.inbound.bytes, privacy: .public) packets_out=\(self.outbound.packets, privacy: .public) bytes_out=\(self.outbound.bytes, privacy: .public) tcp_active=\(self.activeTCP, privacy: .public) udp_active=\(self.activeUDP, privacy: .public) errors=\(snapshotErrors.count, privacy: .public)"
-        )
         sink?(snapshot)
     }
 }

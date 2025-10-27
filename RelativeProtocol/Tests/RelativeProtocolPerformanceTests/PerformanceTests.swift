@@ -8,7 +8,6 @@
 
 import XCTest
 import Network
-import os.log
 @testable import RelativeProtocolCore
 @testable import RelativeProtocolTunnel
 
@@ -69,10 +68,7 @@ final class RelativeProtocolPerformanceTests: XCTestCase {
             provider: provider,
             configuration: configuration,
             metrics: nil,
-            engine: NoOpTun2SocksEngine(
-                logger: Logger(subsystem: "RelativeProtocolTests", category: "NoOp"),
-                debugLoggingEnabled: configuration.logging.enableDebug
-            ),
+            engine: NoOpTun2SocksEngine(),
             hooks: configuration.hooks
         )
         try adapter.start()

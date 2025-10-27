@@ -53,7 +53,6 @@ public extension RelativeProtocolTunnel {
                 return
             }
 
-            logger.notice("Relative Protocol: Starting tunnel (mtu=\(configuration.provider.mtu, privacy: .public))")
             self.configuration = configuration
 
             let metricsCollector: MetricsCollector?
@@ -97,7 +96,6 @@ public extension RelativeProtocolTunnel {
 
         /// Stops the tunnel and releases engine resources.
         public func stop(reason: NEProviderStopReason, completion: @escaping () -> Void) {
-            logger.notice("Relative Protocol: Stopping tunnel (reason=\(reason.rawValue, privacy: .public))")
             adapter?.stop()
             adapter = nil
             metrics = nil
@@ -149,10 +147,7 @@ public extension RelativeProtocolTunnel {
                 logger: Logger(subsystem: "RelativeProtocolTunnel", category: "GoTun2Socks")
             )
 #else
-        engine = NoOpTun2SocksEngine(
-            logger: Logger(subsystem: "RelativeProtocolTunnel", category: "NoOpTun2Socks"),
-            debugLoggingEnabled: configuration.logging.enableDebug
-        )
+        engine = NoOpTun2SocksEngine()
 #endif
 
             let adapter = Tun2SocksAdapter(
