@@ -164,6 +164,47 @@ final class Tun2SocksAdapterTests: XCTestCase {
         adapter.stop()
     }
 
+    func testAnalyzerReceivesPacketsWhenStreamProvided() throws {
+        let flow = MockPacketFlow()
+        let provider = MockProvider(flow: flow)
+        let engine = MockTun2SocksEngine()
+
+        var configuration = makeConfiguration { _ in }
+        let stream = RelativeProtocol.PacketStream(configuration: .init(bufferDuration: 60))
+        configuration.hooks.packetStreamBuilder = { stream }
+
+        let adapter = Tun2SocksAdapter(
+            provider: provider,
+            configuration: configuration,
+            metrics: nil,
+            engine: engine,
+            hooks: configuration.hooks
+        )
+
+        XCTAssertNotNil(adapter.analyzer)
+
+        let readLoopInstalled = expectation(description: "read loop installed")
+        flow.onRead = fulfillOnce(expectation: readLoopInstalled)
+
+        try adapter.start()
+        wait(for: [readLoopInstalled], timeout: 1.0)
+
+        flow.deliver(packets: [Data([0x45, 0x00])], protocols: [NSNumber(value: Int32(AF_INET))])
+        engine.emit(packets: [Data([0x60, 0x00])], protocols: [NSNumber(value: Int32(AF_INET6))])
+
+        let snapshotExpectation = expectation(description: "stream recorded samples")
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
+            stream.snapshot { samples in
+                if samples.count >= 2 {
+                    snapshotExpectation.fulfill()
+                }
+            }
+        }
+
+        wait(for: [snapshotExpectation], timeout: 1.0)
+        adapter.stop()
+    }
+
     func testLifecycleEventsTriggerHooks() throws {
         let flow = MockPacketFlow()
         let provider = MockProvider(flow: flow)

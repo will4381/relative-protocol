@@ -11,13 +11,27 @@ let package = Package(
     products: [
         .library(name: "RelativeProtocolCore", targets: ["RelativeProtocolCore"]),
         .library(name: "RelativeProtocolTunnel", targets: ["RelativeProtocolTunnel"]),
+        .library(name: "RelativeProtocolHost", targets: ["RelativeProtocolHost"]),
     ],
-    dependencies: [],
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-async-dns-resolver.git", from: "0.4.0")
+    ],
     targets: [
         // Vendored binary (gomobile) relative to repo root
         .binaryTarget(
             name: "Tun2SocksBinary",
             path: "RelativeProtocol/Binary/Tun2Socks.xcframework"
+        ),
+        .target(
+            name: "RelativeProtocolHost",
+            dependencies: [
+                "RelativeProtocolCore"
+            ],
+            path: "RelativeProtocol/Sources/RelativeProtocolHost",
+            linkerSettings: [
+                .linkedFramework("NetworkExtension"),
+                .linkedFramework("Network")
+            ]
         ),
         .target(
             name: "RelativeProtocolCore",
@@ -26,7 +40,11 @@ let package = Package(
         ),
         .target(
             name: "RelativeProtocolTunnel",
-            dependencies: ["RelativeProtocolCore", "Tun2SocksBinary"],
+            dependencies: [
+                "RelativeProtocolCore",
+                "Tun2SocksBinary",
+                .product(name: "AsyncDNSResolver", package: "swift-async-dns-resolver")
+            ],
             path: "RelativeProtocol/Sources/RelativeProtocolTunnel",
             linkerSettings: [
                 .linkedFramework("NetworkExtension"),

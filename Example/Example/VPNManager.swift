@@ -10,6 +10,7 @@ import Combine
 import OSLog
 @preconcurrency import NetworkExtension
 import RelativeProtocolCore
+import RelativeProtocolHost
 
 @MainActor
 final class VPNManager: ObservableObject {
@@ -21,243 +22,203 @@ final class VPNManager: ObservableObject {
     @Published private(set) var lastErrorMessage: String?
     @Published private(set) var lastProbeResult: String?
     @Published private(set) var lastHTTPProbeResult: String?
+    @Published private(set) var siteSummaries: [ExampleSiteSummary] = []
+    @Published private(set) var totalObservedSites: Int = 0
+    @Published private(set) var lastControlError: String?
+    @Published private(set) var isFetchingSites = false
 
-    private var manager: NETunnelProviderManager?
-    private var statusObserver: NSObjectProtocol?
+    private let controller = RelativeProtocolHost.Controller()
+    private var cancellables: Set<AnyCancellable> = []
     private let logger = Logger(subsystem: "relative.example", category: "VPNManager")
 
-    private init() { }
+    private init() {
+        controller.$status
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] value in self?.status = value }
+            .store(in: &cancellables)
 
-    deinit {
-        if let statusObserver { NotificationCenter.default.removeObserver(statusObserver) }
-    }
+        controller.$isBusy
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] value in self?.isBusy = value }
+            .store(in: &cancellables)
 
-    func probeHTTP() async {
-        guard await ensureManager(), let manager else {
-            lastHTTPProbeResult = "error: manager unavailable"
-            return
-        }
-        guard manager.connection.status == .connected else {
-            lastHTTPProbeResult = "VPN not connected"
-            return
-        }
+        controller.$isConfigured
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] value in self?.configurationReady = value }
+            .store(in: &cancellables)
 
-        lastHTTPProbeResult = "Running…"
-        guard let url = URL(string: "https://www.apple.com/library/test/success.html") else {
-            lastHTTPProbeResult = "error: invalid URL"
-            return
-        }
-
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 10
-        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-
-        do {
-            let (_, response) = try await URLSession.shared.data(for: request)
-            if let http = response as? HTTPURLResponse {
-                lastHTTPProbeResult = "HTTP \(http.statusCode)"
-            } else {
-                lastHTTPProbeResult = "non-HTTP response"
+        controller.$lastError
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] message in
+                self?.lastErrorMessage = message
             }
-        } catch {
-            lastHTTPProbeResult = "error: \(error.localizedDescription)"
-        }
+            .store(in: &cancellables)
     }
 
     func prepare() async {
         guard !configurationReady else { return }
-        await loadManagerIfNeeded()
+        let interface = RelativeProtocol.Configuration.Interface(
+            address: "10.0.0.2",
+            subnetMask: "255.255.255.0",
+            remoteAddress: "10.0.0.1"
+        )
+        let configuration = RelativeProtocol.Configuration.fullTunnel(
+            interface: interface,
+            dnsServers: ["1.1.1.1"],
+            metrics: .init(isEnabled: true, reportingInterval: 1.0),
+            logging: .init(enableDebug: true)
+        )
+
+        let descriptor = RelativeProtocolHost.TunnelDescriptor(
+            providerBundleIdentifier: "relative-companies.Example.Example-Tunnel",
+            localizedDescription: "Relative Protocol Example",
+            configuration: configuration,
+            validateConfiguration: true
+        )
+
+        do {
+            try await controller.prepareIfNeeded(descriptor: descriptor)
+            lastErrorMessage = controller.lastError
+        } catch {
+            lastErrorMessage = error.localizedDescription
+            logger.error("prepare failed: \(error.localizedDescription, privacy: .public)")
+        }
     }
 
     func connect() async {
-        guard await ensureManager(), let manager else { return }
-
-        switch manager.connection.status {
-        case .connected, .connecting, .reasserting:
-            return
-        default: break
-        }
-
-        isBusy = true
-        defer { isBusy = false }
-
         do {
-            try await Self.loadPreferences(for: manager)
-            guard let session = manager.connection as? NETunnelProviderSession else {
-                throw VPNManagerError.unexpectedConnection
-            }
-            try session.startVPNTunnel()
-            lastErrorMessage = nil
+            try await controller.connect()
         } catch {
-            logger.error("startVPNTunnel failed: \(error.localizedDescription, privacy: .public)")
             lastErrorMessage = error.localizedDescription
-            refreshStatus()
         }
     }
 
-    func disconnect() async {
-        guard await ensureManager(), let manager else { return }
-        switch manager.connection.status {
-        case .disconnected, .disconnecting, .invalid:
-            return
-        default: break
-        }
-        isBusy = true
-        defer { isBusy = false }
-        manager.connection.stopVPNTunnel()
-        refreshStatus()
+    func disconnect() {
+        controller.disconnect()
     }
 
     func probe() async {
-        guard await ensureManager(), let manager else { return }
         lastProbeResult = "Running…"
-        do {
-            try await Self.loadPreferences(for: manager)
-            guard let session = manager.connection as? NETunnelProviderSession else {
-                lastProbeResult = "error: no session"
-                return
-            }
-            try session.sendProviderMessage(Data("probe".utf8)) { [weak self] response in
-                Task { @MainActor in
-                    if let response, let text = String(data: response, encoding: .utf8) {
-                        self?.lastProbeResult = text
-                    } else {
-                        self?.lastProbeResult = "no response"
-                    }
-                }
-            }
-        } catch {
-            lastProbeResult = "error: \(error.localizedDescription)"
+        let result = await RelativeProtocolHost.Probe.tcp(host: "1.1.1.1", port: 443)
+        if let latency = result.duration {
+            lastProbeResult = "\(result.message) (\(Int(latency * 1000)) ms)"
+        } else {
+            lastProbeResult = result.message
         }
     }
 
-    // MARK: - Private
-
-    private func ensureManager() async -> Bool {
-        if manager != nil { return true }
-        await loadManagerIfNeeded()
-        return manager != nil
+    func probeHTTP() async {
+        guard let url = URL(string: "https://www.apple.com/library/test/success.html") else {
+            lastHTTPProbeResult = "error: invalid URL"
+            return
+        }
+        lastHTTPProbeResult = "Running…"
+        let result = await RelativeProtocolHost.Probe.https(url: url)
+        if let latency = result.duration {
+            lastHTTPProbeResult = "\(result.message) (\(Int(latency * 1000)) ms)"
+        } else {
+            lastHTTPProbeResult = result.message
+        }
     }
 
-    private func loadManagerIfNeeded() async {
-        guard !isBusy else { return }
-        isBusy = true
-        defer { isBusy = false }
+    func fetchSites(limit: Int = 50) async {
+        guard status == .connected else {
+            lastControlError = "VPN not connected"
+            return
+        }
+        guard configurationReady else { return }
+        isFetchingSites = true
+        defer { isFetchingSites = false }
 
         do {
-            let managers = try await Self.loadManagers()
-            let activeManager: NETunnelProviderManager
-            if let existing = managers.first {
-                activeManager = existing
-                try await Self.loadPreferences(for: activeManager)
-            } else {
-                activeManager = NETunnelProviderManager()
-            }
-
-            if activeManager.protocolConfiguration == nil {
-                let proto = NETunnelProviderProtocol()
-                // Must match Example Tunnel’s bundle id from project.pbxproj
-                proto.providerBundleIdentifier = "relative-companies.Example.Example-Tunnel"
-                proto.serverAddress = "RelativeProtocol"
-
-                // Provide Relative Protocol configuration for the extension
-                let configuration = makeRelativeProtocolConfiguration()
-                _ = try? configuration.validateOrThrow()
-                proto.providerConfiguration = configuration.providerConfigurationDictionary()
-
-                proto.includeAllNetworks = true
-                proto.excludeLocalNetworks = false
-                proto.disconnectOnSleep = false
-
-                activeManager.protocolConfiguration = proto
-                activeManager.localizedDescription = "Relative Protocol Example"
-                activeManager.isEnabled = true
-
-                try await Self.save(activeManager)
-                try await Self.loadPreferences(for: activeManager)
-            } else if activeManager.isEnabled == false {
-                activeManager.isEnabled = true
-                try await Self.save(activeManager)
-                try await Self.loadPreferences(for: activeManager)
-            }
-
-            manager = activeManager
-            configurationReady = true
-            lastErrorMessage = nil
-
-            observeStatus(for: activeManager)
-            refreshStatus()
+            let response: ExampleSitesResponse = try await controller.controlChannel.send(
+                ExampleAppCommand(command: "events", value: nil, limit: limit),
+                expecting: ExampleSitesResponse.self
+            )
+            siteSummaries = response.sites.sorted { $0.lastSeen > $1.lastSeen }
+            totalObservedSites = response.total
+            lastControlError = nil
+            logger.notice("fetchSites succeeded with \(response.sites.count, privacy: .public) entries")
+        } catch let error as RelativeProtocolHost.ControlChannel.Error {
+            lastControlError = describe(controlError: error)
         } catch {
-            logger.error("Failed to load NETunnelProviderManager: \(error.localizedDescription, privacy: .public)")
-            lastErrorMessage = error.localizedDescription
+            lastControlError = error.localizedDescription
         }
     }
 
-    private func observeStatus(for manager: NETunnelProviderManager) {
-        if let statusObserver { NotificationCenter.default.removeObserver(statusObserver) }
-        statusObserver = NotificationCenter.default.addObserver(
-            forName: .NEVPNStatusDidChange,
-            object: manager.connection,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.refreshStatus() }
+    func clearSites() async {
+        guard status == .connected else {
+            lastControlError = "VPN not connected"
+            return
         }
-        status = manager.connection.status
+        do {
+            let response: ExampleAckResponse = try await controller.controlChannel.send(
+                ExampleAppCommand(command: "clearEvents", value: nil, limit: nil),
+                expecting: ExampleAckResponse.self
+            )
+            totalObservedSites = response.total
+            siteSummaries = []
+            lastControlError = nil
+        } catch let error as RelativeProtocolHost.ControlChannel.Error {
+            lastControlError = describe(controlError: error)
+        } catch {
+            lastControlError = error.localizedDescription
+        }
     }
 
-    private func refreshStatus() {
-        guard let manager else { status = .invalid; return }
-        status = manager.connection.status
-    }
-
-    private func makeRelativeProtocolConfiguration() -> RelativeProtocol.Configuration {
-        RelativeProtocol.Configuration(
-            provider: .init(
-                mtu: 1500,
-                ipv4: .init(
-                    address: "10.0.0.2",
-                    subnetMask: "255.255.255.0",
-                    remoteAddress: "10.0.0.1"
-                ),
-                dns: .init(servers: ["1.1.1.1"]),
-                metrics: .init(isEnabled: true, reportingInterval: 1.0),
-                policies: .init(blockedHosts: [])
-            ),
-            hooks: .init(),
-            logging: .init(enableDebug: true)
-        )
+    private func describe(controlError: RelativeProtocolHost.ControlChannel.Error) -> String {
+        switch controlError {
+        case .tunnelUnavailable:
+            return "tunnel unavailable"
+        case .tunnelNotConnected:
+            return "VPN not connected"
+        case .sessionUnavailable:
+            return "control session unavailable"
+        case .noResponse:
+            return "no response from tunnel"
+        case .encodingFailed(let error):
+            return "encode failed: \(error.localizedDescription)"
+        case .decodingFailed(let error):
+            return "decode failed: \(error.localizedDescription)"
+        }
     }
 }
 
-// MARK: - Helpers
+private struct ExampleAppCommand: Encodable {
+    var command: String
+    var value: Int?
+    var limit: Int?
+}
 
-private extension VPNManager {
-    enum VPNManagerError: Error { case unexpectedConnection }
+struct ExampleSiteSummary: Codable, Identifiable {
+    var remoteIP: String
+    var host: String?
+    var site: String?
+    var firstSeen: Date
+    var lastSeen: Date
+    var inboundBytes: Int
+    var outboundBytes: Int
+    var inboundPackets: Int
+    var outboundPackets: Int
 
-    static func loadManagers() async throws -> [NETunnelProviderManager] {
-        try await withCheckedThrowingContinuation { (c: CheckedContinuation<[NETunnelProviderManager], Error>) in
-            NETunnelProviderManager.loadAllFromPreferences { managers, error in
-                if let error { c.resume(throwing: error) }
-                else { c.resume(returning: managers ?? []) }
-            }
-        }
-    }
+    var id: String { site ?? host ?? remoteIP }
+    var displayName: String { site ?? host ?? remoteIP }
+    var totalBytes: Int { inboundBytes + outboundBytes }
+}
 
-    static func loadPreferences(for manager: NETunnelProviderManager) async throws {
-        try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
-            manager.loadFromPreferences { error in
-                if let error { c.resume(throwing: error) } else { c.resume(returning: ()) }
-            }
-        }
-    }
+private struct ExampleSitesResponse: Decodable {
+    var sites: [ExampleSiteSummary]
+    var total: Int
+}
 
-    static func save(_ manager: NETunnelProviderManager) async throws {
-        try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
-            manager.saveToPreferences { error in
-                if let error { c.resume(throwing: error) } else { c.resume(returning: ()) }
-            }
-        }
-    }
+private struct ExampleAckResponse: Decodable {
+    var command: String
+    var total: Int
+}
+
+private struct ExampleErrorResponse: Decodable {
+    var command: String
+    var error: String
 }
 
 extension NEVPNStatus {

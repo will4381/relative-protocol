@@ -397,6 +397,8 @@ public extension RelativeProtocol.Configuration {
     /// influence runtime behaviour without subclassing package types.
     struct Hooks: Sendable {
         public var packetTap: PacketTap?
+        public var packetStreamBuilder: PacketStreamBuilder?
+        public var trafficEventBusBuilder: TrafficEventBusBuilder?
         public var dnsResolver: DNSResolver?
         public var connectionPolicy: ConnectionPolicy?
         public var latencyInjector: LatencyInjector?
@@ -404,12 +406,16 @@ public extension RelativeProtocol.Configuration {
 
         public init(
             packetTap: PacketTap? = nil,
+            packetStreamBuilder: PacketStreamBuilder? = nil,
+            trafficEventBusBuilder: TrafficEventBusBuilder? = nil,
             dnsResolver: DNSResolver? = nil,
             connectionPolicy: ConnectionPolicy? = nil,
             latencyInjector: LatencyInjector? = nil,
             eventSink: EventSink? = nil
         ) {
             self.packetTap = packetTap
+            self.packetStreamBuilder = packetStreamBuilder
+            self.trafficEventBusBuilder = trafficEventBusBuilder
             self.dnsResolver = dnsResolver
             self.connectionPolicy = connectionPolicy
             self.latencyInjector = latencyInjector
@@ -465,6 +471,12 @@ public extension RelativeProtocol.Configuration {
 
     /// Invoked whenever packets traverse the tunnel in either direction.
     typealias PacketTap = @Sendable (_ context: PacketContext) -> Void
+    /// Produces a per-session packet stream pipeline used to apply reusable
+    /// filters inside the tunnel.
+    typealias PacketStreamBuilder = @Sendable () -> RelativeProtocol.PacketStream?
+    /// Produces a traffic event bus that receives normalized events from the
+    /// detection pipeline.
+    typealias TrafficEventBusBuilder = @Sendable () -> RelativeProtocol.TrafficEventBus?
     /// Resolves hostnames prior to establishing outbound connections.
     typealias DNSResolver = @Sendable (_ host: String) async throws -> [String]
     /// Determines whether an outbound connection should proceed, be blocked,

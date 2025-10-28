@@ -83,4 +83,10 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(error.severityLabel, "error")
         XCTAssertTrue(error.isError)
     }
+
+    func testDefaultDNSIncludesPublicResolvers() {
+        let dns = RelativeProtocol.Configuration.DNS.default
+        XCTAssertTrue(dns.servers.contains("1.1.1.1"))
+        XCTAssertTrue(dns.servers.contains("8.8.8.8"))
+    }
 }

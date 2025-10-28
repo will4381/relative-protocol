@@ -64,8 +64,14 @@ final class Tun2SocksAdapter: @unchecked Sendable {
     private let metrics: MetricsCollector?
     private let engine: Tun2SocksEngine
     private let hooks: RelativeProtocol.Configuration.Hooks
+    private let trafficAnalyzer: TrafficAnalyzer?
+    private let latencyInjector: RelativeProtocol.Configuration.LatencyInjector?
     private let ioQueue = DispatchQueue(label: "RelativeProtocolTunnel.Tun2SocksAdapter", qos: .userInitiated)
     private var isRunning = false
+
+    var analyzer: TrafficAnalyzer? {
+        trafficAnalyzer
+    }
 
     /// - Parameters:
     ///   - provider: The packet tunnel provider backing the virtual interface.
@@ -86,6 +92,17 @@ final class Tun2SocksAdapter: @unchecked Sendable {
         self.metrics = metrics
         self.engine = engine
         self.hooks = hooks
+        self.latencyInjector = hooks.latencyInjector
+        if let stream = hooks.packetStreamBuilder?() {
+            let eventBus = hooks.trafficEventBusBuilder?()
+            self.trafficAnalyzer = TrafficAnalyzer(
+                stream: stream,
+                eventBus: eventBus,
+                configuration: .init(redactor: nil)
+            )
+        } else {
+            self.trafficAnalyzer = nil
+        }
     }
 
     /// Boots the engine and begins draining packets from `packetFlow`.
@@ -130,10 +147,16 @@ final class Tun2SocksAdapter: @unchecked Sendable {
             guard let self else { return }
             self.provider.flow.readPackets { packets, protocols in
                 guard self.isRunning else { return }
-                self.metrics?.record(direction: .inbound, packets: packets.count, bytes: packets.reduce(0) { $0 + $1.count })
+                self.applyLatency()
+                self.metrics?.record(direction: .outbound, packets: packets.count, bytes: packets.reduce(0) { $0 + $1.count })
                 packets.enumerated().forEach { index, packet in
                     let proto = protocols[safe: index]?.int32Value ?? packet.afValue
-                    self.hooks.packetTap?(.init(direction: .inbound, payload: packet, protocolNumber: proto))
+                    self.hooks.packetTap?(.init(direction: .outbound, payload: packet, protocolNumber: proto))
+                    self.trafficAnalyzer?.ingest(sample: .init(
+                        direction: .outbound,
+                        payload: packet,
+                        protocolNumber: proto
+                    ))
                 }
                 handler(packets, protocols)
                 // Reschedule the loop.
@@ -146,10 +169,16 @@ final class Tun2SocksAdapter: @unchecked Sendable {
     private func writePackets(_ packets: [Data], protocols: [NSNumber]) {
         guard !packets.isEmpty else { return }
         guard isRunning else { return }
-        metrics?.record(direction: .outbound, packets: packets.count, bytes: packets.reduce(0) { $0 + $1.count })
+        applyLatency()
+        metrics?.record(direction: .inbound, packets: packets.count, bytes: packets.reduce(0) { $0 + $1.count })
         packets.enumerated().forEach { index, packet in
             let proto = protocols[safe: index]?.int32Value ?? packet.afValue
-            hooks.packetTap?(.init(direction: .outbound, payload: packet, protocolNumber: proto))
+            hooks.packetTap?(.init(direction: .inbound, payload: packet, protocolNumber: proto))
+            trafficAnalyzer?.ingest(sample: .init(
+                direction: .inbound,
+                payload: packet,
+                protocolNumber: proto
+            ))
         }
         provider.flow.writePackets(packets, protocols: protocols)
     }
@@ -193,6 +222,32 @@ private extension Array {
     subscript(safe index: Int) -> Element? {
         guard indices.contains(index) else { return nil }
         return self[index]
+    }
+}
+
+private extension Tun2SocksAdapter {
+    func applyLatency() {
+        guard let latencyInjector else { return }
+        let endpoint = RelativeProtocol.Configuration.Endpoint(host: "relative.protocol.latency", port: 0, transport: .tcp)
+        guard let delay = synchronousLatency(injector: latencyInjector, endpoint: endpoint), delay > 0 else { return }
+        let seconds = Double(delay) / 1_000.0
+        Thread.sleep(forTimeInterval: seconds)
+    }
+
+    func synchronousLatency(
+        injector: @escaping RelativeProtocol.Configuration.LatencyInjector,
+        endpoint: RelativeProtocol.Configuration.Endpoint
+    ) -> Int? {
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: Int?
+        Task.detached {
+            let value = await injector(endpoint)
+            result = value
+            semaphore.signal()
+        }
+        let timeoutResult = semaphore.wait(timeout: .now() + 1)
+        guard timeoutResult == .success else { return nil }
+        return result
     }
 }
 

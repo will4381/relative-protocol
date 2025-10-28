@@ -24,6 +24,7 @@ When running on-device VPN-style proxies it’s imperative that the tunnel remai
     - **Output**: validated configuration passed to `ProviderController.start`.
     - **Use when**: preparing a tunnel session or serialising data to/from `NETunnelProviderProtocol.providerConfiguration`.
     - Call `validateOrThrow()` to receive `[ValidationMessage]`; throws `RelativeProtocol.PackageError.invalidConfiguration` on fatal issues.
+    - Helpers: `RelativeProtocol.Configuration.fullTunnel(...)` and `splitTunnel(...)` provide convenient presets when building standard configurations, with `RelativeProtocol.Configuration.Interface` describing the virtual interface and `RelativeProtocol.Configuration.Route.destination(_:subnetMask:)` for custom route entries.
   - `RelativeProtocol.Configuration.LoggingOptions`
     - **Purpose**: toggle debug logging across the tunnel stack.
     - **Inputs**: `enableDebug` (`Bool`) defaulting to `false`.
@@ -40,6 +41,9 @@ When running on-device VPN-style proxies it’s imperative that the tunnel remai
     - **Purpose**: convey periodic counters.
     - **Fields**: `timestamp`, `inbound`/`outbound` counters (`packets`, `bytes`), `activeTCP`, `activeUDP`, and collected `ErrorEvent`s.
     - **Use when**: metrics sink is supplied via configuration.
+  - `RelativeProtocol.DNSClient`
+    - **Purpose**: perform lightweight forward (`resolve(host:)`) and reverse (`reverseLookup(address:)`) DNS lookups using the platform resolver.
+    - **Use when**: supplementing packet analytics with hostname data in both host apps and the tunnel.
 - `RelativeProtocolTunnel`
   - `RelativeProtocolTunnel.ProviderController`
     - **Purpose**: drive an `NEPacketTunnelProvider` using RelativeProtocol abstractions.
@@ -47,53 +51,85 @@ When running on-device VPN-style proxies it’s imperative that the tunnel remai
     - **Output**: manages lifecycle of the gomobile engine, applies network settings, pushes metrics, invokes hooks.
     - **Use when**: implementing the Network Extension target.
   - Internal adapters wrap the vendored Tun2Socks bridge; no public surface beyond the controller.
+- `RelativeProtocolHost`
+  - `RelativeProtocolHost.Controller`
+    - **Purpose**: manage `NETunnelProviderManager` lifecycle from the host app.
+    - **Inputs**: `prepareIfNeeded(descriptor:)`, `configure(descriptor:)`, `connect()`, `disconnect()`.
+    - **Outputs**: `@Published` properties for `status`, `isBusy`, `isConfigured`, `lastError`; exposes a `ControlChannel` for in-tunnel messaging.
+    - **Use when**: you want a high-level tunnel facade without rewriting manager persistence, status observation, and connection orchestration.
+  - `RelativeProtocolHost.ControlChannel`
+    - **Purpose**: send typed control messages to the tunnel using async/await.
+    - **Inputs**: Encodable requests, optional Decodable response types.
+    - **Use when**: fetching metrics, clearing caches, or invoking custom commands exposed by your `NEPacketTunnelProvider`.
+  - `RelativeProtocolHost.Probe`
+    - **Purpose**: built-in TCP and HTTPS probes for diagnostics.
+    - **Use when**: quickly verifying outbound reachability without adding bespoke NWConnection or URLSession code in every host.
 
 ## Host Integration
 
 ```swift
+import Combine
 import RelativeProtocolCore
+import RelativeProtocolHost
 
-let configuration = RelativeProtocol.Configuration(
-    provider: .init(
-        mtu: 1500,
-        ipv4: .init(
+@MainActor
+final class TunnelViewModel: ObservableObject {
+    private let controller = RelativeProtocolHost.Controller()
+    private var cancellables = Set<AnyCancellable>()
+
+    @Published private(set) var status: NEVPNStatus = .invalid
+    @Published private(set) var isBusy = false
+    @Published private(set) var lastError: String?
+
+    init() {
+        controller.$status
+            .sink { [weak self] in self?.status = $0 }
+            .store(in: &cancellables)
+        controller.$isBusy
+            .sink { [weak self] in self?.isBusy = $0 }
+            .store(in: &cancellables)
+        controller.$lastError
+            .sink { [weak self] in self?.lastError = $0 }
+            .store(in: &cancellables)
+    }
+
+    func prepare() async throws {
+        let interface = RelativeProtocol.Configuration.Interface(
             address: "10.0.0.2",
             subnetMask: "255.255.255.0",
             remoteAddress: "198.51.100.1"
-        ),
-        dns: .init(servers: ["1.1.1.1", "8.8.8.8"]),
-        metrics: .init(isEnabled: true, reportingInterval: 5.0),
-        policies: .init(blockedHosts: ["example.com"])
-    ),
-    hooks: .init(
-        packetTap: { context in
-            // Observe packets in/out of the tunnel (context.direction, payload, protocolNumber).
-        },
-        dnsResolver: { host in
-            // Optionally supply synthetic DNS answers.
-            [host, "2001:db8::1"]
-        },
-        connectionPolicy: { endpoint in
-            // Block clear-text HTTP, allow everything else.
-            endpoint.transport == .tcp && endpoint.port == 80
-                ? .block(reason: "HTTP disallowed")
-                : .allow
-        },
-        latencyInjector: { endpoint in
-            // Inject 200 ms latency for a specific domain.
-            endpoint.host.hasSuffix(".slow.example") ? 200 : nil
-        },
-        eventSink: { event in
-            // lifecycle: willStart/didStart/didStop/didFail
-            print("Tunnel event: \(event)")
-        }
-    ),
-    logging: .init(enableDebug: true)
-)
+        )
+        let configuration = RelativeProtocol.Configuration.fullTunnel(
+            interface: interface,
+            dnsServers: ["1.1.1.1", "8.8.8.8"],
+            policies: .init(blockedHosts: ["example.com"]),
+            hooks: .init(eventSink: { print("Tunnel event: \($0)") })
+        )
 
-let warnings = try configuration.validateOrThrow()
-warnings.filter { !$0.isError }.forEach { warning in
-    print("Relative Protocol warning: \(warning.message)")
+        let descriptor = RelativeProtocolHost.TunnelDescriptor(
+            providerBundleIdentifier: "com.example.MyApp.Tunnel",
+            localizedDescription: "MyApp Tunnel",
+            configuration: configuration,
+            validateConfiguration: true
+        )
+
+        try await controller.prepareIfNeeded(descriptor: descriptor)
+    }
+
+    func connect() async throws {
+        try await controller.connect()
+    }
+
+    func disconnect() {
+        controller.disconnect()
+    }
+
+    func fetchSites() async throws -> [String] {
+        struct Command: Encodable { var command = "events"; var limit = 50 }
+        struct Response: Decodable { var sites: [String] }
+        let response = try await controller.controlChannel.send(Command(), expecting: Response.self)
+        return response.sites
+    }
 }
 ```
 
@@ -108,6 +144,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     override func startTunnel(options: [String : NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         let configuration = RelativeProtocol.Configuration.load(from: (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration)
+        controller.setFilterConfiguration(.init(evaluationInterval: 1.0))
+        controller.configureFilters { coordinator in
+            coordinator.register(MyBurstFilter())
+        }
         controller.start(configuration: configuration, completion: completionHandler)
     }
 
@@ -115,7 +155,36 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         controller.stop(reason: reason, completion: completionHandler)
     }
 }
+
+struct MyBurstFilter: TrafficFilter {
+    let identifier = "demo.burst"
+
+    func evaluate(snapshot: [RelativeProtocol.PacketSample], emit: @escaping @Sendable (RelativeProtocol.TrafficEvent) -> Void) {
+        let inboundBytes = snapshot
+            .filter { $0.direction == .inbound }
+            .reduce(0) { $0 + $1.byteCount }
+        guard inboundBytes > 1_000_000 else { return }
+        let event = RelativeProtocol.TrafficEvent(
+            category: .burst,
+            confidence: .medium,
+            details: [
+                "bytes": String(inboundBytes),
+                "window": "120"
+            ]
+        )
+        emit(event)
+    }
+}
 ```
+
+### Example App
+
+The bundled Example app now exposes a Traffic Analysis panel:
+- Fetch recent `TrafficEvent` bursts from the tunnel and inspect their metadata.
+- Adjust the burst detector threshold (in MB) and push updates to the filter pipeline.
+- Clear the tunnel-side event buffer to start fresh during demos.
+- Tune the global latency injector (0–500 ms) to visualise the impact of artificial delay on traffic.
+- View resolved remote IPs and hostnames for each detected burst for quick triage.
 
 
 
@@ -127,7 +196,7 @@ You can consume Relative Protocol as an SPM dependency.
   - File → Add Package Dependencies…
   - Enter URL: `https://github.com/will4381/relative-protocol`
   - Choose the latest release tag (v1.0 or newer)
-  - Add products you need: `RelativeProtocolCore` and/or `RelativeProtocolTunnel`
+  - Add products you need: `RelativeProtocolCore`, `RelativeProtocolHost`, and/or `RelativeProtocolTunnel`
 
 - Package.swift
 
@@ -146,6 +215,7 @@ let package = Package(
             name: "YourApp",
             dependencies: [
                 .product(name: "RelativeProtocolCore", package: "relative-protocol"),
+                .product(name: "RelativeProtocolHost", package: "relative-protocol"),
                 .product(name: "RelativeProtocolTunnel", package: "relative-protocol"),
             ]
         ),

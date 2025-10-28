@@ -28,6 +28,10 @@ public extension RelativeProtocolTunnel {
         private var metrics: MetricsCollector?
         private var adapter: Tun2SocksAdapter?
         private var configuration: RelativeProtocol.Configuration?
+        private var trafficAnalyzer: TrafficAnalyzer?
+        private var filterCoordinator: FilterCoordinator?
+        private var filterConfiguration: FilterConfiguration = .init()
+        private var pendingFilterInstallers: [(@Sendable (FilterCoordinator) -> Void)] = []
 
         /// - Parameters:
         ///   - provider: The Network Extension provider the controller manages.
@@ -99,7 +103,28 @@ public extension RelativeProtocolTunnel {
             adapter?.stop()
             adapter = nil
             metrics = nil
+            trafficAnalyzer = nil
+            filterCoordinator = nil
+            pendingFilterInstallers.removeAll()
             completion()
+        }
+
+        /// Updates the filter configuration used when the tunnel boots. Must be
+        /// called before `start(configuration:completion:)`.
+        public func setFilterConfiguration(_ configuration: FilterConfiguration) {
+            guard adapter == nil else { return }
+            filterConfiguration = configuration
+        }
+
+        /// Allows callers to register filters once the coordinator becomes
+        /// available. If the tunnel is already running the closure executes
+        /// immediately; otherwise it is deferred until startup completes.
+        public func configureFilters(_ builder: @escaping @Sendable (FilterCoordinator) -> Void) {
+            if let coordinator = filterCoordinator {
+                builder(coordinator)
+            } else {
+                pendingFilterInstallers.append(builder)
+            }
         }
 
         /// Handles messages received from the host app.
@@ -163,6 +188,16 @@ public extension RelativeProtocolTunnel {
                 throw RelativeProtocol.PackageError.engineStartFailed(error.localizedDescription)
             }
             self.adapter = adapter
+            self.trafficAnalyzer = adapter.analyzer
+            if let analyzer = self.trafficAnalyzer {
+                let coordinator = FilterCoordinator(analyzer: analyzer, configuration: filterConfiguration)
+                self.filterCoordinator = coordinator
+                let installers = self.pendingFilterInstallers
+                self.pendingFilterInstallers.removeAll()
+                installers.forEach { $0(coordinator) }
+            } else {
+                self.filterCoordinator = nil
+            }
         }
     }
 }

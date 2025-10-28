@@ -4,7 +4,7 @@ This guide walks through adding Relative Protocol to a new or existing iOS/macOS
 
 ## Overview
 
-- Host app depends on `RelativeProtocolCore` to build and validate configuration and to serialize it for the extension.
+- Host app depends on `RelativeProtocolCore` for configuration primitives and `RelativeProtocolHost` for high-level tunnel lifecycle, control messaging, and diagnostics.
 - Packet Tunnel Extension depends on `RelativeProtocolCore` and `RelativeProtocolTunnel`. The extension delegates tunnel lifecycle to `ProviderController`.
 - The Tun2Socks engine is bundled via a binary target; no separate build steps are required for consumers.
 
@@ -14,7 +14,7 @@ This guide walks through adding Relative Protocol to a new or existing iOS/macOS
   - URL: `https://github.com/will4381/relative-protocol`
   - Version: select the latest release tag
   - Products to add:
-    - Host app target: `RelativeProtocolCore`
+    - Host app target: `RelativeProtocolCore`, `RelativeProtocolHost`
     - Packet Tunnel Extension target: `RelativeProtocolCore` and `RelativeProtocolTunnel`
 
 ## 2) Create Targets
@@ -27,7 +27,7 @@ This guide walks through adding Relative Protocol to a new or existing iOS/macOS
 
 - Host app
   - Capabilities → Network Extensions → enable “Packet Tunnel”.
-  - The host app does not need `RelativeProtocolTunnel` — only `RelativeProtocolCore` is required.
+  - Link `RelativeProtocolHost` to use the provided controller and diagnostics helpers.
 
 - Packet Tunnel Extension
   - Capabilities → Network Extensions → enable “Packet Tunnel”.
@@ -61,106 +61,126 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 }
 ```
 
-## 5) Build a Configuration in the Host App
+## 5) Configure the Tunnel from the Host App
 
-Create a `RelativeProtocol.Configuration`, validate it, and serialize it into the `NETunnelProviderProtocol` for the extension.
+`RelativeProtocolHost.Controller` wraps `NETunnelProviderManager` so the host can focus on configuration and control-plane messaging.
 
 ```swift
+import Combine
 import NetworkExtension
 import RelativeProtocolCore
+import RelativeProtocolHost
 
-func makeConfiguration() -> RelativeProtocol.Configuration {
-    let provider = RelativeProtocol.Configuration.Provider(
-        mtu: 1500,
-        ipv4: .init(
+@MainActor
+final class TunnelCoordinator: ObservableObject {
+    private let controller = RelativeProtocolHost.Controller()
+    private var cancellables = Set<AnyCancellable>()
+
+    @Published private(set) var status: NEVPNStatus = .invalid
+    @Published private(set) var lastError: String?
+
+    init() {
+        controller.$status
+            .sink { [weak self] in self?.status = $0 }
+            .store(in: &cancellables)
+        controller.$lastError
+            .sink { [weak self] in self?.lastError = $0 }
+            .store(in: &cancellables)
+    }
+
+    func prepareIfNeeded() async throws {
+        let interface = RelativeProtocol.Configuration.Interface(
             address: "10.0.0.2",
             subnetMask: "255.255.255.0",
             remoteAddress: "198.51.100.1"
-        ),
-        dns: .init(servers: ["1.1.1.1", "8.8.8.8"]),
-        metrics: .init(isEnabled: true, reportingInterval: 5),
-        policies: .init(blockedHosts: ["example.com"]) // optional
-    )
+        )
 
-    let configuration = RelativeProtocol.Configuration(
-        provider: provider,
-        hooks: .init(
-            packetTap: { context in
-                // Inspect individual packets (direction, payload, protocol number).
-                if context.direction == .inbound {
-                    print("Inbound packet bytes: \(context.payload.count)")
-                }
-            },
-            dnsResolver: { host in
-                // Provide dual-stack responses when local DNS is unavailable.
-                [host, "2001:db8::1"]
-            },
-            connectionPolicy: { endpoint in
-                // Block HTTP, allow everything else.
-                endpoint.transport == .tcp && endpoint.port == 80
-                    ? .block(reason: "HTTP blocked for policy reasons")
-                    : .allow
-            },
-            latencyInjector: { endpoint in
-                // Inject latency on selected UDP hosts.
-                endpoint.transport == .udp && endpoint.host.hasSuffix(".test.false-positive")
-                    ? 150
-                    : nil
-            },
-            eventSink: { event in
-                // React to tunnel lifecycle events.
-                print("Tunnel event: \(event)")
-            }
-        ),
-        logging: .init(enableDebug: false)
-    )
+        let configuration = RelativeProtocol.Configuration.fullTunnel(
+            interface: interface,
+            dnsServers: ["1.1.1.1", "8.8.8.8"],
+            policies: .init(blockedHosts: ["example.com"]),
+            hooks: .init(eventSink: { print("Tunnel event: \($0)") })
+        )
 
-    // Validate and return
-    _ = try? configuration.validateOrThrow()
-    return configuration
-}
+        let descriptor = RelativeProtocolHost.TunnelDescriptor(
+            providerBundleIdentifier: "<your.extension.bundle.identifier>",
+            localizedDescription: "Relative Protocol",
+            configuration: configuration,
+            validateConfiguration: true
+        )
 
-/// Install or update a NETunnelProviderManager and start the tunnel.
-func installAndStartTunnel(completion: @escaping (Error?) -> Void) {
-    NETunnelProviderManager.loadAllFromPreferences { managers, _ in
-        let manager = managers?.first ?? NETunnelProviderManager()
+        try await controller.prepareIfNeeded(descriptor: descriptor)
+    }
 
-        let proto = NETunnelProviderProtocol()
-        proto.providerBundleIdentifier = "<your.extension.bundle.identifier>"
-        proto.serverAddress = "RelativeProtocol" // Required placeholder
+    func connect() async throws {
+        try await controller.connect()
+    }
 
-        // Serialize Relative Protocol configuration for the extension
-        let cfg = makeConfiguration()
-        proto.providerConfiguration = cfg.providerConfigurationDictionary()
+    func disconnect() {
+        controller.disconnect()
+    }
 
-        manager.protocolConfiguration = proto
-        manager.localizedDescription = "Relative Protocol"
-        manager.isEnabled = true
+    func fetchEvents(limit: Int = 50) async throws -> [String] {
+        struct Command: Encodable { var command = "events"; var limit: Int }
+        struct Response: Decodable { var sites: [String] }
+        return try await controller.controlChannel
+            .send(Command(limit: limit), expecting: Response.self)
+            .sites
+    }
 
-        manager.saveToPreferences { error in
-            guard error == nil else { return completion(error) }
-            manager.loadFromPreferences { _ in
-                do {
-                    try manager.connection.startVPNTunnel()
-                    completion(nil)
-                } catch {
-                    completion(error)
-                }
-            }
-        }
+    func runProbes() async {
+        let tcp = await RelativeProtocolHost.Probe.tcp(host: "1.1.1.1", port: 443)
+        print("TCP probe:", tcp.message)
+        let https = await RelativeProtocolHost.Probe.https(url: URL(string: "https://www.apple.com")!)
+        print("HTTPS probe:", https.message)
     }
 }
 ```
+
+`RelativeProtocol.Configuration.fullTunnel` and `splitTunnel` helper functions provide concise presets, while `RelativeProtocol.DNSClient` can supplement analytics with forward/reverse lookups when needed.
 
 ## 6) Optional Hooks & Metrics
 
 - Packet taps
   - `packetTap` receives individual packets with direction, payload, and protocol metadata.
   - Use `dnsResolver`, `connectionPolicy`, and `latencyInjector` to override network behaviour; these closures can perform async work.
+- Packet analysis
+  - Provide `packetStreamBuilder` to buffer packets for the built-in filter pipeline.
+  - Use `trafficEventBusBuilder` to observe normalized `TrafficEvent` output sent from the extension.
 - Event sink
   - Receive `.willStart`, `.didStart`, `.didStop`, `.didFail` from the tunnel.
 - Policies
   - Use `policies.blockedHosts` to block specific domains; host matching is optimized for label-boundary checks.
+
+### Filter Pipeline
+
+Inside your `NEPacketTunnelProvider`, configure the coordinator before calling `start`:
+
+```swift
+controller.setFilterConfiguration(.init(evaluationInterval: 1.0))
+controller.configureFilters { coordinator in
+    coordinator.register(MyCustomFilter())
+}
+```
+
+Filters conform to `TrafficFilter` and analyze buffered packets to emit normalized events:
+
+```swift
+struct MyCustomFilter: TrafficFilter {
+    let identifier = "com.example.custom-filter"
+
+    func evaluate(snapshot: [RelativeProtocol.PacketSample], emit: @escaping @Sendable (RelativeProtocol.TrafficEvent) -> Void) {
+        let outbound = snapshot.filter { $0.direction == .outbound }
+        let totalBytes = outbound.reduce(0) { $0 + $1.byteCount }
+        guard totalBytes > 250_000 else { return }
+        emit(RelativeProtocol.TrafficEvent(
+            category: .observation,
+            confidence: .medium,
+            details: ["outboundBytes": String(totalBytes)]
+        ))
+    }
+}
+```
 
 ## 7) Exchanging Messages (Optional)
 
