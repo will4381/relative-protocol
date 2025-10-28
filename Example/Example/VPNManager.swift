@@ -65,8 +65,8 @@ final class VPNManager: ObservableObject {
         let configuration = RelativeProtocol.Configuration.fullTunnel(
             interface: interface,
             dnsServers: ["1.1.1.1"],
-            metrics: .init(isEnabled: true, reportingInterval: 1.0),
-            logging: .init(enableDebug: true)
+            metrics: .init(isEnabled: false),
+            logging: .init(enableDebug: false)
         )
 
         let descriptor = RelativeProtocolHost.TunnelDescriptor(

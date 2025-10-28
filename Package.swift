@@ -14,7 +14,8 @@ let package = Package(
         .library(name: "RelativeProtocolHost", targets: ["RelativeProtocolHost"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-async-dns-resolver.git", from: "0.4.0")
+        .package(url: "https://github.com/apple/swift-async-dns-resolver.git", from: "0.4.0"),
+        .package(url: "https://github.com/apple/swift-async-algorithms.git", from: "1.0.0")
     ],
     targets: [
         // Vendored binary (gomobile) relative to repo root
@@ -43,7 +44,8 @@ let package = Package(
             dependencies: [
                 "RelativeProtocolCore",
                 "Tun2SocksBinary",
-                .product(name: "AsyncDNSResolver", package: "swift-async-dns-resolver")
+                .product(name: "AsyncDNSResolver", package: "swift-async-dns-resolver"),
+                .product(name: "AsyncAlgorithms", package: "swift-async-algorithms")
             ],
             path: "RelativeProtocol/Sources/RelativeProtocolTunnel",
             linkerSettings: [

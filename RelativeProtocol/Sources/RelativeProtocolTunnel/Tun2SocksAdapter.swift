@@ -13,6 +13,7 @@
 import Foundation
 import Network
 import RelativeProtocolCore
+import AsyncAlgorithms
 
 /// Minimal interface adopted by both the real gomobile bridge and the noop
 /// stub. Keeps the adapter decoupled from generated bindings.
@@ -68,6 +69,10 @@ final class Tun2SocksAdapter: @unchecked Sendable {
     private let latencyInjector: RelativeProtocol.Configuration.LatencyInjector?
     private let ioQueue = DispatchQueue(label: "RelativeProtocolTunnel.Tun2SocksAdapter", qos: .userInitiated)
     private var isRunning = false
+    private var outboundChannel: AsyncChannel<PacketBatch>?
+    private var outboundTask: Task<Void, Never>?
+    private var inboundChannel: AsyncChannel<PacketBatch>?
+    private var inboundTask: Task<Void, Never>?
 
     var analyzer: TrafficAnalyzer? {
         trafficAnalyzer
@@ -109,12 +114,14 @@ final class Tun2SocksAdapter: @unchecked Sendable {
     func start() throws {
         guard !isRunning else { return }
         hooks.eventSink?(.willStart)
+        isRunning = true
+        prepareInboundPipeline()
         let callbacks = Tun2SocksCallbacks(
             startPacketReadLoop: { [weak self] handler in
-                self?.scheduleRead(handler: handler)
+                self?.configureOutboundPipeline(handler: handler)
             },
             emitPackets: { [weak self] packets, protocols in
-                self?.writePackets(packets, protocols: protocols)
+                self?.enqueueInbound(packets: packets, protocols: protocols)
             },
             makeTCPConnection: { [weak self] endpoint in
                 self?.makeTCPConnection(endpoint: endpoint) ?? self!.provider.makeTCPConnection(to: endpoint)
@@ -123,11 +130,11 @@ final class Tun2SocksAdapter: @unchecked Sendable {
                 self?.makeUDPConnection(endpoint: endpoint) ?? self!.provider.makeUDPConnection(to: endpoint, from: nil)
             }
         )
-        isRunning = true
         do {
             try engine.start(callbacks: callbacks)
         } catch {
             isRunning = false
+            teardownPipelines()
             throw error
         }
         hooks.eventSink?(.didStart)
@@ -138,41 +145,106 @@ final class Tun2SocksAdapter: @unchecked Sendable {
         guard isRunning else { return }
         engine.stop()
         isRunning = false
+        teardownPipelines()
         hooks.eventSink?(.didStop)
     }
 
-    /// Continuously reads from the provider and forwards packets to the engine.
-    private func scheduleRead(handler: @escaping @Sendable (_ packets: [Data], _ protocols: [NSNumber]) -> Void) {
+    /// Configures the outbound packet loop that drains the provider and forwards packets.
+    private func configureOutboundPipeline(handler: @escaping @Sendable (_ packets: [Data], _ protocols: [NSNumber]) -> Void) {
+        outboundChannel?.finish()
+        outboundTask?.cancel()
+
+        let channel = AsyncChannel<PacketBatch>()
+        outboundChannel = channel
+        outboundTask = Task { [self, handler, channel] in
+            let buffered = channel.buffer(policy: .bounded(4))
+            for await batch in buffered {
+                if Task.isCancelled { break }
+                await self.processOutbound(batch, handler: handler)
+            }
+        }
+        scheduleRead(into: channel)
+    }
+
+    /// Continuously reads from the provider and forwards packets into the outbound channel.
+    private func scheduleRead(into channel: AsyncChannel<PacketBatch>) {
         ioQueue.async { [weak self] in
             guard let self else { return }
             self.provider.flow.readPackets { packets, protocols in
                 guard self.isRunning else { return }
-                self.applyLatency()
-                self.metrics?.record(direction: .outbound, packets: packets.count, bytes: packets.reduce(0) { $0 + $1.count })
-                packets.enumerated().forEach { index, packet in
-                    let proto = protocols[safe: index]?.int32Value ?? packet.afValue
-                    self.hooks.packetTap?(.init(direction: .outbound, payload: packet, protocolNumber: proto))
-                    self.trafficAnalyzer?.ingest(sample: .init(
-                        direction: .outbound,
-                        payload: packet,
-                        protocolNumber: proto
-                    ))
+                let batch = PacketBatch(packets: packets, protocols: protocols)
+                Task {
+                    await channel.send(batch)
                 }
-                handler(packets, protocols)
                 // Reschedule the loop.
-                self.scheduleRead(handler: handler)
+                self.scheduleRead(into: channel)
             }
         }
     }
 
-    /// Writes packets emitted by the engine back to the provider.
-    private func writePackets(_ packets: [Data], protocols: [NSNumber]) {
+    private func prepareInboundPipeline() {
+        inboundChannel?.finish()
+        inboundTask?.cancel()
+
+        let channel = AsyncChannel<PacketBatch>()
+        inboundChannel = channel
+        inboundTask = Task { [self, channel] in
+            let buffered = channel.buffer(policy: .bounded(4))
+            for await batch in buffered {
+                if Task.isCancelled { break }
+                await self.processInbound(batch)
+            }
+        }
+    }
+
+    private func teardownPipelines() {
+        outboundChannel?.finish()
+        inboundChannel?.finish()
+        outboundTask?.cancel()
+        inboundTask?.cancel()
+        outboundChannel = nil
+        inboundChannel = nil
+        outboundTask = nil
+        inboundTask = nil
+    }
+
+    private func enqueueInbound(packets: [Data], protocols: [NSNumber]) {
         guard !packets.isEmpty else { return }
         guard isRunning else { return }
-        applyLatency()
-        metrics?.record(direction: .inbound, packets: packets.count, bytes: packets.reduce(0) { $0 + $1.count })
-        packets.enumerated().forEach { index, packet in
-            let proto = protocols[safe: index]?.int32Value ?? packet.afValue
+        guard let channel = inboundChannel else { return }
+        let batch = PacketBatch(packets: packets, protocols: protocols)
+        Task {
+            await channel.send(batch)
+        }
+    }
+
+    private func processOutbound(_ batch: PacketBatch, handler: @escaping @Sendable (_ packets: [Data], _ protocols: [NSNumber]) -> Void) async {
+        guard isRunning else { return }
+        await applyLatencyIfNeeded()
+        if !batch.packets.isEmpty {
+            let totalBytes = batch.packets.reduce(0) { $0 + $1.count }
+            metrics?.record(direction: .outbound, packets: batch.packets.count, bytes: totalBytes)
+        }
+        batch.packets.enumerated().forEach { index, packet in
+            let proto = batch.protocols[safe: index]?.int32Value ?? packet.afValue
+            hooks.packetTap?(.init(direction: .outbound, payload: packet, protocolNumber: proto))
+            trafficAnalyzer?.ingest(sample: .init(
+                direction: .outbound,
+                payload: packet,
+                protocolNumber: proto
+            ))
+        }
+        handler(batch.packets, batch.protocols)
+    }
+
+    private func processInbound(_ batch: PacketBatch) async {
+        guard isRunning else { return }
+        guard !batch.packets.isEmpty else { return }
+        await applyLatencyIfNeeded()
+        let totalBytes = batch.packets.reduce(0) { $0 + $1.count }
+        metrics?.record(direction: .inbound, packets: batch.packets.count, bytes: totalBytes)
+        batch.packets.enumerated().forEach { index, packet in
+            let proto = batch.protocols[safe: index]?.int32Value ?? packet.afValue
             hooks.packetTap?(.init(direction: .inbound, payload: packet, protocolNumber: proto))
             trafficAnalyzer?.ingest(sample: .init(
                 direction: .inbound,
@@ -180,7 +252,7 @@ final class Tun2SocksAdapter: @unchecked Sendable {
                 protocolNumber: proto
             ))
         }
-        provider.flow.writePackets(packets, protocols: protocols)
+        provider.flow.writePackets(batch.packets, protocols: batch.protocols)
     }
 
     /// Consults block policies and establishes TCP connections when permitted.
@@ -218,6 +290,11 @@ final class Tun2SocksAdapter: @unchecked Sendable {
     }
 }
 
+private struct PacketBatch: @unchecked Sendable {
+    let packets: [Data]
+    let protocols: [NSNumber]
+}
+
 private extension Array {
     subscript(safe index: Int) -> Element? {
         guard indices.contains(index) else { return nil }
@@ -226,28 +303,19 @@ private extension Array {
 }
 
 private extension Tun2SocksAdapter {
-    func applyLatency() {
+    func applyLatencyIfNeeded() async {
         guard let latencyInjector else { return }
         let endpoint = RelativeProtocol.Configuration.Endpoint(host: "relative.protocol.latency", port: 0, transport: .tcp)
-        guard let delay = synchronousLatency(injector: latencyInjector, endpoint: endpoint), delay > 0 else { return }
-        let seconds = Double(delay) / 1_000.0
-        Thread.sleep(forTimeInterval: seconds)
-    }
-
-    func synchronousLatency(
-        injector: @escaping RelativeProtocol.Configuration.LatencyInjector,
-        endpoint: RelativeProtocol.Configuration.Endpoint
-    ) -> Int? {
-        let semaphore = DispatchSemaphore(value: 0)
-        var result: Int?
-        Task.detached {
-            let value = await injector(endpoint)
-            result = value
-            semaphore.signal()
+        guard let delay = await latencyInjector(endpoint), delay > 0 else { return }
+        let milliseconds = max(delay, 0)
+        let maxMilliseconds = Int(UInt64.max / 1_000_000)
+        let capped = min(milliseconds, maxMilliseconds)
+        let nanoseconds = UInt64(capped) * 1_000_000
+        do {
+            try await Task.sleep(nanoseconds: nanoseconds)
+        } catch {
+            // Ignore cancellation so the pipeline can shut down promptly.
         }
-        let timeoutResult = semaphore.wait(timeout: .now() + 1)
-        guard timeoutResult == .success else { return nil }
-        return result
     }
 }
 

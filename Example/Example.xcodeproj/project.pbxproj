@@ -10,6 +10,7 @@
 		A51939FF2EAACB78006BE440 /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A51939FE2EAACB78006BE440 /* NetworkExtension.framework */; };
 		A5193A072EAACB78006BE440 /* Example Tunnel.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = A51939FC2EAACB78006BE440 /* Example Tunnel.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		A5193A432EAAD48C006BE440 /* RelativeProtocolCore in Frameworks */ = {isa = PBXBuildFile; productRef = A5193A422EAAD48C006BE440 /* RelativeProtocolCore */; };
+		A5193A482EAAD5C7006BE440 /* RelativeProtocolHost in Frameworks */ = {isa = PBXBuildFile; productRef = A5193A472EAAD5C7006BE440 /* RelativeProtocolHost */; };
 		A5193A452EAAD4A4006BE440 /* RelativeProtocolCore in Frameworks */ = {isa = PBXBuildFile; productRef = A5193A442EAAD4A4006BE440 /* RelativeProtocolCore */; };
 		A5193A472EAAD4A4006BE440 /* RelativeProtocolTunnel in Frameworks */ = {isa = PBXBuildFile; productRef = A5193A462EAAD4A4006BE440 /* RelativeProtocolTunnel */; };
 /* End PBXBuildFile section */
@@ -102,6 +103,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				A5193A432EAAD48C006BE440 /* RelativeProtocolCore in Frameworks */,
+				A5193A482EAAD5C7006BE440 /* RelativeProtocolHost in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -186,6 +188,7 @@
 			name = Example;
 			packageProductDependencies = (
 				A5193A422EAAD48C006BE440 /* RelativeProtocolCore */,
+				A5193A472EAAD5C7006BE440 /* RelativeProtocolHost */,
 			);
 			productName = Example;
 			productReference = A51939CE2EAACB49006BE440 /* Example.app */;
@@ -793,6 +796,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = A5193A412EAAD48C006BE440 /* XCLocalSwiftPackageReference "../../VPN-Bridge" */;
 			productName = RelativeProtocolTunnel;
+		};
+		A5193A472EAAD5C7006BE440 /* RelativeProtocolHost */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A5193A412EAAD48C006BE440 /* XCLocalSwiftPackageReference "../../VPN-Bridge" */;
+			productName = RelativeProtocolHost;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
