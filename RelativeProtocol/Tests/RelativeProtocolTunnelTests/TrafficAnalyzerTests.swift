@@ -1,3 +1,13 @@
+//
+//  TrafficAnalyzerTests.swift
+//  RelativeProtocolTunnelTests
+//
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 11/07/2025.
+//
+//  Verifies that traffic analysis respects redaction policies when publishing
+//  events to listeners.
+//
 import XCTest
 import RelativeProtocolCore
 @testable import RelativeProtocolTunnel

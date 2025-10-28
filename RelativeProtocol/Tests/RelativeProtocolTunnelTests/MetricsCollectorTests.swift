@@ -1,3 +1,13 @@
+//
+//  MetricsCollectorTests.swift
+//  RelativeProtocolTunnelTests
+//
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 10/21/2025.
+//
+//  Exercises the metrics collector to ensure packet counts, resets, and error
+//  reporting behave as expected.
+//
 import Foundation
 import XCTest
 @testable import RelativeProtocolCore

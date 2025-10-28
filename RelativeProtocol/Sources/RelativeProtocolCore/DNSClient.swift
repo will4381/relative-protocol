@@ -2,7 +2,11 @@
 //  DNSClient.swift
 //  RelativeProtocolCore
 //
-//  Created by Codex on 10/27/25.
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 10/27/2025.
+//
+//  Wraps system DNS primitives in async helpers for forward and reverse lookups
+//  without blocking the caller's executor.
 //
 
 import Foundation

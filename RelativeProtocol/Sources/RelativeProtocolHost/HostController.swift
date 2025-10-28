@@ -2,7 +2,11 @@
 //  HostController.swift
 //  RelativeProtocolHost
 //
-//  Created by Codex on 10/27/25.
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 10/27/2025.
+//
+//  High-level facade around `NETunnelProviderManager` that prepares, connects,
+//  and observes Relative Protocol tunnel sessions for host apps.
 //
 
 import Foundation

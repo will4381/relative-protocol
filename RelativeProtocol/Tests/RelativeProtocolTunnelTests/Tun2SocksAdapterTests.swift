@@ -1,3 +1,13 @@
+//
+//  Tun2SocksAdapterTests.swift
+//  RelativeProtocolTunnelTests
+//
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 10/21/2025.
+//
+//  Covers adapter lifecycle, packet forwarding, metrics emission, and block
+//  policy behaviour using mock providers and engines.
+//
 import Foundation
 import XCTest
 import Network

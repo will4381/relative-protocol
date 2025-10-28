@@ -2,7 +2,11 @@
 //  ConfigurationBuilder.swift
 //  RelativeProtocolCore
 //
-//  Created by Codex on 10/27/25.
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 10/27/2025.
+//
+//  Provides convenience constructors that assemble common `RelativeProtocol.Configuration`
+//  presets (full tunnel and split tunnel) from lightweight value types.
 //
 
 import Foundation

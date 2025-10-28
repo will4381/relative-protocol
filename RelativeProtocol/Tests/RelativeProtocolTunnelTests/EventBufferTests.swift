@@ -1,3 +1,12 @@
+//
+//  EventBufferTests.swift
+//  RelativeProtocolTunnelTests
+//
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 11/07/2025.
+//
+//  Validates the event buffer's capacity- and interval-based flushing logic.
+//
 import XCTest
 import RelativeProtocolCore
 

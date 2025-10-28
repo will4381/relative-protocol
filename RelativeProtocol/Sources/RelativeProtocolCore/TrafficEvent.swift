@@ -2,7 +2,10 @@
 //  TrafficEvent.swift
 //  RelativeProtocolCore
 //
-//  Created by Codex on 11/07/2025.
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 11/07/2025.
+//
+//  Defines the public traffic event model used by filters and host consumers.
 //
 
 import Foundation

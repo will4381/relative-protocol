@@ -2,7 +2,11 @@
 //  PacketTunnelProvider.swift
 //  Example Tunnel
 //
-//  Created by Will Kusch on 10/23/25.
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 10/23/2025.
+//
+//  Implements the Network Extension provider by bootstrapping the Relative
+//  Protocol tunnel engine and coordinating example-specific filters.
 //
 
 #if canImport(Darwin)

@@ -1,3 +1,13 @@
+//
+//  TrafficEventBusTests.swift
+//  RelativeProtocolTunnelTests
+//
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 10/27/2025.
+//
+//  Ensures the traffic event bus publishes sanitized events and halts delivery
+//  once listeners are removed.
+//
 import XCTest
 import RelativeProtocolCore
 

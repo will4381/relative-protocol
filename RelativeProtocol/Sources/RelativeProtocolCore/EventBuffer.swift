@@ -2,7 +2,11 @@
 //  EventBuffer.swift
 //  RelativeProtocolCore
 //
-//  Created by Codex on 11/07/2025.
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 11/07/2025.
+//
+//  Buffers generated traffic events until capacity or timing thresholds trigger
+//  a flush to the consumer.
 //
 
 import Foundation

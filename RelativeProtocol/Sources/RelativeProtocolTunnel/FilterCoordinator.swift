@@ -2,7 +2,11 @@
 //  FilterCoordinator.swift
 //  RelativeProtocolTunnel
 //
-//  Created by Codex on 11/07/2025.
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 11/07/2025.
+//
+//  Coordinates traffic filters by collecting packet batches, running
+//  evaluations, and buffering emitted events before publishing them.
 //
 
 import Foundation

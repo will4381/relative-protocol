@@ -1,3 +1,13 @@
+//
+//  ConfigurationTests.swift
+//  RelativeProtocolTunnelTests
+//
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 10/21/2025.
+//
+//  Validates configuration builders, serialization, and block-list matching
+//  logic for the tunnel core.
+//
 import XCTest
 @testable import RelativeProtocolCore
 

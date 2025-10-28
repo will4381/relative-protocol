@@ -2,7 +2,11 @@
 //  TrafficEventBus.swift
 //  RelativeProtocolCore
 //
-//  Created by Codex on 11/07/2025.
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 11/07/2025.
+//
+//  Broadcasts traffic events to registered listeners on a dedicated queue with
+//  optional redaction.
 //
 
 import Foundation

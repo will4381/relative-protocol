@@ -1,3 +1,13 @@
+//
+//  NoOpTun2SocksEngineTests.swift
+//  RelativeProtocolTunnelTests
+//
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 10/27/2025.
+//
+//  Verifies that the noop engine echoes packets while running and stops after
+//  shutdown.
+//
 import XCTest
 import Network
 @testable import RelativeProtocolTunnel

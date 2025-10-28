@@ -2,7 +2,10 @@
 //  ContentView.swift
 //  Example
 //
-//  Created by Will Kusch on 10/23/25.
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 10/23/2025.
+//
+//  Displays tunnel status, metrics, and controls in the sample host app UI.
 //
 
 import SwiftUI

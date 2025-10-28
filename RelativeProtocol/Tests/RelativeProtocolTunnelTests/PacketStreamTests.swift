@@ -1,3 +1,13 @@
+//
+//  PacketStreamTests.swift
+//  RelativeProtocolTunnelTests
+//
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 11/07/2025.
+//
+//  Confirms packet stream buffering honours retention windows and delivers
+//  snapshots to observers in order.
+//
 import XCTest
 import RelativeProtocolCore
 @testable import RelativeProtocolTunnel
