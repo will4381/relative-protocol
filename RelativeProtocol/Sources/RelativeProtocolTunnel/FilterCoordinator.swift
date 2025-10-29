@@ -10,12 +10,13 @@
 //
 
 import Foundation
+import AsyncAlgorithms
 import RelativeProtocolCore
 
 /// Filters operate on buffered packet snapshots and emit normalized events.
 public protocol TrafficFilter: Sendable {
     var identifier: String { get }
-    func evaluate(snapshot: [RelativeProtocol.PacketSample], emit: @escaping @Sendable (RelativeProtocol.TrafficEvent) -> Void)
+    func evaluate(snapshot: UnsafeBufferPointer<RelativeProtocol.PacketSample>, emit: @escaping @Sendable (RelativeProtocol.TrafficEvent) -> Void)
 }
 
 /// Configuration describing how frequently filters should evaluate buffered
@@ -41,6 +42,7 @@ public final class FilterCoordinator: @unchecked Sendable {
     private let filtersQueue = DispatchQueue(label: "RelativeProtocolTunnel.FilterCoordinator.filters", attributes: .concurrent)
     private var filters: [TrafficFilter] = []
     private let eventBuffer: RelativeProtocol.EventBuffer?
+    private var evaluationTask: Task<Void, Never>?
 
     init(analyzer: TrafficAnalyzer, configuration: FilterConfiguration = .init()) {
         self.analyzer = analyzer
@@ -50,16 +52,11 @@ public final class FilterCoordinator: @unchecked Sendable {
         } else {
             self.eventBuffer = nil
         }
-        analyzer.stream.addBatchObserver(.init(
-            name: "RelativeProtocol.FilterCoordinator",
-            interval: configuration.evaluationInterval,
-            handler: { [weak self] samples in
-                self?.evaluate(snapshot: samples)
-            }
-        ))
+        startEvaluationLoop()
     }
 
     deinit {
+        evaluationTask?.cancel()
         flushBufferIfNeeded(force: true)
     }
 
@@ -79,7 +76,35 @@ public final class FilterCoordinator: @unchecked Sendable {
         flushBufferIfNeeded(force: true)
     }
 
-    private func evaluate(snapshot: [RelativeProtocol.PacketSample]) {
+    private func startEvaluationLoop() {
+        evaluationTask?.cancel()
+        let interval = configuration.evaluationInterval
+        evaluationTask = Task { [weak self] in
+            let duration = FilterCoordinator.makeDuration(interval: interval)
+            let timer = AsyncTimerSequence(interval: duration, clock: ContinuousClock())
+            for await _ in timer {
+                if Task.isCancelled { break }
+                guard let self else { break }
+                await self.processTimerTick()
+            }
+        }
+    }
+
+    private static func makeDuration(interval: TimeInterval) -> Duration {
+        let seconds = max(interval, 0)
+        let nanosecondsDouble = seconds * 1_000_000_000
+        let capped = min(Double(Int64.max), max(0, nanosecondsDouble))
+        let nanoseconds = Int64(capped)
+        return .nanoseconds(nanoseconds)
+    }
+
+    private func processTimerTick() async {
+        await analyzer.stream.withSnapshot { [weak self] buffer in
+            self?.evaluate(snapshot: buffer)
+        }
+    }
+
+    private func evaluate(snapshot: UnsafeBufferPointer<RelativeProtocol.PacketSample>) {
         guard !snapshot.isEmpty else { return }
         let filters = filtersQueue.sync { self.filters }
         guard !filters.isEmpty else { return }

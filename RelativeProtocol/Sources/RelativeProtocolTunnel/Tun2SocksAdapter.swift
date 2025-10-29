@@ -10,6 +10,7 @@
 //  while delegating actual packet processing to the gomobile engine.
 //
 
+import Darwin
 import Foundation
 import Network
 import RelativeProtocolCore
@@ -66,7 +67,7 @@ final class Tun2SocksAdapter: @unchecked Sendable {
     private let engine: Tun2SocksEngine
     private let hooks: RelativeProtocol.Configuration.Hooks
     private let trafficAnalyzer: TrafficAnalyzer?
-    private let latencyInjector: RelativeProtocol.Configuration.LatencyInjector?
+    private let forwardHostTracker = RelativeProtocolTunnel.ForwardHostTracker()
     private let ioQueue = DispatchQueue(label: "RelativeProtocolTunnel.Tun2SocksAdapter", qos: .userInitiated)
     private var isRunning = false
     private var outboundChannel: AsyncChannel<PacketBatch>?
@@ -76,6 +77,10 @@ final class Tun2SocksAdapter: @unchecked Sendable {
 
     var analyzer: TrafficAnalyzer? {
         trafficAnalyzer
+    }
+
+    var hostTracker: RelativeProtocolTunnel.ForwardHostTracker {
+        forwardHostTracker
     }
 
     /// - Parameters:
@@ -97,7 +102,6 @@ final class Tun2SocksAdapter: @unchecked Sendable {
         self.metrics = metrics
         self.engine = engine
         self.hooks = hooks
-        self.latencyInjector = hooks.latencyInjector
         if let stream = hooks.packetStreamBuilder?() {
             let eventBus = hooks.trafficEventBusBuilder?()
             self.trafficAnalyzer = TrafficAnalyzer(
@@ -220,38 +224,50 @@ final class Tun2SocksAdapter: @unchecked Sendable {
 
     private func processOutbound(_ batch: PacketBatch, handler: @escaping @Sendable (_ packets: [Data], _ protocols: [NSNumber]) -> Void) async {
         guard isRunning else { return }
-        await applyLatencyIfNeeded()
+        let timestamp = Date()
         if !batch.packets.isEmpty {
             let totalBytes = batch.packets.reduce(0) { $0 + $1.count }
             metrics?.record(direction: .outbound, packets: batch.packets.count, bytes: totalBytes)
         }
-        batch.packets.enumerated().forEach { index, packet in
+
+        for (index, packet) in batch.packets.enumerated() {
             let proto = batch.protocols[safe: index]?.int32Value ?? packet.afValue
             hooks.packetTap?(.init(direction: .outbound, payload: packet, protocolNumber: proto))
-            trafficAnalyzer?.ingest(sample: .init(
-                direction: .outbound,
-                payload: packet,
-                protocolNumber: proto
-            ))
+            forwardHostTracker.ingestTLSClientHello(ipPacket: packet, timestamp: timestamp)
+
+            if Tun2SocksAdapter.shouldAnalyze(packet: packet, direction: .outbound) {
+                trafficAnalyzer?.ingest(sample: .init(
+                    direction: .outbound,
+                    payload: packet,
+                    protocolNumber: proto
+                ))
+            }
         }
+
         handler(batch.packets, batch.protocols)
     }
 
     private func processInbound(_ batch: PacketBatch) async {
         guard isRunning else { return }
         guard !batch.packets.isEmpty else { return }
-        await applyLatencyIfNeeded()
         let totalBytes = batch.packets.reduce(0) { $0 + $1.count }
         metrics?.record(direction: .inbound, packets: batch.packets.count, bytes: totalBytes)
-        batch.packets.enumerated().forEach { index, packet in
+
+        for (index, packet) in batch.packets.enumerated() {
             let proto = batch.protocols[safe: index]?.int32Value ?? packet.afValue
             hooks.packetTap?(.init(direction: .inbound, payload: packet, protocolNumber: proto))
-            trafficAnalyzer?.ingest(sample: .init(
-                direction: .inbound,
-                payload: packet,
-                protocolNumber: proto
-            ))
+
+            forwardHostTracker.ingest(ipPacket: packet)
+
+            if Tun2SocksAdapter.shouldAnalyze(packet: packet, direction: .inbound) {
+                trafficAnalyzer?.ingest(sample: .init(
+                    direction: .inbound,
+                    payload: packet,
+                    protocolNumber: proto
+                ))
+            }
         }
+
         provider.flow.writePackets(batch.packets, protocols: batch.protocols)
     }
 
@@ -303,19 +319,79 @@ private extension Array {
 }
 
 private extension Tun2SocksAdapter {
-    func applyLatencyIfNeeded() async {
-        guard let latencyInjector else { return }
-        let endpoint = RelativeProtocol.Configuration.Endpoint(host: "relative.protocol.latency", port: 0, transport: .tcp)
-        guard let delay = await latencyInjector(endpoint), delay > 0 else { return }
-        let milliseconds = max(delay, 0)
-        let maxMilliseconds = Int(UInt64.max / 1_000_000)
-        let capped = min(milliseconds, maxMilliseconds)
-        let nanoseconds = UInt64(capped) * 1_000_000
-        do {
-            try await Task.sleep(nanoseconds: nanoseconds)
-        } catch {
-            // Ignore cancellation so the pipeline can shut down promptly.
+    static func shouldAnalyze(packet: Data, direction: RelativeProtocol.Direction) -> Bool {
+        return packet.withUnsafeBytes { rawBuffer -> Bool in
+            guard let base = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return false }
+            guard rawBuffer.count >= 1 else { return false }
+            let version = base[0] >> 4
+            switch version {
+            case 4:
+                guard rawBuffer.count >= 20 else { return false }
+                let offset = direction == .outbound ? 16 : 12
+                return isPublicIPv4(bytes: base.advanced(by: offset))
+            case 6:
+                guard rawBuffer.count >= 40 else { return false }
+                let offset = direction == .outbound ? 24 : 8
+                return isPublicIPv6(bytes: base.advanced(by: offset))
+            default:
+                return false
+            }
         }
+    }
+
+    static func isPublicIPv4(bytes: UnsafePointer<UInt8>) -> Bool {
+        let first = bytes[0]
+        let second = bytes[1]
+        switch first {
+        case 0, 10, 127:
+            return false
+        case 169 where second == 254:
+            return false
+        case 172 where (16...31).contains(second):
+            return false
+        case 192 where second == 168:
+            return false
+        case 100 where (64...127).contains(second):
+            return false
+        case 198 where (second == 18 || second == 19):
+            return false
+        case 224...239:
+            return false
+        case 255:
+            return false
+        default:
+            return true
+        }
+    }
+
+    static func isPublicIPv6(bytes: UnsafePointer<UInt8>) -> Bool {
+        var octets = [UInt8](repeating: 0, count: 16)
+        for index in 0..<16 {
+            octets[index] = bytes[index]
+        }
+
+        if octets.allSatisfy({ $0 == 0 }) { return false }
+        if octets.dropLast().allSatisfy({ $0 == 0 }) && octets.last == 1 { return false }
+        if (octets[0] & 0xfe) == 0xfc { return false }
+        if octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80 { return false }
+        if octets[0] == 0xff { return false }
+        if octets[0] == 0x20, octets[1] == 0x01, octets[2] == 0x0d, octets[3] == 0xb8 { return false }
+
+        if isIPv4Mapped(octets) {
+            let ipv4 = [octets[12], octets[13], octets[14], octets[15]]
+            return ipv4.withUnsafeBufferPointer { buffer in
+                buffer.baseAddress.map { isPublicIPv4(bytes: $0) } ?? false
+            }
+        }
+
+        return (octets[0] & 0xe0) == 0x20
+    }
+
+    static func isIPv4Mapped(_ octets: [UInt8]) -> Bool {
+        guard octets.count == 16 else { return false }
+        for index in 0..<10 where octets[index] != 0 { return false }
+        if octets[10] != 0xff || octets[11] != 0xff { return false }
+        return true
     }
 }
 

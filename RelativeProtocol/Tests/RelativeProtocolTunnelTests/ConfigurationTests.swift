@@ -36,7 +36,7 @@ final class ConfigurationTests: XCTestCase {
             ),
             dns: .init(servers: ["1.1.1.1"], searchDomains: ["example.com"], matchDomains: ["example.com"]),
             metrics: .init(isEnabled: false, reportingInterval: 30),
-            policies: .init(blockedHosts: ["blocked.example"], latencyRules: [.global(50)])
+            policies: .init(blockedHosts: ["blocked.example"])
         )
         let configuration = RelativeProtocol.Configuration(
             provider: provider,

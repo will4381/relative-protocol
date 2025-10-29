@@ -39,7 +39,7 @@ final class PacketStreamTests: XCTestCase {
 
         stream.snapshot { samples in
             XCTAssertEqual(samples.count, 1)
-            XCTAssertEqual(samples.first?.payload.first, 0x02)
+            XCTAssertEqual(samples.first?.byteCount, 1)
             expectation.fulfill()
         }
 

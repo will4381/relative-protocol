@@ -267,40 +267,13 @@ public extension RelativeProtocol.Configuration {
 
     struct Policies: Codable, Equatable, Sendable {
         public var blockedHosts: [String]
-        public var latencyRules: [LatencyRule]
 
-        public init(blockedHosts: [String] = [], latencyRules: [LatencyRule] = []) {
+        public init(blockedHosts: [String] = []) {
             self.blockedHosts = blockedHosts
-            self.latencyRules = latencyRules
         }
 
         public static var `default`: Policies {
             Policies()
-        }
-    }
-
-    struct LatencyRule: Codable, Equatable, Sendable {
-        public enum Scope: String, Codable, Sendable {
-            case global
-            case host
-        }
-
-        public var scope: Scope
-        public var host: String?
-        public var milliseconds: Int
-
-        public init(scope: Scope, host: String? = nil, milliseconds: Int) {
-            self.scope = scope
-            self.host = host
-            self.milliseconds = milliseconds
-        }
-
-        public static func global(_ milliseconds: Int) -> LatencyRule {
-            LatencyRule(scope: .global, milliseconds: milliseconds)
-        }
-
-        public static func host(_ host: String, milliseconds: Int) -> LatencyRule {
-            LatencyRule(scope: .host, host: host, milliseconds: milliseconds)
         }
     }
 
@@ -401,7 +374,6 @@ public extension RelativeProtocol.Configuration {
         public var trafficEventBusBuilder: TrafficEventBusBuilder?
         public var dnsResolver: DNSResolver?
         public var connectionPolicy: ConnectionPolicy?
-        public var latencyInjector: LatencyInjector?
         public var eventSink: EventSink?
 
         public init(
@@ -410,7 +382,6 @@ public extension RelativeProtocol.Configuration {
             trafficEventBusBuilder: TrafficEventBusBuilder? = nil,
             dnsResolver: DNSResolver? = nil,
             connectionPolicy: ConnectionPolicy? = nil,
-            latencyInjector: LatencyInjector? = nil,
             eventSink: EventSink? = nil
         ) {
             self.packetTap = packetTap
@@ -418,7 +389,6 @@ public extension RelativeProtocol.Configuration {
             self.trafficEventBusBuilder = trafficEventBusBuilder
             self.dnsResolver = dnsResolver
             self.connectionPolicy = connectionPolicy
-            self.latencyInjector = latencyInjector
             self.eventSink = eventSink
         }
     }
@@ -482,9 +452,6 @@ public extension RelativeProtocol.Configuration {
     /// Determines whether an outbound connection should proceed, be blocked,
     /// or fall back to default handling.
     typealias ConnectionPolicy = @Sendable (_ endpoint: Endpoint) async -> ConnectionDecision
-    /// Returns an artificial latency budget (milliseconds) to apply to the
-    /// specified endpoint.
-    typealias LatencyInjector = @Sendable (_ endpoint: Endpoint) async -> Int?
     /// Receives lifecycle events as the tunnel transitions between states.
     typealias EventSink = @Sendable (_ event: Event) -> Void
 }

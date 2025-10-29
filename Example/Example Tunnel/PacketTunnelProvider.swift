@@ -21,7 +21,7 @@ import RelativeProtocolCore
 final class PacketTunnelProvider: NEPacketTunnelProvider {
     private let logger = Logger(subsystem: "relative.example", category: "PacketTunnelProvider")
     private lazy var controller = RelativeProtocolTunnel.ProviderController(provider: self)
-    private let siteCatalog = ExampleSiteCatalog(capacity: 200)
+private let siteCatalog = ExampleSiteCatalog(capacity: 200)
     private let hostResolver = ExampleReverseDNSResolver()
     private let dnsClient = RelativeProtocol.DNSClient()
 
@@ -37,21 +37,27 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         hooks.packetStreamBuilder = {
             let config = RelativeProtocol.PacketStream.Configuration(
-                bufferDuration: 120,
+                bufferDuration: 12,
                 snapshotQueue: DispatchQueue(label: "relative.example.filters")
             )
             return RelativeProtocol.PacketStream(configuration: config)
         }
-        hooks.dnsResolver = { [dnsClient] host in
+        hooks.dnsResolver = { [dnsClient, controller] host in
             let result = try await dnsClient.resolve(host: host)
-            return result.ipv4Addresses + result.ipv6Addresses
+            let addresses = result.ipv4Addresses + result.ipv6Addresses
+            controller.forwardHostTracker?.record(host: host, addresses: addresses, ttl: nil)
+            return addresses
         }
         configuration.hooks = hooks
 
         controller.setFilterConfiguration(.init(evaluationInterval: 1.0))
         controller.configureFilters { [weak self] coordinator in
             guard let self else { return }
-            coordinator.register(ExampleSiteTrackerFilter(catalog: self.siteCatalog, resolver: self.hostResolver))
+            coordinator.register(ExampleSiteTrackerFilter(
+                catalog: self.siteCatalog,
+                resolver: self.hostResolver,
+                forwardHostTracker: self.controller.forwardHostTracker
+            ))
         }
         controller.start(configuration: configuration, completion: completionHandler)
     }
@@ -290,13 +296,7 @@ private final class ExampleSiteCatalog: @unchecked Sendable {
                 entry.outboundBytes += bytes
                 entry.outboundPackets += 1
             }
-            let isNew = self.entries[key] == nil
             self.entries[key] = entry
-            if isNew {
-                self.log.notice("catalog added entry for \(key, privacy: .public) (IP \(remoteIP, privacy: .public))")
-            } else {
-                self.log.notice("catalog updated \(key, privacy: .public) inbound=\(entry.inboundBytes, privacy: .public) outbound=\(entry.outboundBytes, privacy: .public)")
-            }
             self.trimIfNeeded()
         }
     }
@@ -336,49 +336,30 @@ private final class ExampleSiteCatalog: @unchecked Sendable {
             entries.removeValue(forKey: key)
         }
     }
+
 }
 
 private struct ExampleSiteTrackerFilter: TrafficFilter {
     let identifier = "relative.example.filters.siteTracker"
     private let catalog: ExampleSiteCatalog
     private let resolver: ExampleReverseDNSResolver
-    private let log = Logger(subsystem: "relative.example", category: "SiteTrackerFilter")
+    private let forwardHostTracker: RelativeProtocolTunnel.ForwardHostTracker?
 
-    init(catalog: ExampleSiteCatalog, resolver: ExampleReverseDNSResolver) {
+    init(catalog: ExampleSiteCatalog, resolver: ExampleReverseDNSResolver, forwardHostTracker: RelativeProtocolTunnel.ForwardHostTracker?) {
         self.catalog = catalog
         self.resolver = resolver
+        self.forwardHostTracker = forwardHostTracker
     }
 
-    func evaluate(snapshot: [RelativeProtocol.PacketSample], emit _: @escaping @Sendable (RelativeProtocol.TrafficEvent) -> Void) {
-        guard !snapshot.isEmpty else {
-            log.debug("evaluate called with empty snapshot")
-            return
-        }
-        log.notice("processing snapshot with \(snapshot.count, privacy: .public) samples")
+    func evaluate(snapshot: UnsafeBufferPointer<RelativeProtocol.PacketSample>, emit _: @escaping @Sendable (RelativeProtocol.TrafficEvent) -> Void) {
+        guard !snapshot.isEmpty else { return }
         for sample in snapshot {
-            guard let parsed = ExamplePacketParser.parse(sample.payload) else {
-                log.notice("skipping sample: unable to parse payload")
-                continue
-            }
-            if parsed.isDNS {
-                log.notice("skipping sample: DNS traffic")
-                continue
-            }
-            let remoteIP: String
-            switch sample.direction {
-            case .inbound:
-                remoteIP = parsed.sourceIP
-            case .outbound:
-                remoteIP = parsed.destinationIP
-            }
-            log.notice("candidate remote IP \(remoteIP, privacy: .public)")
-            guard isLikelyPublicIP(remoteIP) else {
-                log.notice("skipping sample: non-public IP \(remoteIP, privacy: .public)")
-                continue
-            }
-            let host = resolver.cachedHostname(for: remoteIP)
-            let site = host.flatMap(apexDomain(for:))
-            log.notice("sample for \(remoteIP, privacy: .public) host=\(host ?? "nil", privacy: .public) site=\(site ?? "nil", privacy: .public)")
+            guard let metadata = sample.metadata else { continue }
+            let remoteIP = metadata.remoteAddress(for: sample.direction)
+            guard isLikelyPublicIP(remoteIP) else { continue }
+            let forwardHost = forwardHostTracker?.lookup(ip: remoteIP, at: sample.timestamp)
+            let host = forwardHost ?? resolver.cachedHostname(for: remoteIP)
+            let site = forwardHost.flatMap(apexDomain(for:)) ?? host.flatMap(apexDomain(for:))
             catalog.record(
                 remoteIP: remoteIP,
                 host: host,
@@ -527,92 +508,3 @@ private func describe(error: RelativeProtocol.DNSClient.LookupError) -> String {
 }
 
 // MARK: - Packet Parsing Helpers
-
-private enum ExamplePacketParser {
-    struct ParsedPacket {
-        enum Transport {
-            case udp(srcPort: UInt16, dstPort: UInt16, payload: Data)
-            case tcp
-            case other
-        }
-
-        var sourceIP: String
-        var destinationIP: String
-        var transport: Transport
-    }
-
-    static func parse(_ data: Data) -> ParsedPacket? {
-        guard let firstByte = data.first else { return nil }
-        let version = firstByte >> 4
-
-        switch version {
-        case 4:
-            let ihl = Int(firstByte & 0x0F) * 4
-            guard ihl >= 20, data.count >= ihl else { return nil }
-
-            let protocolNumber = data[9]
-            let srcIP = ipv4String(from: data[12..<16])
-            let dstIP = ipv4String(from: data[16..<20])
-            guard !srcIP.isEmpty, !dstIP.isEmpty else { return nil }
-            let payload = data[ihl...]
-            let transport = transport(for: protocolNumber, payload: payload)
-            return ParsedPacket(sourceIP: srcIP, destinationIP: dstIP, transport: transport)
-        case 6:
-            let headerLength = 40
-            guard data.count >= headerLength else { return nil }
-
-            let nextHeader = data[6]
-            let srcIP = ipv6String(from: data[8..<24])
-            let dstIP = ipv6String(from: data[24..<40])
-            guard !srcIP.isEmpty, !dstIP.isEmpty else { return nil }
-            let payload = data[headerLength...]
-            let transport = transport(for: nextHeader, payload: payload)
-            return ParsedPacket(sourceIP: srcIP, destinationIP: dstIP, transport: transport)
-        default:
-            return nil
-        }
-    }
-
-    private static func ipv4String(from bytes: Data.SubSequence) -> String {
-        guard bytes.count == 4 else { return "" }
-        return bytes.map { String($0) }.joined(separator: ".")
-    }
-
-    private static func ipv6String(from bytes: Data.SubSequence) -> String {
-        guard bytes.count == 16 else { return "" }
-        return bytes.withUnsafeBytes { rawBuffer -> String in
-            guard let baseAddress = rawBuffer.baseAddress else { return "" }
-            var buffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
-            if inet_ntop(AF_INET6, baseAddress, &buffer, socklen_t(INET6_ADDRSTRLEN)) != nil {
-                return String(cString: buffer)
-            }
-            return ""
-        }
-    }
-
-    private static func transport(for protocolNumber: UInt8, payload: Data.SubSequence) -> ParsedPacket.Transport {
-        switch protocolNumber {
-        case 17: // UDP
-            guard payload.count >= 8 else { return .other }
-            let srcPort = UInt16(payload[payload.startIndex]) << 8 | UInt16(payload[payload.startIndex + 1])
-            let dstPort = UInt16(payload[payload.startIndex + 2]) << 8 | UInt16(payload[payload.startIndex + 3])
-            let udpPayload = payload.dropFirst(8)
-            return .udp(srcPort: srcPort, dstPort: dstPort, payload: Data(udpPayload))
-        case 6:
-            return .tcp
-        default:
-            return .other
-        }
-    }
-}
-
-private extension ExamplePacketParser.ParsedPacket {
-    var isDNS: Bool {
-        switch transport {
-        case let .udp(srcPort, dstPort, _):
-            return srcPort == 53 || dstPort == 53
-        default:
-            return false
-        }
-    }
-}

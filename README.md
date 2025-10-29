@@ -31,9 +31,9 @@ When running on-device VPN-style proxies it’s imperative that the tunnel remai
     - **Use when**: enabling verbose diagnostics for development or performance testing.
   - `RelativeProtocol.Configuration.Hooks`
     - **Purpose**: inject custom behaviour.
-    - **Inputs**: optional closures `packetTap(context)`, `dnsResolver(host) async throws -> [String]`, `connectionPolicy(endpoint) async -> ConnectionDecision`, `latencyInjector(endpoint) async -> Int?`, `eventSink(event)`.
-    - **Output**: callbacks invoked by the tunnel runtime (packet inspection, DNS overrides, connection policy decisions, latency shaping, lifecycle reporting).
-    - **Use when**: you need to observe packet flow, provide custom DNS answers, enforce allow/deny lists, inject synthetic latency, or surface tunnel state changes to the host app.
+    - **Inputs**: optional closures `packetTap(context)`, `dnsResolver(host) async throws -> [String]`, `connectionPolicy(endpoint) async -> ConnectionDecision`, `eventSink(event)`.
+    - **Output**: callbacks invoked by the tunnel runtime (packet inspection, DNS overrides, connection policy decisions, lifecycle reporting).
+    - **Use when**: you need to observe packet flow, provide custom DNS answers, enforce allow/deny lists, or surface tunnel state changes to the host app.
   - `RelativeProtocol.Configuration.ValidationMessage`
     - **Properties**: `message: String`, `isError: Bool`, `severityLabel: "warning" | "error"`.
     - **Use when**: presenting validation results to the caller.
@@ -159,8 +159,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 struct MyBurstFilter: TrafficFilter {
     let identifier = "demo.burst"
 
-    func evaluate(snapshot: [RelativeProtocol.PacketSample], emit: @escaping @Sendable (RelativeProtocol.TrafficEvent) -> Void) {
-        let inboundBytes = snapshot
+    func evaluate(snapshot: UnsafeBufferPointer<RelativeProtocol.PacketSample>, emit: @escaping @Sendable (RelativeProtocol.TrafficEvent) -> Void) {
+        let inboundBytes = snapshot.lazy
             .filter { $0.direction == .inbound }
             .reduce(0) { $0 + $1.byteCount }
         guard inboundBytes > 1_000_000 else { return }
@@ -168,8 +168,7 @@ struct MyBurstFilter: TrafficFilter {
             category: .burst,
             confidence: .medium,
             details: [
-                "bytes": String(inboundBytes),
-                "window": "120"
+                "bytes": String(inboundBytes)
             ]
         )
         emit(event)
@@ -177,13 +176,43 @@ struct MyBurstFilter: TrafficFilter {
 }
 ```
 
+### Mapping CDN Edges to Origin Hosts
+
+Relative Protocol automatically instantiates a `ForwardHostTracker` inside the tunnel. The tracker watches DNS responses traversing the virtual interface and maintains a short-lived mapping between resolved hostnames and the remote IP addresses seen in packet samples. You can access it through `ProviderController.forwardHostTracker` and enrich analytics or filters with the original service hostname instead of the CDN edge.
+
+```swift
+controller.configureFilters { coordinator in
+    if let tracker = controller.forwardHostTracker {
+        coordinator.register(MyFilter(hostTracker: tracker))
+    }
+}
+
+struct MyFilter: TrafficFilter {
+    let identifier = "demo.classifier"
+    let hostTracker: RelativeProtocolTunnel.ForwardHostTracker
+
+    func evaluate(snapshot: UnsafeBufferPointer<RelativeProtocol.PacketSample>, emit: @escaping @Sendable (RelativeProtocol.TrafficEvent) -> Void) {
+        guard let sample = snapshot.first else { return }
+        if let metadata = sample.metadata {
+            let ip = metadata.remoteAddress(for: sample.direction)
+            if let hostname = hostTracker.lookup(ip: ip) {
+                print("Resolved \(ip) to \(hostname)")
+            }
+        }
+    }
+}
+```
+
+Packet snapshots retain flow metadata (addresses, ports, protocols) but drop payload bytes to stay within the Network Extension memory budget, so filters should rely on `sample.metadata` instead of reparsing raw data.
+
+`ForwardHostTracker` deduplicates lookups and honours DNS TTLs (default 10 minutes), so it is safe to query on every packet without flooding upstream resolvers.
+
 ### Example App
 
 The bundled Example app now exposes a Traffic Analysis panel:
 - Fetch recent `TrafficEvent` bursts from the tunnel and inspect their metadata.
 - Adjust the burst detector threshold (in MB) and push updates to the filter pipeline.
 - Clear the tunnel-side event buffer to start fresh during demos.
-- Tune the global latency injector (0–500 ms) to visualise the impact of artificial delay on traffic.
 - View resolved remote IPs and hostnames for each detected burst for quick triage.
 
 

@@ -143,14 +143,15 @@ final class TunnelCoordinator: ObservableObject {
 
 - Packet taps
   - `packetTap` receives individual packets with direction, payload, and protocol metadata.
-  - Use `dnsResolver`, `connectionPolicy`, and `latencyInjector` to override network behaviour; these closures can perform async work.
+- Use `dnsResolver` and `connectionPolicy` to override network behaviour; these closures can perform async work.
 - Packet analysis
   - Provide `packetStreamBuilder` to buffer packets for the built-in filter pipeline.
   - Use `trafficEventBusBuilder` to observe normalized `TrafficEvent` output sent from the extension.
+  - Access `providerController.forwardHostTracker` to map CDN edges back to the original service hostname; the tracker caches mappings for 10 minutes and coalesces duplicate lookups.
 - Event sink
   - Receive `.willStart`, `.didStart`, `.didStop`, `.didFail` from the tunnel.
 - Policies
-  - Use `policies.blockedHosts` to block specific domains; host matching is optimized for label-boundary checks.
+- Use `policies.blockedHosts` to block specific domains; host matching is optimized for label-boundary checks.
 
 ### Filter Pipeline
 
@@ -169,8 +170,8 @@ Filters conform to `TrafficFilter` and analyze buffered packets to emit normaliz
 struct MyCustomFilter: TrafficFilter {
     let identifier = "com.example.custom-filter"
 
-    func evaluate(snapshot: [RelativeProtocol.PacketSample], emit: @escaping @Sendable (RelativeProtocol.TrafficEvent) -> Void) {
-        let outbound = snapshot.filter { $0.direction == .outbound }
+    func evaluate(snapshot: UnsafeBufferPointer<RelativeProtocol.PacketSample>, emit: @escaping @Sendable (RelativeProtocol.TrafficEvent) -> Void) {
+        let outbound = snapshot.lazy.filter { $0.direction == .outbound }
         let totalBytes = outbound.reduce(0) { $0 + $1.byteCount }
         guard totalBytes > 250_000 else { return }
         emit(RelativeProtocol.TrafficEvent(

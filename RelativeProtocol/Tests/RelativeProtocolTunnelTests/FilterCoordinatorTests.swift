@@ -15,7 +15,7 @@ import Darwin
 
 private struct TestFilter: TrafficFilter {
     let identifier: String = "test.filter"
-    func evaluate(snapshot: [RelativeProtocol.PacketSample], emit: @escaping @Sendable (RelativeProtocol.TrafficEvent) -> Void) {
+    func evaluate(snapshot: UnsafeBufferPointer<RelativeProtocol.PacketSample>, emit: @escaping @Sendable (RelativeProtocol.TrafficEvent) -> Void) {
         guard snapshot.count >= 2 else { return }
         let event = RelativeProtocol.TrafficEvent(
             category: .burst,

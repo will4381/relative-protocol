@@ -61,24 +61,7 @@ final class VPNManager: ObservableObject {
 
     func prepare() async {
         guard !configurationReady else { return }
-        let interface = RelativeProtocol.Configuration.Interface(
-            address: "10.0.0.2",
-            subnetMask: "255.255.255.0",
-            remoteAddress: "10.0.0.1"
-        )
-        let configuration = RelativeProtocol.Configuration.fullTunnel(
-            interface: interface,
-            dnsServers: ["1.1.1.1"],
-            metrics: .init(isEnabled: false),
-            logging: .init(enableDebug: false)
-        )
-
-        let descriptor = RelativeProtocolHost.TunnelDescriptor(
-            providerBundleIdentifier: "relative-companies.Example.Example-Tunnel",
-            localizedDescription: "Relative Protocol Example",
-            configuration: configuration,
-            validateConfiguration: true
-        )
+        let descriptor = makeDescriptor()
 
         do {
             try await controller.prepareIfNeeded(descriptor: descriptor)
@@ -91,7 +74,10 @@ final class VPNManager: ObservableObject {
 
     func connect() async {
         do {
+            // Ensure configuration is up to date before connecting.
+            try await controller.configure(descriptor: makeDescriptor())
             try await controller.connect()
+            lastErrorMessage = controller.lastError
         } catch {
             lastErrorMessage = error.localizedDescription
         }
@@ -185,6 +171,32 @@ final class VPNManager: ObservableObject {
         case .decodingFailed(let error):
             return "decode failed: \(error.localizedDescription)"
         }
+    }
+
+    private func makeDescriptor() -> RelativeProtocolHost.TunnelDescriptor {
+        let configuration = makeConfiguration()
+        return RelativeProtocolHost.TunnelDescriptor(
+            providerBundleIdentifier: "relative-companies.Example.Example-Tunnel",
+            localizedDescription: "Relative Protocol Example",
+            configuration: configuration,
+            validateConfiguration: true
+        )
+    }
+
+    private func makeConfiguration() -> RelativeProtocol.Configuration {
+        let interface = RelativeProtocol.Configuration.Interface(
+            address: "10.0.0.2",
+            subnetMask: "255.255.255.0",
+            remoteAddress: "10.0.0.1"
+        )
+
+        return RelativeProtocol.Configuration.fullTunnel(
+            interface: interface,
+            dnsServers: ["1.1.1.1"],
+            metrics: .init(isEnabled: false),
+            policies: .init(blockedHosts: []),
+            logging: .init(enableDebug: false)
+        )
     }
 }
 

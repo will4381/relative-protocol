@@ -149,9 +149,6 @@ final class RelativeProtocolPerformanceTests: XCTestCase {
                 }
                 return .allow
             },
-            latencyInjector: { endpoint in
-                endpoint.transport == .udp ? 25 : nil
-            },
             eventSink: { _ in }
         )
 

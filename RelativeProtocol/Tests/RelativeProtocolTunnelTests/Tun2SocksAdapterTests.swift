@@ -15,6 +15,40 @@ import Network
 @testable import RelativeProtocolTunnel
 
 final class Tun2SocksAdapterTests: XCTestCase {
+    private func makeIPv4Packet(
+        source: (UInt8, UInt8, UInt8, UInt8) = (192, 0, 2, 10),
+        destination: (UInt8, UInt8, UInt8, UInt8) = (8, 8, 8, 8)
+    ) -> Data {
+        var bytes = [UInt8](repeating: 0, count: 20)
+        bytes[0] = 0x45 // Version 4, header length 5
+        bytes[8] = 64 // TTL
+        bytes[9] = 6 // TCP
+        bytes[12] = source.0
+        bytes[13] = source.1
+        bytes[14] = source.2
+        bytes[15] = source.3
+        bytes[16] = destination.0
+        bytes[17] = destination.1
+        bytes[18] = destination.2
+        bytes[19] = destination.3
+        return Data(bytes)
+    }
+
+    private func makeIPv6Packet(
+        source: [UInt8] = [0x26, 0x07, 0xf8, 0xb0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        destination: [UInt8] = [0x26, 0x07, 0xf8, 0xb0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02]
+    ) -> Data {
+        precondition(source.count == 16 && destination.count == 16)
+        var bytes = [UInt8](repeating: 0, count: 40)
+        bytes[0] = 0x60 // Version 6
+        for index in 0..<16 {
+            bytes[8 + index] = source[index]
+            bytes[24 + index] = destination[index]
+        }
+        bytes[6] = 17 // UDP
+        return Data(bytes)
+    }
+
     private func makeConfiguration(
         packetTap: @escaping @Sendable (RelativeProtocol.Configuration.PacketContext) -> Void,
         blockedHosts: [String] = [],
@@ -81,15 +115,16 @@ final class Tun2SocksAdapterTests: XCTestCase {
         try adapter.start()
         wait(for: [readLoopInstalled], timeout: 1.0)
 
+        let ipv4Packet = makeIPv4Packet()
         let engineReceived = expectation(description: "engine received packet")
         engine.onReceive = { packets, protocols in
             XCTAssertEqual(packets.count, 1)
             XCTAssertEqual(protocols.count, 1)
-            XCTAssertEqual(packets.first, Data([0x45, 0x00]))
+            XCTAssertEqual(packets.first, ipv4Packet)
             engineReceived.fulfill()
         }
 
-        flow.deliver(packets: [Data([0x45, 0x00])], protocols: [NSNumber(value: Int32(AF_INET))])
+        flow.deliver(packets: [ipv4Packet], protocols: [NSNumber(value: Int32(AF_INET))])
 
         wait(for: [engineReceived], timeout: 1.0)
     }
@@ -113,14 +148,15 @@ final class Tun2SocksAdapterTests: XCTestCase {
         wait(for: [readLoopInstalled], timeout: 1.0)
 
         let packetsWritten = expectation(description: "packets written")
+        let ipv6Packet = makeIPv6Packet()
         flow.onWrite = { packets, protocols in
             XCTAssertEqual(packets.count, 1)
             XCTAssertEqual(protocols.count, 1)
-            XCTAssertEqual(packets.first, Data([0x60, 0x00]))
+            XCTAssertEqual(packets.first, ipv6Packet)
             packetsWritten.fulfill()
         }
 
-        engine.emit(packets: [Data([0x60, 0x00])], protocols: [NSNumber(value: Int32(AF_INET6))])
+        engine.emit(packets: [ipv6Packet], protocols: [NSNumber(value: Int32(AF_INET6))])
 
         wait(for: [packetsWritten], timeout: 1.0)
     }
@@ -156,8 +192,10 @@ final class Tun2SocksAdapterTests: XCTestCase {
         try adapter.start()
         wait(for: [readLoopInstalled], timeout: 1.0)
 
-        flow.deliver(packets: [Data([0x45, 0x10, 0x00, 0x00])], protocols: [NSNumber(value: Int32(AF_INET))])
-        engine.emit(packets: [Data([0x60, 0x11, 0x00, 0x00])], protocols: [NSNumber(value: Int32(AF_INET6))])
+        let outboundPacket = makeIPv4Packet()
+        let inboundPacket = makeIPv6Packet()
+        flow.deliver(packets: [outboundPacket], protocols: [NSNumber(value: Int32(AF_INET))])
+        engine.emit(packets: [inboundPacket], protocols: [NSNumber(value: Int32(AF_INET6))])
 
         wait(for: [metricsExpectation], timeout: 1.0)
 
@@ -199,8 +237,8 @@ final class Tun2SocksAdapterTests: XCTestCase {
         try adapter.start()
         wait(for: [readLoopInstalled], timeout: 1.0)
 
-        flow.deliver(packets: [Data([0x45, 0x00])], protocols: [NSNumber(value: Int32(AF_INET))])
-        engine.emit(packets: [Data([0x60, 0x00])], protocols: [NSNumber(value: Int32(AF_INET6))])
+        flow.deliver(packets: [makeIPv4Packet()], protocols: [NSNumber(value: Int32(AF_INET))])
+        engine.emit(packets: [makeIPv6Packet()], protocols: [NSNumber(value: Int32(AF_INET6))])
 
         let snapshotExpectation = expectation(description: "stream recorded samples")
         DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
@@ -208,6 +246,71 @@ final class Tun2SocksAdapterTests: XCTestCase {
                 if samples.count >= 2 {
                     snapshotExpectation.fulfill()
                 }
+            }
+        }
+
+        wait(for: [snapshotExpectation], timeout: 1.0)
+        adapter.stop()
+    }
+
+    func testPrivateTrafficIsNotBuffered() throws {
+        let flow = MockPacketFlow()
+        let provider = MockProvider(flow: flow)
+        let engine = MockTun2SocksEngine()
+
+        var configuration = makeConfiguration { _ in }
+        let stream = RelativeProtocol.PacketStream(configuration: .init(bufferDuration: 60))
+        configuration.hooks.packetStreamBuilder = { stream }
+
+        let adapter = Tun2SocksAdapter(
+            provider: provider,
+            configuration: configuration,
+            metrics: nil,
+            engine: engine,
+            hooks: configuration.hooks
+        )
+
+        let readLoopInstalled = expectation(description: "read loop installed")
+        flow.onRead = fulfillOnce(expectation: readLoopInstalled)
+
+        try adapter.start()
+        wait(for: [readLoopInstalled], timeout: 1.0)
+
+        let privateOutbound = makeIPv4Packet(destination: (192, 168, 1, 1))
+        flow.deliver(packets: [privateOutbound], protocols: [NSNumber(value: Int32(AF_INET))])
+
+        let privateInbound = makeIPv6Packet(
+            source: [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            destination: [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]
+        )
+        engine.emit(packets: [privateInbound], protocols: [NSNumber(value: Int32(AF_INET6))])
+
+        let snapshotExpectation = expectation(description: "snapshot complete")
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
+            stream.snapshot { samples in
+                if !samples.isEmpty {
+                    let descriptions = samples.map { sample -> String in
+                        let direction = sample.direction.rawValue
+                        let bytes = sample.byteCount
+                        if let metadata = sample.metadata {
+                            let remote = metadata.remoteAddress(for: sample.direction)
+                            let local = metadata.localAddress(for: sample.direction)
+                            let transport: String
+                            switch metadata.transport {
+                            case let .tcp(sourcePort, destinationPort):
+                                transport = "tcp \(sourcePort)->\(destinationPort)"
+                            case let .udp(sourcePort, destinationPort):
+                                transport = "udp \(sourcePort)->\(destinationPort)"
+                            case let .other(number):
+                                transport = "proto \(number)"
+                            }
+                            return "\(direction) \(bytes)B remote=\(remote) local=\(local) \(transport)"
+                        }
+                        return "\(direction) \(bytes)B"
+                    }.joined(separator: "; ")
+                    XCTFail("PacketStream captured \(samples.count) samples for private endpoints: \(descriptions)")
+                }
+                snapshotExpectation.fulfill()
             }
         }
 
@@ -323,6 +426,7 @@ final class Tun2SocksAdapterTests: XCTestCase {
         XCTAssertEqual(provider.udpRequests.count, 1)
         adapter.stop()
     }
+
 }
 
 // MARK: - Test doubles

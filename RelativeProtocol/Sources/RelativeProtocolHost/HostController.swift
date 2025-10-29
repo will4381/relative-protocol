@@ -112,12 +112,37 @@ public extension RelativeProtocolHost {
                     _ = try? descriptor.configuration.validateOrThrow()
                 }
 
-                if activeManager.protocolConfiguration == nil {
+                if let existingProto = activeManager.protocolConfiguration as? NETunnelProviderProtocol {
+                    let desiredConfig = descriptor.configuration.providerConfigurationDictionary()
+                    let currentConfig = existingProto.providerConfiguration as? [String: NSObject] ?? [:]
+                    let currentDict = NSDictionary(dictionary: currentConfig)
+                    let configChanged = !currentDict.isEqual(to: desiredConfig)
+                        || existingProto.providerBundleIdentifier != descriptor.providerBundleIdentifier
+                        || (existingProto.serverAddress ?? "") != descriptor.serverAddress
+                        || existingProto.includeAllNetworks != descriptor.includeAllNetworks
+                        || existingProto.excludeLocalNetworks != descriptor.excludeLocalNetworks
+                        || existingProto.disconnectOnSleep != descriptor.disconnectOnSleep
+                        || activeManager.localizedDescription != descriptor.localizedDescription
+
+                    if configChanged {
+                        existingProto.providerBundleIdentifier = descriptor.providerBundleIdentifier
+                        existingProto.serverAddress = descriptor.serverAddress
+                        existingProto.includeAllNetworks = descriptor.includeAllNetworks
+                        existingProto.excludeLocalNetworks = descriptor.excludeLocalNetworks
+                        existingProto.disconnectOnSleep = descriptor.disconnectOnSleep
+                        existingProto.providerConfiguration = desiredConfig
+                        activeManager.protocolConfiguration = existingProto
+                        activeManager.localizedDescription = descriptor.localizedDescription
+                        activeManager.isEnabled = true
+                        try await Self.save(activeManager)
+                        try await Self.loadPreferences(for: activeManager)
+                    } else if activeManager.isEnabled == false {
+                        activeManager.isEnabled = true
+                        try await Self.save(activeManager)
+                        try await Self.loadPreferences(for: activeManager)
+                    }
+                } else {
                     try await apply(descriptor: descriptor, to: activeManager)
-                } else if activeManager.isEnabled == false {
-                    activeManager.isEnabled = true
-                    try await Self.save(activeManager)
-                    try await Self.loadPreferences(for: activeManager)
                 }
 
                 manager = activeManager

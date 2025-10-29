@@ -11,6 +11,7 @@
 //
 
 import Foundation
+import Collections
 import RelativeProtocolCore
 
 /// Serialises metrics aggregation and emission.
@@ -31,7 +32,7 @@ final class MetricsCollector {
     private var outbound = Counter()
     private var activeTCP = 0
     private var activeUDP = 0
-    private var errors: [RelativeProtocol.MetricsSnapshot.ErrorEvent] = []
+    private var errors: Deque<RelativeProtocol.MetricsSnapshot.ErrorEvent> = []
     private var lastReport = Date()
     private let interval: TimeInterval
     private let maxErrorEvents: Int
@@ -91,8 +92,8 @@ final class MetricsCollector {
         guard !trimmed.isEmpty else { return }
         queue.async { [self] in
             errors.append(.init(message: trimmed))
-            if errors.count > maxErrorEvents {
-                errors.removeFirst(errors.count - maxErrorEvents)
+            while errors.count > maxErrorEvents {
+                _ = errors.popFirst()
             }
             dirty = true
             emitIfNeeded(force: true)
@@ -122,7 +123,7 @@ final class MetricsCollector {
             dirty = false
             return
         }
-        let snapshotErrors = errors
+        let snapshotErrors = Array(errors)
         defer {
             lastReport = now
             self.inbound = Counter()

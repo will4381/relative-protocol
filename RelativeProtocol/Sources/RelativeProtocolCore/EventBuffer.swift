@@ -11,6 +11,7 @@
 
 import Foundation
 import Dispatch
+import Collections
 
 public extension RelativeProtocol {
     /// Stores generated traffic events until the consumer is ready to flush.
@@ -27,7 +28,7 @@ public extension RelativeProtocol {
 
         private let queue: DispatchQueue
         private let configuration: Configuration
-        private var events: [TrafficEvent] = []
+        private var events: Deque<TrafficEvent> = []
         private var lastFlush = Date()
 
         public init(
@@ -61,7 +62,7 @@ public extension RelativeProtocol {
                     events.removeAll(keepingCapacity: true)
                     lastFlush = Date()
                 }
-                return events
+                return Array(events)
             }
         }
 

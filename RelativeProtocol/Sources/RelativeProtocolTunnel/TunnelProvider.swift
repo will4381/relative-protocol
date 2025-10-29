@@ -33,6 +33,10 @@ public extension RelativeProtocolTunnel {
         private var filterConfiguration: FilterConfiguration = .init()
         private var pendingFilterInstallers: [(@Sendable (FilterCoordinator) -> Void)] = []
 
+        public var forwardHostTracker: ForwardHostTracker? {
+            adapter?.hostTracker
+        }
+
         /// - Parameters:
         ///   - provider: The Network Extension provider the controller manages.
         ///   - logger: Optional custom logger for diagnostics.
