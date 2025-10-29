@@ -179,6 +179,9 @@ final class VPNManager: ObservableObject {
             providerBundleIdentifier: "relative-companies.Example.Example-Tunnel",
             localizedDescription: "Relative Protocol Example",
             configuration: configuration,
+            includeAllNetworks: false,
+            excludeLocalNetworks: false,
+            excludeAPNs: true,
             validateConfiguration: true
         )
     }
@@ -190,9 +193,26 @@ final class VPNManager: ObservableObject {
             remoteAddress: "10.0.0.1"
         )
 
+        let appleIPv6Exclusions: [RelativeProtocol.Configuration.IPv6Route] = [
+            .destination("2403:300::", prefixLength: 32),
+            .destination("2620:149::", prefixLength: 32)
+        ]
+
+        let ipv6 = RelativeProtocol.Configuration.IPv6(
+            addresses: ["fd00:1::2"],
+            networkPrefixLengths: [64],
+            excludedRoutes: appleIPv6Exclusions
+        )
+
         return RelativeProtocol.Configuration.fullTunnel(
             interface: interface,
             dnsServers: ["1.1.1.1"],
+            includeAllNetworks: false,
+            excludeLocalNetworks: false,
+            excludedIPv4Routes: [
+                .destination("17.0.0.0", subnetMask: "255.0.0.0")
+            ],
+            ipv6: ipv6,
             metrics: .init(isEnabled: false),
             policies: .init(blockedHosts: []),
             logging: .init(enableDebug: false)

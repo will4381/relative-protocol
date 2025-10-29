@@ -24,6 +24,7 @@ public extension RelativeProtocolHost {
         public var configuration: RelativeProtocol.Configuration
         public var includeAllNetworks: Bool
         public var excludeLocalNetworks: Bool
+        public var excludeAPNs: Bool
         public var disconnectOnSleep: Bool
         public var validateConfiguration: Bool
 
@@ -34,6 +35,7 @@ public extension RelativeProtocolHost {
             configuration: RelativeProtocol.Configuration,
             includeAllNetworks: Bool = true,
             excludeLocalNetworks: Bool = false,
+            excludeAPNs: Bool = false,
             disconnectOnSleep: Bool = false,
             validateConfiguration: Bool = false
         ) {
@@ -43,6 +45,7 @@ public extension RelativeProtocolHost {
             self.configuration = configuration
             self.includeAllNetworks = includeAllNetworks
             self.excludeLocalNetworks = excludeLocalNetworks
+            self.excludeAPNs = excludeAPNs
             self.disconnectOnSleep = disconnectOnSleep
             self.validateConfiguration = validateConfiguration
         }
@@ -116,7 +119,7 @@ public extension RelativeProtocolHost {
                     let desiredConfig = descriptor.configuration.providerConfigurationDictionary()
                     let currentConfig = existingProto.providerConfiguration as? [String: NSObject] ?? [:]
                     let currentDict = NSDictionary(dictionary: currentConfig)
-                    let configChanged = !currentDict.isEqual(to: desiredConfig)
+                    var configChanged = !currentDict.isEqual(to: desiredConfig)
                         || existingProto.providerBundleIdentifier != descriptor.providerBundleIdentifier
                         || (existingProto.serverAddress ?? "") != descriptor.serverAddress
                         || existingProto.includeAllNetworks != descriptor.includeAllNetworks
@@ -124,11 +127,22 @@ public extension RelativeProtocolHost {
                         || existingProto.disconnectOnSleep != descriptor.disconnectOnSleep
                         || activeManager.localizedDescription != descriptor.localizedDescription
 
+                    if #available(iOS 16.4, macOS 13.3, *) {
+                        if existingProto.excludeAPNs != descriptor.excludeAPNs {
+                            configChanged = true
+                        }
+                    } else if descriptor.excludeAPNs {
+                        log.warning("excludeAPNs requested but requires iOS 16.4 / macOS 13.3 or newer")
+                    }
+
                     if configChanged {
                         existingProto.providerBundleIdentifier = descriptor.providerBundleIdentifier
                         existingProto.serverAddress = descriptor.serverAddress
                         existingProto.includeAllNetworks = descriptor.includeAllNetworks
                         existingProto.excludeLocalNetworks = descriptor.excludeLocalNetworks
+                        if #available(iOS 16.4, macOS 13.3, *) {
+                            existingProto.excludeAPNs = descriptor.excludeAPNs
+                        }
                         existingProto.disconnectOnSleep = descriptor.disconnectOnSleep
                         existingProto.providerConfiguration = desiredConfig
                         activeManager.protocolConfiguration = existingProto
@@ -200,8 +214,13 @@ public extension RelativeProtocolHost {
             let proto = NETunnelProviderProtocol()
             proto.providerBundleIdentifier = descriptor.providerBundleIdentifier
             proto.serverAddress = descriptor.serverAddress
-            proto.includeAllNetworks = descriptor.includeAllNetworks
-            proto.excludeLocalNetworks = descriptor.excludeLocalNetworks
+        proto.includeAllNetworks = descriptor.includeAllNetworks
+        proto.excludeLocalNetworks = descriptor.excludeLocalNetworks
+        if #available(iOS 16.4, macOS 13.3, *) {
+            proto.excludeAPNs = descriptor.excludeAPNs
+        } else if descriptor.excludeAPNs {
+            log.warning("excludeAPNs requested but requires iOS 16.4 / macOS 13.3 or newer")
+        }
             proto.disconnectOnSleep = descriptor.disconnectOnSleep
             proto.providerConfiguration = descriptor.configuration.providerConfigurationDictionary()
 

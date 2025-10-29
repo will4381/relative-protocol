@@ -142,6 +142,9 @@ public extension RelativeProtocol.Configuration {
     struct Provider: Codable, Equatable, Sendable {
         public var mtu: Int
         public var ipv4: IPv4
+        public var ipv6: IPv6?
+        public var includeAllNetworks: Bool = true
+        public var excludeLocalNetworks: Bool = false
         public var dns: DNS
         public var metrics: MetricsOptions
         public var policies: Policies
@@ -149,12 +152,18 @@ public extension RelativeProtocol.Configuration {
         public init(
             mtu: Int = 1500,
             ipv4: IPv4 = .default,
+            ipv6: IPv6? = nil,
+            includeAllNetworks: Bool = true,
+            excludeLocalNetworks: Bool = false,
             dns: DNS = .default,
             metrics: MetricsOptions = .default,
             policies: Policies = .default
         ) {
             self.mtu = mtu
             self.ipv4 = ipv4
+            self.ipv6 = ipv6
+            self.includeAllNetworks = includeAllNetworks
+            self.excludeLocalNetworks = excludeLocalNetworks
             self.dns = dns
             self.metrics = metrics
             self.policies = policies
@@ -192,25 +201,30 @@ public extension RelativeProtocol.Configuration {
         public var address: String
         public var subnetMask: String
         public var remoteAddress: String
-        public var includedRoutes: [Route]
+        public var includedRoutes: [Route] = [.default]
+        public var excludedRoutes: [Route] = []
 
         public init(
             address: String,
             subnetMask: String,
             remoteAddress: String,
-            includedRoutes: [Route] = [.default]
+            includedRoutes: [Route] = [.default],
+            excludedRoutes: [Route] = []
         ) {
             self.address = address
             self.subnetMask = subnetMask
             self.remoteAddress = remoteAddress
             self.includedRoutes = includedRoutes
+            self.excludedRoutes = excludedRoutes
         }
 
         public static var `default`: IPv4 {
             IPv4(
                 address: "10.0.0.2",
                 subnetMask: "255.255.255.0",
-                remoteAddress: "198.51.100.1"
+                remoteAddress: "198.51.100.1",
+                includedRoutes: [.default],
+                excludedRoutes: []
             )
         }
     }
@@ -227,6 +241,39 @@ public extension RelativeProtocol.Configuration {
 
         public static var `default`: Route {
             Route(destinationAddress: "0.0.0.0", subnetMask: "0.0.0.0")
+        }
+    }
+
+    struct IPv6: Codable, Equatable, Sendable {
+        public var addresses: [String]
+        public var networkPrefixLengths: [Int]
+        public var includedRoutes: [IPv6Route]
+        public var excludedRoutes: [IPv6Route]
+
+        public init(
+            addresses: [String],
+            networkPrefixLengths: [Int],
+            includedRoutes: [IPv6Route] = [.default],
+            excludedRoutes: [IPv6Route] = []
+        ) {
+            self.addresses = addresses
+            self.networkPrefixLengths = networkPrefixLengths
+            self.includedRoutes = includedRoutes
+            self.excludedRoutes = excludedRoutes
+        }
+    }
+
+    struct IPv6Route: Codable, Equatable, Sendable {
+        public var destinationAddress: String
+        public var networkPrefixLength: Int
+
+        public init(destinationAddress: String, networkPrefixLength: Int) {
+            self.destinationAddress = destinationAddress
+            self.networkPrefixLength = networkPrefixLength
+        }
+
+        public static var `default`: IPv6Route {
+            IPv6Route(destinationAddress: "::", networkPrefixLength: 0)
         }
     }
 

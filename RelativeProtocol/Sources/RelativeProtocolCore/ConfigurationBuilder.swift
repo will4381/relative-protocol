@@ -29,6 +29,10 @@ public extension RelativeProtocol.Configuration {
         interface: Interface,
         dnsServers: [String],
         mtu: Int = 1500,
+        includeAllNetworks: Bool = true,
+        excludeLocalNetworks: Bool = false,
+        excludedIPv4Routes: [RelativeProtocol.Configuration.Route] = [],
+        ipv6: RelativeProtocol.Configuration.IPv6? = nil,
         metrics: RelativeProtocol.Configuration.MetricsOptions = .default,
         policies: RelativeProtocol.Configuration.Policies = .default,
         hooks: RelativeProtocol.Configuration.Hooks = .init(),
@@ -41,8 +45,12 @@ public extension RelativeProtocol.Configuration {
                     address: interface.address,
                     subnetMask: interface.subnetMask,
                     remoteAddress: interface.remoteAddress,
-                    includedRoutes: [.default]
+                    includedRoutes: [.default],
+                    excludedRoutes: excludedIPv4Routes
                 ),
+                ipv6: ipv6,
+                includeAllNetworks: includeAllNetworks,
+                excludeLocalNetworks: excludeLocalNetworks,
                 dns: .init(servers: dnsServers),
                 metrics: metrics,
                 policies: policies
@@ -57,6 +65,10 @@ public extension RelativeProtocol.Configuration {
         routes: [RelativeProtocol.Configuration.Route],
         dnsServers: [String],
         mtu: Int = 1500,
+        includeAllNetworks: Bool = false,
+        excludeLocalNetworks: Bool = false,
+        excludedIPv4Routes: [RelativeProtocol.Configuration.Route] = [],
+        ipv6: RelativeProtocol.Configuration.IPv6? = nil,
         metrics: RelativeProtocol.Configuration.MetricsOptions = .default,
         policies: RelativeProtocol.Configuration.Policies = .default,
         hooks: RelativeProtocol.Configuration.Hooks = .init(),
@@ -69,8 +81,12 @@ public extension RelativeProtocol.Configuration {
                     address: interface.address,
                     subnetMask: interface.subnetMask,
                     remoteAddress: interface.remoteAddress,
-                    includedRoutes: routes
+                    includedRoutes: routes,
+                    excludedRoutes: excludedIPv4Routes
                 ),
+                ipv6: ipv6,
+                includeAllNetworks: includeAllNetworks,
+                excludeLocalNetworks: excludeLocalNetworks,
                 dns: .init(servers: dnsServers),
                 metrics: metrics,
                 policies: policies
@@ -84,5 +100,11 @@ public extension RelativeProtocol.Configuration {
 public extension RelativeProtocol.Configuration.Route {
     static func destination(_ address: String, subnetMask: String) -> Self {
         Self(destinationAddress: address, subnetMask: subnetMask)
+    }
+}
+
+public extension RelativeProtocol.Configuration.IPv6Route {
+    static func destination(_ address: String, prefixLength: Int) -> Self {
+        Self(destinationAddress: address, networkPrefixLength: prefixLength)
     }
 }

@@ -153,7 +153,27 @@ public extension RelativeProtocolTunnel {
             ipv4Settings.includedRoutes = routes.map { route in
                 NEIPv4Route(destinationAddress: route.destinationAddress, subnetMask: route.subnetMask)
             }
+            if !ipv4.excludedRoutes.isEmpty {
+                ipv4Settings.excludedRoutes = ipv4.excludedRoutes.map { route in
+                    NEIPv4Route(destinationAddress: route.destinationAddress, subnetMask: route.subnetMask)
+                }
+            }
             settings.ipv4Settings = ipv4Settings
+            if let ipv6 = configuration.provider.ipv6 {
+                let prefixLengths = ipv6.networkPrefixLengths.map { NSNumber(value: $0) }
+                let ipv6Settings = NEIPv6Settings(addresses: ipv6.addresses, networkPrefixLengths: prefixLengths)
+                if !ipv6.includedRoutes.isEmpty {
+                    ipv6Settings.includedRoutes = ipv6.includedRoutes.map { route in
+                        NEIPv6Route(destinationAddress: route.destinationAddress, networkPrefixLength: NSNumber(value: route.networkPrefixLength))
+                    }
+                }
+                if !ipv6.excludedRoutes.isEmpty {
+                    ipv6Settings.excludedRoutes = ipv6.excludedRoutes.map { route in
+                        NEIPv6Route(destinationAddress: route.destinationAddress, networkPrefixLength: NSNumber(value: route.networkPrefixLength))
+                    }
+                }
+                settings.ipv6Settings = ipv6Settings
+            }
 
             let dns = configuration.provider.dns
             if !dns.servers.isEmpty {

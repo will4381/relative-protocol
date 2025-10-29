@@ -102,6 +102,19 @@ final class TunnelViewModel: ObservableObject {
         let configuration = RelativeProtocol.Configuration.fullTunnel(
             interface: interface,
             dnsServers: ["1.1.1.1", "8.8.8.8"],
+            includeAllNetworks: false,
+            excludeLocalNetworks: false,
+            excludedIPv4Routes: [
+                .destination("17.0.0.0", subnetMask: "255.0.0.0")
+            ],
+            ipv6: .init(
+                addresses: ["fd00:1::2"],
+                networkPrefixLengths: [64],
+                excludedRoutes: [
+                    .destination("2403:300::", prefixLength: 32),
+                    .destination("2620:149::", prefixLength: 32)
+                ]
+            ),
             policies: .init(blockedHosts: ["example.com"]),
             hooks: .init(eventSink: { print("Tunnel event: \($0)") })
         )
@@ -110,6 +123,9 @@ final class TunnelViewModel: ObservableObject {
             providerBundleIdentifier: "com.example.MyApp.Tunnel",
             localizedDescription: "MyApp Tunnel",
             configuration: configuration,
+            includeAllNetworks: false,
+            excludeLocalNetworks: false,
+            excludeAPNs: true,
             validateConfiguration: true
         )
 
