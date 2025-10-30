@@ -31,6 +31,7 @@ private let byteFormatter: ByteCountFormatter = {
 @MainActor
 struct ContentView: View {
     @StateObject private var vpn = VPNManager.shared
+    @State private var newRulePattern = ""
 
     var body: some View {
         ScrollView {
@@ -73,6 +74,148 @@ struct ContentView: View {
                     Task { await vpn.probeHTTP() }
                 }
                 .disabled(vpn.isBusy)
+
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("Global Traffic Shaping")
+                        .font(.headline)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Added latency")
+                            .font(.subheadline)
+                        Slider(
+                            value: Binding(
+                                get: { vpn.shapingConfiguration.defaultLatencyMs },
+                                set: { vpn.setDefaultLatency($0) }
+                            ),
+                            in: 0...500,
+                            step: 10
+                        )
+                        HStack {
+                            Text("0 ms")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Text("500 ms")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Text("\(Int(vpn.shapingConfiguration.defaultLatencyMs)) ms added to all traffic")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Bandwidth ceiling")
+                            .font(.subheadline)
+                        Slider(
+                            value: Binding(
+                                get: { vpn.shapingConfiguration.defaultBandwidthKbps },
+                                set: { vpn.setDefaultBandwidth($0) }
+                            ),
+                            in: 0...4096,
+                            step: 64
+                        )
+                        HStack {
+                            Text("Unlimited")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Text("4 Mbps")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Text(defaultBandwidthDescription)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.horizontal)
+
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Per-Domain Overrides")
+                        .font(.headline)
+
+                    HStack(spacing: 12) {
+                        TextField("Domain or wildcard (e.g. *.example.com)", text: $newRulePattern)
+                            .textFieldStyle(.roundedBorder)
+                            .textInputAutocapitalization(.never)
+                            .disableAutocorrection(true)
+                        Button("Add") {
+                            vpn.addRule(pattern: newRulePattern)
+                            newRulePattern = ""
+                        }
+                        .disabled(newRulePattern.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+
+                    if vpn.shapingConfiguration.rules.isEmpty {
+                        Text("Add wildcard or host-specific rules to override the global profile.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        VStack(alignment: .leading, spacing: 12) {
+                            ForEach(vpn.shapingConfiguration.rules) { rule in
+                                VStack(alignment: .leading, spacing: 8) {
+                                    TextField(
+                                        "Pattern",
+                                        text: Binding(
+                                            get: { rule.pattern },
+                                            set: { vpn.setRulePattern($0, for: rule.id) }
+                                        )
+                                    )
+                                    .textFieldStyle(.roundedBorder)
+                                    .textInputAutocapitalization(.never)
+                                    .disableAutocorrection(true)
+
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("Latency")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                        Slider(
+                                            value: Binding(
+                                                get: { rule.latencyMs },
+                                                set: { vpn.setRuleLatency($0, for: rule.id) }
+                                            ),
+                                            in: 0...500,
+                                            step: 10
+                                        )
+                                        Text("\(Int(rule.latencyMs)) ms added")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("Bandwidth")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                        Slider(
+                                            value: Binding(
+                                                get: { rule.bandwidthKbps },
+                                                set: { vpn.setRuleBandwidth($0, for: rule.id) }
+                                            ),
+                                            in: 0...4096,
+                                            step: 64
+                                        )
+                                        Text(perRuleBandwidthDescription(rule.bandwidthKbps))
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+
+                                    Button(role: .destructive) {
+                                        vpn.removeRule(id: rule.id)
+                                    } label: {
+                                        Label("Remove Rule", systemImage: "trash")
+                                            .font(.caption)
+                                    }
+                                    .buttonStyle(.borderless)
+                                }
+                                .padding(12)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(Color.gray.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal)
 
                 if let probe = vpn.lastProbeResult {
                     Text("Probe: \(probe)")
@@ -199,6 +342,27 @@ struct ContentView: View {
                 await vpn.connect()
             }
         }
+    }
+
+    private var defaultBandwidthDescription: String {
+        let kbps = vpn.shapingConfiguration.defaultBandwidthKbps
+        if kbps <= 0 {
+            return "Unlimited throughput"
+        }
+        if kbps >= 1000 {
+            return String(format: "%.1f Mbps ceiling", kbps / 1000.0)
+        }
+        return "\(Int(kbps)) Kbps ceiling"
+    }
+
+    private func perRuleBandwidthDescription(_ kbps: Double) -> String {
+        if kbps <= 0 {
+            return "Unlimited throughput"
+        }
+        if kbps >= 1000 {
+            return String(format: "%.1f Mbps ceiling", kbps / 1000.0)
+        }
+        return "\(Int(kbps)) Kbps ceiling"
     }
 }
 

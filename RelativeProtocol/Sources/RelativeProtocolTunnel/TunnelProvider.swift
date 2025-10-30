@@ -131,6 +131,15 @@ public extension RelativeProtocolTunnel {
             }
         }
 
+        /// Updates traffic shaping policies on the active adapter without requiring a tunnel restart.
+        public func updateTrafficShaping(_ shaping: RelativeProtocol.Configuration.TrafficShaping) {
+            if var current = configuration {
+                current.provider.policies.trafficShaping = shaping
+                configuration = current
+            }
+            adapter?.updateTrafficShaping(configuration: shaping)
+        }
+
         /// Handles messages received from the host app.
         public func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
             guard !messageData.isEmpty else {
@@ -204,7 +213,8 @@ public extension RelativeProtocolTunnel {
                 configuration: configuration,
                 metrics: metrics,
                 engine: engine,
-                hooks: configuration.hooks
+                hooks: configuration.hooks,
+                logger: logger
             )
             do {
                 try adapter.start()

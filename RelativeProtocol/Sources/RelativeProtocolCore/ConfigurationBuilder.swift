@@ -35,6 +35,7 @@ public extension RelativeProtocol.Configuration {
         ipv6: RelativeProtocol.Configuration.IPv6? = nil,
         metrics: RelativeProtocol.Configuration.MetricsOptions = .default,
         policies: RelativeProtocol.Configuration.Policies = .default,
+        memory: RelativeProtocol.Configuration.MemoryBudget = .default,
         hooks: RelativeProtocol.Configuration.Hooks = .init(),
         logging: RelativeProtocol.Configuration.LoggingOptions = .default
     ) -> RelativeProtocol.Configuration {
@@ -53,7 +54,8 @@ public extension RelativeProtocol.Configuration {
                 excludeLocalNetworks: excludeLocalNetworks,
                 dns: .init(servers: dnsServers),
                 metrics: metrics,
-                policies: policies
+                policies: policies,
+                memory: memory
             ),
             hooks: hooks,
             logging: logging
@@ -71,6 +73,7 @@ public extension RelativeProtocol.Configuration {
         ipv6: RelativeProtocol.Configuration.IPv6? = nil,
         metrics: RelativeProtocol.Configuration.MetricsOptions = .default,
         policies: RelativeProtocol.Configuration.Policies = .default,
+        memory: RelativeProtocol.Configuration.MemoryBudget = .default,
         hooks: RelativeProtocol.Configuration.Hooks = .init(),
         logging: RelativeProtocol.Configuration.LoggingOptions = .default
     ) -> RelativeProtocol.Configuration {
@@ -89,7 +92,8 @@ public extension RelativeProtocol.Configuration {
                 excludeLocalNetworks: excludeLocalNetworks,
                 dns: .init(servers: dnsServers),
                 metrics: metrics,
-                policies: policies
+                policies: policies,
+                memory: memory
             ),
             hooks: hooks,
             logging: logging

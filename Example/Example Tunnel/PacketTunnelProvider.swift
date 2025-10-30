@@ -160,6 +160,15 @@ private extension PacketTunnelProvider {
                 total: siteCatalog.totalCount()
             )
             return encodeResponse(response, command: command.command)
+        case "setShaping":
+            guard let shaping = command.shaping else {
+                return encodeErrorResponse(command: command.command, message: "missing shaping payload")
+            }
+            let configuration = shaping.toRelativeConfiguration()
+            controller.updateTrafficShaping(configuration)
+            logger.notice("updated traffic shaping: defaultLatency=\(configuration.defaultPolicy?.fixedLatencyMilliseconds ?? 0, privacy: .public)ms rules=\(configuration.rules.count, privacy: .public)")
+            let response = ExampleAckResponse(command: command.command, total: siteCatalog.totalCount())
+            return encodeResponse(response, command: command.command)
         default:
             return encodeErrorResponse(command: command.command, message: "unsupported command")
         }
@@ -190,6 +199,7 @@ private struct ExampleControlCommand: Decodable {
     var command: String
     var value: Int?
     var limit: Int?
+    var shaping: ExampleTrafficShapingPayload?
 }
 
 private struct ExampleSitesResponse: Encodable {
@@ -205,6 +215,58 @@ private struct ExampleAckResponse: Encodable {
 private struct ExampleErrorResponse: Encodable {
     var command: String
     var error: String
+}
+
+private struct ExampleTrafficShapingPayload: Codable {
+    var defaultLatencyMs: Double
+    var defaultBandwidthKbps: Double
+    var rules: [ExampleTrafficShapingRulePayload]
+
+    func toRelativeConfiguration() -> RelativeProtocol.Configuration.TrafficShaping {
+        let defaultPolicy = Self.makePolicy(latencyMs: defaultLatencyMs, bandwidthKbps: defaultBandwidthKbps)
+        let compiledRules: [RelativeProtocol.Configuration.TrafficShapingRule] = rules.compactMap { rule in
+            let trimmed = rule.pattern.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            guard let policy = Self.makePolicy(latencyMs: rule.latencyMs, bandwidthKbps: rule.bandwidthKbps) else {
+                return nil
+            }
+            let tokens = trimmed.split(whereSeparator: { $0 == "," || $0 == " " }).map {
+                String($0).trimmingCharacters(in: .whitespacesAndNewlines)
+            }.filter { !$0.isEmpty }
+            var seen: Set<String> = []
+            let hosts = tokens.compactMap { value -> String? in
+                let lowercased = value.lowercased()
+                guard !lowercased.isEmpty, seen.insert(lowercased).inserted else { return nil }
+                return value
+            }.ifEmptyReplace(with: [trimmed])
+            return .init(hosts: hosts, ports: [], policy: policy)
+        }
+        return .init(defaultPolicy: defaultPolicy, rules: compiledRules)
+    }
+
+    private static func makePolicy(latencyMs: Double, bandwidthKbps: Double) -> RelativeProtocol.Configuration.TrafficShapingPolicy? {
+        let latency = max(0, Int(latencyMs.rounded()))
+        let bytesPerSecond = bandwidthKbps > 0 ? max(256, Int(((bandwidthKbps * 1000.0) / 8.0).rounded())) : nil
+        guard latency > 0 || bytesPerSecond != nil else { return nil }
+        let jitter = latency > 0 ? max(10, min(250, Int((latencyMs * 0.25).rounded()))) : 0
+        return .init(
+            fixedLatencyMilliseconds: latency,
+            jitterMilliseconds: jitter,
+            bytesPerSecond: bytesPerSecond
+        )
+    }
+}
+
+private struct ExampleTrafficShapingRulePayload: Codable {
+    var pattern: String
+    var latencyMs: Double
+   var bandwidthKbps: Double
+}
+
+private extension Array where Element == String {
+    func ifEmptyReplace(with fallback: [String]) -> [String] {
+        isEmpty ? fallback : self
+    }
 }
 
 // MARK: - Site Tracking

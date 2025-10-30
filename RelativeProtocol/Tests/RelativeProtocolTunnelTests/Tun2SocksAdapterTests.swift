@@ -11,10 +11,13 @@
 import Foundation
 import XCTest
 import Network
+import os.log
 @testable import RelativeProtocolCore
 @testable import RelativeProtocolTunnel
 
 final class Tun2SocksAdapterTests: XCTestCase {
+    private let testLogger = Logger(subsystem: "RelativeProtocolTests", category: "AdapterTests")
+
     private func makeIPv4Packet(
         source: (UInt8, UInt8, UInt8, UInt8) = (192, 0, 2, 10),
         destination: (UInt8, UInt8, UInt8, UInt8) = (8, 8, 8, 8)
@@ -81,7 +84,8 @@ final class Tun2SocksAdapterTests: XCTestCase {
             configuration: configuration,
             metrics: nil,
             engine: engine,
-            hooks: configuration.hooks
+            hooks: configuration.hooks,
+            logger: testLogger
         )
 
         let readLoopInstalled = expectation(description: "read loop installed")
@@ -106,7 +110,8 @@ final class Tun2SocksAdapterTests: XCTestCase {
             configuration: configuration,
             metrics: nil,
             engine: engine,
-            hooks: configuration.hooks
+            hooks: configuration.hooks,
+            logger: testLogger
         )
 
         let readLoopInstalled = expectation(description: "read loop installed")
@@ -139,7 +144,8 @@ final class Tun2SocksAdapterTests: XCTestCase {
             configuration: configuration,
             metrics: nil,
             engine: engine,
-            hooks: configuration.hooks
+            hooks: configuration.hooks,
+            logger: testLogger
         )
 
         let readLoopInstalled = expectation(description: "read loop installed")
@@ -159,6 +165,62 @@ final class Tun2SocksAdapterTests: XCTestCase {
         engine.emit(packets: [ipv6Packet], protocols: [NSNumber(value: Int32(AF_INET6))])
 
         wait(for: [packetsWritten], timeout: 1.0)
+    }
+
+    func testTrafficShapingPolicyStoreMatchesHostSuffix() {
+        let policy = RelativeProtocol.Configuration.TrafficShapingPolicy(
+            fixedLatencyMilliseconds: 50,
+            jitterMilliseconds: 10,
+            bytesPerSecond: 512_000
+        )
+        let rule = RelativeProtocol.Configuration.TrafficShapingRule(
+            hosts: ["*.example.com"],
+            policy: policy
+        )
+        let shaping = RelativeProtocol.Configuration.TrafficShaping(
+            defaultPolicy: nil,
+            rules: [rule]
+        )
+        let store = TrafficShapingPolicyStore(configuration: shaping)
+
+        XCTAssertTrue(store.hasPolicies)
+
+        let key = PolicyKey(
+            host: "cdn.example.com",
+            ip: "203.0.113.10",
+            port: 443,
+            protocolNumber: 6
+        )
+
+        let matched = store.policy(for: key)
+        XCTAssertNotNil(matched)
+        XCTAssertEqual(matched?.fixedLatencyMilliseconds, 50)
+    }
+
+    func testTrafficShapingPolicyStoreFallsBackToDefault() {
+        let defaultPolicy = RelativeProtocol.Configuration.TrafficShapingPolicy(
+            fixedLatencyMilliseconds: 25,
+            jitterMilliseconds: 0,
+            bytesPerSecond: nil
+        )
+        let shaping = RelativeProtocol.Configuration.TrafficShaping(
+            defaultPolicy: defaultPolicy,
+            rules: []
+        )
+        let store = TrafficShapingPolicyStore(configuration: shaping)
+
+        XCTAssertTrue(store.hasPolicies)
+
+        let key = PolicyKey(
+            host: nil,
+            ip: "198.51.100.2",
+            port: 123,
+            protocolNumber: 17
+        )
+
+        let matched = store.policy(for: key)
+        XCTAssertNotNil(matched)
+        XCTAssertEqual(matched?.fixedLatencyMilliseconds, 25)
     }
 
     func testRoundTripEmitsMetricsAndPacketTap() throws {
@@ -184,7 +246,8 @@ final class Tun2SocksAdapterTests: XCTestCase {
             configuration: configuration,
             metrics: metrics,
             engine: engine,
-            hooks: configuration.hooks
+            hooks: configuration.hooks,
+            logger: testLogger
         )
 
         let readLoopInstalled = expectation(description: "read loop installed")
@@ -226,7 +289,8 @@ final class Tun2SocksAdapterTests: XCTestCase {
             configuration: configuration,
             metrics: nil,
             engine: engine,
-            hooks: configuration.hooks
+            hooks: configuration.hooks,
+            logger: testLogger
         )
 
         XCTAssertNotNil(adapter.analyzer)
@@ -267,7 +331,8 @@ final class Tun2SocksAdapterTests: XCTestCase {
             configuration: configuration,
             metrics: nil,
             engine: engine,
-            hooks: configuration.hooks
+            hooks: configuration.hooks,
+            logger: testLogger
         )
 
         let readLoopInstalled = expectation(description: "read loop installed")
@@ -332,7 +397,8 @@ final class Tun2SocksAdapterTests: XCTestCase {
             configuration: configuration,
             metrics: nil,
             engine: engine,
-            hooks: configuration.hooks
+            hooks: configuration.hooks,
+            logger: testLogger
         )
 
         let readLoopInstalled = expectation(description: "read loop installed")
@@ -370,7 +436,8 @@ final class Tun2SocksAdapterTests: XCTestCase {
             configuration: configuration,
             metrics: nil,
             engine: engine,
-            hooks: configuration.hooks
+            hooks: configuration.hooks,
+            logger: testLogger
         )
 
         let readLoopInstalled = expectation(description: "read loop installed")
@@ -408,7 +475,8 @@ final class Tun2SocksAdapterTests: XCTestCase {
             configuration: configuration,
             metrics: nil,
             engine: engine,
-            hooks: configuration.hooks
+            hooks: configuration.hooks,
+            logger: testLogger
         )
 
         let readLoopInstalled = expectation(description: "read loop installed")

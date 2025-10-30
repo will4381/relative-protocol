@@ -46,7 +46,8 @@ final class GoTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
             let network = NetworkAdapter(
                 callbacks: callbacks,
                 logger: logger,
-                mtu: configuration.provider.mtu
+                mtu: configuration.provider.mtu,
+                memory: configuration.provider.memory
             )
 
             var creationError: NSError?
@@ -163,16 +164,20 @@ private final class NetworkAdapter: NSObject, BridgeNetworkProtocol {
     private let callbacks: Tun2SocksCallbacks
     private let logger: Logger
     private let mtu: Int
+    private let memory: RelativeProtocol.Configuration.MemoryBudget
+    private let sendWindow: SendWindow
     private let lock = DispatchQueue(label: "RelativeProtocolTunnel.NetworkAdapter.lock")
     private var nextHandle: Int64 = 1
     private var tcpConnections: [Int64: ManagedTCPConnection] = [:]
     private var udpConnections: [Int64: ManagedUDPConnection] = [:]
     private weak var engine: BridgeEngine?
 
-    init(callbacks: Tun2SocksCallbacks, logger: Logger, mtu: Int) {
+    init(callbacks: Tun2SocksCallbacks, logger: Logger, mtu: Int, memory: RelativeProtocol.Configuration.MemoryBudget) {
         self.callbacks = callbacks
         self.logger = logger
         self.mtu = mtu
+        self.memory = memory
+        self.sendWindow = SendWindow(limit: memory.maxConcurrentNetworkSends)
     }
 
     func bind(engine: BridgeEngine) {
@@ -217,6 +222,8 @@ private final class NetworkAdapter: NSObject, BridgeNetworkProtocol {
             logger: logger,
             mtu: mtu,
             timeoutMillis: timeoutMillis,
+            perFlowCapBytes: memory.perFlowBytes,
+            sendWindow: sendWindow,
             onClosed: { [weak self] identifier in
                 _ = self?.removeTCP(handle: identifier)
             }
@@ -273,6 +280,8 @@ private final class NetworkAdapter: NSObject, BridgeNetworkProtocol {
             connection: connection,
             engineProvider: { [weak self] in self?.engine },
             logger: logger,
+            perFlowCapBytes: memory.perFlowBytes,
+            sendWindow: sendWindow,
             onClosed: { [weak self] identifier in
                 _ = self?.removeUDP(handle: identifier)
             }
@@ -349,6 +358,8 @@ private final class ManagedTCPConnection: @unchecked Sendable {
     private let logger: Logger
     private let mtu: Int
     private let timeoutMillis: Int64
+    private let perFlowCapBytes: Int
+    private let sendWindow: SendWindow
     private let queue: DispatchQueue
     private var closed = false
     private let closeLock = DispatchQueue(label: "RelativeProtocolTunnel.ManagedTCPConnection.closeLock")
@@ -364,6 +375,8 @@ private final class ManagedTCPConnection: @unchecked Sendable {
         logger: Logger,
         mtu: Int,
         timeoutMillis: Int64,
+        perFlowCapBytes: Int,
+        sendWindow: SendWindow,
         onClosed: @escaping (Int64) -> Void
     ) {
         self.handle = handle
@@ -372,6 +385,8 @@ private final class ManagedTCPConnection: @unchecked Sendable {
         self.logger = logger
         self.mtu = mtu
         self.timeoutMillis = timeoutMillis
+        self.perFlowCapBytes = max(perFlowCapBytes, 1)
+        self.sendWindow = sendWindow
         self.queue = DispatchQueue(label: "RelativeProtocolTunnel.ManagedTCPConnection.\(handle)")
         self.onClosed = onClosed
     }
@@ -408,31 +423,34 @@ private final class ManagedTCPConnection: @unchecked Sendable {
     }
 
     func write(data: Data) throws -> Int {
-        let semaphore = DispatchSemaphore(value: 0)
-        var result: Result<Int, Error> = .success(data.count)
-        connection.send(content: data, completion: .contentProcessed { error in
-            if let error {
-                result = .failure(error)
-            }
-            semaphore.signal()
-        })
+        guard !data.isEmpty else { return 0 }
+        let maxChunk = max(1, min(mtu, perFlowCapBytes))
+        var totalSent = 0
+        var index = data.startIndex
 
-        if timeoutMillis > 0 {
-            let timeout = DispatchTime.now() + .milliseconds(Int(timeoutMillis))
-            if semaphore.wait(timeout: timeout) == .timedOut {
+        while index < data.endIndex {
+            let remaining = data.distance(from: index, to: data.endIndex)
+            let length = min(maxChunk, remaining)
+            let nextIndex = data.index(index, offsetBy: length)
+            let slice = data[index..<nextIndex]
+
+            guard sendWindow.acquire(timeoutMillis: timeoutMillis) else {
                 cancel()
-                throw NSError(domain: "GoTun2SocksEngine", code: -7, userInfo: [NSLocalizedDescriptionKey: "tcp write timeout"])
+                throw NSError(domain: "GoTun2SocksEngine", code: -10, userInfo: [NSLocalizedDescriptionKey: "tcp send throttled by concurrency window"])
             }
-        } else {
-            semaphore.wait()
+
+            do {
+                defer { sendWindow.release() }
+                try sendChunk(Data(slice))
+            } catch {
+                throw error
+            }
+
+            totalSent += length
+            index = nextIndex
         }
 
-        switch result {
-        case .success(let count):
-            return count
-        case .failure(let error):
-            throw error
-        }
+        return totalSent
     }
 
     func cancel() {
@@ -504,6 +522,35 @@ private final class ManagedTCPConnection: @unchecked Sendable {
             engineProvider()?.tcpDidClose(handle, message: reason?.localizedDescription ?? "")
         }
     }
+
+    private func sendChunk(_ chunk: Data) throws {
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: Result<Void, Error> = .success(())
+
+        connection.send(content: chunk, completion: .contentProcessed { error in
+            if let error {
+                result = .failure(error)
+            }
+            semaphore.signal()
+        })
+
+        if timeoutMillis > 0 {
+            let timeout = DispatchTime.now() + .milliseconds(Int(timeoutMillis))
+            if semaphore.wait(timeout: timeout) == .timedOut {
+                cancel()
+                throw NSError(domain: "GoTun2SocksEngine", code: -7, userInfo: [NSLocalizedDescriptionKey: "tcp write timeout"])
+            }
+        } else {
+            semaphore.wait()
+        }
+
+        switch result {
+        case .success:
+            return
+        case .failure(let error):
+            throw error
+        }
+    }
 }
 
 /// Wraps an `NWConnection` representing a UDP session and forwards events to
@@ -513,6 +560,8 @@ private final class ManagedUDPConnection: @unchecked Sendable {
     private let connection: Network.NWConnection
     private let engineProvider: () -> BridgeEngine?
     private let logger: Logger
+    private let perFlowCapBytes: Int
+    private let sendWindow: SendWindow
     private let queue = DispatchQueue(label: "RelativeProtocolTunnel.ManagedUDPConnection")
     private let closeLock = DispatchQueue(label: "RelativeProtocolTunnel.ManagedUDPConnection.closeLock")
     private var closed = false
@@ -523,12 +572,16 @@ private final class ManagedUDPConnection: @unchecked Sendable {
         connection: Network.NWConnection,
         engineProvider: @escaping () -> BridgeEngine?,
         logger: Logger,
+        perFlowCapBytes: Int,
+        sendWindow: SendWindow,
         onClosed: @escaping (Int64) -> Void
     ) {
         self.handle = handle
         self.connection = connection
         self.engineProvider = engineProvider
         self.logger = logger
+        self.perFlowCapBytes = max(perFlowCapBytes, 1)
+        self.sendWindow = sendWindow
         self.onClosed = onClosed
     }
 
@@ -550,9 +603,24 @@ private final class ManagedUDPConnection: @unchecked Sendable {
     }
 
     func write(data: Data) throws -> Int {
+        guard !data.isEmpty else { return 0 }
+        let cap = self.perFlowCapBytes
+        let payload: Data
+        if data.count > cap {
+            self.logger.error("Relative Protocol: udp \(self.handle) payload truncated from \(data.count) to \(cap) bytes due to per-flow limit")
+            payload = Data(data.prefix(cap))
+        } else {
+            payload = data
+        }
+
+        guard self.sendWindow.acquire(timeoutMillis: 0) else {
+            throw NSError(domain: "GoTun2SocksEngine", code: -12, userInfo: [NSLocalizedDescriptionKey: "udp send throttled by concurrency window"])
+        }
+
         let semaphore = DispatchSemaphore(value: 0)
         var writeError: Error?
-        connection.send(content: data, contentContext: .defaultMessage, isComplete: true, completion: .contentProcessed { error in
+        defer { self.sendWindow.release() }
+        connection.send(content: payload, contentContext: .defaultMessage, isComplete: true, completion: .contentProcessed { error in
             writeError = error
             semaphore.signal()
         })
@@ -560,7 +628,7 @@ private final class ManagedUDPConnection: @unchecked Sendable {
         if let writeError {
             throw writeError
         }
-        return data.count
+        return payload.count
     }
 
     func cancel() {
@@ -614,6 +682,28 @@ private extension Data {
     var afValue: UInt32 {
         guard let firstByte = first else { return UInt32(AF_INET) }
         return (firstByte >> 4) == 6 ? UInt32(AF_INET6) : UInt32(AF_INET)
+    }
+}
+
+private final class SendWindow {
+    private let semaphore: DispatchSemaphore
+
+    init(limit: Int) {
+        self.semaphore = DispatchSemaphore(value: max(limit, 1))
+    }
+
+    func acquire(timeoutMillis: Int64) -> Bool {
+        if timeoutMillis > 0 {
+            let deadline = DispatchTime.now() + .milliseconds(Int(timeoutMillis))
+            return semaphore.wait(timeout: deadline) == .success
+        } else {
+            semaphore.wait()
+            return true
+        }
+    }
+
+    func release() {
+        semaphore.signal()
     }
 }
 

@@ -148,6 +148,7 @@ public extension RelativeProtocol.Configuration {
         public var dns: DNS
         public var metrics: MetricsOptions
         public var policies: Policies
+        public var memory: MemoryBudget
 
         public init(
             mtu: Int = 1500,
@@ -157,7 +158,8 @@ public extension RelativeProtocol.Configuration {
             excludeLocalNetworks: Bool = false,
             dns: DNS = .default,
             metrics: MetricsOptions = .default,
-            policies: Policies = .default
+            policies: Policies = .default,
+            memory: MemoryBudget = .default
         ) {
             self.mtu = mtu
             self.ipv4 = ipv4
@@ -167,6 +169,7 @@ public extension RelativeProtocol.Configuration {
             self.dns = dns
             self.metrics = metrics
             self.policies = policies
+            self.memory = memory
         }
 
         public static var `default`: Provider {
@@ -191,6 +194,18 @@ public extension RelativeProtocol.Configuration {
             }
             if dns.servers.isEmpty {
                 messages.append(.warning("No DNS servers configured; system defaults will apply."))
+            }
+            if memory.packetPoolBytes <= 0 {
+                messages.append(.error("Global packet pool must be greater than zero bytes."))
+            }
+            if memory.perFlowBytes <= 0 {
+                messages.append(.error("Per-flow buffer limit must be greater than zero bytes."))
+            }
+            if memory.packetBatchLimit < 1 {
+                messages.append(.error("Packet batch limit must be at least 1."))
+            }
+            if memory.maxConcurrentNetworkSends < 1 {
+                messages.append(.error("Maximum concurrent network sends must be at least 1."))
             }
             return messages
         }
@@ -312,15 +327,94 @@ public extension RelativeProtocol.Configuration {
         }
     }
 
+    struct MemoryBudget: Codable, Equatable, Sendable {
+        public var packetPoolBytes: Int
+        public var perFlowBytes: Int
+        public var packetBatchLimit: Int
+        public var maxConcurrentNetworkSends: Int
+
+        public init(
+            packetPoolBytes: Int = 8 * 1_048_576,
+            perFlowBytes: Int = 128 * 1_024,
+            packetBatchLimit: Int = 4,
+            maxConcurrentNetworkSends: Int = 64
+        ) {
+            self.packetPoolBytes = packetPoolBytes
+            self.perFlowBytes = perFlowBytes
+            self.packetBatchLimit = packetBatchLimit
+            self.maxConcurrentNetworkSends = maxConcurrentNetworkSends
+        }
+
+        public static var `default`: MemoryBudget {
+            MemoryBudget()
+        }
+    }
+
     struct Policies: Codable, Equatable, Sendable {
         public var blockedHosts: [String]
+        public var trafficShaping: TrafficShaping
 
-        public init(blockedHosts: [String] = []) {
+        public init(
+            blockedHosts: [String] = [],
+            trafficShaping: TrafficShaping = .init()
+        ) {
             self.blockedHosts = blockedHosts
+            self.trafficShaping = trafficShaping
         }
 
         public static var `default`: Policies {
             Policies()
+        }
+    }
+
+    struct TrafficShaping: Codable, Equatable, Sendable {
+        public var defaultPolicy: TrafficShapingPolicy?
+        public var rules: [TrafficShapingRule]
+
+        public init(
+            defaultPolicy: TrafficShapingPolicy? = nil,
+            rules: [TrafficShapingRule] = []
+        ) {
+            self.defaultPolicy = defaultPolicy
+            self.rules = rules
+        }
+    }
+
+    struct TrafficShapingRule: Codable, Equatable, Sendable {
+        public var hosts: [String]
+        public var ports: [Int]
+        public var policy: TrafficShapingPolicy
+
+        public init(hosts: [String], ports: [Int] = [], policy: TrafficShapingPolicy) {
+            self.hosts = hosts
+            self.ports = ports
+            self.policy = policy
+        }
+    }
+
+    struct TrafficShapingPolicy: Codable, Equatable, Sendable {
+        public var fixedLatencyMilliseconds: Int
+        public var jitterMilliseconds: Int
+        public var bytesPerSecond: Int?
+
+        public init(
+            fixedLatencyMilliseconds: Int = 0,
+            jitterMilliseconds: Int = 0,
+            bytesPerSecond: Int? = nil
+        ) {
+            self.fixedLatencyMilliseconds = max(0, fixedLatencyMilliseconds)
+            self.jitterMilliseconds = max(0, jitterMilliseconds)
+            if let bytesPerSecond, bytesPerSecond > 0 {
+                self.bytesPerSecond = bytesPerSecond
+            } else {
+                self.bytesPerSecond = nil
+            }
+        }
+
+        public var isNoop: Bool {
+            fixedLatencyMilliseconds == 0 &&
+                jitterMilliseconds == 0 &&
+                bytesPerSecond == nil
         }
     }
 

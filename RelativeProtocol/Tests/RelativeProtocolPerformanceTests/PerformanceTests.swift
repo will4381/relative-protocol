@@ -8,10 +8,12 @@
 
 import XCTest
 import Network
+import os.log
 @testable import RelativeProtocolCore
 @testable import RelativeProtocolTunnel
 
 final class RelativeProtocolPerformanceTests: XCTestCase {
+    private let testLogger = Logger(subsystem: "RelativeProtocolTests", category: "Performance")
 
     func testConfigurationValidationPerformance() throws {
         let configuration = makeTestConfiguration()
@@ -69,7 +71,8 @@ final class RelativeProtocolPerformanceTests: XCTestCase {
             configuration: configuration,
             metrics: nil,
             engine: NoOpTun2SocksEngine(),
-            hooks: configuration.hooks
+            hooks: configuration.hooks,
+            logger: testLogger
         )
         try adapter.start()
         XCTAssertTrue(flow.waitForHandler(timeout: 1), "Adapter did not register read handler in time")

@@ -30,10 +30,16 @@ final class VPNManager: ObservableObject {
     @Published private(set) var totalObservedSites: Int = 0
     @Published private(set) var lastControlError: String?
     @Published private(set) var isFetchingSites = false
+    @Published private(set) var shapingConfiguration = TrafficShapingConfiguration()
 
     private let controller = RelativeProtocolHost.Controller()
     private var cancellables: Set<AnyCancellable> = []
     private let logger = Logger(subsystem: "relative.example", category: "VPNManager")
+    private var pendingApplyTask: Task<Void, Never>?
+
+    deinit {
+        pendingApplyTask?.cancel()
+    }
 
     private init() {
         controller.$status
@@ -48,7 +54,13 @@ final class VPNManager: ObservableObject {
 
         controller.$isConfigured
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] value in self?.configurationReady = value }
+            .sink { [weak self] value in
+                guard let self else { return }
+                self.configurationReady = value
+                if value {
+                    self.scheduleShapingApply()
+                }
+            }
             .store(in: &cancellables)
 
         controller.$lastError
@@ -66,6 +78,7 @@ final class VPNManager: ObservableObject {
         do {
             try await controller.prepareIfNeeded(descriptor: descriptor)
             lastErrorMessage = controller.lastError
+            scheduleShapingApply()
         } catch {
             lastErrorMessage = error.localizedDescription
             logger.error("prepare failed: \(error.localizedDescription, privacy: .public)")
@@ -134,6 +147,74 @@ final class VPNManager: ObservableObject {
         } catch {
             lastControlError = error.localizedDescription
         }
+    }
+
+    func setDefaultLatency(_ value: Double) {
+        let clamped = max(0, min(500, value))
+        var config = shapingConfiguration
+        guard config.defaultLatencyMs != clamped else { return }
+        config.defaultLatencyMs = clamped
+        shapingConfiguration = config
+        scheduleShapingApply()
+    }
+
+    func setDefaultBandwidth(_ value: Double) {
+        let clamped = max(0, min(4096, value))
+        var config = shapingConfiguration
+        guard config.defaultBandwidthKbps != clamped else { return }
+        config.defaultBandwidthKbps = clamped
+        shapingConfiguration = config
+        scheduleShapingApply()
+    }
+
+    func addRule(pattern: String) {
+        let trimmed = pattern.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        var config = shapingConfiguration
+        if config.rules.contains(where: { $0.pattern.caseInsensitiveCompare(trimmed) == .orderedSame }) {
+            return
+        }
+        config.rules.append(.init(pattern: trimmed))
+        shapingConfiguration = config
+        scheduleShapingApply()
+    }
+
+    func setRulePattern(_ pattern: String, for id: UUID) {
+        let trimmed = pattern.trimmingCharacters(in: .whitespacesAndNewlines)
+        var config = shapingConfiguration
+        guard let index = config.rules.firstIndex(where: { $0.id == id }) else { return }
+        if config.rules[index].pattern == trimmed { return }
+        config.rules[index].pattern = trimmed
+        shapingConfiguration = config
+        scheduleShapingApply()
+    }
+
+    func setRuleLatency(_ value: Double, for id: UUID) {
+        var config = shapingConfiguration
+        guard let index = config.rules.firstIndex(where: { $0.id == id }) else { return }
+        let clamped = max(0, min(500, value))
+        if config.rules[index].latencyMs == clamped { return }
+        config.rules[index].latencyMs = clamped
+        shapingConfiguration = config
+        scheduleShapingApply()
+    }
+
+    func setRuleBandwidth(_ value: Double, for id: UUID) {
+        var config = shapingConfiguration
+        guard let index = config.rules.firstIndex(where: { $0.id == id }) else { return }
+        let clamped = max(0, min(4096, value))
+        if config.rules[index].bandwidthKbps == clamped { return }
+        config.rules[index].bandwidthKbps = clamped
+        shapingConfiguration = config
+        scheduleShapingApply()
+    }
+
+    func removeRule(id: UUID) {
+        var config = shapingConfiguration
+        guard let index = config.rules.firstIndex(where: { $0.id == id }) else { return }
+        config.rules.remove(at: index)
+        shapingConfiguration = config
+        scheduleShapingApply()
     }
 
     func clearSites() async {
@@ -214,10 +295,166 @@ final class VPNManager: ObservableObject {
             ],
             ipv6: ipv6,
             metrics: .init(isEnabled: false),
-            policies: .init(blockedHosts: []),
+            policies: .init(
+                blockedHosts: [],
+                trafficShaping: shapingConfiguration.toRelativeConfiguration()
+            ),
+            memory: .init(
+                packetPoolBytes: 4 * 1_048_576,
+                perFlowBytes: 64 * 1_024,
+                packetBatchLimit: 4,
+                maxConcurrentNetworkSends: 64
+            ),
             logging: .init(enableDebug: false)
         )
     }
+
+    private func scheduleShapingApply() {
+        pendingApplyTask?.cancel()
+        guard configurationReady else { return }
+        pendingApplyTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard let self, !Task.isCancelled else { return }
+            await self.applyShapingConfiguration()
+        }
+    }
+
+    private func applyShapingConfiguration() async {
+        do {
+            try await controller.configure(descriptor: makeDescriptor())
+            lastErrorMessage = controller.lastError
+            if status == .connected {
+                do {
+                    let command = ExampleShapingUpdateCommand(
+                        shaping: shapingConfiguration.toExamplePayload()
+                    )
+                    let _: ExampleAckResponse = try await controller.controlChannel.send(
+                        command,
+                        expecting: ExampleAckResponse.self
+                    )
+                } catch {
+                    lastErrorMessage = error.localizedDescription
+                }
+            }
+        } catch {
+            lastErrorMessage = error.localizedDescription
+        }
+    }
+}
+
+extension VPNManager {
+    struct TrafficShapingConfiguration: Equatable {
+        var defaultLatencyMs: Double
+        var defaultBandwidthKbps: Double
+        var rules: [TrafficShapingRuleConfig]
+
+        init(
+            defaultLatencyMs: Double = 0,
+            defaultBandwidthKbps: Double = 0,
+            rules: [TrafficShapingRuleConfig] = []
+        ) {
+            self.defaultLatencyMs = defaultLatencyMs
+            self.defaultBandwidthKbps = defaultBandwidthKbps
+            self.rules = rules
+        }
+
+        fileprivate func toRelativeConfiguration() -> RelativeProtocol.Configuration.TrafficShaping {
+            let defaultPolicy = Self.makePolicy(latencyMs: defaultLatencyMs, bandwidthKbps: defaultBandwidthKbps)
+            let compiledRules: [RelativeProtocol.Configuration.TrafficShapingRule] = rules.compactMap { rule in
+                let trimmed = rule.pattern.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { return nil }
+                guard let policy = Self.makePolicy(latencyMs: rule.latencyMs, bandwidthKbps: rule.bandwidthKbps) else {
+                    return nil
+                }
+                let tokens = trimmed.split(whereSeparator: { $0 == "," || $0 == " " }).map {
+                    String($0).trimmingCharacters(in: .whitespacesAndNewlines)
+                }.filter { !$0.isEmpty }
+                var seen: Set<String> = []
+                let normalized = tokens.compactMap { token -> String? in
+                    let lowercased = token.lowercased()
+                    guard !lowercased.isEmpty, seen.insert(lowercased).inserted else { return nil }
+                    return token
+                }.ifEmptyReplace(with: [trimmed])
+                return .init(
+                    hosts: normalized,
+                    ports: [],
+                    policy: policy
+                )
+            }
+            return .init(
+                defaultPolicy: defaultPolicy,
+                rules: compiledRules
+            )
+        }
+
+        fileprivate func toExamplePayload() -> ExampleTrafficShapingPayload {
+            ExampleTrafficShapingPayload(
+                defaultLatencyMs: defaultLatencyMs,
+                defaultBandwidthKbps: defaultBandwidthKbps,
+                rules: rules.map { rule in
+                    ExampleTrafficShapingRulePayload(
+                        pattern: rule.pattern,
+                        latencyMs: rule.latencyMs,
+                        bandwidthKbps: rule.bandwidthKbps
+                    )
+                }
+            )
+        }
+
+        private static func makePolicy(latencyMs: Double, bandwidthKbps: Double) -> RelativeProtocol.Configuration.TrafficShapingPolicy? {
+            let latency = max(0, Int(latencyMs.rounded()))
+            let bytesPerSecond = bandwidthKbps > 0 ? max(256, Int(((bandwidthKbps * 1000.0) / 8.0).rounded())) : nil
+            guard latency > 0 || bytesPerSecond != nil else { return nil }
+            let jitter = latency > 0 ? max(10, min(250, Int((latencyMs * 0.25).rounded()))) : 0
+            return .init(
+                fixedLatencyMilliseconds: latency,
+                jitterMilliseconds: jitter,
+                bytesPerSecond: bytesPerSecond
+            )
+        }
+    }
+
+    struct TrafficShapingRuleConfig: Identifiable, Equatable {
+        var id: UUID
+        var pattern: String
+        var latencyMs: Double
+        var bandwidthKbps: Double
+
+        init(
+            id: UUID = UUID(),
+            pattern: String,
+            latencyMs: Double = 200,
+            bandwidthKbps: Double = 256
+        ) {
+            self.id = id
+            self.pattern = pattern
+            self.latencyMs = max(0, latencyMs)
+            self.bandwidthKbps = max(0, bandwidthKbps)
+        }
+    }
+}
+
+private extension Array where Element == String {
+    func ifEmptyReplace(with fallback: [String]) -> [String] {
+        isEmpty ? fallback : self
+    }
+}
+
+private struct ExampleShapingUpdateCommand: Encodable {
+    var command = "setShaping"
+    var shaping: ExampleTrafficShapingPayload
+}
+
+private struct ExampleTrafficShapingPayload: Encodable {
+    var defaultLatencyMs: Double
+    var defaultBandwidthKbps: Double
+    var rules: [ExampleTrafficShapingRulePayload]
+}
+
+private struct ExampleTrafficShapingRulePayload: Encodable {
+    var pattern: String
+    var latencyMs: Double
+    var bandwidthKbps: Double
 }
 
 private struct ExampleAppCommand: Encodable {
