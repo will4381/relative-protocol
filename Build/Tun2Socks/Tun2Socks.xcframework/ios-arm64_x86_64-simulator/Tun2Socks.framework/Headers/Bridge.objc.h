@@ -13,10 +13,16 @@
 
 @class BridgeConfig;
 @class BridgeEngine;
+@protocol BridgeLogSink;
+@class BridgeLogSink;
 @protocol BridgeNetwork;
 @class BridgeNetwork;
 @protocol BridgePacketEmitter;
 @class BridgePacketEmitter;
+
+@protocol BridgeLogSink <NSObject>
+- (void)log:(NSString* _Nullable)level message:(NSString* _Nullable)message;
+@end
 
 @protocol BridgeNetwork <NSObject>
 /**
@@ -117,9 +123,28 @@ returns an opaque handle understood by Swift.
  */
 FOUNDATION_EXPORT BridgeEngine* _Nullable BridgeNewEngine(BridgeConfig* _Nullable cfg, id<BridgePacketEmitter> _Nullable emitter, id<BridgeNetwork> _Nullable network, NSError* _Nullable* _Nullable error);
 
+/**
+ * SetLogSink installs a custom zap logger that forwards entries to sink. Pass
+a nil sink to revert to zap's production logger.
+ */
+FOUNDATION_EXPORT BOOL BridgeSetLogSink(id<BridgeLogSink> _Nullable sink, NSString* _Nullable level, NSError* _Nullable* _Nullable error);
+
+@class BridgeLogSink;
+
 @class BridgeNetwork;
 
 @class BridgePacketEmitter;
+
+/**
+ * LogSink allows Swift to receive tun2socks log entries.
+ */
+@interface BridgeLogSink : NSObject <goSeqRefInterface, BridgeLogSink> {
+}
+@property(strong, readonly) _Nonnull id _ref;
+
+- (nonnull instancetype)initWithRef:(_Nonnull id)ref;
+- (void)log:(NSString* _Nullable)level message:(NSString* _Nullable)message;
+@end
 
 /**
  * Network abstracts the Network Extension plumbing behind TCP and UDP sessions.

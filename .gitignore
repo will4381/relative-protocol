@@ -5,3 +5,6 @@
 # SwiftPM build outputs
 /RelativeProtocol/.build/
 .build
+.gomodcache
+.gocache
+.swift-module-cache

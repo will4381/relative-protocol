@@ -9,21 +9,21 @@
 
 package bridge
 
-import (
-	"errors"
-)
+import "errors"
+
+const tunInboundDepth = 128
 
 type tunIO struct {
 	emitter PacketEmitter
 
-	inbound chan []byte
+	inbound chan pooledBytes
 	closed  chan struct{}
 }
 
 func newTunIO(emitter PacketEmitter) *tunIO {
 	return &tunIO{
 		emitter: emitter,
-		inbound: make(chan []byte, 512),
+		inbound: make(chan pooledBytes, tunInboundDepth),
 		closed:  make(chan struct{}),
 	}
 }
@@ -34,20 +34,26 @@ func (t *tunIO) Read(p []byte) (int, error) {
 		if !ok {
 			return 0, errors.New("tun closed")
 		}
-		if len(packet) > len(p) {
-			copy(p, packet[:len(p)])
+		defer packet.release()
+
+		data := packet.bytes()
+		if len(data) > len(p) {
+			copy(p, data[:len(p)])
 			return len(p), nil
 		}
-		copy(p, packet)
-		return len(packet), nil
+		copy(p, data)
+		return len(data), nil
 	case <-t.closed:
 		return 0, errors.New("tun closed")
 	}
 }
 
 func (t *tunIO) Write(p []byte) (int, error) {
-	packet := append([]byte(nil), p...)
-	if err := t.emitter.EmitPacket(packet, inferProtocol(packet)); err != nil {
+	packet := newPooledBytes(p)
+	defer packet.release()
+
+	data := packet.bytes()
+	if err := t.emitter.EmitPacket(data, inferProtocol(data)); err != nil {
 		return 0, err
 	}
 	return len(p), nil
@@ -67,7 +73,7 @@ func (t *tunIO) Inject(packet []byte) error {
 	select {
 	case <-t.closed:
 		return errors.New("tun closed")
-	case t.inbound <- append([]byte(nil), packet...):
+	case t.inbound <- newPooledBytes(packet):
 		return nil
 	}
 }

@@ -10,10 +10,9 @@ const (
 	MaxSegmentSize = (1 << 16) - 1
 
 	// RelayBufferSize is the default buffer size for TCP relays.
-	// io.Copy default buffer size is 32 KiB, but the maximum packet
-	// size of vmess/shadowsocks is about 16 KiB, so define a buffer
-	// of 20 KiB to reduce the memory of each TCP relay.
-	RelayBufferSize = 20 << 10
+	// Align with io.Copy defaults while keeping buffers within the 32–64 KiB
+	// window recommended for iOS tunnel targets.
+	RelayBufferSize = 32 << 10
 )
 
 var _allocator = allocator.New()

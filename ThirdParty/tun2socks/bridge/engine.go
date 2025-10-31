@@ -14,23 +14,37 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"runtime"
+	"runtime/debug"
 	"sync"
 	"time"
 
+	"go.uber.org/atomic"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 
 	"github.com/xjasonlyu/tun2socks/v2/core"
 	"github.com/xjasonlyu/tun2socks/v2/core/device"
 	"github.com/xjasonlyu/tun2socks/v2/core/device/iobased"
+	"github.com/xjasonlyu/tun2socks/v2/core/option"
+	golog "github.com/xjasonlyu/tun2socks/v2/log"
 	M "github.com/xjasonlyu/tun2socks/v2/metadata"
 	"github.com/xjasonlyu/tun2socks/v2/tunnel"
 	"github.com/xjasonlyu/tun2socks/v2/tunnel/statistic"
-)
 
 const (
-	afInet  = 2  // AF_INET
-	afInet6 = 30 // AF_INET6
+	afInet              = 2  // AF_INET
+	afInet6             = 30 // AF_INET6
+	tcpBufferMin        = 16 << 10
+	tcpBufferDefault    = 32 << 10
+	tcpBufferMax        = 64 << 10
+	udpIdleTimeout      = 15 * time.Second
+	tcpHalfCloseTimeout = 5 * time.Second
+
+	memoryLogInterval      = 5 * time.Second
+	idleScavengeThreshold  = 10 * time.Second
+	idleScavengeLimitBytes = 26 << 20
+	retainedScavengeLimitBytes = 8 << 20
 )
 
 // Engine wires the Go tun2socks core to the Swift-based Network Extension host.
@@ -51,6 +65,9 @@ type Engine struct {
 
 	tcpConns map[int64]*swiftTCPConn
 	udpConns map[int64]*swiftUDPSession
+
+	memMonCancel context.CancelFunc
+	lastActivity atomic.Int64
 }
 
 // NewEngine constructs a new bridge instance.
@@ -100,13 +117,22 @@ func (e *Engine) Start() error {
 		mtu:      uint32(e.cfg.MTU),
 	}
 
+	tunnel.SetTCPWaitTimeout(tcpHalfCloseTimeout)
+	tunnel.SetDefaultUDPTimeout(udpIdleTimeout)
+
 	e.tunnel = tunnel.New(&swiftDialer{engine: e}, statistic.DefaultManager)
 	e.tunnel.ProcessAsync()
+
+	stackOpts := []option.Option{
+		option.WithTCPModerateReceiveBuffer(false),
+		option.WithTCPSendBufferSizeRange(tcpBufferMin, tcpBufferDefault, tcpBufferMax),
+		option.WithTCPReceiveBufferSizeRange(tcpBufferMin, tcpBufferDefault, tcpBufferMax),
+	}
 
 	e.stack, err = core.CreateStack(&core.Config{
 		LinkEndpoint:     e.device,
 		TransportHandler: e.tunnel,
-		Options:          nil,
+		Options:          stackOpts,
 	})
 	if err != nil {
 		return fmt.Errorf("create stack: %w", err)
@@ -116,6 +142,9 @@ func (e *Engine) Start() error {
 		<-e.closing
 		endpoint.Wait()
 	}()
+
+	e.lastActivity.Store(time.Now().UnixNano())
+	e.startMemoryMonitor()
 
 	e.running = true
 	return nil
@@ -130,6 +159,10 @@ func (e *Engine) Stop() {
 	}
 	e.running = false
 	close(e.closing)
+	if e.memMonCancel != nil {
+		e.memMonCancel()
+		e.memMonCancel = nil
+	}
 	e.mu.Unlock()
 
 	e.tunnel.Close()
@@ -145,6 +178,9 @@ func (e *Engine) Stop() {
 		delete(e.udpConns, handle)
 	}
 	e.mu.Unlock()
+
+	runtime.GC()
+	debug.FreeOSMemory()
 }
 
 // HandlePacket injects an inbound packet (read from packetFlow) into the Go stack.
@@ -153,6 +189,7 @@ func (e *Engine) HandlePacket(packet []byte, protocolNumber int32) error {
 		return errors.New("engine not running")
 	}
 	_ = protocolNumber
+	e.touchActivity()
 	return e.tun.Inject(packet)
 }
 
@@ -171,6 +208,7 @@ func (e *Engine) TCPDidReceive(handle int64, payload []byte) {
 	if conn == nil {
 		return
 	}
+	e.touchActivity()
 	conn.enqueue(payload)
 }
 
@@ -198,6 +236,7 @@ func (e *Engine) UDPDidReceive(handle int64, payload []byte) {
 	if session == nil {
 		return
 	}
+	e.touchActivity()
 	session.enqueue(payload)
 }
 
@@ -308,4 +347,63 @@ func contextDeadlineMillis(ctx context.Context) int64 {
 		return timeout.Milliseconds()
 	}
 	return 0
+}
+
+func (e *Engine) startMemoryMonitor() {
+	if e.memMonCancel != nil {
+		e.memMonCancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	e.memMonCancel = cancel
+	go e.monitorMemory(ctx)
+}
+
+func (e *Engine) monitorMemory(ctx context.Context) {
+	ticker := time.NewTicker(memoryLogInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			var stats runtime.MemStats
+			runtime.ReadMemStats(&stats)
+
+			sysBytes := stats.Sys
+			var retainedBytes uint64
+			if stats.HeapIdle > stats.HeapReleased {
+				retainedBytes = stats.HeapIdle - stats.HeapReleased
+			}
+
+			// Trigger GC-based scavenging if we either have a build-up of
+			// heap space that can be released back to the OS or the bridge has
+			// been idle long enough to opportunistically trim memory.
+			shouldScavenge := false
+			reason := ""
+
+			if retainedBytes >= uint64(retainedScavengeLimitBytes) {
+				shouldScavenge = true
+				reason = "retained"
+			} else {
+				last := e.lastActivity.Load()
+				if last != 0 {
+					idle := time.Since(time.Unix(0, last))
+					if idle >= idleScavengeThreshold && sysBytes >= uint64(idleScavengeLimitBytes) {
+						shouldScavenge = true
+						reason = "idle"
+					}
+				}
+			}
+
+			if shouldScavenge {
+				golog.Debugf("[bridge] memory scavenging reason=%s heapAlloc=%d heapIdle=%d heapReleased=%d sys=%d", reason, stats.HeapAlloc, stats.HeapIdle, stats.HeapReleased, sysBytes)
+				debug.FreeOSMemory()
+			}
+		}
+	}
+}
+
+func (e *Engine) touchActivity() {
+	e.lastActivity.Store(time.Now().UnixNano())
 }

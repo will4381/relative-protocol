@@ -25,11 +25,13 @@ type swiftTCPConn struct {
 	remote net.Addr
 
 	mu        sync.Mutex
-	recvQueue chan []byte
+	recvQueue chan pooledBytes
 	buffer    []byte
 	closed    bool
 	closeErr  error
 }
+
+const tcpRecvQueueDepth = 16
 
 func newSwiftTCPConn(handle int64, metadata *M.Metadata, engine *Engine) *swiftTCPConn {
 	addr := metadata.TCPAddr()
@@ -44,7 +46,7 @@ func newSwiftTCPConn(handle int64, metadata *M.Metadata, engine *Engine) *swiftT
 		handle:    handle,
 		engine:    engine,
 		remote:    remote,
-		recvQueue: make(chan []byte, 64),
+		recvQueue: make(chan pooledBytes, tcpRecvQueueDepth),
 	}
 }
 
@@ -76,11 +78,13 @@ func (c *swiftTCPConn) Read(p []byte) (int, error) {
 		}
 		return 0, err
 	}
+	defer payload.release()
 
-	n := copy(p, payload)
-	if n < len(payload) {
+	data := payload.bytes()
+	n := copy(p, data)
+	if n < len(data) {
 		c.mu.Lock()
-		c.buffer = append(c.buffer, payload[n:]...)
+		c.buffer = append(c.buffer, data[n:]...)
 		c.mu.Unlock()
 	}
 	return n, nil
@@ -90,6 +94,7 @@ func (c *swiftTCPConn) Write(p []byte) (int, error) {
 	if c.isClosed() {
 		return 0, errors.New("connection closed")
 	}
+	c.engine.touchActivity()
 	n, err := c.engine.network.TCPWrite(c.handle, p)
 	return int(n), err
 }
@@ -129,7 +134,7 @@ func (c *swiftTCPConn) enqueue(payload []byte) {
 		return
 	}
 	c.mu.Unlock()
-	c.recvQueue <- append([]byte(nil), payload...)
+	c.recvQueue <- newPooledBytes(payload)
 }
 
 func (c *swiftTCPConn) closeWithError(err error) {

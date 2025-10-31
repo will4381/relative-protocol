@@ -127,15 +127,15 @@ private extension PacketTunnelProvider {
 
     func handleControlMessage(_ data: Data) -> Data? {
         if let raw = String(data: data, encoding: .utf8) {
-            logger.notice("control message payload: \(raw, privacy: .public)")
+            logger.debug("control message payload: \(raw, privacy: .public)")
         } else {
-            logger.notice("control message payload length \(data.count, privacy: .public) bytes (non-UTF8)")
+            logger.debug("control message payload length \(data.count, privacy: .public) bytes (non-UTF8)")
         }
         let decoder = JSONDecoder()
         let command: ExampleControlCommand
         do {
             command = try decoder.decode(ExampleControlCommand.self, from: data)
-            logger.notice("decoded control command: \(command.command, privacy: .public)")
+            logger.debug("decoded control command: \(command.command, privacy: .public)")
         } catch {
             logger.error("control message decode failed: \(error.localizedDescription, privacy: .public)")
             return encodeErrorResponse(command: "invalid", message: error.localizedDescription)
@@ -144,17 +144,17 @@ private extension PacketTunnelProvider {
         switch command.command {
         case "events":
             let limit = max(1, min(command.limit ?? 50, 200))
-            logger.notice("handling events command, limit=\(limit, privacy: .public)")
+            logger.debug("handling events command, limit=\(limit, privacy: .public)")
             let sites = siteCatalog.summaries(limit: limit)
             let response = ExampleSitesResponse(
                 sites: sites,
                 total: siteCatalog.totalCount()
             )
-            logger.notice("returning \(sites.count, privacy: .public) site summaries")
+            logger.debug("returning \(sites.count, privacy: .public) site summaries")
             return encodeResponse(response, command: command.command)
         case "clearEvents":
             siteCatalog.clear()
-            logger.notice("clearEvents command processed")
+            logger.debug("clearEvents command processed")
             let response = ExampleAckResponse(
                 command: command.command,
                 total: siteCatalog.totalCount()
@@ -166,7 +166,7 @@ private extension PacketTunnelProvider {
             }
             let configuration = shaping.toRelativeConfiguration()
             controller.updateTrafficShaping(configuration)
-            logger.notice("updated traffic shaping: defaultLatency=\(configuration.defaultPolicy?.fixedLatencyMilliseconds ?? 0, privacy: .public)ms rules=\(configuration.rules.count, privacy: .public)")
+            logger.debug("updated traffic shaping: defaultLatency=\(configuration.defaultPolicy?.fixedLatencyMilliseconds ?? 0, privacy: .public)ms rules=\(configuration.rules.count, privacy: .public)")
             let response = ExampleAckResponse(command: command.command, total: siteCatalog.totalCount())
             return encodeResponse(response, command: command.command)
         default:

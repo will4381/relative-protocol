@@ -27,6 +27,7 @@ final class GoTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
     private var packetEmitter: PacketEmitterAdapter?
     private var networkAdapter: NetworkAdapter?
     private let stateQueue = DispatchQueue(label: "RelativeProtocolTunnel.GoTun2SocksEngine")
+    private var logSink: LogSinkAdapter?
     private var running = false
 
     init(configuration: RelativeProtocol.Configuration, logger: Logger) {
@@ -49,6 +50,15 @@ final class GoTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
                 mtu: configuration.provider.mtu,
                 memory: configuration.provider.memory
             )
+
+            let sink = LogSinkAdapter(logger: logger)
+            var logError: NSError?
+            if BridgeSetLogSink(sink, "info", &logError) {
+                logSink = sink
+                logger.notice("Relative Protocol: Go log sink installed")
+            } else if let logError {
+                logger.error("Relative Protocol: failed to install Go logger – \(logError.localizedDescription, privacy: .public)")
+            }
 
             var creationError: NSError?
             guard let engine = BridgeNewEngine(config, emitter, network, &creationError) else {
@@ -94,6 +104,13 @@ final class GoTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
             networkAdapter?.shutdown()
             goEngine?.stop()
 
+            var resetError: NSError?
+            if BridgeSetLogSink(nil, nil, &resetError) {
+                logger.notice("Relative Protocol: Go log sink removed")
+            } else if let resetError {
+                logger.error("Relative Protocol: failed to reset Go logger – \(resetError.localizedDescription, privacy: .public)")
+            }
+            logSink = nil
             callbacks = nil
             goEngine = nil
             packetEmitter = nil
@@ -154,6 +171,32 @@ private final class PacketEmitterAdapter: NSObject, BridgePacketEmitterProtocol 
 
         guard !packets.isEmpty, packets.count == protos.count else { return }
         callbacks.emitPackets(packets, protos)
+    }
+}
+
+private final class LogSinkAdapter: NSObject, BridgeLogSinkProtocol {
+    private let logger: Logger
+
+    init(logger: Logger) {
+        self.logger = logger
+    }
+
+    func log(_ level: String?, message: String?) {
+        guard let message else { return }
+
+        let text = "Go: \(message)"
+        switch level?.lowercased() {
+        case "debug":
+            logger.debug("\(text, privacy: .public)")
+        case "warn", "warning":
+            logger.notice("\(text, privacy: .public)")
+        case "error":
+            logger.error("\(text, privacy: .public)")
+        case "dpanic", "panic", "fatal":
+            logger.fault("\(text, privacy: .public)")
+        default:
+            logger.info("\(text, privacy: .public)")
+        }
     }
 }
 

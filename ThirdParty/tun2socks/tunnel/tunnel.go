@@ -12,13 +12,13 @@ import (
 	"github.com/xjasonlyu/tun2socks/v2/tunnel/statistic"
 )
 
-const (
+var (
 	// tcpConnectTimeout is the default timeout for TCP handshakes.
 	tcpConnectTimeout = 5 * time.Second
 	// tcpWaitTimeout implements a TCP half-close timeout.
-	tcpWaitTimeout = 60 * time.Second
+	tcpWaitTimeout = 5 * time.Second
 	// udpSessionTimeout is the default timeout for UDP sessions.
-	udpSessionTimeout = 60 * time.Second
+	udpSessionTimeout = 15 * time.Second
 )
 
 var _ adapter.TransportHandler = (*Tunnel)(nil)
@@ -113,4 +113,19 @@ func (t *Tunnel) SetDialer(dialer proxy.Dialer) {
 
 func (t *Tunnel) SetUDPTimeout(timeout time.Duration) {
 	t.udpTimeout.Store(timeout)
+}
+
+// SetTCPWaitTimeout overrides the global wait timeout used for TCP half-close.
+func SetTCPWaitTimeout(timeout time.Duration) {
+	if timeout > 0 {
+		tcpWaitTimeout = timeout
+	}
+}
+
+// SetDefaultUDPTimeout adjusts the default UDP session timeout applied to new
+// Tunnel instances. Per-tunnel overrides can still be made via SetUDPTimeout.
+func SetDefaultUDPTimeout(timeout time.Duration) {
+	if timeout > 0 {
+		udpSessionTimeout = timeout
+	}
 }

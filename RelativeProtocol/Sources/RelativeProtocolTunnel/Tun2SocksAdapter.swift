@@ -88,6 +88,9 @@ final class Tun2SocksAdapter: @unchecked Sendable {
     private var outboundTask: Task<Void, Never>?
     private var inboundChannel: AsyncChannel<PacketBatch>?
     private var inboundTask: Task<Void, Never>?
+    private var consecutiveEmptyReads = 0
+    private let emptyReadBackoffBase: TimeInterval = 0.001
+    private let emptyReadBackoffCeiling: TimeInterval = 0.005
 
     var analyzer: TrafficAnalyzer? {
         trafficAnalyzer
@@ -152,6 +155,9 @@ final class Tun2SocksAdapter: @unchecked Sendable {
         hooks.eventSink?(.willStart)
         isRunning = true
         prepareInboundPipeline()
+        ioQueue.async { [weak self] in
+            self?.consecutiveEmptyReads = 0
+        }
         let callbacks = Tun2SocksCallbacks(
             startPacketReadLoop: { [weak self] handler in
                 self?.configureOutboundPipeline(handler: handler)
@@ -207,35 +213,65 @@ final class Tun2SocksAdapter: @unchecked Sendable {
         ioQueue.async { [weak self] in
             guard let self else { return }
             guard self.isRunning else { return }
-            self.provider.flow.readPackets { [weak self] packets, protocols in
+            let delay = self.emptyReadDelay(for: self.consecutiveEmptyReads)
+            let executeRead: () -> Void = { [weak self] in
                 guard let self else { return }
                 guard self.isRunning else { return }
-
-                let totalBytes = Tun2SocksAdapter.totalBytes(in: packets)
-                guard totalBytes > 0, !packets.isEmpty else {
-                    self.scheduleRead(into: channel)
-                    return
-                }
-
-                Task { [weak self] in
+                self.provider.flow.readPackets { [weak self] packets, protocols in
                     guard let self else { return }
-                    if !self.packetBudget.reserve(bytes: totalBytes) {
-                        self.recordDroppedBatch(direction: .outbound, bytes: totalBytes, reason: "packet budget exhausted")
-                        self.scheduleRead(into: channel)
-                        return
+                    self.ioQueue.async { [weak self] in
+                        guard let self else { return }
+                        self.handleReadResult(packets: packets, protocols: protocols, channel: channel)
                     }
-                    self.emitBudgetWarningIfNeeded()
-                    let batch = PacketBatch(
-                        packets: packets,
-                        protocols: protocols,
-                        totalBytes: totalBytes,
-                        reservedBytes: totalBytes
-                    )
-                    self.memorySampler.recordPacketBatch(count: batch.packets.count, tag: "outbound")
-                    await channel.send(batch)
-                    self.scheduleRead(into: channel)
                 }
             }
+            guard delay > 0 else {
+                executeRead()
+                return
+            }
+            self.ioQueue.asyncAfter(deadline: .now() + delay, execute: executeRead)
+        }
+    }
+
+    private func handleReadResult(packets: [Data], protocols: [NSNumber], channel: AsyncChannel<PacketBatch>) {
+        guard isRunning else { return }
+
+        let totalBytes = Tun2SocksAdapter.totalBytes(in: packets)
+        guard totalBytes > 0, !packets.isEmpty else {
+            if consecutiveEmptyReads < 16 {
+                consecutiveEmptyReads += 1
+            }
+            scheduleRead(into: channel)
+            return
+        }
+
+        consecutiveEmptyReads = 0
+
+        Task { [weak self] in
+            guard let self else { return }
+            if !self.packetBudget.reserve(bytes: totalBytes) {
+                self.recordDroppedBatch(direction: .outbound, bytes: totalBytes, reason: "packet budget exhausted")
+                self.scheduleRead(into: channel)
+                return
+            }
+            self.emitBudgetWarningIfNeeded()
+            let batch = PacketBatch(
+                packets: packets,
+                protocols: protocols,
+                totalBytes: totalBytes,
+                reservedBytes: totalBytes
+            )
+            self.memorySampler.recordPacketBatch(count: batch.packets.count, tag: "outbound") {
+                MemoryFootprintSampler.Context(
+                    batchBytes: batch.totalBytes,
+                    packetPoolBytes: self.packetBudget.currentBytes,
+                    packetPoolLimitBytes: self.packetBudget.limitBytes,
+                    packetBatchLimit: self.packetBatchLimit,
+                    packetBudgetUtilization: self.packetBudget.utilization
+                )
+            }
+            await channel.send(batch)
+            self.scheduleRead(into: channel)
         }
     }
 
@@ -264,6 +300,9 @@ final class Tun2SocksAdapter: @unchecked Sendable {
         outboundTask = nil
         inboundTask = nil
         packetBudget.reset()
+        ioQueue.async { [weak self] in
+            self?.consecutiveEmptyReads = 0
+        }
     }
 
     private func enqueueInbound(packets: [Data], protocols: [NSNumber]) {
@@ -277,7 +316,15 @@ final class Tun2SocksAdapter: @unchecked Sendable {
             return
         }
         emitBudgetWarningIfNeeded()
-        memorySampler.recordPacketBatch(count: packets.count, tag: "inbound")
+        memorySampler.recordPacketBatch(count: packets.count, tag: "inbound") {
+            MemoryFootprintSampler.Context(
+                batchBytes: totalBytes,
+                packetPoolBytes: self.packetBudget.currentBytes,
+                packetPoolLimitBytes: self.packetBudget.limitBytes,
+                packetBatchLimit: self.packetBatchLimit,
+                packetBudgetUtilization: self.packetBudget.utilization
+            )
+        }
         let batch = PacketBatch(
             packets: packets,
             protocols: protocols,
@@ -436,16 +483,24 @@ final class Tun2SocksAdapter: @unchecked Sendable {
         os_unfair_lock_unlock(&budgetWarningLock)
         guard shouldLog else { return }
         let percentage = Int(utilization * 100)
-        logger.warning("Relative Protocol: packet backlog at \(percentage)% of budget (\(self.packetBudget.currentBytes)/\(self.memoryBudget.packetPoolBytes) bytes)")
+        logger.debug("Relative Protocol: packet backlog at \(percentage)% of budget (\(self.packetBudget.currentBytes)/\(self.memoryBudget.packetPoolBytes) bytes)")
     }
 
     private func recordDroppedBatch(direction: RelativeProtocol.Direction, bytes: Int, reason: String) {
-        logger.error("Relative Protocol: dropped \(direction.rawValue) packet batch (\(bytes) bytes) – \(reason)")
+        logger.debug("Relative Protocol: dropped \(direction.rawValue) packet batch (\(bytes) bytes) – \(reason)")
         hooks.eventSink?(.didFail("Relative Protocol dropped \(direction.rawValue) packets (\(bytes) bytes): \(reason)"))
     }
 
     private static func totalBytes(in packets: [Data]) -> Int {
         packets.reduce(0) { $0 + $1.count }
+    }
+
+    private func emptyReadDelay(for count: Int) -> TimeInterval {
+        guard count > 0 else { return 0 }
+        let cappedExponent = min(max(count - 1, 0), 4)
+        let multiplier = Double(1 << cappedExponent)
+        let delay = emptyReadBackoffBase * multiplier
+        return min(delay, emptyReadBackoffCeiling)
     }
 
     /// Consults block policies and establishes TCP connections when permitted.
@@ -606,8 +661,9 @@ private final class ShapingScheduler: @unchecked Sendable {
     }
 
     func schedule(delay: TimeInterval, action: @escaping @Sendable () -> Void) {
-        guard delay.isFinite, delay > 0 else {
-            queue.async(execute: action)
+        guard delay.isFinite else { return }
+        if delay <= 0 {
+            action()
             return
         }
         let nanoseconds = Self.nanoseconds(for: delay)
@@ -670,13 +726,54 @@ private final class ByteBudget {
         os_unfair_lock_unlock(&lock)
         return value
     }
+
+    var limitBytes: Int {
+        limit
+    }
 }
 
 private final class MemoryFootprintSampler {
+    struct Context {
+        let batchBytes: Int
+        let packetPoolBytes: Int
+        let packetPoolLimitBytes: Int
+        let packetBatchLimit: Int
+        let packetBudgetUtilization: Double
+    }
+
+    private struct Snapshot {
+        let timestamp: Date
+        let physFootprint: UInt64
+        let residentSize: UInt64
+        let internalSize: UInt64
+        let compressedSize: UInt64
+        let virtualSize: UInt64
+
+        func deltaMB(from previous: Snapshot) -> SnapshotDelta {
+            SnapshotDelta(
+                physFootprint: MemoryFootprintSampler.bytesToMB(physFootprint) - MemoryFootprintSampler.bytesToMB(previous.physFootprint),
+                residentSize: MemoryFootprintSampler.bytesToMB(residentSize) - MemoryFootprintSampler.bytesToMB(previous.residentSize),
+                internalSize: MemoryFootprintSampler.bytesToMB(internalSize) - MemoryFootprintSampler.bytesToMB(previous.internalSize),
+                compressedSize: MemoryFootprintSampler.bytesToMB(compressedSize) - MemoryFootprintSampler.bytesToMB(previous.compressedSize),
+                virtualSize: MemoryFootprintSampler.bytesToMB(virtualSize) - MemoryFootprintSampler.bytesToMB(previous.virtualSize)
+            )
+        }
+    }
+
+    private struct SnapshotDelta {
+        let physFootprint: Double
+        let residentSize: Double
+        let internalSize: Double
+        let compressedSize: Double
+        let virtualSize: Double
+    }
+
     private let logger: Logger
     private let sampleInterval: Int
     private var counter: Int
-    private var lock = os_unfair_lock_s()
+    private var counterLock = os_unfair_lock_s()
+    private var snapshotLock = os_unfair_lock_s()
+    private var lastSnapshot: Snapshot?
 
     init(logger: Logger, sampleInterval: Int) {
         self.logger = logger
@@ -684,22 +781,47 @@ private final class MemoryFootprintSampler {
         self.counter = 0
     }
 
-    func recordPacketBatch(count: Int, tag: String) {
+    func recordPacketBatch(count: Int, tag: String, context: (() -> Context)? = nil) {
         guard count > 0 else { return }
+
         var shouldSample = false
-        os_unfair_lock_lock(&lock)
+        os_unfair_lock_lock(&counterLock)
         counter += count
         if counter >= sampleInterval {
             counter = 0
             shouldSample = true
         }
-        os_unfair_lock_unlock(&lock)
+        os_unfair_lock_unlock(&counterLock)
         guard shouldSample else { return }
-        guard let footprint = MemoryFootprintSampler.currentFootprintMB() else { return }
-        logger.notice("Relative Protocol: footprint = \(footprint, format: .fixed(precision: 1), privacy: .public) MB \(tag, privacy: .public)")
+
+        logger.debug("Relative Protocol: footprint sampling triggered for \(tag, privacy: .public)")
+        let capturedContext = context?()
+        guard let snapshot = MemoryFootprintSampler.captureSnapshot() else {
+            logger.debug("Relative Protocol: footprint sample skipped (task_info unavailable)")
+            return
+        }
+
+        var previousSnapshot: Snapshot?
+        os_unfair_lock_lock(&snapshotLock)
+        previousSnapshot = lastSnapshot
+        lastSnapshot = snapshot
+        os_unfair_lock_unlock(&snapshotLock)
+
+        let delta = previousSnapshot.map { snapshot.deltaMB(from: $0) }
+        let interval = previousSnapshot.map { snapshot.timestamp.timeIntervalSince($0.timestamp) }
+
+        let message = MemoryFootprintSampler.formatLog(
+            tag: tag,
+            packetCount: count,
+            snapshot: snapshot,
+            delta: delta,
+            interval: interval,
+            context: capturedContext
+        )
+        logger.notice("\(message, privacy: .public)")
     }
 
-    private static func currentFootprintMB() -> Double? {
+    private static func captureSnapshot() -> Snapshot? {
         var info = task_vm_info_data_t()
         var count = mach_msg_type_number_t(MemoryLayout.size(ofValue: info) / MemoryLayout<natural_t>.size)
         let result = withUnsafeMutablePointer(to: &info) {
@@ -708,7 +830,75 @@ private final class MemoryFootprintSampler {
             }
         }
         guard result == KERN_SUCCESS else { return nil }
-        return Double(info.phys_footprint) / 1_048_576.0
+
+        return Snapshot(
+            timestamp: Date(),
+            physFootprint: UInt64(info.phys_footprint),
+            residentSize: UInt64(info.resident_size),
+            internalSize: UInt64(info.internal),
+            compressedSize: UInt64(info.compressed),
+            virtualSize: UInt64(info.virtual_size)
+        )
+    }
+
+    private static func bytesToMB(_ bytes: UInt64) -> Double {
+        Double(bytes) / 1_048_576.0
+    }
+
+    private static func formatMB(_ bytes: UInt64, precision: Int = 1) -> String {
+        String(format: "%.\(precision)f", bytesToMB(bytes))
+    }
+
+    private static func formatMB(_ bytes: Int, precision: Int = 1) -> String {
+        let clamped = max(bytes, 0)
+        return formatMB(UInt64(clamped), precision: precision)
+    }
+
+    private static func formatDelta(_ value: Double?, precision: Int = 1) -> String {
+        guard let value else { return "n/a" }
+        return String(format: "%+.\(precision)f", value)
+    }
+
+    private static func formatPercent(_ value: Double, precision: Int = 1) -> String {
+        String(format: "%.\(precision)f%%", value * 100)
+    }
+
+    private static func formatInterval(_ interval: TimeInterval?) -> String {
+        guard let interval else { return "baseline" }
+        if interval < 1 {
+            return String(format: "%.0fms", interval * 1000)
+        }
+        return String(format: "%.2fs", interval)
+    }
+
+    private static func formatLog(
+        tag: String,
+        packetCount: Int,
+        snapshot: Snapshot,
+        delta: SnapshotDelta?,
+        interval: TimeInterval?,
+        context: Context?
+    ) -> String {
+        var parts: [String] = []
+        parts.append("Relative Protocol: footprint \(tag)")
+        parts.append("phys=\(formatMB(snapshot.physFootprint))MB (Δ\(formatDelta(delta?.physFootprint)))")
+        parts.append("rss=\(formatMB(snapshot.residentSize))MB (Δ\(formatDelta(delta?.residentSize)))")
+        parts.append("internal=\(formatMB(snapshot.internalSize))MB (Δ\(formatDelta(delta?.internalSize)))")
+        parts.append("compressed=\(formatMB(snapshot.compressedSize))MB (Δ\(formatDelta(delta?.compressedSize)))")
+        parts.append("vm=\(formatMB(snapshot.virtualSize))MB (Δ\(formatDelta(delta?.virtualSize)))")
+
+        if let context {
+            let poolPrecision = context.packetPoolLimitBytes >= 4 * 1_048_576 ? 1 : 2
+            let batchPrecision = context.batchBytes >= 1_048_576 ? 1 : 3
+            let utilization = max(0, min(context.packetBudgetUtilization, 1))
+            parts.append("pool=\(formatMB(context.packetPoolBytes, precision: poolPrecision))/\(formatMB(context.packetPoolLimitBytes, precision: poolPrecision))MB (util=\(formatPercent(utilization)))")
+            parts.append("batch=\(formatMB(context.batchBytes, precision: batchPrecision))MB (\(packetCount)/\(context.packetBatchLimit) pkts)")
+        } else {
+            parts.append("batch=\(packetCount) pkts")
+        }
+
+        parts.append("interval=\(formatInterval(interval))")
+        return parts.joined(separator: " ")
     }
 }
 

@@ -26,6 +26,7 @@ mkdir -p "${OUTPUT_DIR}" "${LOCAL_GOPATH}" "${LOCAL_GOMOBILE_CACHE}"
 export GOPATH="${LOCAL_GOPATH}"
 export GOMOBILECACHE="${LOCAL_GOMOBILE_CACHE}"
 export GOMODCACHE="${LOCAL_GOPATH}/pkg/mod"
+export GOFLAGS="-trimpath -ldflags=-s -ldflags=-w"
 
 pushd "${ROOT_DIR}/ThirdParty/tun2socks" >/dev/null
 

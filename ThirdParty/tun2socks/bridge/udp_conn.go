@@ -24,9 +24,11 @@ type swiftUDPSession struct {
 	remote net.Addr
 
 	mu        sync.Mutex
-	recvQueue chan []byte
+	recvQueue chan pooledBytes
 	closed    bool
 }
+
+const udpRecvQueueDepth = 16
 
 func newSwiftUDPSession(handle int64, metadata *M.Metadata, engine *Engine) *swiftUDPSession {
 	addr := metadata.UDPAddr()
@@ -41,7 +43,7 @@ func newSwiftUDPSession(handle int64, metadata *M.Metadata, engine *Engine) *swi
 		handle:    handle,
 		engine:    engine,
 		remote:    remote,
-		recvQueue: make(chan []byte, 64),
+		recvQueue: make(chan pooledBytes, udpRecvQueueDepth),
 	}
 }
 
@@ -50,7 +52,10 @@ func (s *swiftUDPSession) ReadFrom(p []byte) (int, net.Addr, error) {
 	if !ok {
 		return 0, s.remote, errors.New("udp session closed")
 	}
-	n := copy(p, payload)
+	defer payload.release()
+
+	data := payload.bytes()
+	n := copy(p, data)
 	return n, s.remote, nil
 }
 
@@ -59,6 +64,7 @@ func (s *swiftUDPSession) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if s.isClosed() {
 		return 0, errors.New("udp session closed")
 	}
+	s.engine.touchActivity()
 	n, err := s.engine.network.UDPWrite(s.handle, p)
 	return int(n), err
 }
@@ -94,7 +100,7 @@ func (s *swiftUDPSession) enqueue(payload []byte) {
 		return
 	}
 	s.mu.Unlock()
-	s.recvQueue <- append([]byte(nil), payload...)
+	s.recvQueue <- newPooledBytes(payload)
 }
 
 func (s *swiftUDPSession) close() {
