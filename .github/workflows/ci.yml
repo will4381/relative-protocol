@@ -79,6 +79,17 @@ jobs:
       - name: Build Leaf xcframework
         run: ./Scripts/build.sh
 
+      - name: Update Package.swift with release metadata
+        id: package_update
+        run: |
+          ./release/update_package.sh \
+            "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/Leaf.xcframework.zip" \
+            "${{ steps.checksum.outputs.sha }}"
+          git diff Package.swift
+        env:
+          LEAF_XCFRAMEWORK_URL: ""
+          LEAF_XCFRAMEWORK_CHECKSUM: ""
+
       - name: Verify xcframework archive
         run: ls -lh RelativeProtocol/Binary/Leaf.xcframework.zip
 
@@ -87,6 +98,14 @@ jobs:
         run: |
           SHA=$(shasum -a 256 RelativeProtocol/Binary/Leaf.xcframework.zip | awk '{print $1}')
           echo "sha=$SHA" >> $GITHUB_OUTPUT
+
+      - name: Commit updated Package.swift
+        if: steps.package_update.outcome == 'success'
+        run: |
+          git config user.name "relative-protocol CI"
+          git config user.email "ci@relativeprotocol.invalid"
+          git add Package.swift
+          git commit -m "chore: update Leaf binary reference for ${{ github.ref_name }}"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v1
@@ -99,3 +118,7 @@ jobs:
             Leaf xcframework SHA-256 checksum: `${{ steps.checksum.outputs.sha }}`
           files: |
             RelativeProtocol/Binary/Leaf.xcframework.zip
+
+      - name: Push manifest update
+        if: steps.package_update.outcome == 'success'
+        run: git push origin HEAD:main
