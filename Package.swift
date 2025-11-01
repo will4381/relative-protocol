@@ -8,32 +8,25 @@ let fileManager = FileManager.default
 
 let leafCandidatePaths: [String] = [
     environment["LEAF_XCFRAMEWORK_PATH"],
-    "RelativeProtocol/Binary/Leaf.xcframework"
+    "RelativeProtocol/Binary/Leaf.xcframework",
+    "Build/Leaf/Leaf.xcframework"
 ].compactMap { $0 }
 
 let leafLocalPath = leafCandidatePaths.first { path in
     fileManager.fileExists(atPath: path)
 }
 
-let leafArchiveURL = environment["LEAF_XCFRAMEWORK_URL"]
-    ?? "https://github.com/will4381/relative-protocol/releases/download/vNEXT/Leaf.xcframework.zip"
-
-let leafArchiveChecksum = environment["LEAF_XCFRAMEWORK_CHECKSUM"]
-    ?? "56dde7c3c2da00280d91fbefe6699b05944de9d380e4d379e60538b872f93162"
-
-let leafBinaryTarget: Target
-if let localPath = leafLocalPath {
-    leafBinaryTarget = .binaryTarget(
-        name: "LeafBinary",
-        path: localPath
-    )
-} else {
-    leafBinaryTarget = .binaryTarget(
-        name: "LeafBinary",
-        url: leafArchiveURL,
-        checksum: leafArchiveChecksum
-    )
+guard let leafBinaryPath = leafLocalPath else {
+    fatalError("""
+    Leaf xcframework not found. Run ./Scripts/build.sh to generate RelativeProtocol/Binary/Leaf.xcframework \
+    or set LEAF_XCFRAMEWORK_PATH to a valid location before resolving the package.
+    """)
 }
+
+let leafBinaryTarget: Target = .binaryTarget(
+    name: "LeafBinary",
+    path: leafBinaryPath
+)
 
 let package = Package(
     name: "RelativeProtocol",

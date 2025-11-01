@@ -270,18 +270,7 @@ let package = Package(
 
 ## Rebuilding Leaf
 
-Run `./Scripts/build.sh` after modifying the Leaf sources. The script regenerates `RelativeProtocol/Binary/Leaf.xcframework`, creates `RelativeProtocol/Binary/Leaf.xcframework.zip`, and prints the archive’s SHA-256 checksum. Upload the zip to your release destination (e.g. GitHub Releases) and update the `LEAF_XCFRAMEWORK_URL` / `LEAF_XCFRAMEWORK_CHECKSUM` values (or override them via environment variables) before tagging so SwiftPM clients can fetch the binary automatically.
-
-### Automated release workflow
-
-The GitHub Actions release job now:
-
-- Builds the Leaf xcframework/zip.
-- Computes the SHA-256 checksum.
-- Runs `release/update_package.sh` to update `Package.swift` with the new release asset URL and checksum.
-- Commits the manifest change back to `main`.
-
-Tagging a release (`v*`) is all that’s required—no manual manifest edits.
+Run `./Scripts/build.sh` after cloning the repository or modifying the Leaf sources. The script regenerates `RelativeProtocol/Binary/Leaf.xcframework` (and an optional zip archive). SwiftPM expects the xcframework to exist locally—either leave it in the default location or set `LEAF_XCFRAMEWORK_PATH` before resolving the package.
 
 ## Licensing
 
