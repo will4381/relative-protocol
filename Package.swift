@@ -19,10 +19,10 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-collections.git", from: "1.0.5")
     ],
     targets: [
-        // Vendored binary (gomobile) relative to repo root
+        // Vendored Leaf binary relative to repo root
         .binaryTarget(
-            name: "Tun2SocksBinary",
-            path: "RelativeProtocol/Binary/Tun2Socks.xcframework"
+            name: "LeafBinary",
+            path: "RelativeProtocol/Binary/Leaf.xcframework"
         ),
         .target(
             name: "RelativeProtocolHost",
@@ -46,7 +46,7 @@ let package = Package(
             name: "RelativeProtocolTunnel",
             dependencies: [
                 "RelativeProtocolCore",
-                "Tun2SocksBinary",
+                "LeafBinary",
                 .product(name: "AsyncDNSResolver", package: "swift-async-dns-resolver"),
                 .product(name: "AsyncAlgorithms", package: "swift-async-algorithms"),
                 .product(name: "Collections", package: "swift-collections")

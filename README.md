@@ -1,6 +1,6 @@
 # Relative Protocol
 
-Portable tunnel components for iOS Network Extension projects. Built to deliver fully on-device VPN/proxy experiences using Apple’s `NEPacketTunnelProvider` API. `RelativeProtocolCore` defines configuration and hook primitives; `RelativeProtocolTunnel` hosts the Network Extension facade and bundles the gomobile-generated Tun2Socks xcframework.
+Portable tunnel components for iOS Network Extension projects. Built to deliver fully on-device VPN/proxy experiences using Apple’s `NEPacketTunnelProvider` API. `RelativeProtocolCore` defines configuration and hook primitives; `RelativeProtocolTunnel` hosts the Network Extension facade and ships the Leaf xcframework built from the Rust FFI bridge.
 
 ## Performance
 
@@ -48,9 +48,9 @@ When running on-device VPN-style proxies it’s imperative that the tunnel remai
   - `RelativeProtocolTunnel.ProviderController`
     - **Purpose**: drive an `NEPacketTunnelProvider` using RelativeProtocol abstractions.
     - **Inputs**: `start(configuration:completion:)`, `stop(reason:completion:)`, `handleAppMessage(_:completionHandler:)`.
-    - **Output**: manages lifecycle of the gomobile engine, applies network settings, pushes metrics, invokes hooks.
+    - **Output**: manages lifecycle of the Leaf engine, applies network settings, pushes metrics, invokes hooks.
     - **Use when**: implementing the Network Extension target.
-  - Internal adapters wrap the vendored Tun2Socks bridge; no public surface beyond the controller.
+  - Internal adapters wrap the vendored Leaf FFI bridge; no public surface beyond the controller.
 - `RelativeProtocolHost`
   - `RelativeProtocolHost.Controller`
     - **Purpose**: manage `NETunnelProviderManager` lifecycle from the host app.
@@ -268,11 +268,11 @@ let package = Package(
 )
 ```
 
-## Rebuilding Tun2Socks
+## Rebuilding Leaf
 
-Run `./Scripts/build.sh` after modifying the Go sources in `ThirdParty/tun2socks/`. The script regenerates `RelativeProtocol/Binary/Tun2Socks.xcframework` using local Go caches; commit the refreshed binary.
+Run `./Scripts/build.sh` after modifying the Leaf sources. The script regenerates `RelativeProtocol/Binary/Leaf.xcframework`; commit the refreshed binary.
 
 ## Licensing
 
 Project code is offered for personal, non-commercial use under the terms in `LICENSE`.
-Upstream licensing for the vendored bridge is preserved in `ThirdParty/tun2socks/LICENSE`.
+Upstream licensing for the Leaf bridge follows the terms published in the Leaf repository (`leaf/LICENSE`).

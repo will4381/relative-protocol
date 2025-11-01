@@ -5,7 +5,7 @@
 //  Copyright (c) 2025 Relative Companies
 //
 //  Applies traffic shaping policies with minimal buffering by delaying packet
-//  batches in place before forwarding them to the tun2socks engine.
+//  batches in place before forwarding them to the Leaf engine.
 //
 
 import Foundation

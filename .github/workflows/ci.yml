@@ -31,8 +31,8 @@ jobs:
       - name: Print Swift toolchain version
         run: swift --version
 
-      - name: Ensure Tun2Socks binary is present
-        run: ls -R RelativeProtocol/Binary/Tun2Socks.xcframework
+      - name: Ensure Leaf binary is present
+        run: ls -R RelativeProtocol/Binary/Leaf.xcframework
 
       - name: Build package (Debug)
         run: swift build
@@ -49,62 +49,36 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Go toolchain
-        id: setup-go
-        uses: actions/setup-go@v5
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          go-version: '1.22'
+          components: rustfmt
 
-      - name: Add Go bin to PATH
-        run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-
-      - name: Ensure cache directories exist
-        run: |
-          mkdir -p "$HOME/Library/Caches/go-build"
-          mkdir -p "$HOME/Library/Caches/gomobile"
-          mkdir -p "$HOME/go/pkg/mod"
-
-      - name: Cache Go modules and build cache
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
-            ~/Library/Caches/go-build
-            ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('ThirdParty/tun2socks/go.sum') }}
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Scripts/build.sh') }}
           restore-keys: |
-            ${{ runner.os }}-go-
-
-      - name: Install gomobile
-        run: |
-          go install golang.org/x/mobile/cmd/gomobile@latest
-
-      - name: Initialize gomobile (installs gobind)
-        run: gomobile init -v
-
-      - name: Cache gomobile artifacts
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/Library/Caches/gomobile
-          key: ${{ runner.os }}-gomobile-${{ hashFiles('ThirdParty/tun2socks/**') }}
-          restore-keys: |
-            ${{ runner.os }}-gomobile-
+            ${{ runner.os }}-cargo-
 
       - name: Prepare build script
         run: chmod +x Scripts/build.sh
 
-      - name: Build Tun2Socks xcframework
+      - name: Build Leaf xcframework
         run: ./Scripts/build.sh
 
       - name: Package xcframework
         run: |
           cd RelativeProtocol/Binary
-          zip -r Tun2Socks.xcframework.zip Tun2Socks.xcframework
+          zip -r Leaf.xcframework.zip Leaf.xcframework
 
       - name: Compute checksum
         id: checksum
         run: |
-          SHA=$(shasum -a 256 RelativeProtocol/Binary/Tun2Socks.xcframework.zip | awk '{print $1}')
+          SHA=$(shasum -a 256 RelativeProtocol/Binary/Leaf.xcframework.zip | awk '{print $1}')
           echo "sha=$SHA" >> $GITHUB_OUTPUT
 
       - name: Publish GitHub Release
@@ -115,6 +89,6 @@ jobs:
           draft: false
           prerelease: false
           body: |
-            Tun2Socks xcframework SHA-256 checksum: `${{ steps.checksum.outputs.sha }}`
+            Leaf xcframework SHA-256 checksum: `${{ steps.checksum.outputs.sha }}`
           files: |
-            RelativeProtocol/Binary/Tun2Socks.xcframework.zip
+            RelativeProtocol/Binary/Leaf.xcframework.zip

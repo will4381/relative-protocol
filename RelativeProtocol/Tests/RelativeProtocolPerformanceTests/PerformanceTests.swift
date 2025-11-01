@@ -66,11 +66,11 @@ final class RelativeProtocolPerformanceTests: XCTestCase {
         let flow = MockPacketFlow()
         let provider = MockProvider(flow: flow)
         let configuration = makeTestConfiguration()
-        let adapter = Tun2SocksAdapter(
+        let adapter = LeafAdapter(
             provider: provider,
             configuration: configuration,
             metrics: nil,
-            engine: NoOpTun2SocksEngine(),
+            engine: NoOpLeafRuntimeEngine(),
             hooks: configuration.hooks,
             logger: testLogger
         )

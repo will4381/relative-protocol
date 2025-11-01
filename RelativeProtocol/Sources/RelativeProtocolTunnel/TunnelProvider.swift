@@ -6,9 +6,9 @@
 //  Personal, non-commercial use only. Created by Will Kusch on 10/21/2025.
 //
 //  High-level façade that coordinates the Network Extension tunnel using
-//  Relative Protocol configuration and the embedded tun2socks engine. The
+//  Relative Protocol configuration and the embedded Leaf engine. The
 //  controller encapsulates all glue necessary to bridge Apple’s
-//  `NEPacketTunnelProvider` APIs with the gomobile-generated bindings.
+//  `NEPacketTunnelProvider` APIs with the Rust FFI bindings.
 //
 
 import Foundation
@@ -21,12 +21,12 @@ public enum RelativeProtocolTunnel {}
 public extension RelativeProtocolTunnel {
     /// Production-ready orchestrator for an `NEPacketTunnelProvider`. Host code
     /// delegates lifecycle events to this controller instead of re-implementing
-    /// gomobile wiring or packet plumbing.
+        /// Leaf wiring or packet plumbing.
     final class ProviderController {
         private unowned let provider: NEPacketTunnelProvider
         private let logger: Logger
         private var metrics: MetricsCollector?
-        private var adapter: Tun2SocksAdapter?
+        private var adapter: LeafAdapter?
         private var configuration: RelativeProtocol.Configuration?
         private var trafficAnalyzer: TrafficAnalyzer?
         private var filterCoordinator: FilterCoordinator?
@@ -46,7 +46,7 @@ public extension RelativeProtocolTunnel {
         }
 
         /// Starts the tunnel by validating configuration, applying network
-        /// settings, and spinning up the tun2socks engine.
+        /// settings, and spinning up the Leaf engine.
         public func start(configuration: RelativeProtocol.Configuration, completion: @escaping (Error?) -> Void) {
             do {
                 let messages = try configuration.validateOrThrow()
@@ -195,20 +195,15 @@ public extension RelativeProtocolTunnel {
             provider.setTunnelNetworkSettings(settings, completionHandler: completion)
         }
 
-        /// Constructs the tun2socks engine/adapter pair and starts processing
+        /// Constructs the Leaf engine/adapter pair and starts processing
         /// packets.
         private func bootBridge(configuration: RelativeProtocol.Configuration, metrics: MetricsCollector?) throws {
-            let engine: Tun2SocksEngine
-            #if canImport(Tun2Socks)
-            engine = GoTun2SocksEngine(
+            let engine: LeafRuntimeEngine = LeafRuntimeBridge(
                 configuration: configuration,
-                logger: Logger(subsystem: "RelativeProtocolTunnel", category: "GoTun2Socks")
+                logger: Logger(subsystem: "RelativeProtocolTunnel", category: "Leaf")
             )
-#else
-        engine = NoOpTun2SocksEngine()
-#endif
 
-            let adapter = Tun2SocksAdapter(
+            let adapter = LeafAdapter(
                 provider: provider,
                 configuration: configuration,
                 metrics: metrics,
