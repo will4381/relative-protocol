@@ -270,7 +270,7 @@ let package = Package(
 
 ## Rebuilding Leaf
 
-Run `./Scripts/build.sh` after modifying the Leaf sources. The script regenerates `RelativeProtocol/Binary/Leaf.xcframework`; commit the refreshed binary.
+Run `./Scripts/build.sh` after modifying the Leaf sources. The script regenerates `RelativeProtocol/Binary/Leaf.xcframework`, creates `RelativeProtocol/Binary/Leaf.xcframework.zip`, and prints the archive’s SHA-256 checksum. Upload the zip to your release destination (e.g. GitHub Releases) and update the `LEAF_XCFRAMEWORK_URL` / `LEAF_XCFRAMEWORK_CHECKSUM` values (or override them via environment variables) before tagging so SwiftPM clients can fetch the binary automatically.
 
 ## Licensing
 

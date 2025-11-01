@@ -27,9 +27,16 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          lfs: true
 
       - name: Print Swift toolchain version
         run: swift --version
+
+      - name: Build Leaf xcframework (local)
+        run: |
+          chmod +x Scripts/build.sh
+          ./Scripts/build.sh
 
       - name: Ensure Leaf binary is present
         run: ls -R RelativeProtocol/Binary/Leaf.xcframework
@@ -48,6 +55,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          lfs: true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -70,10 +79,8 @@ jobs:
       - name: Build Leaf xcframework
         run: ./Scripts/build.sh
 
-      - name: Package xcframework
-        run: |
-          cd RelativeProtocol/Binary
-          zip -r Leaf.xcframework.zip Leaf.xcframework
+      - name: Verify xcframework archive
+        run: ls -lh RelativeProtocol/Binary/Leaf.xcframework.zip
 
       - name: Compute checksum
         id: checksum

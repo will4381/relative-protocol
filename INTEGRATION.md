@@ -6,7 +6,8 @@ This guide walks through adding Relative Protocol to a new or existing iOS/macOS
 
 - Host app depends on `RelativeProtocolCore` for configuration primitives and `RelativeProtocolHost` for high-level tunnel lifecycle, control messaging, and diagnostics.
 - Packet Tunnel Extension depends on `RelativeProtocolCore` and `RelativeProtocolTunnel`. The extension delegates tunnel lifecycle to `ProviderController`.
-- The Leaf engine is bundled via a binary target; no separate build steps are required for consumers.
+- The Leaf engine is distributed via a binary target; consumers fetch the zipped xcframework automatically through SwiftPM.
+- Contributors should run `./Scripts/build.sh` if they need a local Leaf build—the script refreshes `RelativeProtocol/Binary/Leaf.xcframework` and produces a zipped archive plus checksum for release packaging.
 
 ## 1) Add the Package (SPM)
 
