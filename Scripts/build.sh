@@ -59,6 +59,8 @@ TARGETS=(
   "aarch64-apple-ios"
   "x86_64-apple-ios"
   "aarch64-apple-ios-sim"
+  "aarch64-apple-darwin"
+  "x86_64-apple-darwin"
 )
 
 for target in "${TARGETS[@]}"; do
