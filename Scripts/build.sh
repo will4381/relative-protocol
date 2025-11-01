@@ -120,12 +120,4 @@ popd >/dev/null
 mkdir -p "${PACKAGE_BINARY_DIR}/${FRAMEWORK_NAME}"
 rsync -a --delete "${OUTPUT_DIR}/${FRAMEWORK_NAME}/" "${PACKAGE_BINARY_DIR}/${FRAMEWORK_NAME}/"
 
-ZIP_OUTPUT="${PACKAGE_BINARY_DIR}/${FRAMEWORK_NAME}.zip"
-rm -f "${ZIP_OUTPUT}"
-ditto -c -k --sequesterRsrc --keepParent "${PACKAGE_BINARY_DIR}/${FRAMEWORK_NAME}" "${ZIP_OUTPUT}"
-
-SHA256=$(shasum -a 256 "${ZIP_OUTPUT}" | awk '{print $1}')
-
 echo "Leaf XCFramework built at ${PACKAGE_BINARY_DIR}/${FRAMEWORK_NAME}"
-echo "Zip archive created at ${ZIP_OUTPUT}"
-echo "SHA-256: ${SHA256}"
