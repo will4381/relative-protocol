@@ -1,8 +1,0 @@
-framework module "Tun2Socks" {
-	header "ref.h"
-    header "Bridge.objc.h"
-    header "Universe.objc.h"
-    header "Tun2Socks.h"
-
-    export *
-}
