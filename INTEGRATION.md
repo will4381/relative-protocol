@@ -6,7 +6,7 @@ This guide walks through adding Relative Protocol to a new or existing iOS/macOS
 
 - Host app depends on `RelativeProtocolCore` for configuration primitives and `RelativeProtocolHost` for high-level tunnel lifecycle, control messaging, and diagnostics.
 - Packet Tunnel Extension depends on `RelativeProtocolCore` and `RelativeProtocolTunnel`. The extension delegates tunnel lifecycle to `ProviderController`.
-- The Tun2Socks engine is bundled via a binary target; no separate build steps are required for consumers.
+- The Engine binary is bundled via a binary target; no separate build steps are required for consumers.
 
 ## 1) Add the Package (SPM)
 

@@ -2,7 +2,11 @@
 //  ForwardHostTrackerTests.swift
 //  RelativeProtocolTunnelTests
 //
-//  Created by Codex on 10/28/2025.
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 10/22/2025.
+//
+//  Validates that TLS ClientHello parsing and the forward host tracker maintain
+//  accurate IP-to-hostname mappings.
 //
 
 import XCTest

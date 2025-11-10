@@ -2,10 +2,11 @@
 //  TrafficShaper.swift
 //  RelativeProtocolTunnel
 //
-//  Copyright (c) 2025 Relative Companies
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 10/21/2025.
 //
 //  Applies traffic shaping policies with minimal buffering by delaying packet
-//  batches in place before forwarding them to the tun2socks engine.
+//  batches in place before forwarding them to the engine.
 //
 
 import Foundation

@@ -1,32 +1,32 @@
 //
-//  GoTun2SocksEngine.swift
+//  BundledEngine.swift
 //  RelativeProtocolTunnel
 //
 //  Copyright (c) 2025 Relative Companies, Inc.
 //  Personal, non-commercial use only. Created by Will Kusch on 10/20/2025.
 //
-//  Bridges the gomobile-generated Tun2Socks bindings into the adapter by
-//  translating callbacks between Swift and Go while keeping the generated
-//  framework isolated from the rest of the package.
+//  Bridges the bundled engine bindings into the adapter by translating
+//  callbacks between Swift and the vendored framework while keeping it
+//  isolated from the rest of the package.
 //
 
-#if canImport(Tun2Socks)
+#if canImport(Engine)
 
 import Darwin
 import Foundation
 import Network
 import os.log
 import RelativeProtocolCore
-import Tun2Socks
+import Engine
 
-final class GoTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
+final class BundledEngine: Engine, @unchecked Sendable {
     private let configuration: RelativeProtocol.Configuration
     private let logger: Logger
-    private var callbacks: Tun2SocksCallbacks?
-    private var goEngine: BridgeEngine?
+    private var callbacks: EngineCallbacks?
+    private var bridgeEngine: BridgeEngine?
     private var packetEmitter: PacketEmitterAdapter?
     private var networkAdapter: NetworkAdapter?
-    private let stateQueue = DispatchQueue(label: "RelativeProtocolTunnel.GoTun2SocksEngine")
+    private let stateQueue = DispatchQueue(label: "RelativeProtocolTunnel.BundledEngine")
     private var logSink: LogSinkAdapter?
     private var running = false
 
@@ -35,8 +35,8 @@ final class GoTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
         self.logger = logger
     }
 
-    /// Boots the gomobile engine and wires its callbacks into Swift.
-    func start(callbacks: Tun2SocksCallbacks) throws {
+    /// Boots the bundled engine and wires its callbacks into Swift.
+    func start(callbacks: EngineCallbacks) throws {
         try stateQueue.sync {
             guard !running else { return }
 
@@ -55,15 +55,15 @@ final class GoTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
             var logError: NSError?
             if BridgeSetLogSink(sink, "info", &logError) {
                 logSink = sink
-                logger.notice("Relative Protocol: Go log sink installed")
+                logger.notice("Relative Protocol: engine log sink installed")
             } else if let logError {
-                logger.error("Relative Protocol: failed to install Go logger – \(logError.localizedDescription, privacy: .public)")
+                logger.error("Relative Protocol: failed to install engine logger – \(logError.localizedDescription, privacy: .public)")
             }
 
             var creationError: NSError?
             guard let engine = BridgeNewEngine(config, emitter, network, &creationError) else {
                 throw creationError ?? NSError(
-                    domain: "GoTun2SocksEngine",
+                    domain: "BundledEngine",
                     code: -4,
                     userInfo: [NSLocalizedDescriptionKey: "BridgeNewEngine returned nil without error"]
                 )
@@ -72,7 +72,7 @@ final class GoTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
 
             try engine.start()
 
-            goEngine = engine
+            bridgeEngine = engine
             packetEmitter = emitter
             networkAdapter = network
             self.callbacks = callbacks
@@ -81,7 +81,7 @@ final class GoTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
             callbacks.startPacketReadLoop { [weak self] packets, protocols in
                 guard
                     let self,
-                    let engine = self.goEngine
+                    let engine = self.bridgeEngine
                 else { return }
 
                 for (index, packet) in packets.enumerated() {
@@ -97,22 +97,22 @@ final class GoTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
         }
     }
 
-    /// Stops the gomobile engine and releases associated resources.
+    /// Stops the bundled engine and releases associated resources.
     func stop() {
         stateQueue.sync {
             guard running else { return }
             networkAdapter?.shutdown()
-            goEngine?.stop()
+            bridgeEngine?.stop()
 
             var resetError: NSError?
             if BridgeSetLogSink(nil, nil, &resetError) {
-                logger.notice("Relative Protocol: Go log sink removed")
+                logger.notice("Relative Protocol: engine log sink removed")
             } else if let resetError {
-                logger.error("Relative Protocol: failed to reset Go logger – \(resetError.localizedDescription, privacy: .public)")
+                logger.error("Relative Protocol: failed to reset engine logger – \(resetError.localizedDescription, privacy: .public)")
             }
             logSink = nil
             callbacks = nil
-            goEngine = nil
+            bridgeEngine = nil
             packetEmitter = nil
             networkAdapter = nil
             running = false
@@ -122,17 +122,17 @@ final class GoTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
 
 // MARK: - Packet emission
 
-/// Bridges packet emission from the Go bridge back into Swift callbacks.
+/// Bridges packet emission from the engine bridge back into Swift callbacks.
 private final class PacketEmitterAdapter: NSObject, BridgePacketEmitterProtocol {
-    private let callbacks: Tun2SocksCallbacks
+    private let callbacks: EngineCallbacks
 
-    init(callbacks: Tun2SocksCallbacks) {
+    init(callbacks: EngineCallbacks) {
         self.callbacks = callbacks
     }
 
     func emitPacket(_ packet: Data?, protocolNumber: Int32) throws {
         guard let packet else {
-            throw NSError(domain: "GoTun2SocksEngine", code: -3, userInfo: [NSLocalizedDescriptionKey: "packet is nil"])
+            throw NSError(domain: "BundledEngine", code: -3, userInfo: [NSLocalizedDescriptionKey: "packet is nil"])
         }
         callbacks.emitPackets([packet], [NSNumber(value: protocolNumber)])
     }
@@ -184,7 +184,7 @@ private final class LogSinkAdapter: NSObject, BridgeLogSinkProtocol {
     func log(_ level: String?, message: String?) {
         guard let message else { return }
 
-        let text = "Go: \(message)"
+        let text = "Engine: \(message)"
         switch level?.lowercased() {
         case "debug":
             logger.debug("\(text, privacy: .public)")
@@ -202,9 +202,9 @@ private final class LogSinkAdapter: NSObject, BridgeLogSinkProtocol {
 
 // MARK: - Network plumbing
 
-/// Handles TCP/UDP lifecycle requests originating from the Go bridge.
+/// Handles TCP/UDP lifecycle requests originating from the engine bridge.
 private final class NetworkAdapter: NSObject, BridgeNetworkProtocol {
-    private let callbacks: Tun2SocksCallbacks
+    private let callbacks: EngineCallbacks
     private let logger: Logger
     private let mtu: Int
     private let memory: RelativeProtocol.Configuration.MemoryBudget
@@ -215,7 +215,7 @@ private final class NetworkAdapter: NSObject, BridgeNetworkProtocol {
     private var udpConnections: [Int64: ManagedUDPConnection] = [:]
     private weak var engine: BridgeEngine?
 
-    init(callbacks: Tun2SocksCallbacks, logger: Logger, mtu: Int, memory: RelativeProtocol.Configuration.MemoryBudget) {
+    init(callbacks: EngineCallbacks, logger: Logger, mtu: Int, memory: RelativeProtocol.Configuration.MemoryBudget) {
         self.callbacks = callbacks
         self.logger = logger
         self.mtu = mtu
@@ -248,10 +248,10 @@ private final class NetworkAdapter: NSObject, BridgeNetworkProtocol {
         ret0_: UnsafeMutablePointer<Int64>?
     ) throws {
         guard let host else {
-            throw NSError(domain: "GoTun2SocksEngine", code: -1, userInfo: [NSLocalizedDescriptionKey: "host is nil"])
+            throw NSError(domain: "BundledEngine", code: -1, userInfo: [NSLocalizedDescriptionKey: "host is nil"])
         }
         guard let nwPort = Network.NWEndpoint.Port(rawValue: UInt16(clamping: port)) else {
-            throw NSError(domain: "GoTun2SocksEngine", code: -2, userInfo: [NSLocalizedDescriptionKey: "invalid port \(port)"])
+            throw NSError(domain: "BundledEngine", code: -2, userInfo: [NSLocalizedDescriptionKey: "invalid port \(port)"])
         }
 
         let endpoint = Network.NWEndpoint.hostPort(host: Network.NWEndpoint.Host(host), port: nwPort)
@@ -291,7 +291,7 @@ private final class NetworkAdapter: NSObject, BridgeNetworkProtocol {
             return
         }
         guard let connection = tcpConnection(for: handle) else {
-            throw NSError(domain: "GoTun2SocksEngine", code: -3, userInfo: [NSLocalizedDescriptionKey: "missing tcp handle \(handle)"])
+            throw NSError(domain: "BundledEngine", code: -3, userInfo: [NSLocalizedDescriptionKey: "missing tcp handle \(handle)"])
         }
         let written = try connection.write(data: payload)
         ret0_?.pointee = Int32(written)
@@ -308,10 +308,10 @@ private final class NetworkAdapter: NSObject, BridgeNetworkProtocol {
         ret0_: UnsafeMutablePointer<Int64>?
     ) throws {
         guard let host else {
-            throw NSError(domain: "GoTun2SocksEngine", code: -4, userInfo: [NSLocalizedDescriptionKey: "host is nil"])
+            throw NSError(domain: "BundledEngine", code: -4, userInfo: [NSLocalizedDescriptionKey: "host is nil"])
         }
         guard let nwPort = Network.NWEndpoint.Port(rawValue: UInt16(clamping: port)) else {
-            throw NSError(domain: "GoTun2SocksEngine", code: -5, userInfo: [NSLocalizedDescriptionKey: "invalid port \(port)"])
+            throw NSError(domain: "BundledEngine", code: -5, userInfo: [NSLocalizedDescriptionKey: "invalid port \(port)"])
         }
 
         let endpoint = Network.NWEndpoint.hostPort(host: Network.NWEndpoint.Host(host), port: nwPort)
@@ -347,7 +347,7 @@ private final class NetworkAdapter: NSObject, BridgeNetworkProtocol {
             return
         }
         guard let connection = udpConnection(for: handle) else {
-            throw NSError(domain: "GoTun2SocksEngine", code: -6, userInfo: [NSLocalizedDescriptionKey: "missing udp handle \(handle)"])
+            throw NSError(domain: "BundledEngine", code: -6, userInfo: [NSLocalizedDescriptionKey: "missing udp handle \(handle)"])
         }
         let written = try connection.write(data: payload)
         ret0_?.pointee = Int32(written)
@@ -393,7 +393,7 @@ private final class NetworkAdapter: NSObject, BridgeNetworkProtocol {
 
 // Remaining ManagedTCPConnection and ManagedUDPConnection classes unchanged…
 
-/// Wraps an `NWConnection` and forwards events back to the Go engine.
+/// Wraps an `NWConnection` and forwards events back to the engine core.
 private final class ManagedTCPConnection: @unchecked Sendable {
     private let handle: Int64
     private let connection: Network.NWConnection
@@ -451,7 +451,7 @@ private final class ManagedTCPConnection: @unchecked Sendable {
 
         if readySemaphore.wait(timeout: timeout) == .timedOut {
             cancel()
-            throw NSError(domain: "GoTun2SocksEngine", code: -8, userInfo: [NSLocalizedDescriptionKey: "tcp dial timeout"])
+            throw NSError(domain: "BundledEngine", code: -8, userInfo: [NSLocalizedDescriptionKey: "tcp dial timeout"])
         }
 
         let result = stateLock.sync { readyResult }
@@ -479,7 +479,7 @@ private final class ManagedTCPConnection: @unchecked Sendable {
 
             guard sendWindow.acquire(timeoutMillis: timeoutMillis) else {
                 cancel()
-                throw NSError(domain: "GoTun2SocksEngine", code: -10, userInfo: [NSLocalizedDescriptionKey: "tcp send throttled by concurrency window"])
+                throw NSError(domain: "BundledEngine", code: -10, userInfo: [NSLocalizedDescriptionKey: "tcp send throttled by concurrency window"])
             }
 
             do {
@@ -514,7 +514,7 @@ private final class ManagedTCPConnection: @unchecked Sendable {
             signalReady(result: .failure(error))
             notifyClose(reason: error)
         case .cancelled:
-            signalReady(result: .failure(NSError(domain: "GoTun2SocksEngine", code: -9, userInfo: [NSLocalizedDescriptionKey: "connection cancelled"])))
+            signalReady(result: .failure(NSError(domain: "BundledEngine", code: -9, userInfo: [NSLocalizedDescriptionKey: "connection cancelled"])))
             notifyClose(reason: nil)
         default:
             break
@@ -581,7 +581,7 @@ private final class ManagedTCPConnection: @unchecked Sendable {
             let timeout = DispatchTime.now() + .milliseconds(Int(timeoutMillis))
             if semaphore.wait(timeout: timeout) == .timedOut {
                 cancel()
-                throw NSError(domain: "GoTun2SocksEngine", code: -7, userInfo: [NSLocalizedDescriptionKey: "tcp write timeout"])
+                throw NSError(domain: "BundledEngine", code: -7, userInfo: [NSLocalizedDescriptionKey: "tcp write timeout"])
             }
         } else {
             semaphore.wait()
@@ -597,7 +597,7 @@ private final class ManagedTCPConnection: @unchecked Sendable {
 }
 
 /// Wraps an `NWConnection` representing a UDP session and forwards events to
-/// the Go engine.
+/// the engine core.
 private final class ManagedUDPConnection: @unchecked Sendable {
     private let handle: Int64
     private let connection: Network.NWConnection
@@ -657,7 +657,7 @@ private final class ManagedUDPConnection: @unchecked Sendable {
         }
 
         guard self.sendWindow.acquire(timeoutMillis: 0) else {
-            throw NSError(domain: "GoTun2SocksEngine", code: -12, userInfo: [NSLocalizedDescriptionKey: "udp send throttled by concurrency window"])
+            throw NSError(domain: "BundledEngine", code: -12, userInfo: [NSLocalizedDescriptionKey: "udp send throttled by concurrency window"])
         }
 
         let semaphore = DispatchSemaphore(value: 0)

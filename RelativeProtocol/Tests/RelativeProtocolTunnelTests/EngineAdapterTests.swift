@@ -1,5 +1,5 @@
 //
-//  Tun2SocksAdapterTests.swift
+//  EngineAdapterTests.swift
 //  RelativeProtocolTunnelTests
 //
 //  Copyright (c) 2025 Relative Companies, Inc.
@@ -15,7 +15,7 @@ import os.log
 @testable import RelativeProtocolCore
 @testable import RelativeProtocolTunnel
 
-final class Tun2SocksAdapterTests: XCTestCase {
+final class EngineAdapterTests: XCTestCase {
     private let testLogger = Logger(subsystem: "RelativeProtocolTests", category: "AdapterTests")
 
     private func makeIPv4Packet(
@@ -77,9 +77,9 @@ final class Tun2SocksAdapterTests: XCTestCase {
     func testStartAndStopLifecycle() throws {
         let flow = MockPacketFlow()
         let provider = MockProvider(flow: flow)
-        let engine = MockTun2SocksEngine()
+        let engine = MockEngine()
         let configuration = makeConfiguration { _ in }
-        let adapter = Tun2SocksAdapter(
+        let adapter = EngineAdapter(
             provider: provider,
             configuration: configuration,
             metrics: nil,
@@ -103,9 +103,9 @@ final class Tun2SocksAdapterTests: XCTestCase {
     func testInboundPacketsForwardedToEngine() throws {
         let flow = MockPacketFlow()
         let provider = MockProvider(flow: flow)
-        let engine = MockTun2SocksEngine()
+        let engine = MockEngine()
         let configuration = makeConfiguration { _ in }
-        let adapter = Tun2SocksAdapter(
+        let adapter = EngineAdapter(
             provider: provider,
             configuration: configuration,
             metrics: nil,
@@ -137,9 +137,9 @@ final class Tun2SocksAdapterTests: XCTestCase {
     func testOutboundPacketsReachPacketFlow() throws {
         let flow = MockPacketFlow()
         let provider = MockProvider(flow: flow)
-        let engine = MockTun2SocksEngine()
+        let engine = MockEngine()
         let configuration = makeConfiguration { _ in }
-        let adapter = Tun2SocksAdapter(
+        let adapter = EngineAdapter(
             provider: provider,
             configuration: configuration,
             metrics: nil,
@@ -226,7 +226,7 @@ final class Tun2SocksAdapterTests: XCTestCase {
     func testRoundTripEmitsMetricsAndPacketTap() throws {
         let flow = MockPacketFlow()
         let provider = MockProvider(flow: flow)
-        let engine = MockTun2SocksEngine()
+        let engine = MockEngine()
         let tappedContexts = ThreadSafeArray<RelativeProtocol.Configuration.PacketContext>()
         let configuration = makeConfiguration { context in
             tappedContexts.append(context)
@@ -241,7 +241,7 @@ final class Tun2SocksAdapterTests: XCTestCase {
         }
         metrics.reset()
 
-        let adapter = Tun2SocksAdapter(
+        let adapter = EngineAdapter(
             provider: provider,
             configuration: configuration,
             metrics: metrics,
@@ -278,13 +278,13 @@ final class Tun2SocksAdapterTests: XCTestCase {
     func testAnalyzerReceivesPacketsWhenStreamProvided() throws {
         let flow = MockPacketFlow()
         let provider = MockProvider(flow: flow)
-        let engine = MockTun2SocksEngine()
+        let engine = MockEngine()
 
         var configuration = makeConfiguration { _ in }
         let stream = RelativeProtocol.PacketStream(configuration: .init(bufferDuration: 60))
         configuration.hooks.packetStreamBuilder = { stream }
 
-        let adapter = Tun2SocksAdapter(
+        let adapter = EngineAdapter(
             provider: provider,
             configuration: configuration,
             metrics: nil,
@@ -320,13 +320,13 @@ final class Tun2SocksAdapterTests: XCTestCase {
     func testPrivateTrafficIsNotBuffered() throws {
         let flow = MockPacketFlow()
         let provider = MockProvider(flow: flow)
-        let engine = MockTun2SocksEngine()
+        let engine = MockEngine()
 
         var configuration = makeConfiguration { _ in }
         let stream = RelativeProtocol.PacketStream(configuration: .init(bufferDuration: 60))
         configuration.hooks.packetStreamBuilder = { stream }
 
-        let adapter = Tun2SocksAdapter(
+        let adapter = EngineAdapter(
             provider: provider,
             configuration: configuration,
             metrics: nil,
@@ -386,13 +386,13 @@ final class Tun2SocksAdapterTests: XCTestCase {
     func testLifecycleEventsTriggerHooks() throws {
         let flow = MockPacketFlow()
         let provider = MockProvider(flow: flow)
-        let engine = MockTun2SocksEngine()
+        let engine = MockEngine()
         let events = ThreadSafeArray<RelativeProtocol.Configuration.Event>()
         let configuration = makeConfiguration(
             packetTap: { _ in },
             eventSink: { event in events.append(event) }
         )
-        let adapter = Tun2SocksAdapter(
+        let adapter = EngineAdapter(
             provider: provider,
             configuration: configuration,
             metrics: nil,
@@ -420,7 +420,7 @@ final class Tun2SocksAdapterTests: XCTestCase {
     func testBlockedTCPHostTriggersFailureEvent() throws {
         let flow = MockPacketFlow()
         let provider = RecordingProvider(flow: flow)
-        let engine = MockTun2SocksEngine()
+        let engine = MockEngine()
         let failureExpectation = expectation(description: "blocked tcp host reported")
         let configuration = makeConfiguration(
             packetTap: { _ in },
@@ -431,7 +431,7 @@ final class Tun2SocksAdapterTests: XCTestCase {
                 }
             }
         )
-        let adapter = Tun2SocksAdapter(
+        let adapter = EngineAdapter(
             provider: provider,
             configuration: configuration,
             metrics: nil,
@@ -459,7 +459,7 @@ final class Tun2SocksAdapterTests: XCTestCase {
     func testBlockedUDPHostTriggersFailureEvent() throws {
         let flow = MockPacketFlow()
         let provider = RecordingProvider(flow: flow)
-        let engine = MockTun2SocksEngine()
+        let engine = MockEngine()
         let failureExpectation = expectation(description: "blocked udp host reported")
         let configuration = makeConfiguration(
             packetTap: { _ in },
@@ -470,7 +470,7 @@ final class Tun2SocksAdapterTests: XCTestCase {
                 }
             }
         )
-        let adapter = Tun2SocksAdapter(
+        let adapter = EngineAdapter(
             provider: provider,
             configuration: configuration,
             metrics: nil,
@@ -499,7 +499,7 @@ final class Tun2SocksAdapterTests: XCTestCase {
 
 // MARK: - Test doubles
 
-private final class MockTun2SocksEngine: Tun2SocksEngine {
+private final class MockEngine: Engine {
     private(set) var startCallCount = 0
     private(set) var stopCallCount = 0
     var onReceive: (@Sendable ([Data], [NSNumber]) -> Void)?
@@ -507,7 +507,7 @@ private final class MockTun2SocksEngine: Tun2SocksEngine {
     private var tcpFactory: (@Sendable (NWEndpoint) -> NWConnection)?
     private var udpFactory: (@Sendable (NWEndpoint) -> NWConnection)?
 
-    func start(callbacks: Tun2SocksCallbacks) throws {
+    func start(callbacks: EngineCallbacks) throws {
         startCallCount += 1
         tcpFactory = callbacks.makeTCPConnection
         udpFactory = callbacks.makeUDPConnection

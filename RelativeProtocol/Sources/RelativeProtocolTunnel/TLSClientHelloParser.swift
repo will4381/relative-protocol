@@ -2,7 +2,11 @@
 //  TLSClientHelloParser.swift
 //  RelativeProtocolTunnel
 //
-//  Created by Codex on 10/28/2025.
+//  Copyright (c) 2025 Relative Companies, Inc.
+//  Personal, non-commercial use only. Created by Will Kusch on 10/22/2025.
+//
+//  Parses TLS ClientHello packets to extract hostname/IP mappings used by the
+//  forward host tracker.
 //
 
 import Foundation

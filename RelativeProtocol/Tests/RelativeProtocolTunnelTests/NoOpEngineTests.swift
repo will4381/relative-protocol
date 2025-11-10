@@ -1,5 +1,5 @@
 //
-//  NoOpTun2SocksEngineTests.swift
+//  NoOpEngineTests.swift
 //  RelativeProtocolTunnelTests
 //
 //  Copyright (c) 2025 Relative Companies, Inc.
@@ -12,9 +12,9 @@ import XCTest
 import Network
 @testable import RelativeProtocolTunnel
 
-final class NoOpTun2SocksEngineTests: XCTestCase {
+final class NoOpEngineTests: XCTestCase {
     func testEchoesPacketsWhileRunning() throws {
-        let engine = NoOpTun2SocksEngine()
+        let engine = NoOpEngine()
 
         let readLoopInstalled = expectation(description: "read loop installed")
         let firstEmission = expectation(description: "first packet echoed")
@@ -24,7 +24,7 @@ final class NoOpTun2SocksEngineTests: XCTestCase {
         var readHandler: (([Data], [NSNumber]) -> Void)?
         var emissionCount = 0
 
-        let callbacks = Tun2SocksCallbacks(
+        let callbacks = EngineCallbacks(
             startPacketReadLoop: { handler in
                 readHandler = handler
                 readLoopInstalled.fulfill()

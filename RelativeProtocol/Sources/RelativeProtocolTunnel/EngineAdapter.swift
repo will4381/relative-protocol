@@ -1,13 +1,13 @@
 //
-//  Tun2SocksAdapter.swift
+//  EngineAdapter.swift
 //  RelativeProtocolTunnel
 //
 //  Copyright (c) 2025 Relative Companies, Inc.
 //  Personal, non-commercial use only. Created by Will Kusch on 10/20/2025.
 //
-//  Bridges `NEPacketTunnelProvider` packet flow into the tun2socks core. The
+//  Bridges `NEPacketTunnelProvider` packet flow into the engine core. The
 //  adapter owns the read loop, metrics accounting, and hook invocation logic
-//  while delegating actual packet processing to the gomobile engine.
+//  while delegating actual packet processing to the embedded engine.
 //
 
 import Darwin
@@ -18,31 +18,31 @@ import os.lock
 import RelativeProtocolCore
 import AsyncAlgorithms
 
-/// Minimal interface adopted by both the real gomobile bridge and the noop
+/// Minimal interface adopted by both the real bundled bridge and the noop
 /// stub. Keeps the adapter decoupled from generated bindings.
-protocol Tun2SocksEngine {
-    func start(callbacks: Tun2SocksCallbacks) throws
+protocol Engine {
+    func start(callbacks: EngineCallbacks) throws
     func stop()
 }
 
 /// Callback set passed into the engine so it can interact with the adapter
 /// without a hard dependency on `NEPacketTunnelProvider`.
-struct Tun2SocksCallbacks {
+struct EngineCallbacks {
     let startPacketReadLoop: (@escaping @Sendable (_ packets: [Data], _ protocols: [NSNumber]) -> Void) -> Void
     let emitPackets: (_ packets: [Data], _ protocols: [NSNumber]) -> Void
     let makeTCPConnection: (_ endpoint: Network.NWEndpoint) -> Network.NWConnection
     let makeUDPConnection: (_ endpoint: Network.NWEndpoint) -> Network.NWConnection
 }
 
-/// Shim used when the gomobile-generated bindings are unavailable. It simply
+/// Shim used when the bundled bindings are unavailable. It simply
 /// reflects packets back through the tunnel so the provider remains responsive.
-final class NoOpTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
+final class NoOpEngine: Engine, @unchecked Sendable {
     private let queue = DispatchQueue(label: "RelativeProtocolTunnel.NoOpEngine")
     private var isRunning = false
 
     init() {}
 
-    func start(callbacks: Tun2SocksCallbacks) throws {
+    func start(callbacks: EngineCallbacks) throws {
         isRunning = true
         queue.async { [weak self] in
             guard let self else { return }
@@ -60,18 +60,18 @@ final class NoOpTun2SocksEngine: Tun2SocksEngine, @unchecked Sendable {
     }
 }
 
-/// Coordinates packet I/O between `NEPacketTunnelProvider` and the tun2socks
+/// Coordinates packet I/O between `NEPacketTunnelProvider` and the engine
 /// core, enforcing hooks and metrics along the way.
-final class Tun2SocksAdapter: @unchecked Sendable {
+final class EngineAdapter: @unchecked Sendable {
     private let provider: PacketTunnelProviding
     private let configuration: RelativeProtocol.Configuration
     private let metrics: MetricsCollector?
-    private let engine: Tun2SocksEngine
+    private let engine: Engine
     private let hooks: RelativeProtocol.Configuration.Hooks
     private let logger: Logger
     private let trafficAnalyzer: TrafficAnalyzer?
     private let forwardHostTracker = RelativeProtocolTunnel.ForwardHostTracker()
-    private let ioQueue = DispatchQueue(label: "RelativeProtocolTunnel.Tun2SocksAdapter", qos: .userInitiated)
+    private let ioQueue = DispatchQueue(label: "RelativeProtocolTunnel.EngineAdapter", qos: .userInitiated)
     private let memoryBudget: RelativeProtocol.Configuration.MemoryBudget
     private let packetBudget: ByteBudget
     private let trafficShaper: TrafficShaper?
@@ -105,13 +105,13 @@ final class Tun2SocksAdapter: @unchecked Sendable {
     ///   - configuration: Runtime configuration describing block lists and
     ///     other policies.
     ///   - metrics: Optional collector that records packet statistics.
-    ///   - engine: Concrete engine implementation (gomobile or noop).
+    ///   - engine: Concrete engine implementation (bundled or noop).
     ///   - hooks: Caller-supplied hooks for telemetry and policy decisions.
     init(
         provider: PacketTunnelProviding,
         configuration: RelativeProtocol.Configuration,
         metrics: MetricsCollector?,
-        engine: Tun2SocksEngine,
+        engine: Engine,
         hooks: RelativeProtocol.Configuration.Hooks,
         logger: Logger
     ) {
@@ -158,7 +158,7 @@ final class Tun2SocksAdapter: @unchecked Sendable {
         ioQueue.async { [weak self] in
             self?.consecutiveEmptyReads = 0
         }
-        let callbacks = Tun2SocksCallbacks(
+        let callbacks = EngineCallbacks(
             startPacketReadLoop: { [weak self] handler in
                 self?.configureOutboundPipeline(handler: handler)
             },
@@ -236,7 +236,7 @@ final class Tun2SocksAdapter: @unchecked Sendable {
     private func handleReadResult(packets: [Data], protocols: [NSNumber], channel: AsyncChannel<PacketBatch>) {
         guard isRunning else { return }
 
-        let totalBytes = Tun2SocksAdapter.totalBytes(in: packets)
+        let totalBytes = EngineAdapter.totalBytes(in: packets)
         guard totalBytes > 0, !packets.isEmpty else {
             if consecutiveEmptyReads < 16 {
                 consecutiveEmptyReads += 1
@@ -309,7 +309,7 @@ final class Tun2SocksAdapter: @unchecked Sendable {
         guard !packets.isEmpty else { return }
         guard isRunning else { return }
         guard let channel = inboundChannel else { return }
-        let totalBytes = Tun2SocksAdapter.totalBytes(in: packets)
+        let totalBytes = EngineAdapter.totalBytes(in: packets)
         guard totalBytes > 0 else { return }
         if !packetBudget.reserve(bytes: totalBytes) {
             recordDroppedBatch(direction: .inbound, bytes: totalBytes, reason: "packet budget exhausted")
@@ -353,7 +353,7 @@ final class Tun2SocksAdapter: @unchecked Sendable {
             hooks.packetTap?(.init(direction: .outbound, payload: packet, protocolNumber: proto))
             forwardHostTracker.ingestTLSClientHello(ipPacket: packet, timestamp: timestamp)
 
-            if Tun2SocksAdapter.shouldAnalyze(packet: packet, direction: .outbound) {
+            if EngineAdapter.shouldAnalyze(packet: packet, direction: .outbound) {
                 trafficAnalyzer?.ingest(sample: .init(
                     direction: .outbound,
                     payload: packet,
@@ -400,7 +400,7 @@ final class Tun2SocksAdapter: @unchecked Sendable {
 
             forwardHostTracker.ingest(ipPacket: packet, timestamp: timestamp)
 
-            if Tun2SocksAdapter.shouldAnalyze(packet: packet, direction: .inbound) {
+            if EngineAdapter.shouldAnalyze(packet: packet, direction: .inbound) {
                 trafficAnalyzer?.ingest(sample: .init(
                     direction: .inbound,
                     payload: packet,
@@ -909,7 +909,7 @@ private extension Array {
     }
 }
 
-private extension Tun2SocksAdapter {
+private extension EngineAdapter {
     static func shouldAnalyze(packet: Data, direction: RelativeProtocol.Direction) -> Bool {
         return packet.withUnsafeBytes { rawBuffer -> Bool in
             guard let base = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return false }
