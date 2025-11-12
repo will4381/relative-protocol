@@ -26,6 +26,7 @@ public extension RelativeProtocolTunnel {
         private unowned let provider: NEPacketTunnelProvider
         private let logger: Logger
         private var metrics: MetricsCollector?
+        private var metricsSink: (@Sendable (RelativeProtocol.MetricsSnapshot) -> Void)?
         private var adapter: EngineAdapter?
         private var configuration: RelativeProtocol.Configuration?
         private var trafficAnalyzer: TrafficAnalyzer?
@@ -48,8 +49,10 @@ public extension RelativeProtocolTunnel {
         /// Starts the tunnel by validating configuration, applying network
         /// settings, and spinning up the engine.
         public func start(configuration: RelativeProtocol.Configuration, completion: @escaping (Error?) -> Void) {
+            logger.notice("Relative Protocol: start requested – includeAll=\(configuration.provider.includeAllNetworks, privacy: .public) mtu=\(configuration.provider.mtu, privacy: .public)")
             do {
                 let messages = try configuration.validateOrThrow()
+                logger.notice("Relative Protocol: configuration validation completed (\(messages.count, privacy: .public) warnings/errors)")
                 for message in messages where !message.isError {
                     logger.warning("Relative Protocol: Configuration warning – \(message.message, privacy: .public)")
                 }
@@ -68,7 +71,7 @@ public extension RelativeProtocolTunnel {
                 metricsCollector = MetricsCollector(
                     subsystem: "RelativeProtocolTunnel",
                     interval: configuration.provider.metrics.reportingInterval,
-                    sink: nil
+                    sink: metricsSink
                 )
                 metricsCollector?.reset()
             } else {
@@ -91,6 +94,7 @@ public extension RelativeProtocolTunnel {
                 }
 
                 do {
+                    self.logger.notice("Relative Protocol: network settings committed; booting engine bridge")
                     try self.bootBridge(configuration: configuration, metrics: metricsCollector)
                     completion(nil)
                 } catch {
@@ -104,12 +108,16 @@ public extension RelativeProtocolTunnel {
 
         /// Stops the tunnel and releases engine resources.
         public func stop(reason: NEProviderStopReason, completion: @escaping () -> Void) {
+            logger.notice(
+                "Relative Protocol: stop requested – reason=\(reason.rawValue, privacy: .public) adapterActive=\(self.adapter != nil, privacy: .public) filters=\(self.filterCoordinator != nil, privacy: .public)"
+            )
             adapter?.stop()
             adapter = nil
             metrics = nil
             trafficAnalyzer = nil
             filterCoordinator = nil
             pendingFilterInstallers.removeAll()
+            logger.notice("Relative Protocol: stop completed")
             completion()
         }
 
@@ -118,6 +126,9 @@ public extension RelativeProtocolTunnel {
         public func setFilterConfiguration(_ configuration: FilterConfiguration) {
             guard adapter == nil else { return }
             filterConfiguration = configuration
+            logger.debug(
+                "Relative Protocol: filter configuration updated – interval=\(configuration.evaluationInterval, privacy: .public)"
+            )
         }
 
         /// Allows callers to register filters once the coordinator becomes
@@ -125,8 +136,10 @@ public extension RelativeProtocolTunnel {
         /// immediately; otherwise it is deferred until startup completes.
         public func configureFilters(_ builder: @escaping @Sendable (FilterCoordinator) -> Void) {
             if let coordinator = filterCoordinator {
+                logger.notice("Relative Protocol: filter coordinator ready – executing installer immediately")
                 builder(coordinator)
             } else {
+                logger.notice("Relative Protocol: deferring filter installer until tunnel boots")
                 pendingFilterInstallers.append(builder)
             }
         }
@@ -137,6 +150,9 @@ public extension RelativeProtocolTunnel {
                 current.provider.policies.trafficShaping = shaping
                 configuration = current
             }
+            logger.notice(
+                "Relative Protocol: updating traffic shaping – defaultLatency=\(shaping.defaultPolicy?.fixedLatencyMilliseconds ?? 0, privacy: .public)ms rules=\(shaping.rules.count, privacy: .public)"
+            )
             adapter?.updateTrafficShaping(configuration: shaping)
         }
 
@@ -147,6 +163,11 @@ public extension RelativeProtocolTunnel {
                 return
             }
             completionHandler?(Data("ack".utf8))
+        }
+
+        /// Allows hosts to observe metrics snapshots for logging or UI.
+        public func setMetricsSink(_ sink: (@Sendable (RelativeProtocol.MetricsSnapshot) -> Void)?) {
+            metricsSink = sink
         }
 
         // MARK: - Private
@@ -191,30 +212,57 @@ public extension RelativeProtocolTunnel {
                 dnsSettings.searchDomains = dns.searchDomains
                 settings.dnsSettings = dnsSettings
             }
-
+            logger.notice(
+                "Relative Protocol: applying network settings – ipv4=\(ipv4.address, privacy: .public)/\(ipv4.subnetMask, privacy: .public) routes=\(routes.count, privacy: .public) mtu=\(configuration.provider.mtu, privacy: .public)"
+            )
             provider.setTunnelNetworkSettings(settings, completionHandler: completion)
         }
 
         /// Constructs the engine/adapter pair and starts processing
         /// packets.
         private func bootBridge(configuration: RelativeProtocol.Configuration, metrics: MetricsCollector?) throws {
+            var runtimeConfiguration = configuration
+            let trackerProvider: () -> RelativeProtocolTunnel.ForwardHostTracker? = { [weak self] in
+                self?.adapter?.hostTracker
+            }
+
             let engine: Engine
-            #if canImport(Engine)
-            engine = BundledEngine(
+            if let rustEngine = RustEngine.make(
                 configuration: configuration,
-                logger: Logger(subsystem: "RelativeProtocolTunnel", category: "BundledEngine")
-            )
-#else
-        engine = NoOpEngine()
-#endif
+                logger: Logger(subsystem: "RelativeProtocolTunnel", category: "RustEngine")
+            ) {
+                logger.notice("Relative Protocol: Rust engine selected for tunnel")
+                rustEngine.installTrackerProvider(trackerProvider)
+                if let engineResolver = rustEngine.makeDNSResolver(trackerProvider: trackerProvider) {
+                    runtimeConfiguration.hooks.dnsResolver = RustDNSResolverAdapter.mergedResolver(
+                        hooksResolver: runtimeConfiguration.hooks.dnsResolver,
+                        engineResolver: engineResolver,
+                        tracker: trackerProvider
+                    )
+                }
+                engine = rustEngine
+            } else {
+                logger.warning("Relative Protocol: Rust engine unavailable; using bundled engine")
+                #if canImport(Engine)
+                engine = BundledEngine(
+                    configuration: runtimeConfiguration,
+                    logger: Logger(subsystem: "RelativeProtocolTunnel", category: "BundledEngine")
+                )
+                #else
+                engine = NoOpEngine()
+                #endif
+            }
 
             let adapter = EngineAdapter(
                 provider: provider,
-                configuration: configuration,
+                configuration: runtimeConfiguration,
                 metrics: metrics,
                 engine: engine,
-                hooks: configuration.hooks,
+                hooks: runtimeConfiguration.hooks,
                 logger: logger
+            )
+            logger.notice(
+                "Relative Protocol: initializing engine adapter – packetPool=\(runtimeConfiguration.provider.memory.packetPoolBytes, privacy: .public) bytes batchLimit=\(runtimeConfiguration.provider.memory.packetBatchLimit, privacy: .public)"
             )
             do {
                 try adapter.start()
@@ -228,10 +276,16 @@ public extension RelativeProtocolTunnel {
                 self.filterCoordinator = coordinator
                 let installers = self.pendingFilterInstallers
                 self.pendingFilterInstallers.removeAll()
+                if !installers.isEmpty {
+                    logger.notice("Relative Protocol: executing \(installers.count, privacy: .public) pending filter installers")
+                }
                 installers.forEach { $0(coordinator) }
             } else {
+                logger.warning("Relative Protocol: filter coordinator unavailable (packet stream missing)")
                 self.filterCoordinator = nil
             }
+            self.configuration = runtimeConfiguration
+            logger.notice("Relative Protocol: engine adapter started – analyzerPresent=\(self.trafficAnalyzer != nil, privacy: .public)")
         }
     }
 }

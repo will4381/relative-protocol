@@ -145,6 +145,7 @@ public extension RelativeProtocol.Configuration {
         public var ipv6: IPv6?
         public var includeAllNetworks: Bool = true
         public var excludeLocalNetworks: Bool = false
+        public var excludeAPNs: Bool = false
         public var dns: DNS
         public var metrics: MetricsOptions
         public var policies: Policies
@@ -156,6 +157,7 @@ public extension RelativeProtocol.Configuration {
             ipv6: IPv6? = nil,
             includeAllNetworks: Bool = true,
             excludeLocalNetworks: Bool = false,
+            excludeAPNs: Bool = false,
             dns: DNS = .default,
             metrics: MetricsOptions = .default,
             policies: Policies = .default,
@@ -166,6 +168,7 @@ public extension RelativeProtocol.Configuration {
             self.ipv6 = ipv6
             self.includeAllNetworks = includeAllNetworks
             self.excludeLocalNetworks = excludeLocalNetworks
+            self.excludeAPNs = excludeAPNs
             self.dns = dns
             self.metrics = metrics
             self.policies = policies
@@ -424,10 +427,42 @@ public extension RelativeProtocol.Configuration {
     }
 
     struct LoggingOptions: Codable, Equatable, Sendable {
-        public var enableDebug: Bool
+        public struct Breadcrumbs: OptionSet, Codable, Sendable {
+            public let rawValue: UInt32
 
-        public init(enableDebug: Bool = false) {
+            public init(rawValue: UInt32) {
+                self.rawValue = rawValue
+            }
+
+            public init(from decoder: Decoder) throws {
+                let container = try decoder.singleValueContainer()
+                let value = try container.decode(UInt32.self)
+                self.init(rawValue: value)
+            }
+
+            public func encode(to encoder: Encoder) throws {
+                var container = encoder.singleValueContainer()
+                try container.encode(rawValue)
+            }
+
+            public static let device = Breadcrumbs(rawValue: 0b0000_0001)
+            public static let flow = Breadcrumbs(rawValue: 0b0000_0010)
+            public static let dns = Breadcrumbs(rawValue: 0b0000_0100)
+            public static let metrics = Breadcrumbs(rawValue: 0b0000_1000)
+            public static let ffi = Breadcrumbs(rawValue: 0b0001_0000)
+            public static let poll = Breadcrumbs(rawValue: 0b0010_0000)
+            public static let all = Breadcrumbs(rawValue: .max)
+        }
+
+        public var enableDebug: Bool
+        public var breadcrumbs: Breadcrumbs
+
+        public init(
+            enableDebug: Bool = false,
+            breadcrumbs: Breadcrumbs = []
+        ) {
             self.enableDebug = enableDebug
+            self.breadcrumbs = breadcrumbs
         }
 
         public static let `default` = LoggingOptions()
@@ -485,6 +520,58 @@ public extension RelativeProtocol {
         public var activeTCP: Int
         public var activeUDP: Int
         public var errors: [ErrorEvent]
+        public var flow: FlowMetrics?
+
+        public struct FlowMetrics: Sendable {
+            public struct Counters: Sendable {
+                public var tcpAdmissionFail: UInt64
+                public var udpAdmissionFail: UInt64
+                public var tcpBackpressureDrops: UInt64
+                public var udpBackpressureDrops: UInt64
+
+                public init(
+                    tcpAdmissionFail: UInt64,
+                    udpAdmissionFail: UInt64,
+                    tcpBackpressureDrops: UInt64,
+                    udpBackpressureDrops: UInt64
+                ) {
+                    self.tcpAdmissionFail = tcpAdmissionFail
+                    self.udpAdmissionFail = udpAdmissionFail
+                    self.tcpBackpressureDrops = tcpBackpressureDrops
+                    self.udpBackpressureDrops = udpBackpressureDrops
+                }
+            }
+
+            public struct Stats: Sendable {
+                public var pollIterations: UInt64
+                public var framesEmitted: UInt64
+                public var bytesEmitted: UInt64
+                public var tcpFlushEvents: UInt64
+                public var udpFlushEvents: UInt64
+
+                public init(
+                    pollIterations: UInt64,
+                    framesEmitted: UInt64,
+                    bytesEmitted: UInt64,
+                    tcpFlushEvents: UInt64,
+                    udpFlushEvents: UInt64
+                ) {
+                    self.pollIterations = pollIterations
+                    self.framesEmitted = framesEmitted
+                    self.bytesEmitted = bytesEmitted
+                    self.tcpFlushEvents = tcpFlushEvents
+                    self.udpFlushEvents = udpFlushEvents
+                }
+            }
+
+            public var counters: Counters
+            public var stats: Stats
+
+            public init(counters: Counters, stats: Stats) {
+                self.counters = counters
+                self.stats = stats
+            }
+        }
 
         public init(
             timestamp: Date,
@@ -492,7 +579,8 @@ public extension RelativeProtocol {
             outbound: Counter,
             activeTCP: Int,
             activeUDP: Int,
-            errors: [ErrorEvent]
+            errors: [ErrorEvent],
+            flow: FlowMetrics? = nil
         ) {
             self.timestamp = timestamp
             self.inbound = inbound
@@ -500,6 +588,7 @@ public extension RelativeProtocol {
             self.activeTCP = activeTCP
             self.activeUDP = activeUDP
             self.errors = errors
+            self.flow = flow
         }
     }
 }

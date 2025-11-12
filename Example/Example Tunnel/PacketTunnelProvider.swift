@@ -29,6 +29,10 @@ private let siteCatalog = ExampleSiteCatalog(capacity: 200)
         let providerConfig = (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration as? [String: NSObject]
         var configuration = RelativeProtocol.Configuration.load(from: providerConfig)
 
+        // Always enable verbose Rust logging so sample users can see every breadcrumb.
+        configuration.logging.enableDebug = true
+        configuration.logging.breadcrumbs = .all
+
         // Respect the host application's logging preference; do not force debug logs on.
         var hooks = configuration.hooks
         hooks.eventSink = { [weak self] event in
@@ -50,6 +54,18 @@ private let siteCatalog = ExampleSiteCatalog(capacity: 200)
         }
         configuration.hooks = hooks
 
+        controller.setMetricsSink { [weak self] snapshot in
+            guard let self else { return }
+            if let flow = snapshot.flow {
+                self.logger.info(
+                    "Flow metrics: poll=\(flow.stats.pollIterations, privacy: .public) frames=\(flow.stats.framesEmitted, privacy: .public) bytes=\(flow.stats.bytesEmitted, privacy: .public) tcpDrops=\(flow.counters.tcpBackpressureDrops, privacy: .public) udpDrops=\(flow.counters.udpBackpressureDrops, privacy: .public)"
+                )
+            } else {
+                self.logger.info(
+                    "Packet totals in=\(snapshot.inbound.packets, privacy: .public)/\(snapshot.inbound.bytes, privacy: .public) out=\(snapshot.outbound.packets, privacy: .public)/\(snapshot.outbound.bytes, privacy: .public)"
+                )
+            }
+        }
         controller.setFilterConfiguration(.init(evaluationInterval: 1.0))
         controller.configureFilters { [weak self] coordinator in
             guard let self else { return }

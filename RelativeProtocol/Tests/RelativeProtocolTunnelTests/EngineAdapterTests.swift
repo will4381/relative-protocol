@@ -503,36 +503,33 @@ private final class MockEngine: Engine {
     private(set) var startCallCount = 0
     private(set) var stopCallCount = 0
     var onReceive: (@Sendable ([Data], [NSNumber]) -> Void)?
-    private var emitClosure: (@Sendable ([Data], [NSNumber]) -> Void)?
-    private var tcpFactory: (@Sendable (NWEndpoint) -> NWConnection)?
-    private var udpFactory: (@Sendable (NWEndpoint) -> NWConnection)?
+    private var callbacks: EngineCallbacks?
 
     func start(callbacks: EngineCallbacks) throws {
         startCallCount += 1
-        tcpFactory = callbacks.makeTCPConnection
-        udpFactory = callbacks.makeUDPConnection
+        self.callbacks = callbacks
         callbacks.startPacketReadLoop { [weak self] packets, protocols in
             self?.onReceive?(packets, protocols)
         }
-        emitClosure = callbacks.emitPackets
     }
 
     func stop() {
         stopCallCount += 1
+        callbacks = nil
     }
 
     func emit(packets: [Data], protocols: [NSNumber]) {
-        emitClosure?(packets, protocols)
+        callbacks?.emitPackets(packets, protocols)
     }
 
     @discardableResult
     func requestTCPConnection(to endpoint: NWEndpoint) -> NWConnection? {
-        tcpFactory?(endpoint)
+        callbacks?.makeTCPConnection(endpoint)
     }
 
     @discardableResult
     func requestUDPConnection(to endpoint: NWEndpoint) -> NWConnection? {
-        udpFactory?(endpoint)
+        callbacks?.makeUDPConnection(endpoint)
     }
 }
 

@@ -25,6 +25,30 @@ protocol Engine {
     func stop()
 }
 
+extension Engine {
+    func flowMetricsSnapshot() -> EngineFlowMetrics? { nil }
+}
+
+struct EngineFlowMetrics: Sendable {
+    struct Counters: Sendable {
+        var tcpAdmissionFail: UInt64
+        var udpAdmissionFail: UInt64
+        var tcpBackpressureDrops: UInt64
+        var udpBackpressureDrops: UInt64
+    }
+
+    struct Stats: Sendable {
+        var pollIterations: UInt64
+        var framesEmitted: UInt64
+        var bytesEmitted: UInt64
+        var tcpFlushEvents: UInt64
+        var udpFlushEvents: UInt64
+    }
+
+    var counters: Counters
+    var stats: Stats
+}
+
 /// Callback set passed into the engine so it can interact with the adapter
 /// without a hard dependency on `NEPacketTunnelProvider`.
 struct EngineCallbacks {
@@ -91,6 +115,10 @@ final class EngineAdapter: @unchecked Sendable {
     private var consecutiveEmptyReads = 0
     private let emptyReadBackoffBase: TimeInterval = 0.001
     private let emptyReadBackoffCeiling: TimeInterval = 0.005
+    private var flowMetricsTimer: DispatchSourceTimer?
+    private var readLogBudget = 5
+    private var didLogReadScheduling = false
+    private var emptyReadWarningLogged = false
 
     var analyzer: TrafficAnalyzer? {
         trafficAnalyzer
@@ -154,6 +182,9 @@ final class EngineAdapter: @unchecked Sendable {
         guard !isRunning else { return }
         hooks.eventSink?(.willStart)
         isRunning = true
+        logger.notice(
+            "EngineAdapter: start invoked – packetPoolLimit=\(self.memoryBudget.packetPoolBytes, privacy: .public) batchLimit=\(self.packetBatchLimit, privacy: .public)"
+        )
         prepareInboundPipeline()
         ioQueue.async { [weak self] in
             self?.consecutiveEmptyReads = 0
@@ -180,6 +211,7 @@ final class EngineAdapter: @unchecked Sendable {
             throw error
         }
         hooks.eventSink?(.didStart)
+        startFlowMetricsReporter()
     }
 
     /// Halts packet processing and tears down engine resources.
@@ -187,6 +219,7 @@ final class EngineAdapter: @unchecked Sendable {
         guard isRunning else { return }
         engine.stop()
         isRunning = false
+        stopFlowMetricsReporter()
         teardownPipelines()
         hooks.eventSink?(.didStop)
     }
@@ -198,8 +231,9 @@ final class EngineAdapter: @unchecked Sendable {
 
         let channel = AsyncChannel<PacketBatch>()
         outboundChannel = channel
+        logger.notice("EngineAdapter: outbound pipeline installed (bufferLimit=\(self.packetBatchLimit, privacy: .public))")
         outboundTask = Task { [self, handler, channel] in
-            let buffered = channel.buffer(policy: .bounded(packetBatchLimit))
+            let buffered = channel.buffer(policy: .bounded(self.packetBatchLimit))
             for await batch in buffered {
                 if Task.isCancelled { break }
                 await self.processOutbound(batch, handler: handler)
@@ -214,6 +248,13 @@ final class EngineAdapter: @unchecked Sendable {
             guard let self else { return }
             guard self.isRunning else { return }
             let delay = self.emptyReadDelay(for: self.consecutiveEmptyReads)
+            if !self.didLogReadScheduling {
+                self.didLogReadScheduling = true
+                self.logger.notice("EngineAdapter: read loop scheduled (initial delay=\(delay, privacy: .public))")
+            } else if delay > 0, self.consecutiveEmptyReads >= 4, !self.emptyReadWarningLogged {
+                self.emptyReadWarningLogged = true
+                self.logger.warning("EngineAdapter: consecutive empty reads threshold reached (\(self.consecutiveEmptyReads, privacy: .public))")
+            }
             let executeRead: () -> Void = { [weak self] in
                 guard let self else { return }
                 guard self.isRunning else { return }
@@ -241,12 +282,16 @@ final class EngineAdapter: @unchecked Sendable {
             if consecutiveEmptyReads < 16 {
                 consecutiveEmptyReads += 1
             }
+            if self.consecutiveEmptyReads == 8 {
+                self.logger.notice("EngineAdapter: observed \(self.consecutiveEmptyReads) consecutive empty reads")
+            }
             scheduleRead(into: channel)
             return
         }
 
         consecutiveEmptyReads = 0
 
+        let logPacketCount = packets.count
         Task { [weak self] in
             guard let self else { return }
             if !self.packetBudget.reserve(bytes: totalBytes) {
@@ -273,6 +318,12 @@ final class EngineAdapter: @unchecked Sendable {
             await channel.send(batch)
             self.scheduleRead(into: channel)
         }
+        if readLogBudget > 0 {
+            readLogBudget -= 1
+            logger.debug(
+                "EngineAdapter: outbound read batch \(logPacketCount, privacy: .public) packets / \(totalBytes, privacy: .public) bytes (reserved=\(self.packetBudget.currentBytes, privacy: .public))"
+            )
+        }
     }
 
     private func prepareInboundPipeline() {
@@ -280,9 +331,12 @@ final class EngineAdapter: @unchecked Sendable {
         inboundTask?.cancel()
 
         let channel = AsyncChannel<PacketBatch>()
+        readLogBudget = 5
+        didLogReadScheduling = false
+        emptyReadWarningLogged = false
         inboundChannel = channel
         inboundTask = Task { [self, channel] in
-            let buffered = channel.buffer(policy: .bounded(packetBatchLimit))
+            let buffered = channel.buffer(policy: .bounded(self.packetBatchLimit))
             for await batch in buffered {
                 if Task.isCancelled { break }
                 await self.processInbound(batch)
@@ -303,6 +357,27 @@ final class EngineAdapter: @unchecked Sendable {
         ioQueue.async { [weak self] in
             self?.consecutiveEmptyReads = 0
         }
+        logger.notice("EngineAdapter: pipelines torn down; packet budget reset")
+    }
+
+    private func startFlowMetricsReporter() {
+        guard flowMetricsTimer == nil else { return }
+        guard metrics != nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: ioQueue)
+        let interval = max(1, configuration.provider.metrics.reportingInterval)
+        timer.schedule(deadline: .now() + interval, repeating: interval)
+        timer.setEventHandler { [weak self] in
+            guard let self, let metrics = self.metrics else { return }
+            guard let snapshot = self.engine.flowMetricsSnapshot() else { return }
+            metrics.record(engineMetrics: snapshot)
+        }
+        timer.resume()
+        flowMetricsTimer = timer
+    }
+
+    private func stopFlowMetricsReporter() {
+        flowMetricsTimer?.cancel()
+        flowMetricsTimer = nil
     }
 
     private func enqueueInbound(packets: [Data], protocols: [NSNumber]) {
@@ -487,7 +562,9 @@ final class EngineAdapter: @unchecked Sendable {
     }
 
     private func recordDroppedBatch(direction: RelativeProtocol.Direction, bytes: Int, reason: String) {
-        logger.debug("Relative Protocol: dropped \(direction.rawValue) packet batch (\(bytes) bytes) – \(reason)")
+        logger.notice(
+            "Relative Protocol: dropped \(direction.rawValue) packet batch (\(bytes) bytes) – \(reason) pool=\(self.packetBudget.currentBytes)/\(self.packetBudget.limitBytes)"
+        )
         hooks.eventSink?(.didFail("Relative Protocol dropped \(direction.rawValue) packets (\(bytes) bytes): \(reason)"))
     }
 
@@ -509,6 +586,7 @@ final class EngineAdapter: @unchecked Sendable {
             return provider.makeTCPConnection(to: endpoint)
         }
         let hostString = host.debugDescription
+        logger.debug("EngineAdapter: creating TCP connection to \(hostString, privacy: .public)")
 
         if configuration.matchesBlockedHost(hostString) {
             let connection = provider.makeTCPConnection(to: endpoint)
@@ -516,8 +594,13 @@ final class EngineAdapter: @unchecked Sendable {
             hooks.eventSink?(.didFail("Relative Protocol: Blocked TCP host \(hostString)"))
             return connection
         }
-
-        return provider.makeTCPConnection(to: endpoint)
+        let connection = provider.makeTCPConnection(to: endpoint)
+        connection.pathUpdateHandler = { [weak self] path in
+            guard let self else { return }
+            let pathSummary = path.debugDescription
+            self.logger.debug("EngineAdapter: TCP path for \(hostString, privacy: .public) -> \(pathSummary, privacy: .public)")
+        }
+        return connection
     }
 
     /// Consults block policies and establishes UDP sessions when permitted.
@@ -526,6 +609,7 @@ final class EngineAdapter: @unchecked Sendable {
             return provider.makeUDPConnection(to: endpoint, from: nil)
         }
         let hostString = host.debugDescription
+        logger.debug("EngineAdapter: creating UDP connection to \(hostString, privacy: .public)")
 
         if configuration.matchesBlockedHost(hostString) {
             let connection = provider.makeUDPConnection(to: endpoint, from: nil)
@@ -533,8 +617,13 @@ final class EngineAdapter: @unchecked Sendable {
             hooks.eventSink?(.didFail("Relative Protocol: Blocked UDP host \(hostString)"))
             return connection
         }
-
-        return provider.makeUDPConnection(to: endpoint, from: nil)
+        let connection = provider.makeUDPConnection(to: endpoint, from: nil)
+        connection.pathUpdateHandler = { [weak self] path in
+            guard let self else { return }
+            let pathSummary = path.debugDescription
+            self.logger.debug("EngineAdapter: UDP path for \(hostString, privacy: .public) -> \(pathSummary, privacy: .public)")
+        }
+        return connection
     }
 }
 

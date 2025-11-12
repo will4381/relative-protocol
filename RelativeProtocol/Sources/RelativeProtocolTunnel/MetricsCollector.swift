@@ -33,6 +33,7 @@ final class MetricsCollector {
     private var activeTCP = 0
     private var activeUDP = 0
     private var errors: Deque<RelativeProtocol.MetricsSnapshot.ErrorEvent> = []
+    private var flowMetrics: EngineFlowMetrics?
     private var lastReport = Date()
     private let interval: TimeInterval
     private let maxErrorEvents: Int
@@ -111,6 +112,16 @@ final class MetricsCollector {
             self.errors.removeAll()
             self.lastReport = Date()
             self.dirty = false
+            self.flowMetrics = nil
+        }
+    }
+
+    /// Records the latest engine-provided flow metrics.
+    func record(engineMetrics: EngineFlowMetrics) {
+        queue.async { [self] in
+            self.flowMetrics = engineMetrics
+            self.dirty = true
+            self.emitIfNeeded(force: true)
         }
     }
 
@@ -119,7 +130,7 @@ final class MetricsCollector {
         let now = Date()
         guard force || now.timeIntervalSince(lastReport) >= interval else { return }
         guard dirty else { return }
-        guard inbound.packets > 0 || outbound.packets > 0 || !errors.isEmpty || activeTCP > 0 || activeUDP > 0 else {
+        guard inbound.packets > 0 || outbound.packets > 0 || !errors.isEmpty || activeTCP > 0 || activeUDP > 0 || flowMetrics != nil else {
             dirty = false
             return
         }
@@ -138,9 +149,30 @@ final class MetricsCollector {
             outbound: .init(packets: outbound.packets, bytes: outbound.bytes),
             activeTCP: activeTCP,
             activeUDP: activeUDP,
-            errors: snapshotErrors
+            errors: snapshotErrors,
+            flow: flowMetrics?.asSnapshot()
         )
 
         sink?(snapshot)
+    }
+}
+
+private extension EngineFlowMetrics {
+    func asSnapshot() -> RelativeProtocol.MetricsSnapshot.FlowMetrics {
+        .init(
+            counters: .init(
+                tcpAdmissionFail: counters.tcpAdmissionFail,
+                udpAdmissionFail: counters.udpAdmissionFail,
+                tcpBackpressureDrops: counters.tcpBackpressureDrops,
+                udpBackpressureDrops: counters.udpBackpressureDrops
+            ),
+            stats: .init(
+                pollIterations: stats.pollIterations,
+                framesEmitted: stats.framesEmitted,
+                bytesEmitted: stats.bytesEmitted,
+                tcpFlushEvents: stats.tcpFlushEvents,
+                udpFlushEvents: stats.udpFlushEvents
+            )
+        )
     }
 }

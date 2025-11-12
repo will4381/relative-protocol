@@ -108,6 +108,39 @@ final class MetricsCollectorTests: XCTestCase {
         XCTAssertEqual(snapshot?.inbound.packets, 0)
         XCTAssertEqual(snapshot?.outbound.packets, 0)
     }
+
+    func testEngineMetricsRecordingPropagatesToSnapshots() {
+        let expectation = expectation(description: "engine metrics snapshot")
+        let captured = ThreadSafeBox<RelativeProtocol.MetricsSnapshot>()
+        let collector = MetricsCollector(subsystem: "test", interval: 0.0, sink: { snapshot in
+            captured.set(snapshot)
+            expectation.fulfill()
+        })
+
+        collector.reset()
+        let metrics = EngineFlowMetrics(
+            counters: .init(
+                tcpAdmissionFail: 1,
+                udpAdmissionFail: 2,
+                tcpBackpressureDrops: 3,
+                udpBackpressureDrops: 4
+            ),
+            stats: .init(
+                pollIterations: 10,
+                framesEmitted: 20,
+                bytesEmitted: 30,
+                tcpFlushEvents: 5,
+                udpFlushEvents: 6
+            )
+        )
+        collector.record(engineMetrics: metrics)
+
+        wait(for: [expectation], timeout: 1.0)
+        let snapshot = captured.get()
+        XCTAssertEqual(snapshot?.flow?.counters.tcpAdmissionFail, 1)
+        XCTAssertEqual(snapshot?.flow?.counters.udpBackpressureDrops, 4)
+        XCTAssertEqual(snapshot?.flow?.stats.framesEmitted, 20)
+    }
 }
 
 // MARK: - Helpers

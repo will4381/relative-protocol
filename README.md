@@ -27,7 +27,7 @@ When running on-device VPN-style proxies it’s imperative that the tunnel remai
     - Helpers: `RelativeProtocol.Configuration.fullTunnel(...)` and `splitTunnel(...)` provide convenient presets when building standard configurations, with `RelativeProtocol.Configuration.Interface` describing the virtual interface and `RelativeProtocol.Configuration.Route.destination(_:subnetMask:)` for custom route entries.
   - `RelativeProtocol.Configuration.LoggingOptions`
     - **Purpose**: toggle debug logging across the tunnel stack.
-    - **Inputs**: `enableDebug` (`Bool`) defaulting to `false`.
+    - **Inputs**: `enableDebug` (`Bool`, default `false`), `breadcrumbs` (`LoggingOptions.Breadcrumbs`, default `[]`) to opt into device/flow/DNS/metrics/FFI/poll breadcrumbs or `.all`.
     - **Use when**: enabling verbose diagnostics for development or performance testing.
   - `RelativeProtocol.Configuration.Hooks`
     - **Purpose**: inject custom behaviour.

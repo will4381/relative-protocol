@@ -53,9 +53,10 @@ final class BundledEngine: Engine, @unchecked Sendable {
 
             let sink = LogSinkAdapter(logger: logger)
             var logError: NSError?
-            if BridgeSetLogSink(sink, "info", &logError) {
+            let minimumLevel = configuration.logging.enableDebug ? "debug" : "info"
+            if BridgeSetLogSink(sink, minimumLevel, &logError) {
                 logSink = sink
-                logger.notice("Relative Protocol: engine log sink installed")
+                logger.notice("Relative Protocol: engine log sink installed (level=\(minimumLevel, privacy: .public))")
             } else if let logError {
                 logger.error("Relative Protocol: failed to install engine logger – \(logError.localizedDescription, privacy: .public)")
             }

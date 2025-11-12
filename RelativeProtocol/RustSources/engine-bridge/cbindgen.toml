@@ -1,0 +1,7 @@
+language = "C"
+pragma_once = true
+include_guard = "ENGINE_BRIDGE_H"
+documentation = true
+usize_is_size_t = true
+
+sys_includes = ["stddef.h", "stdint.h", "stdbool.h"]

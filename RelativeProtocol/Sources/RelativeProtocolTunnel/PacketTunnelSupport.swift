@@ -47,8 +47,7 @@ extension NEPacketTunnelProvider: PacketTunnelProviding {
 
     func makeTCPConnection(to remoteEndpoint: Network.NWEndpoint) -> Network.NWConnection {
         let parameters = Network.NWParameters(tls: nil, tcp: Network.NWProtocolTCP.Options())
-        parameters.allowLocalEndpointReuse = true
-        parameters.prohibitedInterfaceTypes = [.loopback, .other]
+        configureBypassParameters(parameters)
         return Network.NWConnection(to: remoteEndpoint, using: parameters)
     }
 
@@ -57,11 +56,20 @@ extension NEPacketTunnelProvider: PacketTunnelProviding {
         from localEndpoint: Network.NWEndpoint?
     ) -> Network.NWConnection {
         let parameters = Network.NWParameters(dtls: nil, udp: Network.NWProtocolUDP.Options())
-        parameters.allowLocalEndpointReuse = true
-        parameters.prohibitedInterfaceTypes = [.loopback, .other]
+        configureBypassParameters(parameters)
         if let localEndpoint {
             parameters.requiredLocalEndpoint = localEndpoint
         }
         return Network.NWConnection(to: remoteEndpoint, using: parameters)
+    }
+
+    private func configureBypassParameters(_ parameters: Network.NWParameters) {
+        parameters.allowLocalEndpointReuse = true
+        parameters.prohibitedInterfaceTypes = [
+            NWInterface.InterfaceType.loopback,
+            NWInterface.InterfaceType.other
+        ]
+        parameters.preferNoProxies = true
+        parameters.includePeerToPeer = false
     }
 }

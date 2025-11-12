@@ -99,4 +99,16 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertTrue(dns.servers.contains("1.1.1.1"))
         XCTAssertTrue(dns.servers.contains("8.8.8.8"))
     }
+
+    func testLoggingOptionsRoundTripBreadcrumbs() throws {
+        let options = RelativeProtocol.Configuration.LoggingOptions(
+            enableDebug: true,
+            breadcrumbs: [.flow, .dns, .ffi]
+        )
+        let data = try JSONEncoder().encode(options)
+        let decoded = try JSONDecoder().decode(RelativeProtocol.Configuration.LoggingOptions.self, from: data)
+        XCTAssertEqual(decoded, options)
+        XCTAssertTrue(decoded.breadcrumbs.contains(.flow))
+        XCTAssertFalse(decoded.breadcrumbs.contains(.metrics))
+    }
 }

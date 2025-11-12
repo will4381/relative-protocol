@@ -12,6 +12,7 @@
 import Foundation
 import AsyncAlgorithms
 import RelativeProtocolCore
+import os.log
 
 /// Filters operate on buffered packet snapshots and emit normalized events.
 public protocol TrafficFilter: Sendable {
@@ -43,6 +44,8 @@ public final class FilterCoordinator: @unchecked Sendable {
     private var filters: [TrafficFilter] = []
     private let eventBuffer: RelativeProtocol.EventBuffer?
     private var evaluationTask: Task<Void, Never>?
+    private let logger = Logger(subsystem: "RelativeProtocolTunnel", category: "FilterCoordinator")
+    private let coordinatorID = UUID()
 
     init(analyzer: TrafficAnalyzer, configuration: FilterConfiguration = .init()) {
         self.analyzer = analyzer
@@ -53,32 +56,44 @@ public final class FilterCoordinator: @unchecked Sendable {
             self.eventBuffer = nil
         }
         startEvaluationLoop()
+        logger.notice(
+            "FilterCoordinator \(self.coordinatorID.uuidString, privacy: .public) created – interval=\(configuration.evaluationInterval, privacy: .public)s buffered=\(self.eventBuffer != nil, privacy: .public)"
+        )
     }
 
     deinit {
         evaluationTask?.cancel()
         flushBufferIfNeeded(force: true)
+        logger.notice("FilterCoordinator \(self.coordinatorID.uuidString, privacy: .public) destroyed")
     }
 
     public func register(_ filter: TrafficFilter) {
         filtersQueue.async(flags: .barrier) { [weak self] in
             self?.filters.append(filter)
+            self?.logger.notice(
+                "FilterCoordinator \(self?.coordinatorID.uuidString ?? "") registered filter \(filter.identifier, privacy: .public); total=\(self?.filters.count ?? 0, privacy: .public)"
+            )
         }
     }
 
     public func removeAllFilters() {
         filtersQueue.async(flags: .barrier) { [weak self] in
             self?.filters.removeAll()
+            self?.logger.notice("FilterCoordinator \(self?.coordinatorID.uuidString ?? "") removed all filters")
         }
     }
 
     public func flush() {
+        logger.debug("FilterCoordinator \(self.coordinatorID.uuidString, privacy: .public) flush requested")
         flushBufferIfNeeded(force: true)
     }
 
     private func startEvaluationLoop() {
         evaluationTask?.cancel()
         let interval = configuration.evaluationInterval
+        logger.notice(
+            "FilterCoordinator \(self.coordinatorID.uuidString, privacy: .public) starting evaluation loop every \(interval, privacy: .public)s"
+        )
         evaluationTask = Task { [weak self] in
             let duration = FilterCoordinator.makeDuration(interval: interval)
             let timer = AsyncTimerSequence(interval: duration, clock: ContinuousClock())
@@ -108,6 +123,9 @@ public final class FilterCoordinator: @unchecked Sendable {
         guard !snapshot.isEmpty else { return }
         let filters = filtersQueue.sync { self.filters }
         guard !filters.isEmpty else { return }
+        logger.debug(
+            "FilterCoordinator \(self.coordinatorID.uuidString, privacy: .public) evaluating \(filters.count, privacy: .public) filters with \(snapshot.count, privacy: .public) samples"
+        )
         for filter in filters {
             filter.evaluate(snapshot: snapshot) { [weak self] event in
                 self?.handle(event: event)
@@ -133,6 +151,9 @@ public final class FilterCoordinator: @unchecked Sendable {
         if force || buffer.count() >= configuration.eventBufferConfiguration?.capacity ?? 0 {
             let events = buffer.drain()
             events.forEach { analyzer.publish(event: $0) }
+            logger.notice(
+                "FilterCoordinator \(self.coordinatorID.uuidString, privacy: .public) flushed \(events.count, privacy: .public) buffered events (force=\(force, privacy: .public))"
+            )
         }
     }
 }

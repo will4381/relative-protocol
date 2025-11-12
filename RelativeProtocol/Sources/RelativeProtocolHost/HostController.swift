@@ -22,11 +22,39 @@ public extension RelativeProtocolHost {
         public var serverAddress: String
         public var localizedDescription: String
         public var configuration: RelativeProtocol.Configuration
-        public var includeAllNetworks: Bool
-        public var excludeLocalNetworks: Bool
-        public var excludeAPNs: Bool
         public var disconnectOnSleep: Bool
         public var validateConfiguration: Bool
+
+        public var includeAllNetworks: Bool {
+            get { configuration.provider.includeAllNetworks }
+            set { configuration.provider.includeAllNetworks = newValue }
+        }
+
+        public var excludeLocalNetworks: Bool {
+            get { configuration.provider.excludeLocalNetworks }
+            set { configuration.provider.excludeLocalNetworks = newValue }
+        }
+
+        public var excludeAPNs: Bool {
+            get { configuration.provider.excludeAPNs }
+            set { configuration.provider.excludeAPNs = newValue }
+        }
+
+        public init(
+            providerBundleIdentifier: String,
+            serverAddress: String = "RelativeProtocol",
+            localizedDescription: String,
+            configuration: RelativeProtocol.Configuration,
+            disconnectOnSleep: Bool = false,
+            validateConfiguration: Bool = false
+        ) {
+            self.providerBundleIdentifier = providerBundleIdentifier
+            self.serverAddress = serverAddress
+            self.localizedDescription = localizedDescription
+            self.configuration = configuration
+            self.disconnectOnSleep = disconnectOnSleep
+            self.validateConfiguration = validateConfiguration
+        }
 
         public init(
             providerBundleIdentifier: String,
@@ -39,15 +67,17 @@ public extension RelativeProtocolHost {
             disconnectOnSleep: Bool = false,
             validateConfiguration: Bool = false
         ) {
-            self.providerBundleIdentifier = providerBundleIdentifier
-            self.serverAddress = serverAddress
-            self.localizedDescription = localizedDescription
-            self.configuration = configuration
+            self.init(
+                providerBundleIdentifier: providerBundleIdentifier,
+                serverAddress: serverAddress,
+                localizedDescription: localizedDescription,
+                configuration: configuration,
+                disconnectOnSleep: disconnectOnSleep,
+                validateConfiguration: validateConfiguration
+            )
             self.includeAllNetworks = includeAllNetworks
             self.excludeLocalNetworks = excludeLocalNetworks
             self.excludeAPNs = excludeAPNs
-            self.disconnectOnSleep = disconnectOnSleep
-            self.validateConfiguration = validateConfiguration
         }
     }
 }
