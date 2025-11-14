@@ -192,6 +192,30 @@ struct MyBurstFilter: TrafficFilter {
 }
 ```
 
+## Linux Traffic Harness
+
+When testing the Rust engine outside of iOS you can run it directly on a Linux host (or VPS) and route scoped traffic through the user-space tunnel.
+
+1. Ensure the repo is synced to the server and Rust is installed via `rustup`.
+2. Run `sudo ./Scripts/linux_tunnel_runner.sh` (defaults assume the repo lives in `/root/VPN-Bridge`).
+   - The script launches the standalone engine, creates a `rp-demo` TUN device, registers routing table `relative`, and adds a dedicated `rpclient` user whose traffic is policy-routed into the tunnel.
+3. Generate real traffic through the tunnel by executing commands as `rpclient`, e.g.
+
+```bash
+runuser -u rpclient -- curl -I https://example.com
+```
+
+Environment variables such as `IFACE`, `ENGINE_DIR`, `TEST_USER`, and `AUTO_TEST_COMMAND` can be overridden to suit different setups. Stop the harness with `Ctrl+C` to tear down the temporary routes and halt the engine.
+
+### QA Helpers
+
+- `Scripts/http_probe.sh` runs a battery of HEAD requests (both HTTP and HTTPS) as `rpclient` so you can quickly confirm tunneled web traffic across different CDNs. Override `TEST_USER` or pass custom URLs as arguments as needed.
+- `Scripts/quic_probe.sh` sends an HTTP/3 request (QUIC) to a target such as `https://cloudflare-quic.com` to verify UDP/QUIC plumbing.
+- `Scripts/dns_resolver.sh` issues IPv4 and IPv6 DNS lookups (defaulting to Cloudflare) through the tunnel, always reporting the original QNAME so CDN aliases map back to the user-facing host.
+- `Scripts/traffic_matrix.sh` hammers the tunnel with POSTs, large downloads, concurrent curls, websockets, and QUIC so you can observe flow/burst behavior.
+- `Scripts/mtu_probe.sh` runs IPv4/IPv6 ping sweeps at multiple payload sizes to catch MTU/fragmentation regressions.
+- `Scripts/regression_suite.sh` ties everything together—run it as root to execute HTTP/HTTPS/HTTP3 + DNS probes and fail fast if the harness log contains FlowManager warnings.
+
 ### Mapping CDN Edges to Origin Hosts
 
 Relative Protocol automatically instantiates a `ForwardHostTracker` inside the tunnel. The tracker watches DNS responses traversing the virtual interface and maintains a short-lived mapping between resolved hostnames and the remote IP addresses seen in packet samples. You can access it through `ProviderController.forwardHostTracker` and enrich analytics or filters with the original service hostname instead of the CDN edge.

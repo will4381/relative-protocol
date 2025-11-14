@@ -1,337 +1,191 @@
-//
-//  ContentView.swift
-//  Example
-//
-//  Copyright (c) 2025 Relative Companies, Inc.
-//  Personal, non-commercial use only. Created by Will Kusch on 10/23/2025.
-//
-//  Displays tunnel status, metrics, and controls in the sample host app UI.
-//
-
 import SwiftUI
-import OSLog
 import NetworkExtension
 import RelativeProtocolCore
-
-private let trafficDateFormatter: DateFormatter = {
-    let formatter = DateFormatter()
-    formatter.dateStyle = .none
-    formatter.timeStyle = .medium
-    return formatter
-}()
-
-private let byteFormatter: ByteCountFormatter = {
-    let formatter = ByteCountFormatter()
-    formatter.allowedUnits = [.useKB, .useMB, .useGB]
-    formatter.countStyle = .decimal
-    formatter.includesUnit = true
-    return formatter
-}()
 
 @MainActor
 struct ContentView: View {
     @StateObject private var vpn = VPNManager.shared
-    @State private var newRulePattern = ""
+    @State private var rulePattern = "example.com"
+    @State private var actionSelection: RuleActionSelection = .block
+    @State private var latencyMs: Double = 300
+    @State private var jitterMs: Double = 50
 
     var body: some View {
         ScrollView {
-            VStack(spacing: 20) {
-                Text("Relative Protocol – Example")
-                    .font(.title3)
-                    .bold()
-
-                Text(vpn.status.displayTitle)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-
-                if let error = vpn.lastErrorMessage {
-                    Text(error)
-                        .font(.footnote)
-                        .foregroundStyle(.red)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal)
-                }
-
-                Button(action: toggle) {
-                    HStack {
-                        if vpn.isBusy { ProgressView().tint(.white) }
-                        Text(vpn.status.isActive ? "Disconnect" : "Connect")
-                            .bold()
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 14)
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(vpn.isBusy || !vpn.configurationReady)
-                .padding(.horizontal)
-
-                Button("Probe Network") {
-                    Task { await vpn.probe() }
-                }
-                .disabled(vpn.isBusy)
-
-                Button("Probe HTTPS") {
-                    Task { await vpn.probeHTTP() }
-                }
-                .disabled(vpn.isBusy)
-
-                VStack(alignment: .leading, spacing: 16) {
-                    Text("Global Traffic Shaping")
-                        .font(.headline)
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Added latency")
-                            .font(.subheadline)
-                        Slider(
-                            value: Binding(
-                                get: { vpn.shapingConfiguration.defaultLatencyMs },
-                                set: { vpn.setDefaultLatency($0) }
-                            ),
-                            in: 0...500,
-                            step: 10
-                        )
-                        HStack {
-                            Text("0 ms")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            Text("500 ms")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        Text("\(Int(vpn.shapingConfiguration.defaultLatencyMs)) ms added to all traffic")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Bandwidth ceiling")
-                            .font(.subheadline)
-                        Slider(
-                            value: Binding(
-                                get: { vpn.shapingConfiguration.defaultBandwidthKbps },
-                                set: { vpn.setDefaultBandwidth($0) }
-                            ),
-                            in: 0...4096,
-                            step: 64
-                        )
-                        HStack {
-                            Text("Unlimited")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            Text("4 Mbps")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        Text(defaultBandwidthDescription)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .padding(.horizontal)
-
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("Per-Domain Overrides")
-                        .font(.headline)
-
-                    HStack(spacing: 12) {
-                        TextField("Domain or wildcard (e.g. *.example.com)", text: $newRulePattern)
-                            .textFieldStyle(.roundedBorder)
-                            .textInputAutocapitalization(.never)
-                            .disableAutocorrection(true)
-                        Button("Add") {
-                            vpn.addRule(pattern: newRulePattern)
-                            newRulePattern = ""
-                        }
-                        .disabled(newRulePattern.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    }
-
-                    if vpn.shapingConfiguration.rules.isEmpty {
-                        Text("Add wildcard or host-specific rules to override the global profile.")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    } else {
-                        VStack(alignment: .leading, spacing: 12) {
-                            ForEach(vpn.shapingConfiguration.rules) { rule in
-                                VStack(alignment: .leading, spacing: 8) {
-                                    TextField(
-                                        "Pattern",
-                                        text: Binding(
-                                            get: { rule.pattern },
-                                            set: { vpn.setRulePattern($0, for: rule.id) }
-                                        )
-                                    )
-                                    .textFieldStyle(.roundedBorder)
-                                    .textInputAutocapitalization(.never)
-                                    .disableAutocorrection(true)
-
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text("Latency")
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                        Slider(
-                                            value: Binding(
-                                                get: { rule.latencyMs },
-                                                set: { vpn.setRuleLatency($0, for: rule.id) }
-                                            ),
-                                            in: 0...500,
-                                            step: 10
-                                        )
-                                        Text("\(Int(rule.latencyMs)) ms added")
-                                            .font(.caption2)
-                                            .foregroundStyle(.secondary)
-                                    }
-
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text("Bandwidth")
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                        Slider(
-                                            value: Binding(
-                                                get: { rule.bandwidthKbps },
-                                                set: { vpn.setRuleBandwidth($0, for: rule.id) }
-                                            ),
-                                            in: 0...4096,
-                                            step: 64
-                                        )
-                                        Text(perRuleBandwidthDescription(rule.bandwidthKbps))
-                                            .font(.caption2)
-                                            .foregroundStyle(.secondary)
-                                    }
-
-                                    Button(role: .destructive) {
-                                        vpn.removeRule(id: rule.id)
-                                    } label: {
-                                        Label("Remove Rule", systemImage: "trash")
-                                            .font(.caption)
-                                    }
-                                    .buttonStyle(.borderless)
-                                }
-                                .padding(12)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(Color.gray.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
-                            }
-                        }
-                    }
-                }
-                .padding(.horizontal)
-
-                if let probe = vpn.lastProbeResult {
-                    Text("Probe: \(probe)")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal)
-                }
-
-                if let http = vpn.lastHTTPProbeResult {
-                    Text("HTTPS Probe: \(http)")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal)
-                }
-
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("How it works")
-                        .font(.headline)
-                    Text("This app installs a personal VPN configuration using Apple’s Network Extension (Packet Tunnel). Traffic is routed into a virtual interface and bridged by Relative Protocol. You will be prompted once to allow VPN control.")
-                    Text("Sources are local to this repo; no external servers are required for this demo.")
-                }
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .padding()
-
-                Divider()
-
-                VStack(alignment: .leading, spacing: 16) {
-                    Text("Observed Sites")
-                        .font(.headline)
-
-                    HStack(spacing: 12) {
-                        Button {
-                            Task { await vpn.fetchSites() }
-                        } label: {
-                            HStack {
-                                if vpn.isFetchingSites {
-                                    ProgressView()
-                                        .progressViewStyle(.circular)
-                                        .tint(.accentColor)
-                                } else {
-                                    Image(systemName: "arrow.clockwise")
-                                }
-                                Text("Fetch Sites")
-                            }
-                        }
-                        .buttonStyle(.bordered)
-                        .disabled(vpn.isFetchingSites || !vpn.status.isActive)
-
-                        Button("Clear Sites") {
-                            Task { await vpn.clearSites() }
-                        }
-                        .buttonStyle(.bordered)
-                        .disabled(!vpn.status.isActive)
-                    }
-
-                    if let controlError = vpn.lastControlError {
-                        Text(controlError)
-                            .font(.footnote)
-                            .foregroundStyle(.red)
-                    }
-
-                    if vpn.siteSummaries.isEmpty {
-                        Text("No sites observed yet. Connect the tunnel and fetch to view recent activity.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                    } else {
-                        Text("Unique sites tracked: \(vpn.totalObservedSites)")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-
-                        VStack(alignment: .leading, spacing: 12) {
-                            ForEach(vpn.siteSummaries) { summary in
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(summary.displayName)
-                                        .font(.subheadline)
-                                        .bold()
-                                    Text("Last seen: \(trafficDateFormatter.string(from: summary.lastSeen))")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                    if let host = summary.host, host != summary.displayName {
-                                        Text("Host: \(host)")
-                                            .font(.caption)
-                                            .foregroundStyle(.primary)
-                                    }
-                                    Text("Remote IP: \(summary.remoteIP)")
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                    let inbound = byteFormatter.string(fromByteCount: Int64(summary.inboundBytes))
-                                    let outbound = byteFormatter.string(fromByteCount: Int64(summary.outboundBytes))
-                                    Text("Inbound \(inbound) · Outbound \(outbound)")
-                                        .font(.caption)
-                                        .foregroundStyle(.primary)
-                                    Text("Packets in/out: \(summary.inboundPackets)/\(summary.outboundPackets)")
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                    if summary.firstSeen < summary.lastSeen {
-                                        Text("First seen: \(trafficDateFormatter.string(from: summary.firstSeen))")
-                                            .font(.caption2)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                                .padding(12)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(Color.gray.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
-                            }
-                        }
-                    }
-                }
-                .padding()
-
-                Spacer()
+            VStack(spacing: 24) {
+                headerSection
+                hostRuleSection
+                dnsSection
+                telemetrySection
             }
-            .padding(.top, 24)
+            .padding()
+            .frame(maxWidth: .infinity)
         }
         .task { await vpn.prepare() }
+    }
+
+    private var headerSection: some View {
+        VStack(spacing: 16) {
+            Text("Relative Protocol – Example")
+                .font(.title2)
+                .bold()
+
+            Text(vpn.status.displayTitle)
+                .font(.headline)
+                .foregroundStyle(.secondary)
+
+            if let message = vpn.lastErrorMessage {
+                Text(message)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+            }
+
+            Button(action: toggle) {
+                HStack {
+                    if vpn.isBusy { ProgressView().tint(.white) }
+                    Text(vpn.status.isActive ? "Disconnect" : "Connect")
+                        .bold()
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 14)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(vpn.isBusy || (!vpn.configurationReady && !vpn.status.isActive))
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var hostRuleSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Host Rules")
+                .font(.headline)
+            VStack(spacing: 12) {
+                TextField("Pattern (e.g. *.example.com or 23.215.0.138)", text: $rulePattern)
+                    .textFieldStyle(.roundedBorder)
+                Picker("Action", selection: $actionSelection) {
+                    Text("Block").tag(RuleActionSelection.block)
+                    Text("Shape").tag(RuleActionSelection.shape)
+                }
+                .pickerStyle(.segmented)
+                if actionSelection == .shape {
+                    VStack {
+                        HStack {
+                            Text("Latency: \(Int(latencyMs)) ms")
+                            Spacer()
+                        }
+                        Slider(value: $latencyMs, in: 50...1000, step: 50)
+                    }
+                    VStack {
+                        HStack {
+                            Text("Jitter: \(Int(jitterMs)) ms")
+                            Spacer()
+                        }
+                        Slider(value: $jitterMs, in: 0...500, step: 25)
+                    }
+                }
+                Button("Install Rule") {
+                    Task {
+                        let action = actionSelection.action(latency: UInt32(latencyMs), jitter: UInt32(jitterMs))
+                        await vpn.installHostRule(pattern: rulePattern, action: action)
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(vpn.isBusy || !vpn.status.isActive)
+            }
+            .padding()
+            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+
+            if vpn.hostRules.isEmpty {
+                Text("No host rules installed.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(vpn.hostRules) { rule in
+                    HStack {
+                        VStack(alignment: .leading) {
+                            Text(rule.pattern)
+                                .font(.subheadline)
+                                .bold()
+                            Text(rule.action.description)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button(role: .destructive) {
+                            Task { await vpn.removeHostRule(rule) }
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                        .disabled(vpn.isBusy)
+                    }
+                    .padding(.vertical, 4)
+                    Divider()
+                }
+                .padding(.vertical, -4)
+            }
+        }
+        .padding()
+        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16))
+    }
+
+    private var dnsSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("DNS Activity")
+                    .font(.headline)
+                Spacer()
+                Button("Refresh") {
+                    Task { await vpn.refreshDnsHistory() }
+                }
+                .disabled(!vpn.status.isActive || vpn.isBusy)
+            }
+
+            if vpn.dnsHistory.isEmpty {
+                Text(vpn.status.isActive ? "Waiting for DNS requests…" : "Connect to start capturing DNS activity.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(vpn.dnsHistory.reversed()) { record in
+                    DNSRow(observation: record)
+                        .padding(.vertical, 6)
+                    Divider()
+                }
+                .padding(.vertical, -6)
+            }
+        }
+        .padding()
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
+    }
+
+    private var telemetrySection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Telemetry")
+                    .font(.headline)
+                Spacer()
+                Button("Pull Packets") {
+                    Task { await vpn.drainTelemetry() }
+                }
+                .disabled(!vpn.status.isActive || vpn.isBusy)
+            }
+
+            if vpn.telemetryEvents.isEmpty {
+                Text("Drain telemetry to view packet records.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(vpn.telemetryEvents.reversed()) { event in
+                    TelemetryRow(event: event)
+                        .padding(.vertical, 6)
+                    Divider()
+                }
+                .padding(.vertical, -6)
+            }
+        }
+        .padding()
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
     }
 
     private func toggle() {
@@ -343,27 +197,117 @@ struct ContentView: View {
             }
         }
     }
+}
 
-    private var defaultBandwidthDescription: String {
-        let kbps = vpn.shapingConfiguration.defaultBandwidthKbps
-        if kbps <= 0 {
-            return "Unlimited throughput"
-        }
-        if kbps >= 1000 {
-            return String(format: "%.1f Mbps ceiling", kbps / 1000.0)
-        }
-        return "\(Int(kbps)) Kbps ceiling"
-    }
+private struct DNSRow: View {
+    let observation: DNSObservation
+    private static let formatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.timeStyle = .medium
+        formatter.dateStyle = .none
+        return formatter
+    }()
 
-    private func perRuleBandwidthDescription(_ kbps: Double) -> String {
-        if kbps <= 0 {
-            return "Unlimited throughput"
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(observation.host)
+                .font(.subheadline)
+                .bold()
+            Text(observation.addresses.joined(separator: ", "))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+            HStack(spacing: 12) {
+                Label("TTL \(observation.ttlSeconds)s", systemImage: "clock")
+                    .font(.caption2)
+                Label(Self.formatter.string(from: observation.observedAt), systemImage: "calendar")
+                    .font(.caption2)
+            }
+            .foregroundStyle(.secondary)
         }
-        if kbps >= 1000 {
-            return String(format: "%.1f Mbps ceiling", kbps / 1000.0)
-        }
-        return "\(Int(kbps)) Kbps ceiling"
     }
 }
 
 #Preview { ContentView() }
+
+private enum RuleActionSelection {
+    case block
+    case shape
+
+    func action(latency: UInt32, jitter: UInt32) -> HostRuleConfiguration.Action {
+        switch self {
+        case .block:
+            return .block
+        case .shape:
+            return .shape(latencyMs: latency, jitterMs: jitter)
+        }
+    }
+}
+
+private extension HostRuleConfiguration.Action {
+    var description: String {
+        switch self {
+        case .block:
+            return "Block"
+        case .shape(let latencyMs, let jitterMs):
+            return "Shape (\(latencyMs)ms ±\(jitterMs)ms)"
+        }
+    }
+}
+
+private struct TelemetryRow: View {
+    let event: TelemetryEvent
+    private static let formatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.timeStyle = .medium
+        formatter.dateStyle = .none
+        return formatter
+    }()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(Self.formatter.string(from: event.timestamp))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text(event.direction == .clientToNetwork ? "↗︎" : "↘︎")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Text("\(event.source) → \(event.destination)")
+                .font(.caption)
+            if let dns = event.dnsQuery {
+                Text("DNS: \(dns)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            HStack(spacing: 8) {
+                Label("Proto \(event.protocolNumber)", systemImage: "point.topleft.down.curvedto.point.bottomright.up")
+                Label("\(event.payloadLength) bytes", systemImage: "arrow.up.arrow.down")
+            }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                if event.flags.contains(.policyBlock) {
+                    label(text: "Blocked", color: .red)
+                }
+                if event.flags.contains(.policyShape) {
+                    label(text: "Shaped", color: .orange)
+                }
+                if event.flags.contains(.dns) {
+                    label(text: "DNS", color: .blue)
+                }
+            }
+        }
+    }
+
+    private func label(text: String, color: Color) -> some View {
+        Text(text.uppercased())
+            .font(.caption2)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(color.opacity(0.15), in: Capsule())
+            .foregroundStyle(color)
+    }
+}

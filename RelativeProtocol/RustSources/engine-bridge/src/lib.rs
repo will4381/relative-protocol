@@ -4,19 +4,25 @@ mod device;
 mod dns;
 pub mod ffi;
 mod flow_manager;
-mod logger;
+pub mod logger;
+mod policy;
 mod quic;
+mod telemetry;
 
 use crate::device::{TunDevice, TunHandle, DEFAULT_MTU, RING_CAPACITY};
 use crate::dns::{ResolveError, ResolveOutcome, Resolver, SystemResolver};
 use crate::ffi::{
-    BridgeCallbacks, BridgeConfig, BridgeLogSink, BridgeResolveResult, FlowCounters, FlowStats,
+    BridgeCallbacks, BridgeConfig, BridgeHostRuleConfig, BridgeLogSink, BridgeResolveResult,
+    BridgeTelemetryEvent, BridgeTelemetryIp, FlowCounters, FlowStats, BRIDGE_TELEMETRY_MAX_QNAME,
 };
 use crate::flow_manager::FlowManager;
 use crate::logger::BreadcrumbFlags;
+use crate::policy::{PolicyManager, RuleAction, ShapingConfig};
+use crate::telemetry::Telemetry;
 use once_cell::sync::OnceCell;
 use smoltcp::time::Instant as SmoltInstant;
 use std::ffi::CStr;
+use std::net::IpAddr;
 use std::os::raw::c_char;
 use std::ptr::NonNull;
 use std::slice;
@@ -40,6 +46,8 @@ pub struct BridgeEngine {
     tun_handle: TunHandle,
     poll_task: Mutex<Option<JoinHandle<()>>>,
     wake: Arc<Notify>,
+    telemetry: Arc<Telemetry>,
+    policy: Arc<PolicyManager>,
 }
 
 struct EngineState {
@@ -59,15 +67,25 @@ impl BridgeEngine {
         let device = TunDevice::new(mtu, Arc::clone(&wake));
         let tun_handle = device.handle();
 
+        let telemetry = Arc::new(Telemetry::new());
+        let policy = PolicyManager::new();
+
         let engine = Self {
             callbacks: OnceCell::new(),
             runtime,
             state: Arc::new(Mutex::new(EngineState { running: false })),
             resolver: SystemResolver::default(),
-            flows: Arc::new(Mutex::new(FlowManager::new(device, Arc::clone(&wake)))),
+            flows: Arc::new(Mutex::new(FlowManager::new(
+                device,
+                Arc::clone(&wake),
+                Arc::clone(&telemetry),
+                Arc::clone(&policy),
+            ))),
             tun_handle,
             poll_task: Mutex::new(None),
             wake,
+            telemetry,
+            policy,
         };
 
         logger::breadcrumb(
@@ -204,6 +222,18 @@ impl BridgeEngine {
             .lock()
             .map(|flows| flows.stats())
             .unwrap_or_default()
+    }
+
+    fn drain_telemetry(&self, max_events: usize) -> (Vec<crate::telemetry::TelemetryEvent>, u64) {
+        self.telemetry.drain(max_events)
+    }
+
+    fn install_host_rule(&self, pattern: &str, action: RuleAction) -> u64 {
+        self.policy.install_rule(pattern, action)
+    }
+
+    fn remove_host_rule(&self, id: u64) -> bool {
+        self.policy.remove_rule(id)
     }
 
     fn start_poll_loop(&self) {
@@ -436,6 +466,30 @@ pub unsafe extern "C" fn BridgeEngineGetStats(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn BridgeTelemetryDrain(
+    engine: *mut BridgeEngine,
+    out_events: *mut BridgeTelemetryEvent,
+    max_events: usize,
+    dropped_out: *mut u64,
+) -> usize {
+    let Some(engine) = NonNull::new(engine) else {
+        return 0;
+    };
+    if out_events.is_null() || max_events == 0 {
+        return 0;
+    }
+    let (events, dropped) = unsafe { engine.as_ref() }.drain_telemetry(max_events);
+    if let Some(ptr) = unsafe { dropped_out.as_mut() } {
+        *ptr = dropped;
+    }
+    let out_slice = unsafe { slice::from_raw_parts_mut(out_events, max_events) };
+    for (idx, event) in events.iter().enumerate() {
+        out_slice[idx] = bridge_event_from(event);
+    }
+    events.len()
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn BridgeEngineResolveHost(
     engine: *mut BridgeEngine,
     host: *const c_char,
@@ -481,4 +535,92 @@ pub unsafe extern "C" fn BridgeResolveResultFree(result: *mut BridgeResolveResul
 #[no_mangle]
 pub extern "C" fn BridgeEnsureLinked() -> bool {
     true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BridgeHostRuleAdd(
+    engine: *mut BridgeEngine,
+    config: *const BridgeHostRuleConfig,
+    out_id: *mut u64,
+) -> bool {
+    let Some(engine) = NonNull::new(engine) else {
+        return false;
+    };
+    let Some(cfg) = (unsafe { config.as_ref() }) else {
+        return false;
+    };
+    if cfg.pattern.is_null() {
+        return false;
+    }
+    let pattern = match unsafe { CStr::from_ptr(cfg.pattern) }.to_str() {
+        Ok(p) if !p.is_empty() => p,
+        _ => return false,
+    };
+    let action = if cfg.block {
+        RuleAction::Block
+    } else {
+        RuleAction::Shape(ShapingConfig {
+            latency_ms: cfg.latency_ms,
+            jitter_ms: cfg.jitter_ms,
+        })
+    };
+    let id = unsafe { engine.as_ref() }.install_host_rule(pattern, action);
+    if let Some(out) = unsafe { out_id.as_mut() } {
+        *out = id;
+    }
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BridgeHostRuleRemove(engine: *mut BridgeEngine, rule_id: u64) -> bool {
+    let Some(engine) = NonNull::new(engine) else {
+        return false;
+    };
+    unsafe { engine.as_ref() }.remove_host_rule(rule_id)
+}
+
+fn bridge_event_from(event: &crate::telemetry::TelemetryEvent) -> BridgeTelemetryEvent {
+    let mut out = BridgeTelemetryEvent::default();
+    out.timestamp_ms = event.timestamp_ms;
+    out.payload_len = event.payload_len;
+    out.protocol = event.protocol;
+    out.direction = match event.direction {
+        crate::telemetry::PacketDirection::ClientToNetwork => 0,
+        crate::telemetry::PacketDirection::NetworkToClient => 1,
+    };
+    out.flags = event.flags;
+    out.src_ip = encode_ip(&event.src);
+    out.dst_ip = encode_ip(&event.dst);
+    if let Some(qname) = &event.dns_qname {
+        let bytes = qname.as_bytes();
+        let max_len = BRIDGE_TELEMETRY_MAX_QNAME.saturating_sub(1);
+        let len = bytes.len().min(max_len);
+        for (idx, byte) in bytes.iter().take(len).enumerate() {
+            out.dns_qname[idx] = *byte as c_char;
+        }
+        out.dns_qname[len] = 0;
+        out.dns_qname_len = len as u8;
+        out.flags |= crate::telemetry::TELEMETRY_FLAG_DNS;
+    }
+    if event.dns_response {
+        out.flags |= crate::telemetry::TELEMETRY_FLAG_DNS_RESPONSE;
+    }
+    out
+}
+
+fn encode_ip(addr: &IpAddr) -> BridgeTelemetryIp {
+    match addr {
+        IpAddr::V4(v4) => {
+            let mut out = BridgeTelemetryIp::default();
+            out.family = 4;
+            out.bytes[..4].copy_from_slice(&v4.octets());
+            out
+        }
+        IpAddr::V6(v6) => {
+            let mut out = BridgeTelemetryIp::default();
+            out.family = 6;
+            out.bytes.copy_from_slice(&v6.octets());
+            out
+        }
+    }
 }

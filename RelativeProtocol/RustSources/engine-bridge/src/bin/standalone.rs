@@ -1,8 +1,10 @@
-use engine_bridge::ffi::{BridgeCallbacks, BridgeConfig, BridgeLogSink};
+use engine_bridge::ffi::{BridgeCallbacks, BridgeConfig, BridgeHostRuleConfig, BridgeLogSink};
+use engine_bridge::logger::{self, BreadcrumbFlags};
 use engine_bridge::{
     BridgeEngineHandlePacket, BridgeEngineOnDialResult, BridgeEngineOnTcpClose,
     BridgeEngineOnTcpReceive, BridgeEngineOnUdpClose, BridgeEngineOnUdpReceive, BridgeEngineStart,
-    BridgeEngineStop, BridgeFreeEngine, BridgeNewEngine, BridgeSetBreadcrumbMask, BridgeSetLogSink,
+    BridgeEngineStop, BridgeFreeEngine, BridgeHostRuleAdd, BridgeNewEngine,
+    BridgeSetBreadcrumbMask, BridgeSetLogSink,
 };
 use libc::{self, c_char, c_void};
 use std::collections::HashMap;
@@ -10,12 +12,17 @@ use std::env;
 use std::ffi::{CStr, CString};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "macos")]
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::ptr;
 use std::slice;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+compile_error!("standalone runner currently supports only macOS and Linux");
 
 #[derive(Clone, Copy)]
 struct EngineHandle(*mut engine_bridge::BridgeEngine);
@@ -32,19 +39,25 @@ unsafe impl Sync for EngineHandle {}
 fn main() -> anyhow::Result<()> {
     let settings = Settings::parse()?;
     eprintln!(
-        "[standalone] launching Relative Protocol engine (mtu={}, utun={:?})",
-        settings.mtu, settings.utun_index
+        "[standalone] launching Relative Protocol engine (mtu={}, utun={:?}, ifname={:?})",
+        settings.mtu, settings.utun_index, settings.ifname
     );
 
-    let utun = UtunDevice::connect(settings.utun_index)?;
+    let tun = SystemTunDevice::connect(&settings)?;
+    let interface_name = tun.name().to_string();
+
+    #[cfg(target_os = "macos")]
     println!(
         "[standalone] created interface {}. Configure it (as root) via:\n  sudo ifconfig {} inet 10.0.0.2 10.0.0.1 up\n  sudo ifconfig {} inet6 fd00:1::2 prefixlen 64\nthen add the routes you want to steer through this interface.",
-        utun.name(),
-        utun.name(),
-        utun.name()
+        interface_name, interface_name, interface_name
+    );
+    #[cfg(target_os = "linux")]
+    println!(
+        "[standalone] created interface {}. Configure it (as root) via:\n  sudo ip link set {} up\n  sudo ip addr add 10.0.0.2/24 dev {}\n  sudo ip -6 addr add fd00:1::2/64 dev {}\nthen add the routes you want to steer through this interface.",
+        interface_name, interface_name, interface_name, interface_name
     );
 
-    let (mut tun_reader, mut tun_writer) = utun.into_parts();
+    let (mut tun_reader, mut tun_writer) = tun.into_parts();
     let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>();
 
     let config = BridgeConfig {
@@ -58,9 +71,7 @@ fn main() -> anyhow::Result<()> {
     let engine = EngineHandle(engine_ptr);
 
     install_log_sink();
-    unsafe {
-        BridgeSetBreadcrumbMask(u32::MAX);
-    }
+    BridgeSetBreadcrumbMask(u32::MAX);
 
     let state = Arc::new(StandaloneState::new(tun_tx.clone()));
     let context = Box::into_raw(Box::new(StandaloneContext {
@@ -88,14 +99,15 @@ fn main() -> anyhow::Result<()> {
         }
         anyhow::bail!("BridgeEngineStart failed with status {}", status);
     }
+    install_startup_rules(engine);
 
     let reader_engine = engine;
-    let reader_handle = thread::Builder::new()
+    let _reader_handle = thread::Builder::new()
         .name("tun-reader".into())
         .spawn(move || tun_reader_loop(reader_engine, &mut tun_reader))
         .expect("failed to spawn tun reader");
 
-    let writer_handle = thread::Builder::new()
+    let _writer_handle = thread::Builder::new()
         .name("tun-writer".into())
         .spawn(move || tun_writer_loop(&mut tun_writer, tun_rx))
         .expect("failed to spawn tun writer");
@@ -115,8 +127,8 @@ fn main() -> anyhow::Result<()> {
             drop(Box::from_raw(context));
             BridgeFreeEngine(engine.as_ptr());
         }
-        let _ = reader_handle.join();
-        let _ = writer_handle.join();
+        let _ = _reader_handle.join();
+        let _ = _writer_handle.join();
         Ok(())
     }
 }
@@ -125,12 +137,14 @@ fn main() -> anyhow::Result<()> {
 struct Settings {
     mtu: u32,
     utun_index: Option<u32>,
+    ifname: Option<String>,
 }
 
 impl Settings {
     fn parse() -> anyhow::Result<Self> {
         let mut mtu = 1500;
         let mut utun_index = None;
+        let mut ifname = None;
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -150,106 +164,150 @@ impl Settings {
                             .map_err(|_| anyhow::anyhow!("invalid utun index"))?,
                     );
                 }
+                "--ifname" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--ifname requires a value"))?;
+                    if value.is_empty() {
+                        anyhow::bail!("--ifname requires a non-empty value");
+                    }
+                    ifname = Some(value);
+                }
                 _ => {
                     anyhow::bail!(
-                        "unknown argument '{}'. Supported flags: --mtu <value>, --utun <index>",
+                        "unknown argument '{}'. Supported flags: --mtu <value>, --utun <index>, --ifname <name>",
                         arg
                     );
                 }
             }
         }
-        Ok(Self { mtu, utun_index })
+        Ok(Self {
+            mtu,
+            utun_index,
+            ifname,
+        })
     }
 }
 
-struct UtunDevice {
+struct SystemTunDevice {
     reader: std::fs::File,
     writer: std::fs::File,
     name: String,
 }
 
-impl UtunDevice {
-    fn connect(unit: Option<u32>) -> io::Result<Self> {
-        #[cfg(not(target_os = "macos"))]
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "standalone runner currently supports only macOS",
-            ));
+impl SystemTunDevice {
+    #[cfg(target_os = "macos")]
+    fn connect(settings: &Settings) -> io::Result<Self> {
+        use std::mem::{size_of, zeroed};
+
+        const UTUN_CONTROL_NAME: &[u8] = b"com.apple.net.utun_control";
+        let fd = unsafe { libc::socket(libc::PF_SYSTEM, libc::SOCK_DGRAM, libc::SYSPROTO_CONTROL) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+
+        let mut info: libc::ctl_info = unsafe { zeroed() };
+        for (idx, byte) in UTUN_CONTROL_NAME.iter().enumerate() {
+            info.ctl_name[idx] = *byte as libc::c_char;
+        }
+        let ioctl_status = unsafe { libc::ioctl(owned.as_raw_fd(), libc::CTLIOCGINFO, &mut info) };
+        if ioctl_status < 0 {
+            return Err(io::Error::last_os_error());
         }
 
-        #[cfg(target_os = "macos")]
-        {
-            use std::mem::{size_of, zeroed};
+        let mut addr: libc::sockaddr_ctl = unsafe { zeroed() };
+        addr.sc_len = size_of::<libc::sockaddr_ctl>() as u8;
+        addr.sc_family = libc::AF_SYSTEM as u8;
+        addr.ss_sysaddr = libc::AF_SYS_CONTROL as u16;
+        addr.sc_id = info.ctl_id;
+        addr.sc_unit = settings.utun_index.map(|value| value + 1).unwrap_or(0);
 
-            const UTUN_CONTROL_NAME: &[u8] = b"com.apple.net.utun_control";
-            let fd =
-                unsafe { libc::socket(libc::PF_SYSTEM, libc::SOCK_DGRAM, libc::SYSPROTO_CONTROL) };
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-
-            let mut info: libc::ctl_info = unsafe { zeroed() };
-            for (idx, byte) in UTUN_CONTROL_NAME.iter().enumerate() {
-                info.ctl_name[idx] = *byte as libc::c_char;
-            }
-            let ioctl_status =
-                unsafe { libc::ioctl(owned.as_raw_fd(), libc::CTLIOCGINFO, &mut info) };
-            if ioctl_status < 0 {
-                return Err(io::Error::last_os_error());
-            }
-
-            let mut addr: libc::sockaddr_ctl = unsafe { zeroed() };
-            addr.sc_len = size_of::<libc::sockaddr_ctl>() as u8;
-            addr.sc_family = libc::AF_SYSTEM as u8;
-            addr.ss_sysaddr = libc::AF_SYS_CONTROL as u16;
-            addr.sc_id = info.ctl_id;
-            addr.sc_unit = unit.map(|value| value + 1).unwrap_or(0);
-
-            let connect_status = unsafe {
-                libc::connect(
-                    owned.as_raw_fd(),
-                    &addr as *const _ as *const libc::sockaddr,
-                    size_of::<libc::sockaddr_ctl>() as u32,
-                )
-            };
-            if connect_status < 0 {
-                return Err(io::Error::last_os_error());
-            }
-
-            let mut ifname = [0u8; libc::IFNAMSIZ];
-            let mut ifname_len = ifname.len() as u32;
-            let opt_status = unsafe {
-                libc::getsockopt(
-                    owned.as_raw_fd(),
-                    libc::SYSPROTO_CONTROL,
-                    libc::UTUN_OPT_IFNAME,
-                    ifname.as_mut_ptr() as *mut _,
-                    &mut ifname_len,
-                )
-            };
-            if opt_status < 0 {
-                return Err(io::Error::last_os_error());
-            }
-
-            let trimmed_len = if ifname_len == 0 {
-                0
-            } else {
-                (ifname_len as usize).saturating_sub(1)
-            };
-            let name = String::from_utf8_lossy(&ifname[..trimmed_len]).into_owned();
-
-            let reader_fd = owned.try_clone()?;
-            let reader = std::fs::File::from(reader_fd);
-            let writer = std::fs::File::from(owned);
-
-            Ok(Self {
-                reader,
-                writer,
-                name,
-            })
+        let connect_status = unsafe {
+            libc::connect(
+                owned.as_raw_fd(),
+                &addr as *const _ as *const libc::sockaddr,
+                size_of::<libc::sockaddr_ctl>() as u32,
+            )
+        };
+        if connect_status < 0 {
+            return Err(io::Error::last_os_error());
         }
+
+        let mut ifname = [0u8; libc::IFNAMSIZ];
+        let mut ifname_len = ifname.len() as u32;
+        let opt_status = unsafe {
+            libc::getsockopt(
+                owned.as_raw_fd(),
+                libc::SYSPROTO_CONTROL,
+                libc::UTUN_OPT_IFNAME,
+                ifname.as_mut_ptr() as *mut _,
+                &mut ifname_len,
+            )
+        };
+        if opt_status < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let trimmed_len = if ifname_len == 0 {
+            0
+        } else {
+            (ifname_len as usize).saturating_sub(1)
+        };
+        let name = String::from_utf8_lossy(&ifname[..trimmed_len]).into_owned();
+
+        let reader_fd = owned.try_clone()?;
+        let reader = std::fs::File::from(reader_fd);
+        let writer = std::fs::File::from(owned);
+
+        Ok(Self {
+            reader,
+            writer,
+            name,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn connect(settings: &Settings) -> io::Result<Self> {
+        use std::mem::zeroed;
+
+        const TUN_DEVICE: &str = "/dev/net/tun";
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(TUN_DEVICE)?;
+        let fd = file.as_raw_fd();
+
+        let mut ifreq: libc::ifreq = unsafe { zeroed() };
+        if let Some(name) = settings.ifname.as_deref() {
+            for (idx, byte) in name.as_bytes().iter().enumerate() {
+                if idx >= libc::IFNAMSIZ {
+                    break;
+                }
+                ifreq.ifr_name[idx] = *byte as libc::c_char;
+            }
+        }
+        unsafe {
+            ifreq.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short;
+        }
+
+        let status = unsafe { libc::ioctl(fd, libc::TUNSETIFF, &ifreq) };
+        if status < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let name = unsafe {
+            CStr::from_ptr(ifreq.ifr_name.as_ptr())
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        let reader = file.try_clone()?;
+        Ok(Self {
+            reader,
+            writer: file,
+            name,
+        })
     }
 
     fn into_parts(self) -> (std::fs::File, std::fs::File) {
@@ -283,6 +341,10 @@ impl StandaloneState {
     fn send_tcp(&self, handle: u64, payload: &[u8]) -> io::Result<()> {
         let map = self.tcp.lock().unwrap();
         if let Some(entry) = map.get(&handle) {
+            flow_trace(format!(
+                "[standalone][tcp send] handle {handle} forwarding {} bytes",
+                payload.len()
+            ));
             entry
                 .tx
                 .send(payload.to_vec())
@@ -371,20 +433,37 @@ unsafe extern "C" fn request_tcp_dial(
     let host_str = CStr::from_ptr(host).to_string_lossy().into_owned();
     let state = Arc::clone(&ctx.state);
     let engine = ctx.engine;
+    flow_trace(format!(
+        "[standalone][dial] handle {handle} resolving {host_str}:{port}"
+    ));
     thread::spawn(move || match resolve_target(&host_str, port) {
-        Ok(addr) => match TcpStream::connect(addr) {
-            Ok(stream) => {
-                if let Err(err) = stream.set_nodelay(true) {
-                    report_tcp_failure(engine, handle, err);
-                    return;
+        Ok(addr) => {
+            flow_trace(format!(
+                "[standalone][dial] handle {handle} connecting to {addr}"
+            ));
+            match TcpStream::connect(addr) {
+                Ok(stream) => {
+                    if let Err(err) = stream.set_nodelay(true) {
+                        report_tcp_failure(engine, handle, err);
+                        return;
+                    }
+                    flow_trace(format!(
+                        "[standalone][dial] handle {handle} connected to {addr}"
+                    ));
+                    start_tcp_workers(state, engine, handle, stream);
                 }
-                start_tcp_workers(state, engine, handle, stream);
+                Err(err) => {
+                    logger::warn(format!(
+                        "[standalone][dial] handle {handle} connect error: {err}"
+                    ));
+                    report_tcp_failure(engine, handle, err);
+                }
             }
-            Err(err) => {
-                report_tcp_failure(engine, handle, err);
-            }
-        },
+        }
         Err(err) => {
+            logger::warn(format!(
+                "[standalone][dial] handle {handle} resolve error: {err}"
+            ));
             report_tcp_failure(engine, handle, err);
         }
     });
@@ -434,7 +513,9 @@ unsafe extern "C" fn tcp_send(
     let ctx = &*(context as *mut StandaloneContext);
     let data = slice::from_raw_parts(payload, length);
     if let Err(err) = ctx.state.send_tcp(handle, data) {
-        eprintln!("[standalone][tcp_send] handle {handle} send error: {err}");
+        logger::warn(format!(
+            "[standalone][tcp_send] handle {handle} send error: {err}"
+        ));
     }
 }
 
@@ -541,6 +622,9 @@ fn start_tcp_workers(
     unsafe {
         BridgeEngineOnDialResult(engine.as_ptr(), handle, true, ptr::null());
     }
+    flow_trace(format!(
+        "[standalone][dial] handle {handle} signaled ready to engine"
+    ));
 
     let writer_engine = engine;
     thread::spawn(move || {
@@ -550,11 +634,16 @@ fn start_tcp_workers(
                 break;
             }
             if let Err(err) = writer.write_all(&payload) {
-                eprintln!("[standalone][tcp writer] handle {handle} error: {err}");
+                logger::warn(format!(
+                    "[standalone][tcp writer] handle {handle} error: {err}"
+                ));
                 break;
             }
         }
         let _ = writer.shutdown(std::net::Shutdown::Both);
+        flow_trace(format!(
+            "[standalone][tcp writer] handle {handle} closing socket"
+        ));
         unsafe {
             BridgeEngineOnTcpClose(writer_engine.as_ptr(), handle);
         }
@@ -572,12 +661,17 @@ fn start_tcp_workers(
                 },
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(err) => {
-                    eprintln!("[standalone][tcp reader] handle {handle} error: {err}");
+                    logger::warn(format!(
+                        "[standalone][tcp reader] handle {handle} error: {err}"
+                    ));
                     break;
                 }
             }
         }
         reader_state.remove_tcp(handle);
+        flow_trace(format!(
+            "[standalone][tcp reader] handle {handle} closing socket"
+        ));
         unsafe {
             BridgeEngineOnTcpClose(engine.as_ptr(), handle);
         }
@@ -604,7 +698,7 @@ fn start_udp_workers(
         }
     };
     thread::spawn(move || {
-        let mut sock = writer_socket;
+        let sock = writer_socket;
         while let Ok(payload) = rx.recv() {
             if payload.is_empty() {
                 break;
@@ -618,7 +712,7 @@ fn start_udp_workers(
 
     let reader_state = Arc::clone(&state);
     thread::spawn(move || {
-        let mut sock = socket;
+        let sock = socket;
         let mut buf = vec![0u8; 65535];
         loop {
             match sock.recv(&mut buf) {
@@ -645,19 +739,18 @@ fn tun_reader_loop(engine: EngineHandle, reader: &mut std::fs::File) {
     loop {
         match reader.read(&mut buf) {
             Ok(0) => continue,
-            Ok(n) if n > 4 => {
-                let proto = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                let payload = &buf[4..n];
-                unsafe {
-                    BridgeEngineHandlePacket(
-                        engine.as_ptr(),
-                        payload.as_ptr(),
-                        payload.len(),
-                        proto,
-                    );
+            Ok(n) => {
+                if let Some((proto, payload)) = parse_tun_frame(&buf[..n]) {
+                    unsafe {
+                        BridgeEngineHandlePacket(
+                            engine.as_ptr(),
+                            payload.as_ptr(),
+                            payload.len(),
+                            proto,
+                        );
+                    }
                 }
             }
-            Ok(_) => continue,
             Err(err) => {
                 eprintln!("[standalone][tun reader] error: {err}");
                 break;
@@ -673,11 +766,7 @@ fn tun_writer_loop(writer: &mut std::fs::File, rx: mpsc::Receiver<Vec<u8>>) {
                 if frame.is_empty() {
                     continue;
                 }
-                let proto = infer_protocol(&frame);
-                let mut packet = Vec::with_capacity(frame.len() + 4);
-                packet.extend_from_slice(&proto.to_be_bytes());
-                packet.extend_from_slice(&frame);
-                if let Err(err) = writer.write_all(&packet) {
+                if let Err(err) = write_tun_frame(writer, &frame) {
                     eprintln!("[standalone][tun writer] error: {err}");
                     break;
                 }
@@ -696,6 +785,39 @@ fn infer_protocol(frame: &[u8]) -> u32 {
     } else {
         libc::AF_INET as u32
     }
+}
+
+#[cfg(target_os = "macos")]
+fn parse_tun_frame(buffer: &[u8]) -> Option<(u32, &[u8])> {
+    if buffer.len() <= 4 {
+        return None;
+    }
+    let proto = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
+    Some((proto, &buffer[4..]))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_tun_frame(buffer: &[u8]) -> Option<(u32, &[u8])> {
+    if buffer.is_empty() {
+        None
+    } else {
+        let proto = infer_protocol(buffer);
+        Some((proto, buffer))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn write_tun_frame(writer: &mut std::fs::File, frame: &[u8]) -> io::Result<()> {
+    let proto = infer_protocol(frame);
+    let mut packet = Vec::with_capacity(frame.len() + 4);
+    packet.extend_from_slice(&proto.to_be_bytes());
+    packet.extend_from_slice(frame);
+    writer.write_all(&packet)
+}
+
+#[cfg(target_os = "linux")]
+fn write_tun_frame(writer: &mut std::fs::File, frame: &[u8]) -> io::Result<()> {
+    writer.write_all(frame)
 }
 
 fn install_log_sink() {
@@ -726,4 +848,131 @@ fn install_log_sink() {
     unsafe {
         BridgeSetLogSink(&sink, level.as_ptr(), ptr::null_mut());
     }
+}
+
+fn install_startup_rules(engine: EngineHandle) {
+    let Ok(spec) = env::var("HOST_RULES") else {
+        return;
+    };
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return;
+    }
+    for raw_rule in spec.split(';') {
+        let entry = raw_rule.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        match parse_rule(entry) {
+            Ok(rule) => {
+                let pattern_cstr = match CString::new(rule.pattern.clone()) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        eprintln!(
+                            "[standalone] invalid host rule pattern (contains nulls): {}",
+                            rule.pattern
+                        );
+                        continue;
+                    }
+                };
+                let mut id: u64 = 0;
+                let config = BridgeHostRuleConfig {
+                    pattern: pattern_cstr.as_ptr(),
+                    block: matches!(rule.action, RuleActionSpec::Block),
+                    latency_ms: match rule.action {
+                        RuleActionSpec::Shape { latency_ms, .. } => latency_ms,
+                        _ => 0,
+                    },
+                    jitter_ms: match rule.action {
+                        RuleActionSpec::Shape { jitter_ms, .. } => jitter_ms,
+                        _ => 0,
+                    },
+                };
+                let ok =
+                    unsafe { BridgeHostRuleAdd(engine.as_ptr(), &config, &mut id as *mut u64) };
+                if ok {
+                    match rule.action {
+                        RuleActionSpec::Block => {
+                            println!(
+                                "[standalone] installed host rule #{id} pattern='{}' action=block",
+                                rule.pattern
+                            );
+                        }
+                        RuleActionSpec::Shape {
+                            latency_ms,
+                            jitter_ms,
+                        } => {
+                            println!(
+                                "[standalone] installed host rule #{id} pattern='{}' action=shape latency={}ms jitter={}ms",
+                                rule.pattern, latency_ms, jitter_ms
+                            );
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "[standalone] failed to install host rule pattern='{}'",
+                        rule.pattern
+                    );
+                }
+            }
+            Err(err) => {
+                eprintln!("[standalone] {err}");
+            }
+        }
+    }
+}
+
+struct ParsedRule {
+    pattern: String,
+    action: RuleActionSpec,
+}
+
+enum RuleActionSpec {
+    Block,
+    Shape { latency_ms: u32, jitter_ms: u32 },
+}
+
+fn parse_rule(input: &str) -> Result<ParsedRule, String> {
+    let mut parts = input.split(':').map(str::trim);
+    let pattern = parts
+        .next()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| format!("host rule '{}' missing pattern", input))?
+        .to_ascii_lowercase();
+    let action = parts
+        .next()
+        .map(|value| value.to_ascii_lowercase())
+        .ok_or_else(|| format!("host rule '{}' missing action", input))?;
+    let action_spec = match action.as_str() {
+        "block" => RuleActionSpec::Block,
+        "shape" => {
+            let latency_str = parts
+                .next()
+                .ok_or_else(|| format!("host rule '{}' missing latency_ms", input))?;
+            let latency_ms = parse_u32(latency_str)
+                .ok_or_else(|| format!("invalid latency_ms '{}'", latency_str))?;
+            let jitter_ms = parts.next().map(parse_u32).flatten().unwrap_or(0);
+            RuleActionSpec::Shape {
+                latency_ms,
+                jitter_ms,
+            }
+        }
+        _ => {
+            return Err(format!(
+                "host rule '{}' has unsupported action '{}'",
+                input, action
+            ))
+        }
+    };
+    Ok(ParsedRule {
+        pattern,
+        action: action_spec,
+    })
+}
+
+fn parse_u32(value: &str) -> Option<u32> {
+    value.parse::<u32>().ok()
+}
+fn flow_trace(message: impl Into<String>) {
+    logger::breadcrumb(BreadcrumbFlags::FLOW, message.into());
 }

@@ -18,6 +18,16 @@
 
 #define MAX_EMIT_BATCH 64
 
+#define BRIDGE_TELEMETRY_MAX_QNAME 128
+
+#define TELEMETRY_FLAG_DNS 1
+
+#define TELEMETRY_FLAG_DNS_RESPONSE 2
+
+#define TELEMETRY_FLAG_POLICY_BLOCK 4
+
+#define TELEMETRY_FLAG_POLICY_SHAPE 8
+
 /**
  * Opaque engine handle shared with Swift/ObjC.
  */
@@ -86,12 +96,36 @@ typedef struct FlowStats {
   uint64_t udp_flush_events;
 } FlowStats;
 
+typedef struct BridgeTelemetryIp {
+  uint8_t family;
+  uint8_t bytes[16];
+} BridgeTelemetryIp;
+
+typedef struct BridgeTelemetryEvent {
+  uint64_t timestamp_ms;
+  uint32_t payload_len;
+  uint8_t protocol;
+  uint8_t direction;
+  uint8_t flags;
+  struct BridgeTelemetryIp src_ip;
+  struct BridgeTelemetryIp dst_ip;
+  uint8_t dns_qname_len;
+  char dns_qname[BRIDGE_TELEMETRY_MAX_QNAME];
+} BridgeTelemetryEvent;
+
 typedef struct BridgeResolveResult {
   char **addresses;
   size_t count;
   void *storage;
   uint32_t ttl_seconds;
 } BridgeResolveResult;
+
+typedef struct BridgeHostRuleConfig {
+  const char *pattern;
+  bool block;
+  uint32_t latency_ms;
+  uint32_t jitter_ms;
+} BridgeHostRuleConfig;
 
 struct BridgeEngine *BridgeNewEngine(const struct BridgeConfig *config);
 
@@ -133,6 +167,11 @@ bool BridgeEngineGetCounters(struct BridgeEngine *engine, struct FlowCounters *o
 
 bool BridgeEngineGetStats(struct BridgeEngine *engine, struct FlowStats *out);
 
+size_t BridgeTelemetryDrain(struct BridgeEngine *engine,
+                            struct BridgeTelemetryEvent *out_events,
+                            size_t max_events,
+                            uint64_t *dropped_out);
+
 int32_t BridgeEngineResolveHost(struct BridgeEngine *engine,
                                 const char *host,
                                 struct BridgeResolveResult *result);
@@ -140,5 +179,11 @@ int32_t BridgeEngineResolveHost(struct BridgeEngine *engine,
 void BridgeResolveResultFree(struct BridgeResolveResult *result);
 
 bool BridgeEnsureLinked(void);
+
+bool BridgeHostRuleAdd(struct BridgeEngine *engine,
+                       const struct BridgeHostRuleConfig *config,
+                       uint64_t *out_id);
+
+bool BridgeHostRuleRemove(struct BridgeEngine *engine, uint64_t rule_id);
 
 #endif /* ENGINE_BRIDGE_H */

@@ -23,10 +23,7 @@ let package = Package(
         .library(name: "RelativeProtocolTunnel", targets: ["RelativeProtocolTunnel"]),
         .library(name: "RelativeProtocolHost", targets: ["RelativeProtocolHost"]),
     ],
-    dependencies: [
-        .package(url: "https://github.com/apple/swift-async-algorithms.git", from: "1.0.0"),
-        .package(url: "https://github.com/apple/swift-collections.git", from: "1.0.5")
-    ],
+    dependencies: [],
     targets: [
         // Vendored binary (prebuilt) relative to repo root
         .binaryTarget(
@@ -46,18 +43,14 @@ let package = Package(
         ),
         .target(
             name: "RelativeProtocolCore",
-            dependencies: [
-                .product(name: "Collections", package: "swift-collections")
-            ],
+            dependencies: [],
             path: "RelativeProtocol/Sources/RelativeProtocolCore"
         ),
         .target(
             name: "RelativeProtocolTunnel",
             dependencies: [
                 "RelativeProtocolCore",
-                "EngineBinary",
-                .product(name: "AsyncAlgorithms", package: "swift-async-algorithms"),
-                .product(name: "Collections", package: "swift-collections")
+                "EngineBinary"
             ],
             path: "RelativeProtocol/Sources/RelativeProtocolTunnel",
             linkerSettings: [

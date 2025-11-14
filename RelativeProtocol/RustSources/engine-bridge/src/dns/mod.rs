@@ -62,6 +62,12 @@ pub fn parse_response(payload: &[u8]) -> Vec<DnsMapping> {
         offset += 4; // type + class
     }
     let mut host_map: HashMap<String, DnsMapping> = HashMap::new();
+    let mut alias_roots: HashMap<String, Vec<String>> = HashMap::new();
+    for question in &questions {
+        alias_roots
+            .entry(question.clone())
+            .or_insert_with(|| vec![question.clone()]);
+    }
     for _ in 0..an_count {
         let name = match read_name(payload, &mut offset) {
             Some(n) => n,
@@ -82,29 +88,54 @@ pub fn parse_response(payload: &[u8]) -> Vec<DnsMapping> {
         if offset + rdlength > payload.len() {
             return Vec::new();
         }
-        let rdata = &payload[offset..offset + rdlength];
+        let rdata_start = offset;
         offset += rdlength;
 
         match record_type {
             1 => {
                 if rdlength == 4 {
-                    let addr = IpAddr::V4(Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3]));
-                    insert_mapping(&mut host_map, &name, addr, ttl);
+                    let addr = IpAddr::V4(Ipv4Addr::new(
+                        payload[rdata_start],
+                        payload[rdata_start + 1],
+                        payload[rdata_start + 2],
+                        payload[rdata_start + 3],
+                    ));
+                    let roots = lookup_roots(&alias_roots, &name);
+                    for root in roots {
+                        insert_mapping(&mut host_map, root.as_str(), addr, ttl);
+                    }
                 }
             }
             28 => {
                 if rdlength == 16 {
                     let addr = IpAddr::V6(Ipv6Addr::new(
-                        u16::from_be_bytes([rdata[0], rdata[1]]),
-                        u16::from_be_bytes([rdata[2], rdata[3]]),
-                        u16::from_be_bytes([rdata[4], rdata[5]]),
-                        u16::from_be_bytes([rdata[6], rdata[7]]),
-                        u16::from_be_bytes([rdata[8], rdata[9]]),
-                        u16::from_be_bytes([rdata[10], rdata[11]]),
-                        u16::from_be_bytes([rdata[12], rdata[13]]),
-                        u16::from_be_bytes([rdata[14], rdata[15]]),
+                        u16::from_be_bytes([payload[rdata_start], payload[rdata_start + 1]]),
+                        u16::from_be_bytes([payload[rdata_start + 2], payload[rdata_start + 3]]),
+                        u16::from_be_bytes([payload[rdata_start + 4], payload[rdata_start + 5]]),
+                        u16::from_be_bytes([payload[rdata_start + 6], payload[rdata_start + 7]]),
+                        u16::from_be_bytes([payload[rdata_start + 8], payload[rdata_start + 9]]),
+                        u16::from_be_bytes([payload[rdata_start + 10], payload[rdata_start + 11]]),
+                        u16::from_be_bytes([payload[rdata_start + 12], payload[rdata_start + 13]]),
+                        u16::from_be_bytes([payload[rdata_start + 14], payload[rdata_start + 15]]),
                     ));
-                    insert_mapping(&mut host_map, &name, addr, ttl);
+                    let roots = lookup_roots(&alias_roots, &name);
+                    for root in roots {
+                        insert_mapping(&mut host_map, root.as_str(), addr, ttl);
+                    }
+                }
+            }
+            5 => {
+                let mut cname_offset = rdata_start;
+                if let Some(target) = read_name(payload, &mut cname_offset) {
+                    let roots = lookup_roots(&alias_roots, &name);
+                    if !roots.is_empty() {
+                        let entry = alias_roots.entry(target).or_insert_with(Vec::new);
+                        for root in roots {
+                            if !entry.iter().any(|existing| existing == &root) {
+                                entry.push(root);
+                            }
+                        }
+                    }
                 }
             }
             _ => continue,
@@ -121,6 +152,13 @@ fn insert_mapping(map: &mut HashMap<String, DnsMapping>, name: &str, address: Ip
         ttl: Some(ttl),
     });
     entry.addresses.push(address);
+}
+
+fn lookup_roots(alias_roots: &HashMap<String, Vec<String>>, name: &str) -> Vec<String> {
+    alias_roots
+        .get(name)
+        .cloned()
+        .unwrap_or_else(|| vec![name.to_string()])
 }
 
 #[allow(dead_code)]
@@ -165,5 +203,61 @@ fn read_name(buf: &[u8], offset: &mut usize) -> Option<String> {
         None
     } else {
         Some(labels.join("."))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode_name(name: &str) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        for label in name.split('.') {
+            encoded.push(label.len() as u8);
+            encoded.extend_from_slice(label.as_bytes());
+        }
+        encoded.push(0);
+        encoded
+    }
+
+    #[test]
+    fn parse_response_maps_addresses_to_question_name() {
+        let question = "v16.us.tiktok.com";
+        let cname = "edge.example.net";
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x12, 0x34]); // id
+        payload.extend_from_slice(&[0x81, 0x80]); // standard response
+        payload.extend_from_slice(&[0x00, 0x01]); // qdcount
+        payload.extend_from_slice(&[0x00, 0x02]); // ancount
+        payload.extend_from_slice(&[0x00, 0x00]); // nscount
+        payload.extend_from_slice(&[0x00, 0x00]); // arcount
+        payload.extend_from_slice(&encode_name(question));
+        payload.extend_from_slice(&[0x00, 0x01]); // type A
+        payload.extend_from_slice(&[0x00, 0x01]); // class IN
+        payload.extend_from_slice(&encode_name(question)); // answer name
+        payload.extend_from_slice(&[0x00, 0x05]); // CNAME
+        payload.extend_from_slice(&[0x00, 0x01]); // class IN
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]); // ttl 60
+        let cname_encoded = encode_name(cname);
+        payload.extend_from_slice(&[
+            ((cname_encoded.len() as u16) >> 8) as u8,
+            (cname_encoded.len() as u16 & 0xFF) as u8,
+        ]);
+        payload.extend_from_slice(&cname_encoded);
+        payload.extend_from_slice(&encode_name(cname));
+        payload.extend_from_slice(&[0x00, 0x01]); // type A
+        payload.extend_from_slice(&[0x00, 0x01]); // class IN
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]); // ttl 60
+        payload.extend_from_slice(&[0x00, 0x04]); // rdlength
+        payload.extend_from_slice(&[1, 2, 3, 4]); // IPv4 addr
+
+        let mappings = parse_response(&payload);
+        assert_eq!(mappings.len(), 1);
+        let mapping = &mappings[0];
+        assert_eq!(mapping.host, question);
+        assert_eq!(
+            mapping.addresses,
+            vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]
+        );
     }
 }

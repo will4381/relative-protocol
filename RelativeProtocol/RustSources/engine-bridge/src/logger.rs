@@ -52,6 +52,7 @@ bitflags! {
         const METRICS= 0b0000_1000;
         const FFI    = 0b0001_0000;
         const POLL   = 0b0010_0000;
+        const PACKET = 0b0100_0000;
         const ALL    = u32::MAX;
     }
 }

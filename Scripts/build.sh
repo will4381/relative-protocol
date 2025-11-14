@@ -38,6 +38,7 @@ build_target() {
     info "building ${target}"
     cargo build \
         --manifest-path "$ENGINE_DIR/Cargo.toml" \
+        --lib \
         --release \
         --target "${target}"
 }
@@ -75,6 +76,33 @@ create_xcframework() {
         -library "$mac_universal" -headers "$ENGINE_DIR/include" \
         -output "$XCFRAMEWORK_PATH" >/dev/null
     info "xcframework created at $XCFRAMEWORK_PATH"
+
+    install_module_maps
+}
+
+install_module_maps() {
+    local slices=(
+        "$XCFRAMEWORK_PATH/ios-arm64"
+        "$XCFRAMEWORK_PATH/ios-arm64_x86_64-simulator"
+        "$XCFRAMEWORK_PATH/macos-arm64_x86_64"
+    )
+    for slice in "${slices[@]}"; do
+        info "installing module map for $(basename "$slice")"
+        mkdir -p "$slice/Modules"
+        cat > "$slice/Modules/module.modulemap" <<'EOF'
+module EngineBinary {
+  header "bridge.h"
+  export *
+}
+EOF
+        mkdir -p "$slice/Headers"
+        cat > "$slice/Headers/module.modulemap" <<'EOF'
+module EngineBinary {
+  header "bridge.h"
+  export *
+}
+EOF
+    done
 }
 
 main() {

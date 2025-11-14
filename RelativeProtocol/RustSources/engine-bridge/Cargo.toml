@@ -26,6 +26,7 @@ smoltcp = { version = "0.11", default-features = false, features = ["std", "verb
 thiserror = "1.0"
 tokio = { version = "1.36", default-features = false, features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 parking_lot = "0.12"
+wildmatch = "2"
 
 [build-dependencies]
 cbindgen = { version = "0.26", optional = true }

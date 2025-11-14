@@ -1,0 +1,4 @@
+module EngineBinary {
+  header "bridge.h"
+  export *
+}

@@ -146,6 +146,7 @@ dependencies = [
  "smoltcp",
  "thiserror 1.0.69",
  "tokio",
+ "wildmatch",
 ]
 
 [[package]]
@@ -601,6 +602,12 @@ checksum = "0562428422c63773dad2c345a1882263bbf4d65cf3f42e90921f787ef5ad58e7"
 dependencies = [
  "wit-bindgen",
 ]
+
+[[package]]
+name = "wildmatch"
+version = "2.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d654e41fe05169e03e27b97e0c23716535da037c1652a31fd99c6b2fad84059"
 
 [[package]]
 name = "winapi"

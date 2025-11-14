@@ -181,3 +181,51 @@ pub struct FlowCounters {
     pub tcp_backpressure_drops: u64,
     pub udp_backpressure_drops: u64,
 }
+
+pub const BRIDGE_TELEMETRY_MAX_QNAME: usize = 128;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BridgeTelemetryIp {
+    pub family: u8,
+    pub bytes: [u8; 16],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct BridgeTelemetryEvent {
+    pub timestamp_ms: u64,
+    pub payload_len: u32,
+    pub protocol: u8,
+    pub direction: u8,
+    pub flags: u8,
+    pub src_ip: BridgeTelemetryIp,
+    pub dst_ip: BridgeTelemetryIp,
+    pub dns_qname_len: u8,
+    pub dns_qname: [c_char; BRIDGE_TELEMETRY_MAX_QNAME],
+}
+
+impl Default for BridgeTelemetryEvent {
+    fn default() -> Self {
+        Self {
+            timestamp_ms: 0,
+            payload_len: 0,
+            protocol: 0,
+            direction: 0,
+            flags: 0,
+            src_ip: BridgeTelemetryIp::default(),
+            dst_ip: BridgeTelemetryIp::default(),
+            dns_qname_len: 0,
+            dns_qname: [0; BRIDGE_TELEMETRY_MAX_QNAME],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct BridgeHostRuleConfig {
+    pub pattern: *const c_char,
+    pub block: bool,
+    pub latency_ms: u32,
+    pub jitter_ms: u32,
+}

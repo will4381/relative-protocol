@@ -19,6 +19,7 @@ pub const MAX_EMIT_BATCH: usize = 64;
 pub enum ParsedPacket<'a> {
     Tcp(TcpPacket<'a>),
     Udp(UdpPacket<'a>),
+    Other,
 }
 
 #[derive(Debug, Clone)]
@@ -27,8 +28,15 @@ pub struct TcpPacket<'a> {
     pub dst: IpAddr,
     pub src_port: u16,
     pub dst_port: u16,
+    pub flags: TcpFlags,
     #[allow(dead_code)]
     pub payload: &'a [u8],
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TcpFlags {
+    pub fin: bool,
+    pub rst: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +90,7 @@ impl TunDevice {
         }
     }
 
+    #[allow(dead_code)]
     pub fn mtu(&self) -> usize {
         self.mtu
     }
@@ -235,7 +244,7 @@ fn parse_ipv4<'a>(packet: &'a [u8]) -> Option<ParsedPacket<'a>> {
     match protocol {
         6 => parse_tcp(src, dst, payload),
         17 => parse_udp(src, dst, payload),
-        _ => None,
+        _ => Some(ParsedPacket::Other),
     }
 }
 
@@ -272,7 +281,7 @@ fn parse_ipv6<'a>(packet: &'a [u8]) -> Option<ParsedPacket<'a>> {
     match next_header {
         6 => parse_tcp(src, dst, payload),
         17 => parse_udp(src, dst, payload),
-        _ => None,
+        _ => Some(ParsedPacket::Other),
     }
 }
 
@@ -286,12 +295,18 @@ fn parse_tcp<'a>(src: IpAddr, dst: IpAddr, payload: &'a [u8]) -> Option<ParsedPa
     if data_offset < 20 || data_offset > payload.len() {
         return None;
     }
+    let flags_byte = payload[13];
+    let flags = TcpFlags {
+        fin: flags_byte & 0x01 != 0,
+        rst: flags_byte & 0x04 != 0,
+    };
     let segment = &payload[data_offset..];
     Some(ParsedPacket::Tcp(TcpPacket {
         src,
         dst,
         src_port,
         dst_port,
+        flags,
         payload: segment,
     }))
 }
