@@ -8,3 +8,13 @@
 .gomodcache
 .gocache
 .swift-module-cache
+.swiftpm/
+**/.swiftpm/
+
+# Xcode user state
+*.xcuserstate
+
+# Rust build outputs (keep xcframework artifacts that must ship)
+**/target/
+!**/target/**/*.xcframework
+!**/target/**/*.xcframework/**

@@ -20,11 +20,11 @@ impl FlowManager {
         }
     }
 
-    fn emit_dns_mapping(&self, callbacks: BridgeCallbacks, mapping: &DnsMapping) {
+    pub(super) fn emit_dns_mapping(&self, callbacks: BridgeCallbacks, mapping: &DnsMapping) {
         if mapping.addresses.is_empty() {
             return;
         }
-        let ttl = mapping.ttl.unwrap_or(60).min(u32::MAX);
+        let ttl = mapping.ttl.unwrap_or(60);
         let c_host = match CString::new(mapping.host.as_str()) {
             Ok(value) => value,
             Err(_) => return,

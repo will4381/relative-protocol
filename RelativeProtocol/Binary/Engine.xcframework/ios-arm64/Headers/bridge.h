@@ -14,8 +14,6 @@
 
 #define DEFAULT_MTU 1280
 
-#define RING_CAPACITY 1024
-
 #define MAX_EMIT_BATCH 64
 
 #define BRIDGE_TELEMETRY_MAX_QNAME 128
@@ -35,11 +33,35 @@ typedef struct BridgeEngine BridgeEngine;
 
 /**
  * Mirror of the `BridgeConfig` struct defined in `include/bridge.h`.
+ * Optimized defaults for iOS Network Extensions (50MB jetsam limit).
  */
 typedef struct BridgeConfig {
   uint32_t mtu;
   uint32_t packet_pool_bytes;
   uint32_t per_flow_bytes;
+  uint32_t poll_min_interval_ms;
+  uint32_t poll_max_interval_ms;
+  /**
+   * Memory budget for socket buffers in bytes. Default: 16MB.
+   * Sockets are allocated dynamically up to this limit.
+   */
+  uint32_t socket_memory_budget;
+  /**
+   * TCP receive buffer size per socket in bytes. Default: 16384 (16KB).
+   */
+  uint32_t tcp_rx_buffer_size;
+  /**
+   * TCP transmit buffer size per socket in bytes. Default: 16384 (16KB).
+   */
+  uint32_t tcp_tx_buffer_size;
+  /**
+   * UDP buffer size per socket in bytes. Default: 16384 (16KB).
+   */
+  uint32_t udp_buffer_size;
+  /**
+   * Ring buffer capacity for inbound/outbound packets. Default: 512.
+   */
+  uint32_t ring_capacity;
 } BridgeConfig;
 
 typedef void (*EmitPacketsFn)(const uint8_t *const *packets,
@@ -86,6 +108,18 @@ typedef struct FlowCounters {
   uint64_t udp_admission_fail;
   uint64_t tcp_backpressure_drops;
   uint64_t udp_backpressure_drops;
+  /**
+   * Count of invalid IP packets (malformed headers, bad version, etc.)
+   */
+  uint64_t invalid_ip_packets;
+  /**
+   * Count of invalid TCP packets (bad checksums, truncated, etc.)
+   */
+  uint64_t invalid_tcp_packets;
+  /**
+   * Count of invalid UDP packets (bad checksums, truncated, etc.)
+   */
+  uint64_t invalid_udp_packets;
 } FlowCounters;
 
 typedef struct FlowStats {
@@ -157,6 +191,10 @@ bool BridgeEngineOnUdpReceive(struct BridgeEngine *engine,
 void BridgeEngineOnTcpClose(struct BridgeEngine *engine, uint64_t handle);
 
 void BridgeEngineOnUdpClose(struct BridgeEngine *engine, uint64_t handle);
+
+void BridgeEngineOnTcpSendFailed(struct BridgeEngine *engine, uint64_t handle, const char *error);
+
+void BridgeEngineOnUdpSendFailed(struct BridgeEngine *engine, uint64_t handle, const char *error);
 
 void BridgeEngineOnDialResult(struct BridgeEngine *engine,
                               uint64_t handle,

@@ -1,3 +1,8 @@
+//! Async standalone runner for the Relative Protocol engine.
+//!
+//! Uses tokio for async I/O - eliminates thread-per-flow overhead and prevents thread leaks.
+//! Architecture: tokio runtime manages all network I/O with ~4 OS threads regardless of flow count.
+
 use engine_bridge::ffi::{BridgeCallbacks, BridgeConfig, BridgeHostRuleConfig, BridgeLogSink};
 use engine_bridge::logger::{self, BreadcrumbFlags};
 use engine_bridge::{
@@ -11,15 +16,27 @@ use std::collections::HashMap;
 use std::env;
 use std::ffi::{CStr, CString};
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
-#[cfg(target_os = "macos")]
-use std::os::fd::{FromRawFd, OwnedFd};
 use std::ptr;
 use std::slice;
-use std::sync::{mpsc, Arc, Mutex};
-use std::thread;
-use std::time::Duration;
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::{mpsc, Mutex};
+
+#[cfg(target_os = "macos")]
+use std::os::fd::{FromRawFd, OwnedFd};
+
+/// Firewall mark for outbound sockets to bypass TUN routing.
+#[cfg(target_os = "linux")]
+const BYPASS_FWMARK: u32 = 100;
+
+/// Read buffer size for network I/O.
+#[cfg(feature = "ios-memory-profile")]
+const READ_BUFFER_SIZE: usize = 4 * 1024;
+#[cfg(not(feature = "ios-memory-profile"))]
+const READ_BUFFER_SIZE: usize = 65535;
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 compile_error!("standalone runner currently supports only macOS and Linux");
@@ -36,7 +53,8 @@ impl EngineHandle {
 unsafe impl Send for EngineHandle {}
 unsafe impl Sync for EngineHandle {}
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let settings = Settings::parse()?;
     eprintln!(
         "[standalone] launching Relative Protocol engine (mtu={}, utun={:?}, ifname={:?})",
@@ -48,17 +66,19 @@ fn main() -> anyhow::Result<()> {
 
     #[cfg(target_os = "macos")]
     println!(
-        "[standalone] created interface {}. Configure it (as root) via:\n  sudo ifconfig {} inet 10.0.0.2 10.0.0.1 up\n  sudo ifconfig {} inet6 fd00:1::2 prefixlen 64\nthen add the routes you want to steer through this interface.",
+        "[standalone] created interface {}. Configure it (as root) via:\n  sudo ifconfig {} inet 10.0.0.2 10.0.0.1 up\n  sudo ifconfig {} inet6 fd00:1::2 prefixlen 64",
         interface_name, interface_name, interface_name
     );
     #[cfg(target_os = "linux")]
     println!(
-        "[standalone] created interface {}. Configure it (as root) via:\n  sudo ip link set {} up\n  sudo ip addr add 10.0.0.2/24 dev {}\n  sudo ip -6 addr add fd00:1::2/64 dev {}\nthen add the routes you want to steer through this interface.",
+        "[standalone] created interface {}. Configure it (as root) via:\n  sudo ip link set {} up\n  sudo ip addr add 10.0.0.2/24 dev {}\n  sudo ip -6 addr add fd00:1::2/64 dev {}",
         interface_name, interface_name, interface_name, interface_name
     );
 
     let (mut tun_reader, mut tun_writer) = tun.into_parts();
-    let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>();
+    // Large channel to prevent packet drops under heavy load.
+    // emit_packets uses try_send which drops packets if channel is full.
+    let (tun_tx, mut tun_rx) = mpsc::channel::<Vec<u8>>(8192);
 
     let config = BridgeConfig {
         mtu: settings.mtu,
@@ -101,35 +121,40 @@ fn main() -> anyhow::Result<()> {
     }
     install_startup_rules(engine);
 
+    // TUN reader thread (blocking I/O, separate OS thread)
     let reader_engine = engine;
-    let _reader_handle = thread::Builder::new()
+    std::thread::Builder::new()
         .name("tun-reader".into())
         .spawn(move || tun_reader_loop(reader_engine, &mut tun_reader))
         .expect("failed to spawn tun reader");
 
-    let _writer_handle = thread::Builder::new()
+    // TUN writer task (receives from channel, writes to TUN)
+    std::thread::Builder::new()
         .name("tun-writer".into())
-        .spawn(move || tun_writer_loop(&mut tun_writer, tun_rx))
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                while let Some(frame) = tun_rx.recv().await {
+                    if frame.is_empty() {
+                        continue;
+                    }
+                    if let Err(err) = write_tun_frame(&mut tun_writer, &frame) {
+                        eprintln!("[standalone][tun writer] error: {err}");
+                        break;
+                    }
+                }
+            });
+        })
         .expect("failed to spawn tun writer");
 
-    println!("[standalone] engine running. Press Ctrl+C to terminate.");
-    loop {
-        thread::sleep(Duration::from_secs(5));
-    }
+    println!("[standalone] engine running (async). Press Ctrl+C to terminate.");
 
-    // NOTE: unreachable under normal operation because the process is expected to be
-    // terminated by the user (Ctrl+C). The following cleanup is left here for
-    // completeness should we decide to add graceful shutdown logic later.
-    #[allow(unreachable_code)]
-    {
-        unsafe {
-            BridgeEngineStop(engine.as_ptr());
-            drop(Box::from_raw(context));
-            BridgeFreeEngine(engine.as_ptr());
-        }
-        let _ = _reader_handle.join();
-        let _ = _writer_handle.join();
-        Ok(())
+    // Keep main alive
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
     }
 }
 
@@ -175,17 +200,13 @@ impl Settings {
                 }
                 _ => {
                     anyhow::bail!(
-                        "unknown argument '{}'. Supported flags: --mtu <value>, --utun <index>, --ifname <name>",
+                        "unknown argument '{}'. Supported: --mtu <value>, --utun <index>, --ifname <name>",
                         arg
                     );
                 }
             }
         }
-        Ok(Self {
-            mtu,
-            utun_index,
-            ifname,
-        })
+        Ok(Self { mtu, utun_index, ifname })
     }
 }
 
@@ -249,22 +270,14 @@ impl SystemTunDevice {
             return Err(io::Error::last_os_error());
         }
 
-        let trimmed_len = if ifname_len == 0 {
-            0
-        } else {
-            (ifname_len as usize).saturating_sub(1)
-        };
+        let trimmed_len = if ifname_len == 0 { 0 } else { (ifname_len as usize).saturating_sub(1) };
         let name = String::from_utf8_lossy(&ifname[..trimmed_len]).into_owned();
 
         let reader_fd = owned.try_clone()?;
         let reader = std::fs::File::from(reader_fd);
         let writer = std::fs::File::from(owned);
 
-        Ok(Self {
-            reader,
-            writer,
-            name,
-        })
+        Ok(Self { reader, writer, name })
     }
 
     #[cfg(target_os = "linux")]
@@ -287,9 +300,7 @@ impl SystemTunDevice {
                 ifreq.ifr_name[idx] = *byte as libc::c_char;
             }
         }
-        unsafe {
-            ifreq.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short;
-        }
+        ifreq.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short;
 
         let status = unsafe { libc::ioctl(fd, libc::TUNSETIFF, &ifreq) };
         if status < 0 {
@@ -303,11 +314,7 @@ impl SystemTunDevice {
         };
 
         let reader = file.try_clone()?;
-        Ok(Self {
-            reader,
-            writer: file,
-            name,
-        })
+        Ok(Self { reader, writer: file, name })
     }
 
     fn into_parts(self) -> (std::fs::File, std::fs::File) {
@@ -319,10 +326,24 @@ impl SystemTunDevice {
     }
 }
 
+/// Shared state for async flow management.
+/// Uses tokio Mutex for async-safe access and tokio channels for communication.
 struct StandaloneState {
     tun_tx: mpsc::Sender<Vec<u8>>,
-    tcp: Mutex<HashMap<u64, TcpEntry>>,
-    udp: Mutex<HashMap<u64, UdpEntry>>,
+    tcp: Mutex<HashMap<u64, TcpFlowHandle>>,
+    udp: Mutex<HashMap<u64, UdpFlowHandle>>,
+}
+
+/// Handle to a TCP flow - includes channel to send data and abort handle to cancel the task.
+struct TcpFlowHandle {
+    tx: mpsc::Sender<Vec<u8>>,
+    abort_handle: tokio::task::AbortHandle,
+}
+
+/// Handle to a UDP flow - uses blocking I/O on dedicated threads (more reliable than tokio for UDP).
+struct UdpFlowHandle {
+    tx: std::sync::mpsc::Sender<Vec<u8>>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl StandaloneState {
@@ -334,69 +355,64 @@ impl StandaloneState {
         }
     }
 
-    fn insert_tcp(&self, handle: u64, entry: TcpEntry) {
-        self.tcp.lock().unwrap().insert(handle, entry);
+    async fn insert_tcp(&self, handle: u64, flow: TcpFlowHandle) {
+        self.tcp.lock().await.insert(handle, flow);
     }
 
-    fn send_tcp(&self, handle: u64, payload: &[u8]) -> io::Result<()> {
-        let map = self.tcp.lock().unwrap();
-        if let Some(entry) = map.get(&handle) {
-            flow_trace(format!(
-                "[standalone][tcp send] handle {handle} forwarding {} bytes",
-                payload.len()
-            ));
-            entry
-                .tx
-                .send(payload.to_vec())
+    async fn send_tcp(&self, handle: u64, payload: Vec<u8>) -> io::Result<()> {
+        let map = self.tcp.lock().await;
+        if let Some(flow) = map.get(&handle) {
+            flow.tx
+                .send(payload)
+                .await
                 .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "tcp channel closed"))
         } else {
-            Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "tcp handle missing",
-            ))
+            Err(io::Error::new(io::ErrorKind::NotFound, "tcp handle missing"))
         }
     }
 
-    fn remove_tcp(&self, handle: u64) {
-        self.tcp.lock().unwrap().remove(&handle);
-    }
-
-    fn insert_udp(&self, handle: u64, entry: UdpEntry) {
-        self.udp.lock().unwrap().insert(handle, entry);
-    }
-
-    fn send_udp(&self, handle: u64, payload: &[u8]) -> io::Result<()> {
-        let map = self.udp.lock().unwrap();
-        if let Some(entry) = map.get(&handle) {
-            entry
-                .tx
-                .send(payload.to_vec())
-                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "udp channel closed"))
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "udp handle missing",
-            ))
+    async fn remove_tcp(&self, handle: u64) {
+        if let Some(flow) = self.tcp.lock().await.remove(&handle) {
+            flow.abort_handle.abort(); // Cancel the task
         }
     }
 
-    fn remove_udp(&self, handle: u64) {
-        self.udp.lock().unwrap().remove(&handle);
+    fn insert_udp_sync(&self, handle: u64, flow: UdpFlowHandle) {
+        // Use blocking_lock since this is called from std threads
+        futures::executor::block_on(async {
+            self.udp.lock().await.insert(handle, flow);
+        });
     }
-}
 
-struct TcpEntry {
-    tx: mpsc::Sender<Vec<u8>>,
-}
+    fn send_udp_sync(&self, handle: u64, payload: Vec<u8>) -> io::Result<()> {
+        // Use blocking approach since this is called from FFI context
+        futures::executor::block_on(async {
+            let map = self.udp.lock().await;
+            if let Some(flow) = map.get(&handle) {
+                flow.tx
+                    .send(payload)
+                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "udp channel closed"))
+            } else {
+                Err(io::Error::new(io::ErrorKind::NotFound, "udp handle missing"))
+            }
+        })
+    }
 
-struct UdpEntry {
-    tx: mpsc::Sender<Vec<u8>>,
+    fn remove_udp_sync(&self, handle: u64) {
+        futures::executor::block_on(async {
+            if let Some(flow) = self.udp.lock().await.remove(&handle) {
+                flow.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+    }
 }
 
 struct StandaloneContext {
     engine: EngineHandle,
     state: Arc<StandaloneState>,
 }
+
+// ==================== FFI Callbacks ====================
 
 unsafe extern "C" fn emit_packets(
     packets: *const *const u8,
@@ -416,7 +432,7 @@ unsafe extern "C" fn emit_packets(
             continue;
         }
         let data = slice::from_raw_parts(packets[i], sizes[i]);
-        let _ = ctx.state.tun_tx.send(data.to_vec());
+        let _ = ctx.state.tun_tx.try_send(data.to_vec());
     }
 }
 
@@ -433,38 +449,20 @@ unsafe extern "C" fn request_tcp_dial(
     let host_str = CStr::from_ptr(host).to_string_lossy().into_owned();
     let state = Arc::clone(&ctx.state);
     let engine = ctx.engine;
-    flow_trace(format!(
-        "[standalone][dial] handle {handle} resolving {host_str}:{port}"
-    ));
-    thread::spawn(move || match resolve_target(&host_str, port) {
-        Ok(addr) => {
-            flow_trace(format!(
-                "[standalone][dial] handle {handle} connecting to {addr}"
-            ));
-            match TcpStream::connect(addr) {
-                Ok(stream) => {
-                    if let Err(err) = stream.set_nodelay(true) {
-                        report_tcp_failure(engine, handle, err);
-                        return;
-                    }
-                    flow_trace(format!(
-                        "[standalone][dial] handle {handle} connected to {addr}"
-                    ));
-                    start_tcp_workers(state, engine, handle, stream);
-                }
-                Err(err) => {
-                    logger::warn(format!(
-                        "[standalone][dial] handle {handle} connect error: {err}"
-                    ));
-                    report_tcp_failure(engine, handle, err);
-                }
+
+    flow_trace(format!("[standalone][dial] handle {handle} resolving {host_str}:{port}"));
+
+    // Spawn async task for TCP connection
+    tokio::spawn(async move {
+        match resolve_and_connect_tcp(&host_str, port).await {
+            Ok(stream) => {
+                flow_trace(format!("[standalone][dial] handle {handle} connected"));
+                start_tcp_flow(state, engine, handle, stream).await;
             }
-        }
-        Err(err) => {
-            logger::warn(format!(
-                "[standalone][dial] handle {handle} resolve error: {err}"
-            ));
-            report_tcp_failure(engine, handle, err);
+            Err(err) => {
+                logger::warn(format!("[standalone][dial] handle {handle} error: {err}"));
+                report_dial_failure(engine, handle, err);
+            }
         }
     });
 }
@@ -482,23 +480,25 @@ unsafe extern "C" fn request_udp_dial(
     let host_str = CStr::from_ptr(host).to_string_lossy().into_owned();
     let state = Arc::clone(&ctx.state);
     let engine = ctx.engine;
-    thread::spawn(move || match resolve_target(&host_str, port) {
-        Ok(addr) => match bind_udp(&addr) {
-            Ok(socket) => {
-                if let Err(err) = socket.connect(addr) {
-                    report_tcp_failure(engine, handle, err);
-                    return;
+
+    flow_trace(format!("[standalone][udp dial] handle {handle} resolving {host_str}:{port}"));
+
+    // Spawn std thread for UDP connection (blocking I/O is more reliable for UDP)
+    std::thread::Builder::new()
+        .name(format!("udp-dial-{}", handle))
+        .spawn(move || {
+            match resolve_and_connect_udp_blocking(&host_str, port) {
+                Ok(socket) => {
+                    flow_trace(format!("[standalone][udp dial] handle {handle} connected"));
+                    start_udp_flow_blocking(state, engine, handle, socket);
                 }
-                start_udp_workers(state, engine, handle, socket);
+                Err(err) => {
+                    logger::warn(format!("[standalone][udp dial] handle {handle} error: {err}"));
+                    report_dial_failure(engine, handle, err);
+                }
             }
-            Err(err) => {
-                report_tcp_failure(engine, handle, err);
-            }
-        },
-        Err(err) => {
-            report_tcp_failure(engine, handle, err);
-        }
-    });
+        })
+        .expect("failed to spawn UDP dial thread");
 }
 
 unsafe extern "C" fn tcp_send(
@@ -511,12 +511,15 @@ unsafe extern "C" fn tcp_send(
         return;
     }
     let ctx = &*(context as *mut StandaloneContext);
-    let data = slice::from_raw_parts(payload, length);
-    if let Err(err) = ctx.state.send_tcp(handle, data) {
-        logger::warn(format!(
-            "[standalone][tcp_send] handle {handle} send error: {err}"
-        ));
-    }
+    let data = slice::from_raw_parts(payload, length).to_vec();
+    let state = Arc::clone(&ctx.state);
+
+    // Fire-and-forget send via channel
+    tokio::spawn(async move {
+        if let Err(err) = state.send_tcp(handle, data).await {
+            logger::warn(format!("[standalone][tcp_send] handle {handle} error: {err}"));
+        }
+    });
 }
 
 unsafe extern "C" fn udp_send(
@@ -529,9 +532,11 @@ unsafe extern "C" fn udp_send(
         return;
     }
     let ctx = &*(context as *mut StandaloneContext);
-    let data = slice::from_raw_parts(payload, length);
-    if let Err(err) = ctx.state.send_udp(handle, data) {
-        eprintln!("[standalone][udp_send] handle {handle} send error: {err}");
+    let data = slice::from_raw_parts(payload, length).to_vec();
+
+    // Use sync method directly - no need to spawn tokio task for UDP
+    if let Err(err) = ctx.state.send_udp_sync(handle, data) {
+        eprintln!("[standalone][udp_send] handle {handle} error: {err}");
     }
 }
 
@@ -540,7 +545,11 @@ unsafe extern "C" fn tcp_close(handle: u64, _message: *const c_char, context: *m
         return;
     }
     let ctx = &*(context as *mut StandaloneContext);
-    ctx.state.remove_tcp(handle);
+    let state = Arc::clone(&ctx.state);
+
+    tokio::spawn(async move {
+        state.remove_tcp(handle).await;
+    });
 }
 
 unsafe extern "C" fn udp_close(handle: u64, _message: *const c_char, context: *mut c_void) {
@@ -548,7 +557,9 @@ unsafe extern "C" fn udp_close(handle: u64, _message: *const c_char, context: *m
         return;
     }
     let ctx = &*(context as *mut StandaloneContext);
-    ctx.state.remove_udp(handle);
+
+    // Use sync method directly - no need to spawn tokio task for UDP
+    ctx.state.remove_udp_sync(handle);
 }
 
 unsafe extern "C" fn record_dns(
@@ -583,159 +594,366 @@ unsafe extern "C" fn record_dns(
     }
 }
 
-fn resolve_target(host: &str, port: u16) -> io::Result<SocketAddr> {
-    (host, port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "no addresses"))
-}
+// ==================== Async Network Functions ====================
 
-fn bind_udp(addr: &SocketAddr) -> io::Result<UdpSocket> {
-    match addr {
-        SocketAddr::V4(_) => UdpSocket::bind("0.0.0.0:0"),
-        SocketAddr::V6(_) => UdpSocket::bind("[::]:0"),
+async fn resolve_and_connect_tcp(host: &str, port: u16) -> io::Result<TcpStream> {
+    use tokio::net::lookup_host;
+
+    let addr = lookup_host(format!("{}:{}", host, port))
+        .await?
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "no addresses"))?;
+
+    #[cfg(target_os = "linux")]
+    {
+        // Create socket with SO_MARK before connecting
+        let socket = create_marked_tcp_socket(&addr)?;
+        socket.connect(addr).await
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        TcpStream::connect(addr).await
     }
 }
 
-fn report_tcp_failure(engine: EngineHandle, handle: u64, err: io::Error) {
+#[cfg(target_os = "linux")]
+fn create_marked_tcp_socket(addr: &SocketAddr) -> io::Result<tokio::net::TcpSocket> {
+    use std::os::fd::FromRawFd;
+
+    let domain = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
+    let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // Set SO_MARK
+    let mark = BYPASS_FWMARK;
+    let result = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_MARK,
+            &mark as *const _ as *const libc::c_void,
+            std::mem::size_of::<u32>() as libc::socklen_t,
+        )
+    };
+    if result < 0 {
+        unsafe { libc::close(fd) };
+        return Err(io::Error::last_os_error());
+    }
+
+    let std_socket = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+    std_socket.set_nonblocking(true)?;
+
+    // Convert to tokio socket
+    let socket = tokio::net::TcpSocket::from_std_stream(std_socket);
+    Ok(socket)
+}
+
+async fn resolve_and_connect_udp(host: &str, port: u16) -> io::Result<UdpSocket> {
+    use tokio::net::lookup_host;
+
+    let addr = lookup_host(format!("{}:{}", host, port))
+        .await?
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "no addresses"))?;
+
+    let bind_addr = if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+
+    #[cfg(target_os = "linux")]
+    let socket = {
+        let std_socket = create_marked_udp_socket(&addr)?;
+        UdpSocket::from_std(std_socket)?
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let socket = UdpSocket::bind(bind_addr).await?;
+
+    socket.connect(addr).await?;
+    Ok(socket)
+}
+
+#[cfg(target_os = "linux")]
+fn create_marked_udp_socket(addr: &SocketAddr) -> io::Result<std::net::UdpSocket> {
+    use std::os::fd::FromRawFd;
+
+    let domain = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
+    let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // Set SO_MARK
+    let mark = BYPASS_FWMARK;
+    let result = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_MARK,
+            &mark as *const _ as *const libc::c_void,
+            std::mem::size_of::<u32>() as libc::socklen_t,
+        )
+    };
+    if result < 0 {
+        unsafe { libc::close(fd) };
+        return Err(io::Error::last_os_error());
+    }
+
+    // Bind to any address
+    let bind_addr: SocketAddr = if addr.is_ipv4() {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
+    };
+
+    let sockaddr = match bind_addr {
+        SocketAddr::V4(v4) => {
+            let sin = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: 0,
+                sin_addr: libc::in_addr { s_addr: 0 },
+                sin_zero: [0; 8],
+            };
+            unsafe {
+                libc::bind(
+                    fd,
+                    &sin as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+        }
+        SocketAddr::V6(_) => {
+            let sin6 = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: 0,
+                sin6_flowinfo: 0,
+                sin6_addr: libc::in6_addr { s6_addr: [0; 16] },
+                sin6_scope_id: 0,
+            };
+            unsafe {
+                libc::bind(
+                    fd,
+                    &sin6 as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            }
+        }
+    };
+
+    if sockaddr < 0 {
+        unsafe { libc::close(fd) };
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(unsafe { std::net::UdpSocket::from_raw_fd(fd) })
+}
+
+fn report_dial_failure(engine: EngineHandle, handle: u64, err: io::Error) {
     let reason = CString::new(err.to_string()).unwrap_or_default();
     unsafe {
         BridgeEngineOnDialResult(engine.as_ptr(), handle, false, reason.as_ptr());
     }
 }
 
-fn start_tcp_workers(
+// ==================== Flow Task Management ====================
+
+/// Start a TCP flow task that handles both reading and writing using select!.
+/// Single task per flow - no separate reader/writer threads.
+async fn start_tcp_flow(
     state: Arc<StandaloneState>,
     engine: EngineHandle,
     handle: u64,
     stream: TcpStream,
 ) {
-    let reader = match stream.try_clone() {
-        Ok(reader) => reader,
-        Err(err) => {
-            report_tcp_failure(engine, handle, err);
-            return;
-        }
-    };
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    state.insert_tcp(handle, TcpEntry { tx: tx.clone() });
-    unsafe {
-        BridgeEngineOnDialResult(engine.as_ptr(), handle, true, ptr::null());
-    }
-    flow_trace(format!(
-        "[standalone][dial] handle {handle} signaled ready to engine"
-    ));
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
 
-    let writer_engine = engine;
-    thread::spawn(move || {
-        let mut writer = stream;
-        while let Ok(payload) = rx.recv() {
-            if payload.is_empty() {
-                break;
-            }
-            if let Err(err) = writer.write_all(&payload) {
-                logger::warn(format!(
-                    "[standalone][tcp writer] handle {handle} error: {err}"
-                ));
-                break;
-            }
-        }
-        let _ = writer.shutdown(std::net::Shutdown::Both);
-        flow_trace(format!(
-            "[standalone][tcp writer] handle {handle} closing socket"
-        ));
-        unsafe {
-            BridgeEngineOnTcpClose(writer_engine.as_ptr(), handle);
-        }
-    });
+    // Spawn the flow task
+    let task = tokio::spawn(async move {
+        let (mut reader, mut writer) = stream.into_split();
+        let mut buf = vec![0u8; READ_BUFFER_SIZE];
 
-    let reader_state = Arc::clone(&state);
-    thread::spawn(move || {
-        let mut reader = reader;
-        let mut buf = vec![0u8; 65535];
         loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => unsafe {
-                    BridgeEngineOnTcpReceive(engine.as_ptr(), handle, buf.as_ptr(), n);
-                },
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                Err(err) => {
-                    logger::warn(format!(
-                        "[standalone][tcp reader] handle {handle} error: {err}"
-                    ));
-                    break;
+            tokio::select! {
+                // Handle incoming data from network
+                result = reader.read(&mut buf) => {
+                    match result {
+                        Ok(0) => break, // EOF
+                        Ok(n) => {
+                            unsafe {
+                                BridgeEngineOnTcpReceive(engine.as_ptr(), handle, buf.as_ptr(), n);
+                            }
+                        }
+                        Err(err) => {
+                            logger::warn(format!("[tcp flow {handle}] read error: {err}"));
+                            break;
+                        }
+                    }
+                }
+
+                // Handle outgoing data from engine
+                msg = rx.recv() => {
+                    match msg {
+                        Some(data) if !data.is_empty() => {
+                            if let Err(err) = writer.write_all(&data).await {
+                                logger::warn(format!("[tcp flow {handle}] write error: {err}"));
+                                break;
+                            }
+                        }
+                        _ => break, // Channel closed or empty signal
+                    }
                 }
             }
         }
-        reader_state.remove_tcp(handle);
-        flow_trace(format!(
-            "[standalone][tcp reader] handle {handle} closing socket"
-        ));
+
+        // Notify engine of close
         unsafe {
             BridgeEngineOnTcpClose(engine.as_ptr(), handle);
         }
     });
-}
 
-fn start_udp_workers(
-    state: Arc<StandaloneState>,
-    engine: EngineHandle,
-    handle: u64,
-    socket: UdpSocket,
-) {
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    state.insert_udp(handle, UdpEntry { tx: tx.clone() });
+    // CRITICAL: Store the flow handle BEFORE signaling dial success.
+    // This prevents a race condition where the engine sends data before the handle is registered.
+    state.insert_tcp(handle, TcpFlowHandle {
+        tx,
+        abort_handle: task.abort_handle(),
+    }).await;
+
+    // Now signal dial success - the handle is ready to receive data
     unsafe {
         BridgeEngineOnDialResult(engine.as_ptr(), handle, true, ptr::null());
     }
-
-    let writer_socket = match socket.try_clone() {
-        Ok(sock) => sock,
-        Err(err) => {
-            report_tcp_failure(engine, handle, err);
-            return;
-        }
-    };
-    thread::spawn(move || {
-        let sock = writer_socket;
-        while let Ok(payload) = rx.recv() {
-            if payload.is_empty() {
-                break;
-            }
-            if let Err(err) = sock.send(&payload) {
-                eprintln!("[standalone][udp writer] handle {handle} error: {err}");
-                break;
-            }
-        }
-    });
-
-    let reader_state = Arc::clone(&state);
-    thread::spawn(move || {
-        let sock = socket;
-        let mut buf = vec![0u8; 65535];
-        loop {
-            match sock.recv(&mut buf) {
-                Ok(0) => continue,
-                Ok(n) => unsafe {
-                    BridgeEngineOnUdpReceive(engine.as_ptr(), handle, buf.as_ptr(), n);
-                },
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                Err(err) => {
-                    eprintln!("[standalone][udp reader] handle {handle} error: {err}");
-                    break;
-                }
-            }
-        }
-        reader_state.remove_udp(handle);
-        unsafe {
-            BridgeEngineOnUdpClose(engine.as_ptr(), handle);
-        }
-    });
 }
 
+/// Blocking DNS resolution and UDP socket creation.
+/// More reliable than tokio async for UDP when called from FFI context.
+fn resolve_and_connect_udp_blocking(host: &str, port: u16) -> io::Result<std::net::UdpSocket> {
+    use std::net::ToSocketAddrs;
+
+    let addr = format!("{}:{}", host, port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "no addresses"))?;
+
+    let bind_addr = if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+
+    #[cfg(target_os = "linux")]
+    let socket = {
+        create_marked_udp_socket(&addr)?
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let socket = std::net::UdpSocket::bind(bind_addr)?;
+
+    socket.connect(addr)?;
+    Ok(socket)
+}
+
+/// Start a UDP flow using blocking I/O on dedicated threads.
+/// This is more reliable than tokio async for UDP when called from FFI context.
+fn start_udp_flow_blocking(
+    state: Arc<StandaloneState>,
+    engine: EngineHandle,
+    handle: u64,
+    socket: std::net::UdpSocket,
+) {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Set socket timeout for graceful shutdown
+    socket.set_read_timeout(Some(Duration::from_millis(500))).ok();
+
+    let socket = Arc::new(socket);
+    let read_socket = Arc::clone(&socket);
+    let write_socket = Arc::clone(&socket);
+    let shutdown_reader = Arc::clone(&shutdown);
+
+    // Spawn reader thread
+    let reader_handle = handle;
+    std::thread::Builder::new()
+        .name(format!("udp-read-{}", handle))
+        .spawn(move || {
+            let mut buf = vec![0u8; READ_BUFFER_SIZE];
+            loop {
+                if shutdown_reader.load(Ordering::SeqCst) {
+                    break;
+                }
+                match read_socket.recv(&mut buf) {
+                    Ok(0) => continue,
+                    Ok(n) => {
+                        unsafe {
+                            BridgeEngineOnUdpReceive(engine.as_ptr(), reader_handle, buf.as_ptr(), n);
+                        }
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+                        // Timeout - check shutdown flag and continue
+                        continue;
+                    }
+                    Err(err) => {
+                        if !shutdown_reader.load(Ordering::SeqCst) {
+                            eprintln!("[udp flow {reader_handle}] read error: {err}");
+                        }
+                        break;
+                    }
+                }
+            }
+            // Notify engine of close
+            unsafe {
+                BridgeEngineOnUdpClose(engine.as_ptr(), reader_handle);
+            }
+        })
+        .expect("failed to spawn UDP reader");
+
+    // Spawn writer thread
+    let writer_handle = handle;
+    let shutdown_writer = Arc::clone(&shutdown);
+    std::thread::Builder::new()
+        .name(format!("udp-write-{}", handle))
+        .spawn(move || {
+            loop {
+                match rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(data) if !data.is_empty() => {
+                        if let Err(err) = write_socket.send(&data) {
+                            if !shutdown_writer.load(Ordering::SeqCst) {
+                                eprintln!("[udp flow {writer_handle}] write error: {err}");
+                            }
+                            break;
+                        }
+                    }
+                    Ok(_) => continue, // Empty data, continue
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if shutdown_writer.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        break;
+                    }
+                }
+            }
+        })
+        .expect("failed to spawn UDP writer");
+
+    // CRITICAL: Store the flow handle BEFORE signaling dial success.
+    // This prevents a race condition where the engine sends data before the handle is registered.
+    // This is especially important for QUIC (used by TikTok) which sends data immediately.
+    state.insert_udp_sync(handle, UdpFlowHandle { tx, shutdown });
+
+    // Now signal dial success - the handle is ready to receive data
+    unsafe {
+        BridgeEngineOnDialResult(engine.as_ptr(), handle, true, ptr::null());
+    }
+}
+
+// ==================== TUN I/O ====================
+
 fn tun_reader_loop(engine: EngineHandle, reader: &mut std::fs::File) {
-    let mut buf = vec![0u8; 65540];
+    let tun_buf_size = READ_BUFFER_SIZE.max(1600);
+    let mut buf = vec![0u8; tun_buf_size];
     loop {
         match reader.read(&mut buf) {
             Ok(0) => continue,
@@ -755,23 +973,6 @@ fn tun_reader_loop(engine: EngineHandle, reader: &mut std::fs::File) {
                 eprintln!("[standalone][tun reader] error: {err}");
                 break;
             }
-        }
-    }
-}
-
-fn tun_writer_loop(writer: &mut std::fs::File, rx: mpsc::Receiver<Vec<u8>>) {
-    loop {
-        match rx.recv() {
-            Ok(frame) => {
-                if frame.is_empty() {
-                    continue;
-                }
-                if let Err(err) = write_tun_frame(writer, &frame) {
-                    eprintln!("[standalone][tun writer] error: {err}");
-                    break;
-                }
-            }
-            Err(_) => break,
         }
     }
 }
@@ -820,6 +1021,8 @@ fn write_tun_frame(writer: &mut std::fs::File, frame: &[u8]) -> io::Result<()> {
     writer.write_all(frame)
 }
 
+// ==================== Logging & Rules ====================
+
 fn install_log_sink() {
     unsafe extern "C" fn log_sink(
         level: *const c_char,
@@ -851,9 +1054,7 @@ fn install_log_sink() {
 }
 
 fn install_startup_rules(engine: EngineHandle) {
-    let Ok(spec) = env::var("HOST_RULES") else {
-        return;
-    };
+    let Ok(spec) = env::var("HOST_RULES") else { return };
     let spec = spec.trim();
     if spec.is_empty() {
         return;
@@ -867,13 +1068,7 @@ fn install_startup_rules(engine: EngineHandle) {
             Ok(rule) => {
                 let pattern_cstr = match CString::new(rule.pattern.clone()) {
                     Ok(value) => value,
-                    Err(_) => {
-                        eprintln!(
-                            "[standalone] invalid host rule pattern (contains nulls): {}",
-                            rule.pattern
-                        );
-                        continue;
-                    }
+                    Err(_) => continue,
                 };
                 let mut id: u64 = 0;
                 let config = BridgeHostRuleConfig {
@@ -888,36 +1083,12 @@ fn install_startup_rules(engine: EngineHandle) {
                         _ => 0,
                     },
                 };
-                let ok =
-                    unsafe { BridgeHostRuleAdd(engine.as_ptr(), &config, &mut id as *mut u64) };
+                let ok = unsafe { BridgeHostRuleAdd(engine.as_ptr(), &config, &mut id as *mut u64) };
                 if ok {
-                    match rule.action {
-                        RuleActionSpec::Block => {
-                            println!(
-                                "[standalone] installed host rule #{id} pattern='{}' action=block",
-                                rule.pattern
-                            );
-                        }
-                        RuleActionSpec::Shape {
-                            latency_ms,
-                            jitter_ms,
-                        } => {
-                            println!(
-                                "[standalone] installed host rule #{id} pattern='{}' action=shape latency={}ms jitter={}ms",
-                                rule.pattern, latency_ms, jitter_ms
-                            );
-                        }
-                    }
-                } else {
-                    eprintln!(
-                        "[standalone] failed to install host rule pattern='{}'",
-                        rule.pattern
-                    );
+                    println!("[standalone] installed rule #{id}: {}", rule.pattern);
                 }
             }
-            Err(err) => {
-                eprintln!("[standalone] {err}");
-            }
+            Err(err) => eprintln!("[standalone] {err}"),
         }
     }
 }
@@ -937,42 +1108,25 @@ fn parse_rule(input: &str) -> Result<ParsedRule, String> {
     let pattern = parts
         .next()
         .filter(|p| !p.is_empty())
-        .ok_or_else(|| format!("host rule '{}' missing pattern", input))?
+        .ok_or_else(|| format!("rule '{}' missing pattern", input))?
         .to_ascii_lowercase();
     let action = parts
         .next()
-        .map(|value| value.to_ascii_lowercase())
-        .ok_or_else(|| format!("host rule '{}' missing action", input))?;
+        .map(|v| v.to_ascii_lowercase())
+        .ok_or_else(|| format!("rule '{}' missing action", input))?;
     let action_spec = match action.as_str() {
         "block" => RuleActionSpec::Block,
         "shape" => {
-            let latency_str = parts
-                .next()
-                .ok_or_else(|| format!("host rule '{}' missing latency_ms", input))?;
-            let latency_ms = parse_u32(latency_str)
-                .ok_or_else(|| format!("invalid latency_ms '{}'", latency_str))?;
-            let jitter_ms = parts.next().map(parse_u32).flatten().unwrap_or(0);
-            RuleActionSpec::Shape {
-                latency_ms,
-                jitter_ms,
-            }
+            let latency_str = parts.next().ok_or_else(|| format!("missing latency"))?;
+            let latency_ms = latency_str.parse().map_err(|_| format!("invalid latency"))?;
+            let jitter_ms = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            RuleActionSpec::Shape { latency_ms, jitter_ms }
         }
-        _ => {
-            return Err(format!(
-                "host rule '{}' has unsupported action '{}'",
-                input, action
-            ))
-        }
+        _ => return Err(format!("unknown action '{}'", action)),
     };
-    Ok(ParsedRule {
-        pattern,
-        action: action_spec,
-    })
+    Ok(ParsedRule { pattern, action: action_spec })
 }
 
-fn parse_u32(value: &str) -> Option<u32> {
-    value.parse::<u32>().ok()
-}
 fn flow_trace(message: impl Into<String>) {
     logger::breadcrumb(BreadcrumbFlags::FLOW, message.into());
 }

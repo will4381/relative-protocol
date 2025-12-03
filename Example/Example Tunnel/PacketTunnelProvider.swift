@@ -1,14 +1,23 @@
 import NetworkExtension
 import RelativeProtocolCore
 import RelativeProtocolTunnel
+import os.log
+
+private let log = OSLog(subsystem: "com.relative.tunnel", category: "PacketTunnelProvider")
 
 final class PacketTunnelProvider: NEPacketTunnelProvider {
     private lazy var controller = ProviderController(provider: self)
 
     override func startTunnel(options: [String : NSObject]?, completionHandler: @escaping (Error?) -> Void) {
-        let configuration = RelativeProtocol.Configuration.load(
-            from: (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration
-        )
+        let providerConfig = (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration
+        os_log(.default, log: log, "[RPDBG] startTunnel: providerConfig keys=%{public}@", providerConfig?.keys.joined(separator: ", ") ?? "nil")
+        if let configData = providerConfig?["configuration"] as? Data {
+            os_log(.default, log: log, "[RPDBG] startTunnel: configuration data size=%d", configData.count)
+        } else {
+            os_log(.default, log: log, "[RPDBG] startTunnel: NO configuration data - will use defaults!")
+        }
+        let configuration = RelativeProtocol.Configuration.load(from: providerConfig)
+        os_log(.default, log: log, "[RPDBG] startTunnel: loaded config logging.enabled=%{public}@", configuration.logging.enabled ? "true" : "false")
         controller.start(configuration: configuration, completion: completionHandler)
     }
 
@@ -27,20 +36,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             completionHandler(try? encoder.encode(response))
             return
         }
-        if let request = try? decoder.decode(DNSHistoryRequest.self, from: messageData) {
-            let observations = controller.recentDnsObservations(limit: max(0, request.limit))
-            let response = TunnelResponse.dnsHistory(.init(observations: observations))
-            completionHandler(try? encoder.encode(response))
-            return
-        }
         completionHandler(nil)
     }
 
     private func handle(command: TunnelCommand) -> TunnelResponse? {
         switch command.kind {
         case .dnsHistory:
-            let limit = max(0, command.dnsRequest?.limit ?? 0)
-            let observations = controller.recentDnsObservations(limit: limit)
+            guard let request = command.dnsRequest else { return nil }
+            let observations = controller.recentDnsObservations(limit: request.limit)
             return .dnsHistory(.init(observations: observations))
         case .installHostRules:
             let rules = command.hostRules ?? []

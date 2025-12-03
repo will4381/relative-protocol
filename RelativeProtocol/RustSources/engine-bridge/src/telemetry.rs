@@ -1,10 +1,15 @@
+use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::net::IpAddr;
-use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::logger::{self, BreadcrumbFlags};
 
+/// Maximum telemetry events to buffer before dropping old ones.
+/// iOS uses smaller queue to reduce memory footprint.
+#[cfg(any(target_os = "ios", target_os = "tvos", target_os = "watchos", feature = "ios-memory-profile"))]
+const MAX_EVENTS: usize = 256;
+#[cfg(not(any(target_os = "ios", target_os = "tvos", target_os = "watchos", feature = "ios-memory-profile")))]
 const MAX_EVENTS: usize = 4096;
 
 pub const TELEMETRY_FLAG_DNS: u8 = 0x01;
@@ -12,7 +17,7 @@ pub const TELEMETRY_FLAG_DNS_RESPONSE: u8 = 0x02;
 pub const TELEMETRY_FLAG_POLICY_BLOCK: u8 = 0x04;
 pub const TELEMETRY_FLAG_POLICY_SHAPE: u8 = 0x08;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PacketDirection {
     ClientToNetwork,
     #[allow(dead_code)]
@@ -80,7 +85,7 @@ impl Telemetry {
     }
 
     pub fn record(&self, event: TelemetryEvent) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock();
         if guard.events.len() >= MAX_EVENTS {
             guard.events.pop_front();
             guard.dropped = guard.dropped.saturating_add(1);
@@ -93,14 +98,9 @@ impl Telemetry {
     }
 
     pub fn drain(&self, max_events: usize) -> (Vec<TelemetryEvent>, u64) {
-        let mut guard = self.inner.lock().unwrap();
-        let mut drained = Vec::with_capacity(max_events.min(guard.events.len()));
-        while drained.len() < max_events {
-            match guard.events.pop_front() {
-                Some(event) => drained.push(event),
-                None => break,
-            }
-        }
+        let mut guard = self.inner.lock();
+        let count = max_events.min(guard.events.len());
+        let drained: Vec<TelemetryEvent> = guard.events.drain(..count).collect();
         let dropped = guard.dropped;
         guard.dropped = 0;
         (drained, dropped)

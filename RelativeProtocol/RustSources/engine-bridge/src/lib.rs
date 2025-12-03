@@ -1,4 +1,5 @@
 #![deny(unsafe_op_in_unsafe_fn)]
+#![allow(clippy::missing_safety_doc)] // FFI functions consumed by Swift, not Rust
 
 mod device;
 mod dns;
@@ -9,16 +10,17 @@ mod policy;
 mod quic;
 mod telemetry;
 
-use crate::device::{TunDevice, TunHandle, DEFAULT_MTU, RING_CAPACITY};
+use crate::device::{ParseError, TunDevice, TunHandle, DEFAULT_MTU};
 use crate::dns::{ResolveError, ResolveOutcome, Resolver, SystemResolver};
 use crate::ffi::{
     BridgeCallbacks, BridgeConfig, BridgeHostRuleConfig, BridgeLogSink, BridgeResolveResult,
     BridgeTelemetryEvent, BridgeTelemetryIp, FlowCounters, FlowStats, BRIDGE_TELEMETRY_MAX_QNAME,
 };
-use crate::flow_manager::FlowManager;
-use crate::logger::BreadcrumbFlags;
+use crate::flow_manager::{FlowManager, SocketBudget};
+use crate::logger::{rate_limited_error, BreadcrumbFlags, ErrorCategory};
 use crate::policy::{PolicyManager, RuleAction, ShapingConfig};
 use crate::telemetry::Telemetry;
+use crossbeam_channel::{Sender, TrySendError};
 use once_cell::sync::OnceCell;
 use smoltcp::time::Instant as SmoltInstant;
 use std::ffi::CStr;
@@ -26,15 +28,22 @@ use std::net::IpAddr;
 use std::os::raw::c_char;
 use std::ptr::NonNull;
 use std::slice;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::time::Instant as StdInstant;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::{self, Duration};
 
+/// Capacity of the lock-free packet ingress channel.
+/// Sized for high-throughput scenarios while keeping memory bounded.
+const PACKET_CHANNEL_CAPACITY: usize = 512;
+
 const MIN_MTU: usize = 576;
 const MAX_MTU: usize = 9000;
+const DEFAULT_POLL_MIN_MS: u64 = 10; // iOS-optimized for battery
+const DEFAULT_POLL_MAX_MS: u64 = 250;
 
 /// Opaque engine handle shared with Swift/ObjC.
 pub struct BridgeEngine {
@@ -48,6 +57,11 @@ pub struct BridgeEngine {
     wake: Arc<Notify>,
     telemetry: Arc<Telemetry>,
     policy: Arc<PolicyManager>,
+    poll_min_interval: Duration,
+    poll_max_interval: Duration,
+    /// Lock-free channel for packet ingress from FFI to poll loop.
+    /// Packets are pushed here by handle_packet() and drained in poll().
+    packet_tx: Sender<Vec<u8>>,
 }
 
 struct EngineState {
@@ -56,19 +70,48 @@ struct EngineState {
 
 impl BridgeEngine {
     fn new(config: BridgeConfig) -> anyhow::Result<Self> {
+        // Use multi_thread runtime to ensure poll loop runs in background
+        // Enable both time AND io for async network operations
         let runtime = Builder::new_multi_thread()
-            .worker_threads(1)
-            .max_blocking_threads(1)
+            .worker_threads(2)
             .enable_time()
+            .enable_io()
             .build()?;
 
         let wake = Arc::new(Notify::new());
         let mtu = normalize_mtu(config.mtu);
-        let device = TunDevice::new(mtu, Arc::clone(&wake));
+        let ring_capacity = if config.ring_capacity == 0 {
+            256 // iOS-optimized default
+        } else {
+            config.ring_capacity as usize
+        };
+        let device = TunDevice::new(mtu, Arc::clone(&wake), ring_capacity);
         let tun_handle = device.handle();
 
         let telemetry = Arc::new(Telemetry::new());
         let policy = PolicyManager::new();
+        let poll_min_ms = if config.poll_min_interval_ms == 0 {
+            DEFAULT_POLL_MIN_MS as u32
+        } else {
+            config.poll_min_interval_ms.max(1)
+        };
+        let mut poll_max_ms = if config.poll_max_interval_ms == 0 {
+            DEFAULT_POLL_MAX_MS as u32
+        } else {
+            config.poll_max_interval_ms
+        };
+        poll_max_ms = poll_max_ms.max(poll_min_ms);
+        let poll_min = Duration::from_millis(poll_min_ms as u64);
+        let poll_max = Duration::from_millis(poll_max_ms as u64);
+        let socket_budget = SocketBudget::from_config(
+            config.socket_memory_budget,
+            config.tcp_rx_buffer_size,
+            config.tcp_tx_buffer_size,
+            config.udp_buffer_size,
+        );
+
+        // Create lock-free channel for packet ingress
+        let (packet_tx, packet_rx) = crossbeam_channel::bounded(PACKET_CHANNEL_CAPACITY);
 
         let engine = Self {
             callbacks: OnceCell::new(),
@@ -80,19 +123,27 @@ impl BridgeEngine {
                 Arc::clone(&wake),
                 Arc::clone(&telemetry),
                 Arc::clone(&policy),
+                socket_budget,
+                packet_rx,
             ))),
             tun_handle,
             poll_task: Mutex::new(None),
             wake,
             telemetry,
             policy,
+            poll_min_interval: poll_min,
+            poll_max_interval: poll_max,
+            packet_tx,
         };
 
         logger::breadcrumb(
             BreadcrumbFlags::DEVICE,
             format!(
-                "BridgeEngine initialized (mtu={}, ring_cap={})",
-                mtu, RING_CAPACITY
+                "BridgeEngine initialized (mtu={}, ring_cap={}, mem_budget={}MB, tcp_buf={}KB)",
+                mtu,
+                ring_capacity,
+                socket_budget.memory_budget / (1024 * 1024),
+                socket_budget.tcp_rx_buffer_size / 1024
             ),
         );
 
@@ -109,12 +160,12 @@ impl BridgeEngine {
             .map_err(|_| anyhow::anyhow!("callbacks already installed"))?;
 
         {
-            let mut state = self.state.lock().expect("state lock poisoned");
+            let mut state = self.state.lock();
             state.running = true;
         }
 
         {
-            let mut flows = self.flows.lock().expect("flows lock poisoned");
+            let mut flows = self.flows.lock();
             flows.install_callbacks(*self.callbacks.get().expect("callbacks missing"));
         }
 
@@ -139,64 +190,167 @@ impl BridgeEngine {
             "BridgeEngine stop requested".to_string(),
         );
         {
-            let mut state = self.state.lock().expect("state lock poisoned");
+            let mut state = self.state.lock();
             state.running = false;
         }
+        // Wake up the poll task so it can exit gracefully
         self.wake.notify_waiters();
-        if let Ok(mut task) = self.poll_task.lock() {
-            if let Some(handle) = task.take() {
-                handle.abort();
+
+        // Try to wait for the poll task to exit gracefully first
+        let task_handle = {
+            let mut task = self.poll_task.lock();
+            task.take()
+        };
+
+        if let Some(handle) = task_handle {
+            // Give the task a brief moment to exit gracefully
+            let wait_result = self.runtime.block_on(async {
+                tokio::select! {
+                    result = handle => {
+                        match result {
+                            Ok(()) => true,
+                            Err(e) if e.is_cancelled() => {
+                                logger::breadcrumb(
+                                    BreadcrumbFlags::DEVICE,
+                                    "Poll task was cancelled".to_string(),
+                                );
+                                true
+                            }
+                            Err(e) => {
+                                logger::warn(format!("Poll task exited with error: {:?}", e));
+                                true
+                            }
+                        }
+                    }
+                    _ = time::sleep(Duration::from_millis(500)) => {
+                        logger::breadcrumb(
+                            BreadcrumbFlags::DEVICE,
+                            "Poll task did not exit in time, forcing abort".to_string(),
+                        );
+                        false
+                    }
+                }
+            });
+
+            if !wait_result {
+                logger::warn("BridgeEngine: poll task did not exit gracefully");
             }
         }
 
         logger::breadcrumb(BreadcrumbFlags::DEVICE, "BridgeEngine stopped".to_string());
     }
 
-    fn handle_packet(&self, packet: &[u8], protocol: u32) -> bool {
-        let Some(parsed) = crate::device::parse_packet(packet) else {
-            logger::breadcrumb(
-                BreadcrumbFlags::DEVICE,
-                format!(
-                    "Dropped packet (len={}, proto=0x{:x}) – unsupported L3 header",
-                    packet.len(),
-                    protocol
-                ),
-            );
-            return false;
-        };
-        if let Ok(mut flows) = self.flows.lock() {
-            flows.process_packet(&parsed);
+    fn handle_packet(&self, packet: &[u8], _protocol: u32) -> bool {
+        // Validate packet without holding any locks
+        match crate::device::parse_packet_validated(packet) {
+            Ok(_) => {
+                // Valid packet - push to lock-free channel for processing in poll loop
+                match self.packet_tx.try_send(packet.to_vec()) {
+                    Ok(()) => {
+                        // Wake the poll loop to process the packet
+                        self.wake.notify_one();
+                        true
+                    }
+                    Err(TrySendError::Full(_)) => {
+                        // Channel full - packet will be dropped
+                        // This is rare under normal conditions with PACKET_CHANNEL_CAPACITY=512
+                        logger::breadcrumb(
+                            BreadcrumbFlags::DEVICE,
+                            "Packet channel full, dropping packet".to_string(),
+                        );
+                        false
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        // Channel disconnected - engine is shutting down
+                        false
+                    }
+                }
+            }
+            Err(err) => {
+                // Invalid packet - log error (counters updated during poll)
+                // Rate-limited logging to prevent log flooding
+                let category = match err {
+                    ParseError::MalformedTcpSegment => ErrorCategory::PacketInvalidTcp,
+                    ParseError::MalformedUdpDatagram => ErrorCategory::PacketInvalidUdp,
+                    _ => ErrorCategory::PacketInvalidIp,
+                };
+                rate_limited_error(
+                    category,
+                    format!("{} (len={})", err.description(), packet.len()),
+                );
+                false
+            }
         }
-        true
     }
 
     fn on_tcp_receive(&self, handle: u64, payload: &[u8]) -> bool {
-        if let Ok(mut flows) = self.flows.lock() {
-            return flows.on_tcp_receive(handle, payload);
-        }
-        false
+        let mut flows = self.flows.lock();
+        flows.on_tcp_receive(handle, payload)
     }
 
     fn on_udp_receive(&self, handle: u64, payload: &[u8]) -> bool {
-        if let Ok(mut flows) = self.flows.lock() {
-            return flows.on_udp_receive(handle, payload);
-        }
-        false
+        let mut flows = self.flows.lock();
+        flows.on_udp_receive(handle, payload)
     }
 
     fn on_tcp_close(&self, handle: u64) {
-        if let Ok(mut flows) = self.flows.lock() {
-            flows.on_tcp_close(handle);
-        }
+        let mut flows = self.flows.lock();
+        flows.on_tcp_close(handle);
     }
 
     fn on_udp_close(&self, handle: u64) {
-        if let Ok(mut flows) = self.flows.lock() {
-            flows.on_udp_close(handle);
-        }
+        let mut flows = self.flows.lock();
+        flows.on_udp_close(handle);
+    }
+
+    fn on_tcp_send_failed(&self, handle: u64, error: Option<&str>) {
+        logger::breadcrumb(
+            BreadcrumbFlags::FLOW,
+            format!("TCP send failed handle={} error={:?}", handle, error),
+        );
+        let mut flows = self.flows.lock();
+        flows.on_tcp_send_failed(handle, error);
+    }
+
+    fn on_udp_send_failed(&self, handle: u64, error: Option<&str>) {
+        logger::breadcrumb(
+            BreadcrumbFlags::FLOW,
+            format!("UDP send failed handle={} error={:?}", handle, error),
+        );
+        let mut flows = self.flows.lock();
+        flows.on_udp_send_failed(handle, error);
     }
 
     fn enqueue_frame(&self, packet: &[u8]) -> bool {
+        // Log TCP packets being enqueued for smoltcp processing
+        if packet.len() >= 40 {
+            let version = packet[0] >> 4;
+            if version == 4 && packet[9] == 6 {
+                let header_len = ((packet[0] & 0x0F) as usize) * 4;
+                if packet.len() >= header_len + 20 {
+                    let src_port = u16::from_be_bytes([packet[header_len], packet[header_len + 1]]);
+                    let dst_port = u16::from_be_bytes([packet[header_len + 2], packet[header_len + 3]]);
+                    let flags = packet[header_len + 13];
+                    let flags_str = format!(
+                        "{}{}{}{}",
+                        if flags & 0x02 != 0 { "S" } else { "" },
+                        if flags & 0x10 != 0 { "A" } else { "" },
+                        if flags & 0x01 != 0 { "F" } else { "" },
+                        if flags & 0x04 != 0 { "R" } else { "" }
+                    );
+                    let data_off = ((packet[header_len + 12] >> 4) as usize) * 4;
+                    let tcp_payload = packet.len().saturating_sub(header_len + data_off);
+                    logger::breadcrumb(
+                        BreadcrumbFlags::DEVICE,
+                        format!(
+                            "ENQUEUE_FRAME tcp {}:{} flags=[{}] payload={} queue_len={}",
+                            src_port, dst_port, flags_str, tcp_payload,
+                            self.tun_handle.inbound_queue_len()
+                        ),
+                    );
+                }
+            }
+        }
         self.tun_handle.push_inbound(packet)
     }
 
@@ -205,23 +359,16 @@ impl BridgeEngine {
     }
 
     fn on_dial_result(&self, handle: u64, success: bool, reason: Option<&str>) {
-        if let Ok(mut flows) = self.flows.lock() {
-            flows.on_dial_result(handle, success, reason);
-        }
+        let mut flows = self.flows.lock();
+        flows.on_dial_result(handle, success, reason);
     }
 
     fn copy_counters(&self) -> FlowCounters {
-        self.flows
-            .lock()
-            .map(|flows| flows.counters())
-            .unwrap_or_default()
+        self.flows.lock().counters()
     }
 
     fn copy_stats(&self) -> FlowStats {
-        self.flows
-            .lock()
-            .map(|flows| flows.stats())
-            .unwrap_or_default()
+        self.flows.lock().stats()
     }
 
     fn drain_telemetry(&self, max_events: usize) -> (Vec<crate::telemetry::TelemetryEvent>, u64) {
@@ -240,16 +387,23 @@ impl BridgeEngine {
         let flows = Arc::clone(&self.flows);
         let state = Arc::clone(&self.state);
         let wake = Arc::clone(&self.wake);
+        let min_delay = self.poll_min_interval;
+        let max_delay = self.poll_max_interval;
+        // Clone callbacks for use in poll loop - they're Copy so this is cheap
+        let callbacks = *self.callbacks.get().expect("callbacks not installed");
         let handle = self.runtime.spawn(async move {
             let epoch = StdInstant::now();
-            let mut ticker = time::interval(Duration::from_millis(5));
+            let mut delay = min_delay;
             loop {
+                let mut reset_delay = false;
                 tokio::select! {
-                    _ = ticker.tick() => {}
-                    _ = wake.notified() => {}
-                }
+                    _ = time::sleep(delay) => {}
+                    _ = wake.notified() => {
+                        reset_delay = true;
+                    }
+                };
                 let running = {
-                    let guard = state.lock().expect("state lock poisoned");
+                    let guard = state.lock();
                     guard.running
                 };
                 if !running {
@@ -257,12 +411,24 @@ impl BridgeEngine {
                 }
                 let now = epoch.elapsed();
                 let millis = now.as_millis().min(i64::MAX as u128) as i64;
-                if let Ok(mut flows) = flows.lock() {
-                    flows.poll(SmoltInstant::from_millis(millis));
+
+                // Poll under lock, then execute callbacks outside lock
+                let (did_work, batch) = {
+                    let mut flows = flows.lock();
+                    flows.poll(SmoltInstant::from_millis(millis))
+                };
+                // Lock is now released - execute callbacks without blocking FFI handlers
+                batch.execute(callbacks);
+
+                if did_work || reset_delay {
+                    delay = min_delay;
+                } else {
+                    let doubled = delay.checked_mul(2).unwrap_or(max_delay);
+                    delay = if doubled > max_delay { max_delay } else { doubled };
                 }
             }
         });
-        let mut slot = self.poll_task.lock().expect("poll task lock poisoned");
+        let mut slot = self.poll_task.lock();
         *slot = Some(handle);
     }
 }
@@ -310,7 +476,7 @@ pub unsafe extern "C" fn BridgeEngineStart(
         return -2;
     };
 
-    match unsafe { engine.as_ref() }.start(unsafe { callbacks.as_ref().clone() }) {
+    match unsafe { engine.as_ref() }.start(unsafe { *callbacks.as_ref() }) {
         Ok(_) => 0,
         Err(error) => {
             crate::logger::error(format!("BridgeEngineStart error: {error:?}"));
@@ -336,10 +502,7 @@ pub unsafe extern "C" fn BridgeSetLogSink(
     let level_str = if level.is_null() {
         None
     } else {
-        match unsafe { CStr::from_ptr(level) }.to_str() {
-            Ok(value) => Some(value),
-            Err(_) => None,
-        }
+        unsafe { CStr::from_ptr(level) }.to_str().ok()
     };
     crate::logger::install_sink(sink_ref, level_str).is_ok()
 }
@@ -365,8 +528,12 @@ pub unsafe extern "C" fn BridgeEngineHandlePacket(
     // Safety: caller guarantees `packet` points to `length` bytes of readable memory.
     let slice = unsafe { slice::from_raw_parts(packet, length) };
     let engine_ref = unsafe { engine.as_ref() };
+    // IMPORTANT: Create socket/flow BEFORE enqueueing the packet.
+    // This prevents a race where the poll loop processes the packet before
+    // the socket exists, causing the first packet (e.g., DNS query) to be dropped.
+    let result = engine_ref.handle_packet(slice, protocol);
     engine_ref.enqueue_frame(slice);
-    engine_ref.handle_packet(slice, protocol)
+    result
 }
 
 #[no_mangle]
@@ -415,6 +582,40 @@ pub unsafe extern "C" fn BridgeEngineOnUdpClose(engine: *mut BridgeEngine, handl
     if let Some(engine) = NonNull::new(engine) {
         unsafe { engine.as_ref() }.on_udp_close(handle);
     }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BridgeEngineOnTcpSendFailed(
+    engine: *mut BridgeEngine,
+    handle: u64,
+    error: *const c_char,
+) {
+    let Some(engine) = NonNull::new(engine) else {
+        return;
+    };
+    let error_str = if error.is_null() {
+        None
+    } else {
+        unsafe { CStr::from_ptr(error) }.to_str().ok()
+    };
+    unsafe { engine.as_ref() }.on_tcp_send_failed(handle, error_str);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BridgeEngineOnUdpSendFailed(
+    engine: *mut BridgeEngine,
+    handle: u64,
+    error: *const c_char,
+) {
+    let Some(engine) = NonNull::new(engine) else {
+        return;
+    };
+    let error_str = if error.is_null() {
+        None
+    } else {
+        unsafe { CStr::from_ptr(error) }.to_str().ok()
+    };
+    unsafe { engine.as_ref() }.on_udp_send_failed(handle, error_str);
 }
 
 #[no_mangle]
@@ -579,6 +780,7 @@ pub unsafe extern "C" fn BridgeHostRuleRemove(engine: *mut BridgeEngine, rule_id
     unsafe { engine.as_ref() }.remove_host_rule(rule_id)
 }
 
+#[allow(clippy::field_reassign_with_default)]
 fn bridge_event_from(event: &crate::telemetry::TelemetryEvent) -> BridgeTelemetryEvent {
     let mut out = BridgeTelemetryEvent::default();
     out.timestamp_ms = event.timestamp_ms;
@@ -611,14 +813,12 @@ fn bridge_event_from(event: &crate::telemetry::TelemetryEvent) -> BridgeTelemetr
 fn encode_ip(addr: &IpAddr) -> BridgeTelemetryIp {
     match addr {
         IpAddr::V4(v4) => {
-            let mut out = BridgeTelemetryIp::default();
-            out.family = 4;
+            let mut out = BridgeTelemetryIp { family: 4, ..Default::default() };
             out.bytes[..4].copy_from_slice(&v4.octets());
             out
         }
         IpAddr::V6(v6) => {
-            let mut out = BridgeTelemetryIp::default();
-            out.family = 6;
+            let mut out = BridgeTelemetryIp { family: 6, ..Default::default() };
             out.bytes.copy_from_slice(&v6.octets());
             out
         }

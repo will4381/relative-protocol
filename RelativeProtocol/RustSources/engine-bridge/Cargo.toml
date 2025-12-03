@@ -16,17 +16,23 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 [features]
 default = []
 generate-header = ["dep:cbindgen"]
+# Enable iOS-like memory constraints for testing on any platform
+ios-memory-profile = []
 
 [dependencies]
 anyhow = "1.0"
 bitflags = "2.4"
+crossbeam-channel = "0.5"
 libc = "0.2"
 once_cell = "1.19"
+parking_lot = "0.12"
+rustc-hash = "2.0"
+smallvec = "1.13"
 smoltcp = { version = "0.11", default-features = false, features = ["std", "verbose", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "medium-ip"] }
 thiserror = "1.0"
-tokio = { version = "1.36", default-features = false, features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
-parking_lot = "0.12"
+tokio = { version = "1.36", default-features = false, features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
 wildmatch = "2"
+futures = "0.3"
 
 [build-dependencies]
 cbindgen = { version = "0.26", optional = true }
@@ -36,3 +42,7 @@ language = "C"
 header = "include/bridge.h"
 include-version = false
 documentation = true
+
+# Profiling: release with debug symbols for flamegraph
+[profile.release]
+debug = true

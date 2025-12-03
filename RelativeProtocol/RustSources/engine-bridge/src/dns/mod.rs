@@ -129,7 +129,7 @@ pub fn parse_response(payload: &[u8]) -> Vec<DnsMapping> {
                 if let Some(target) = read_name(payload, &mut cname_offset) {
                     let roots = lookup_roots(&alias_roots, &name);
                     if !roots.is_empty() {
-                        let entry = alias_roots.entry(target).or_insert_with(Vec::new);
+                        let entry = alias_roots.entry(target).or_default();
                         for root in roots {
                             if !entry.iter().any(|existing| existing == &root) {
                                 entry.push(root);
@@ -163,10 +163,12 @@ fn lookup_roots(alias_roots: &HashMap<String, Vec<String>>, name: &str) -> Vec<S
 
 #[allow(dead_code)]
 fn read_name(buf: &[u8], offset: &mut usize) -> Option<String> {
-    let mut labels = Vec::new();
+    // Pre-allocate for typical DNS name (about 64 bytes total)
+    let mut result = String::with_capacity(64);
     let mut position = *offset;
     let mut jumped = false;
     let mut guard = 0;
+    let mut first_label = true;
     while position < buf.len() && guard < buf.len() {
         guard += 1;
         let len = buf[position] as usize;
@@ -181,7 +183,7 @@ fn read_name(buf: &[u8], offset: &mut usize) -> Option<String> {
             if position + 1 >= buf.len() {
                 return None;
             }
-            let pointer = (((len & 0x3F) as usize) << 8) | buf[position + 1] as usize;
+            let pointer = ((len & 0x3F) << 8) | buf[position + 1] as usize;
             position = pointer;
             if !jumped {
                 *offset += 2;
@@ -193,71 +195,31 @@ fn read_name(buf: &[u8], offset: &mut usize) -> Option<String> {
         if position + len > buf.len() {
             return None;
         }
-        labels.push(String::from_utf8_lossy(&buf[position..position + len]).to_string());
+        // Build result string directly instead of collecting into Vec
+        if !first_label {
+            result.push('.');
+        }
+        first_label = false;
+        // Try UTF-8 first, fallback to lossy only if needed
+        match std::str::from_utf8(&buf[position..position + len]) {
+            Ok(s) => result.push_str(s),
+            Err(_) => result.push_str(&String::from_utf8_lossy(&buf[position..position + len])),
+        }
         position += len;
         if !jumped {
             *offset = position;
         }
+        // Limit label count
+        if result.matches('.').count() >= 31 {
+            break;
+        }
     }
-    if labels.is_empty() {
+    if result.is_empty() {
         None
     } else {
-        Some(labels.join("."))
+        Some(result)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn encode_name(name: &str) -> Vec<u8> {
-        let mut encoded = Vec::new();
-        for label in name.split('.') {
-            encoded.push(label.len() as u8);
-            encoded.extend_from_slice(label.as_bytes());
-        }
-        encoded.push(0);
-        encoded
-    }
-
-    #[test]
-    fn parse_response_maps_addresses_to_question_name() {
-        let question = "v16.us.tiktok.com";
-        let cname = "edge.example.net";
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&[0x12, 0x34]); // id
-        payload.extend_from_slice(&[0x81, 0x80]); // standard response
-        payload.extend_from_slice(&[0x00, 0x01]); // qdcount
-        payload.extend_from_slice(&[0x00, 0x02]); // ancount
-        payload.extend_from_slice(&[0x00, 0x00]); // nscount
-        payload.extend_from_slice(&[0x00, 0x00]); // arcount
-        payload.extend_from_slice(&encode_name(question));
-        payload.extend_from_slice(&[0x00, 0x01]); // type A
-        payload.extend_from_slice(&[0x00, 0x01]); // class IN
-        payload.extend_from_slice(&encode_name(question)); // answer name
-        payload.extend_from_slice(&[0x00, 0x05]); // CNAME
-        payload.extend_from_slice(&[0x00, 0x01]); // class IN
-        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]); // ttl 60
-        let cname_encoded = encode_name(cname);
-        payload.extend_from_slice(&[
-            ((cname_encoded.len() as u16) >> 8) as u8,
-            (cname_encoded.len() as u16 & 0xFF) as u8,
-        ]);
-        payload.extend_from_slice(&cname_encoded);
-        payload.extend_from_slice(&encode_name(cname));
-        payload.extend_from_slice(&[0x00, 0x01]); // type A
-        payload.extend_from_slice(&[0x00, 0x01]); // class IN
-        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]); // ttl 60
-        payload.extend_from_slice(&[0x00, 0x04]); // rdlength
-        payload.extend_from_slice(&[1, 2, 3, 4]); // IPv4 addr
-
-        let mappings = parse_response(&payload);
-        assert_eq!(mappings.len(), 1);
-        let mapping = &mappings[0];
-        assert_eq!(mapping.host, question);
-        assert_eq!(
-            mapping.addresses,
-            vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]
-        );
-    }
-}
+mod tests;

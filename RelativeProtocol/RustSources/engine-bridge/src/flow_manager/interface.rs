@@ -1,18 +1,9 @@
-use super::state::{
-    TCP_RX_BUFFER_SIZE, TCP_SOCKET_COUNT, TCP_TX_BUFFER_SIZE, UDP_BUFFER_SIZE, UDP_PACKET_METADATA,
-    UDP_SOCKET_COUNT,
-};
+use super::state::{SocketBudget, UDP_PACKET_METADATA};
 use super::*;
 
-pub(super) fn build_interface_and_sockets(
-    mut device: TunDevice,
-) -> (
-    TunDevice,
-    Interface,
-    SocketSet<'static>,
-    Vec<SocketHandle>,
-    Vec<SocketHandle>,
-) {
+/// Build the network interface with an empty socket set.
+/// Sockets are allocated dynamically as flows are admitted.
+pub(super) fn build_interface(mut device: TunDevice) -> (TunDevice, Interface, SocketSet<'static>) {
     let ipv4_addr = Ipv4Address::new(10, 0, 0, 1);
     let ipv6_addr = Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 1);
 
@@ -31,54 +22,77 @@ pub(super) fn build_interface_and_sockets(
         routes.add_default_ipv6_route(ipv6_addr).ok();
     }
 
-    let mut sockets = SocketSet::new(Vec::new());
-    let mut tcp_pool = Vec::with_capacity(TCP_SOCKET_COUNT);
-    for _ in 0..TCP_SOCKET_COUNT {
-        let socket = TcpSocket::new(
-            TcpSocketBuffer::new(vec![0; TCP_RX_BUFFER_SIZE]),
-            TcpSocketBuffer::new(vec![0; TCP_TX_BUFFER_SIZE]),
-        );
-        let handle = sockets.add(socket);
-        tcp_pool.push(handle);
-    }
+    let sockets = SocketSet::new(Vec::new());
+    (device, interface, sockets)
+}
 
-    let mut udp_pool = Vec::with_capacity(UDP_SOCKET_COUNT);
-    for _ in 0..UDP_SOCKET_COUNT {
-        let rx_meta = vec![PacketMetadata::EMPTY; UDP_PACKET_METADATA];
-        let tx_meta = vec![PacketMetadata::EMPTY; UDP_PACKET_METADATA];
-        let socket = UdpSocket::new(
-            PacketBuffer::new(rx_meta, vec![0; UDP_BUFFER_SIZE]),
-            PacketBuffer::new(tx_meta, vec![0; UDP_BUFFER_SIZE]),
-        );
-        let handle = sockets.add(socket);
-        udp_pool.push(handle);
-    }
+/// Allocate a new TCP socket with the given buffer sizes.
+pub(super) fn allocate_tcp_socket(
+    sockets: &mut SocketSet<'static>,
+    budget: &SocketBudget,
+) -> SocketHandle {
+    let socket = TcpSocket::new(
+        TcpSocketBuffer::new(vec![0; budget.tcp_rx_buffer_size]),
+        TcpSocketBuffer::new(vec![0; budget.tcp_tx_buffer_size]),
+    );
+    sockets.add(socket)
+}
 
-    (device, interface, sockets, tcp_pool, udp_pool)
+/// Allocate a new UDP socket with the given buffer size.
+pub(super) fn allocate_udp_socket(
+    sockets: &mut SocketSet<'static>,
+    budget: &SocketBudget,
+) -> SocketHandle {
+    let rx_meta = vec![PacketMetadata::EMPTY; UDP_PACKET_METADATA];
+    let tx_meta = vec![PacketMetadata::EMPTY; UDP_PACKET_METADATA];
+    let socket = UdpSocket::new(
+        PacketBuffer::new(rx_meta, vec![0; budget.udp_buffer_size]),
+        PacketBuffer::new(tx_meta, vec![0; budget.udp_buffer_size]),
+    );
+    sockets.add(socket)
+}
+
+// Thread-local buffers for emit_frames to avoid repeated allocations
+thread_local! {
+    static EMIT_PTRS: std::cell::RefCell<Vec<*const u8>> = std::cell::RefCell::new(Vec::with_capacity(64));
+    static EMIT_SIZES: std::cell::RefCell<Vec<usize>> = std::cell::RefCell::new(Vec::with_capacity(64));
+    static EMIT_PROTOCOLS: std::cell::RefCell<Vec<u32>> = std::cell::RefCell::new(Vec::with_capacity(64));
 }
 
 pub(super) fn emit_frames(callbacks: BridgeCallbacks, frames: Vec<Vec<u8>>) {
     if frames.is_empty() {
         return;
     }
-    let mut packet_ptrs: Vec<*const u8> = Vec::with_capacity(frames.len());
-    let mut sizes: Vec<usize> = Vec::with_capacity(frames.len());
-    let mut protocols: Vec<u32> = Vec::with_capacity(frames.len());
-    for frame in &frames {
-        packet_ptrs.push(frame.as_ptr());
-        sizes.push(frame.len());
-        protocols.push(protocol_number(frame));
-    }
 
-    unsafe {
-        (callbacks.emit_packets)(
-            packet_ptrs.as_ptr(),
-            sizes.as_ptr(),
-            protocols.as_ptr(),
-            packet_ptrs.len(),
-            callbacks.context,
-        );
-    }
+    EMIT_PTRS.with(|ptrs| {
+        EMIT_SIZES.with(|sizes| {
+            EMIT_PROTOCOLS.with(|protocols| {
+                let mut ptrs = ptrs.borrow_mut();
+                let mut sizes = sizes.borrow_mut();
+                let mut protocols = protocols.borrow_mut();
+
+                ptrs.clear();
+                sizes.clear();
+                protocols.clear();
+
+                for frame in &frames {
+                    ptrs.push(frame.as_ptr());
+                    sizes.push(frame.len());
+                    protocols.push(protocol_number(frame));
+                }
+
+                unsafe {
+                    (callbacks.emit_packets)(
+                        ptrs.as_ptr(),
+                        sizes.as_ptr(),
+                        protocols.as_ptr(),
+                        ptrs.len(),
+                        callbacks.context,
+                    );
+                }
+            });
+        });
+    });
 }
 
 fn protocol_number(frame: &[u8]) -> u32 {
