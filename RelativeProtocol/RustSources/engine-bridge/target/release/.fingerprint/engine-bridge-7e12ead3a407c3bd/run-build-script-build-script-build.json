@@ -1,1 +1,0 @@
-{"rustc":4996801173321332248,"features":"","declared_features":"","target":0,"profile":0,"path":0,"deps":[[4398472161076913487,"build_script_build",false,983700282005979253]],"local":[{"RerunIfChanged":{"output":"release/build/engine-bridge-7e12ead3a407c3bd/output","paths":["src","include/bridge.h"]}}],"rustflags":[],"config":0,"compile_kind":0}

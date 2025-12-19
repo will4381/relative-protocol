@@ -1,3 +1,0 @@
-cargo:rerun-if-changed=src
-cargo:rerun-if-changed=include/bridge.h
-cargo:warning=bridge.h unchanged
