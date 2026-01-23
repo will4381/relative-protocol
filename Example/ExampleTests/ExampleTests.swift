@@ -5,35 +5,33 @@
 //  Copyright (c) 2025 Relative Companies, Inc.
 //  Personal, non-commercial use only. Created by Will Kusch on 10/23/2025.
 //
-//  Placeholder unit tests for the sample host application target.
+//  Core data model coverage for the Example app.
 //
 
 import XCTest
-@testable import Example
+import RelativeProtocolCore
 
 final class ExampleTests: XCTestCase {
+    func testMetricsSnapshotCodableRoundTrip() throws {
+        let sample = PacketSample(
+            timestamp: 1.0,
+            direction: .outbound,
+            ipVersion: .v4,
+            transport: .udp,
+            length: 64,
+            flowId: 42,
+            burstId: 1,
+            srcPort: 12000,
+            dstPort: 53,
+            dnsQueryName: "example.com"
+        )
+        let snapshot = MetricsSnapshot(capturedAt: 123.0, samples: [sample])
 
-    override func setUpWithError() throws {
-        // Put setup code here. This method is called before the invocation of each test method in the class.
+        let data = try JSONEncoder().encode(snapshot)
+        let decoded = try JSONDecoder().decode(MetricsSnapshot.self, from: data)
+
+        XCTAssertEqual(decoded.capturedAt, snapshot.capturedAt, accuracy: 0.0001)
+        XCTAssertEqual(decoded.samples.count, 1)
+        XCTAssertEqual(decoded.samples.first, sample)
     }
-
-    override func tearDownWithError() throws {
-        // Put teardown code here. This method is called after the invocation of each test method in the class.
-    }
-
-    func testExample() throws {
-        // This is an example of a functional test case.
-        // Use XCTAssert and related functions to verify your tests produce the correct results.
-        // Any test you write for XCTest can be annotated as throws and async.
-        // Mark your test throws to produce an unexpected failure when your test encounters an uncaught error.
-        // Mark your test async to allow awaiting for asynchronous code to complete. Check the results with assertions afterwards.
-    }
-
-    func testPerformanceExample() throws {
-        // This is an example of a performance test case.
-        self.measure {
-            // Put the code you want to measure the time of here.
-        }
-    }
-
 }
