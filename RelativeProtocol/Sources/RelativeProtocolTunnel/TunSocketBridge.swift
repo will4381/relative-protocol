@@ -1,3 +1,6 @@
+// Created by Will Kusch 1/23/26
+// Property of Relative Companies Inc. See LICENSE for more info.
+// Code is not to be reproduced or used in any commercial project, free or paid.
 import Darwin
 import Foundation
 import RelativeProtocolCore
@@ -45,7 +48,7 @@ final class TunSocketBridge {
         self.writeSource = writeSource
     }
 
-    func startReadLoop(handler: @escaping (Data, Int32) -> Void) {
+    func startReadLoop(handler: @escaping ([Data], [Int32]) -> Void) {
         let source = DispatchSource.makeReadSource(fileDescriptor: appFD, queue: queue)
         source.setEventHandler { [weak self] in
             self?.drainReadable(handler: handler)
@@ -113,9 +116,14 @@ final class TunSocketBridge {
         close(engineFD)
     }
 
-    private func drainReadable(handler: @escaping (Data, Int32) -> Void) {
+    private func drainReadable(handler: @escaping ([Data], [Int32]) -> Void) {
         let bufferSize = mtu + MemoryLayout<UInt32>.size
         var buffer = [UInt8](repeating: 0, count: bufferSize)
+        let batchLimit = 32
+        var packets: [Data] = []
+        var families: [Int32] = []
+        packets.reserveCapacity(batchLimit)
+        families.reserveCapacity(batchLimit)
 
         while true {
             let bytesRead = recv(appFD, &buffer, buffer.count, 0)
@@ -141,7 +149,17 @@ final class TunSocketBridge {
             if family != AF_INET && family != AF_INET6 {
                 family = payload.first.map { (($0 >> 4) & 0x0F) == 6 ? AF_INET6 : AF_INET } ?? AF_INET
             }
-            handler(payload, family)
+            packets.append(payload)
+            families.append(family)
+            if packets.count >= batchLimit {
+                handler(packets, families)
+                packets.removeAll(keepingCapacity: true)
+                families.removeAll(keepingCapacity: true)
+            }
+        }
+
+        if !packets.isEmpty {
+            handler(packets, families)
         }
     }
 

@@ -1,3 +1,6 @@
+// Created by Will Kusch 1/23/26
+// Property of Relative Companies Inc. See LICENSE for more info.
+// Code is not to be reproduced or used in any commercial project, free or paid.
 import Combine
 import Foundation
 import RelativeProtocolHost
@@ -49,12 +52,16 @@ final class VPNManager: ObservableObject {
         "burstThresholdMs": 350,
         "flowTTLSeconds": 300,
         "maxTrackedFlows": 2048,
-        "maxPendingAnalytics": 512
+        "maxPendingAnalytics": 512,
+        "packetStreamEnabled": true,
+        "packetStreamMaxBytes": 5_000_000,
+        "signatureFileName": "app_signatures.json"
     ]
     private let appGroupID = "group.relative-companies.Example"
     private lazy var metricsClient = MetricsClient(appGroupID: appGroupID)
 
     init() {
+        ensureSignatureFile()
         Task { await refreshStatus() }
     }
 
@@ -68,6 +75,7 @@ final class VPNManager: ObservableObject {
 
     func refreshStatus() async {
         do {
+            ensureSignatureFile()
             let managers = try await loadAllManagers()
             guard let existing = managers.first else {
                 manager = nil
@@ -89,6 +97,7 @@ final class VPNManager: ObservableObject {
         defer { isBusy = false }
 
         do {
+            ensureSignatureFile()
             let manager = try await loadOrCreateManager()
             configureManager(manager)
             try await saveManager(manager)
@@ -107,6 +116,7 @@ final class VPNManager: ObservableObject {
         defer { isBusy = false }
 
         do {
+            ensureSignatureFile()
             let manager = try await loadOrCreateManager()
             configureManager(manager)
             try await saveManager(manager)
@@ -154,6 +164,7 @@ final class VPNManager: ObservableObject {
         defer { isBusy = false }
 
         do {
+            ensureSignatureFile()
             let manager = try await loadOrCreateManager()
             configureManager(manager)
             manager.isEnabled = true
@@ -282,5 +293,10 @@ final class VPNManager: ObservableObject {
                 }
             }
         }
+    }
+
+    private func ensureSignatureFile() {
+        guard let url = AppSignatureStore.defaultURL(appGroupID: appGroupID) else { return }
+        AppSignatureStore.writeIfMissing(AppSignatureStore.sampleSignatures, to: url)
     }
 }

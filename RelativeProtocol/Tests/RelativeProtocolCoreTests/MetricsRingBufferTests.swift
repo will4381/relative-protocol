@@ -1,3 +1,6 @@
+// Created by Will Kusch 1/23/26
+// Property of Relative Companies Inc. See LICENSE for more info.
+// Code is not to be reproduced or used in any commercial project, free or paid.
 import XCTest
 import RelativeProtocolCore
 
@@ -31,9 +34,17 @@ final class MetricsRingBufferTests: XCTestCase {
             length: 64,
             flowId: id,
             burstId: 0,
+            srcAddress: "192.0.2.2",
+            dstAddress: "198.51.100.2",
             srcPort: 1234,
             dstPort: 53,
-            dnsQueryName: nil
+            dnsQueryName: nil,
+            dnsCname: nil,
+            registrableDomain: nil,
+            tlsServerName: nil,
+            quicVersion: nil,
+            quicDestinationConnectionId: nil,
+            quicSourceConnectionId: nil
         )
     }
 }

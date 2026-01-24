@@ -1,3 +1,6 @@
+// Created by Will Kusch 1/23/26
+// Property of Relative Companies Inc. See LICENSE for more info.
+// Code is not to be reproduced or used in any commercial project, free or paid.
 import XCTest
 import RelativeProtocolCore
 
@@ -46,7 +49,13 @@ final class FlowTrackerTests: XCTestCase {
             srcPort: 12000,
             dstPort: 53,
             length: 60,
-            dnsQueryName: nil
+            dnsQueryName: nil,
+            dnsCname: nil,
+            registrableDomain: nil,
+            tlsServerName: nil,
+            quicVersion: nil,
+            quicDestinationConnectionId: nil,
+            quicSourceConnectionId: nil
         )
     }
 }

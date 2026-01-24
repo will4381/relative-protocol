@@ -1,3 +1,6 @@
+// Created by Will Kusch 1/23/26
+// Property of Relative Companies Inc. See LICENSE for more info.
+// Code is not to be reproduced or used in any commercial project, free or paid.
 import Foundation
 import HevSocks5Tunnel
 import RelativeProtocolCore
@@ -13,8 +16,10 @@ final class Tun2SocksEngine {
         isRunning = true
 
         let configString = buildConfigString(configuration: configuration, socksPort: socksPort)
-        NSLog("Tun2SocksEngine: socks5 address=127.0.0.1 port=\(socksPort)")
-        NSLog("Tun2SocksEngine: starting with tunFD=\(tunFD) socksPort=\(socksPort)")
+        if RelativeLog.isVerbose {
+            NSLog("Tun2SocksEngine: socks5 address=127.0.0.1 port=\(socksPort)")
+            NSLog("Tun2SocksEngine: starting with tunFD=\(tunFD) socksPort=\(socksPort)")
+        }
         let data = Data(configString.utf8)
         configData = data
 
@@ -26,15 +31,19 @@ final class Tun2SocksEngine {
                 }
                 return hev_socks5_tunnel_main_from_str(base, UInt32(data.count), tunFD)
             }
-            self.logger.info("tun2socks exited with code \(result, privacy: .public)")
-            NSLog("Tun2SocksEngine: exited with code \(result)")
+            if RelativeLog.isVerbose {
+                self.logger.info("tun2socks exited with code \(result, privacy: .public)")
+                NSLog("Tun2SocksEngine: exited with code \(result)")
+            }
             self.isRunning = false
         }
     }
 
     func stop() {
         guard isRunning else { return }
-        NSLog("Tun2SocksEngine: stop requested")
+        if RelativeLog.isVerbose {
+            NSLog("Tun2SocksEngine: stop requested")
+        }
         hev_socks5_tunnel_quit()
         isRunning = false
         configData = nil

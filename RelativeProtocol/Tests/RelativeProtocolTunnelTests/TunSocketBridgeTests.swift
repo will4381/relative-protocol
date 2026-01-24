@@ -1,3 +1,6 @@
+// Created by Will Kusch 1/23/26
+// Property of Relative Companies Inc. See LICENSE for more info.
+// Code is not to be reproduced or used in any commercial project, free or paid.
 import XCTest
 @testable import RelativeProtocolTunnel
 
@@ -33,9 +36,9 @@ final class TunSocketBridgeTests: XCTestCase {
         let expectation = XCTestExpectation(description: "read loop")
         let payload = Data([0x60, 0x00, 0x00, 0x00, 0x01])
 
-        bridge.startReadLoop { data, family in
-            XCTAssertEqual(data, payload)
-            XCTAssertEqual(family, Int32(AF_INET6))
+        bridge.startReadLoop { packets, families in
+            XCTAssertEqual(packets.first, payload)
+            XCTAssertEqual(families.first, Int32(AF_INET6))
             expectation.fulfill()
         }
 

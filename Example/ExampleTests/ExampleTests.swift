@@ -1,3 +1,6 @@
+// Created by Will Kusch 1/23/26
+// Property of Relative Companies Inc. See LICENSE for more info.
+// Code is not to be reproduced or used in any commercial project, free or paid.
 //
 //  ExampleTests.swift
 //  ExampleTests
@@ -21,9 +24,17 @@ final class ExampleTests: XCTestCase {
             length: 64,
             flowId: 42,
             burstId: 1,
+            srcAddress: "192.0.2.10",
+            dstAddress: "198.51.100.53",
             srcPort: 12000,
             dstPort: 53,
-            dnsQueryName: "example.com"
+            dnsQueryName: "example.com",
+            dnsCname: "example.net",
+            registrableDomain: "example.com",
+            tlsServerName: nil,
+            quicVersion: nil,
+            quicDestinationConnectionId: nil,
+            quicSourceConnectionId: nil
         )
         let snapshot = MetricsSnapshot(capturedAt: 123.0, samples: [sample])
 

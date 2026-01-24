@@ -1,3 +1,6 @@
+// Created by Will Kusch 1/23/26
+// Property of Relative Companies Inc. See LICENSE for more info.
+// Code is not to be reproduced or used in any commercial project, free or paid.
 import XCTest
 @testable import RelativeProtocolCore
 
@@ -18,10 +21,13 @@ final class TunnelConfigurationTests: XCTestCase {
         XCTAssertTrue(config.metricsEnabled)
         XCTAssertEqual(config.metricsRingBufferSize, 2048)
         XCTAssertEqual(config.metricsSnapshotInterval, 1.0)
+        XCTAssertEqual(config.metricsStoreFormat, .json)
         XCTAssertEqual(config.burstThresholdMs, 350)
         XCTAssertEqual(config.flowTTLSeconds, 300)
         XCTAssertEqual(config.maxTrackedFlows, 2048)
         XCTAssertEqual(config.maxPendingAnalytics, 512)
+        XCTAssertFalse(config.packetStreamEnabled)
+        XCTAssertEqual(config.packetStreamMaxBytes, 5_000_000)
 
         XCTAssertEqual(config.ipv4Address, "10.0.0.2")
         XCTAssertEqual(config.ipv4SubnetMask, "255.255.255.0")
@@ -46,10 +52,13 @@ final class TunnelConfigurationTests: XCTestCase {
             "metricsEnabled": NSNumber(value: 0),
             "metricsRingBufferSize": "128",
             "metricsSnapshotInterval": "2.5",
+            "metricsStoreFormat": "ndjson",
             "burstThresholdMs": "400",
             "flowTTLSeconds": NSNumber(value: 120),
             "maxTrackedFlows": "4096",
             "maxPendingAnalytics": NSNumber(value: 256),
+            "packetStreamEnabled": "true",
+            "packetStreamMaxBytes": "2000000",
             "ipv4Address": "10.1.0.2",
             "ipv4SubnetMask": "255.255.0.0",
             "ipv4Router": "10.1.0.1",
@@ -71,10 +80,13 @@ final class TunnelConfigurationTests: XCTestCase {
         XCTAssertFalse(config.metricsEnabled)
         XCTAssertEqual(config.metricsRingBufferSize, 128)
         XCTAssertEqual(config.metricsSnapshotInterval, 2.5)
+        XCTAssertEqual(config.metricsStoreFormat, .ndjson)
         XCTAssertEqual(config.burstThresholdMs, 400)
         XCTAssertEqual(config.flowTTLSeconds, 120)
         XCTAssertEqual(config.maxTrackedFlows, 4096)
         XCTAssertEqual(config.maxPendingAnalytics, 256)
+        XCTAssertTrue(config.packetStreamEnabled)
+        XCTAssertEqual(config.packetStreamMaxBytes, 2_000_000)
         XCTAssertEqual(config.ipv4Address, "10.1.0.2")
         XCTAssertEqual(config.ipv4SubnetMask, "255.255.0.0")
         XCTAssertEqual(config.ipv4Router, "10.1.0.1")

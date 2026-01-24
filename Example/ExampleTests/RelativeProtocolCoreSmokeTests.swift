@@ -1,3 +1,6 @@
+// Created by Will Kusch 1/23/26
+// Property of Relative Companies Inc. See LICENSE for more info.
+// Code is not to be reproduced or used in any commercial project, free or paid.
 //
 //  RelativeProtocolCoreSmokeTests.swift
 //  ExampleTests
@@ -57,14 +60,10 @@ final class RelativeProtocolCoreSmokeTests: XCTestCase {
         XCTAssertEqual(metadata?.dnsQueryName, "example.com")
     }
 
-    func testMetricsStoreCapsSnapshots() throws {
-        let suiteName = "test.metrics.\(UUID().uuidString)"
-        guard let defaults = UserDefaults(suiteName: suiteName) else {
-            throw XCTSkip("UserDefaults suite unavailable for \(suiteName)")
-        }
-        defaults.removePersistentDomain(forName: suiteName)
-
-        let store = MetricsStore(appGroupID: suiteName, maxSnapshots: 2, maxBytes: 10_000)
+    func testMetricsStoreCapsSnapshots() {
+        let appGroupID = "test.metrics.\(UUID().uuidString)"
+        let store = MetricsStore(appGroupID: appGroupID, maxSnapshots: 2, maxBytes: 10_000)
+        store.clear()
         store.append(makeSnapshot(id: 1))
         store.append(makeSnapshot(id: 2))
         store.append(makeSnapshot(id: 3))
@@ -75,14 +74,10 @@ final class RelativeProtocolCoreSmokeTests: XCTestCase {
         XCTAssertEqual(loaded.last?.samples.first?.flowId, 3)
     }
 
-    func testMetricsStoreRejectsOversizedSnapshot() throws {
-        let suiteName = "test.metrics.large.\(UUID().uuidString)"
-        guard let defaults = UserDefaults(suiteName: suiteName) else {
-            throw XCTSkip("UserDefaults suite unavailable for \(suiteName)")
-        }
-        defaults.removePersistentDomain(forName: suiteName)
-
-        let store = MetricsStore(appGroupID: suiteName, maxSnapshots: 5, maxBytes: 256)
+    func testMetricsStoreRejectsOversizedSnapshot() {
+        let appGroupID = "test.metrics.large.\(UUID().uuidString)"
+        let store = MetricsStore(appGroupID: appGroupID, maxSnapshots: 5, maxBytes: 256)
+        store.clear()
         store.append(makeSnapshot(id: 1, dnsNameLength: 512))
 
         XCTAssertTrue(store.load().isEmpty)
@@ -97,9 +92,17 @@ final class RelativeProtocolCoreSmokeTests: XCTestCase {
             length: 64,
             flowId: id,
             burstId: 0,
+            srcAddress: "192.0.2.1",
+            dstAddress: "198.51.100.1",
             srcPort: 12000,
             dstPort: 53,
-            dnsQueryName: nil
+            dnsQueryName: nil,
+            dnsCname: nil,
+            registrableDomain: nil,
+            tlsServerName: nil,
+            quicVersion: nil,
+            quicDestinationConnectionId: nil,
+            quicSourceConnectionId: nil
         )
     }
 
@@ -113,9 +116,17 @@ final class RelativeProtocolCoreSmokeTests: XCTestCase {
             length: 120,
             flowId: id,
             burstId: 0,
+            srcAddress: "192.0.2.53",
+            dstAddress: "198.51.100.2",
             srcPort: 53,
             dstPort: 53000,
-            dnsQueryName: dnsName
+            dnsQueryName: dnsName,
+            dnsCname: nil,
+            registrableDomain: dnsName,
+            tlsServerName: nil,
+            quicVersion: nil,
+            quicDestinationConnectionId: nil,
+            quicSourceConnectionId: nil
         )
         return MetricsSnapshot(capturedAt: 1, samples: [sample])
     }
@@ -131,7 +142,13 @@ final class RelativeProtocolCoreSmokeTests: XCTestCase {
             srcPort: 12000,
             dstPort: 53,
             length: 60,
-            dnsQueryName: nil
+            dnsQueryName: nil,
+            dnsCname: nil,
+            registrableDomain: nil,
+            tlsServerName: nil,
+            quicVersion: nil,
+            quicDestinationConnectionId: nil,
+            quicSourceConnectionId: nil
         )
     }
 

@@ -13,6 +13,8 @@
 
 # Xcode user state
 *.xcuserstate
+**/xcuserdata/
+*.xcuserdatad
 
 # Rust build outputs (keep xcframework artifacts that must ship)
 **/target/

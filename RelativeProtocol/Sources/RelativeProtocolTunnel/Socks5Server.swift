@@ -1,3 +1,6 @@
+// Created by Will Kusch 1/23/26
+// Property of Relative Companies Inc. See LICENSE for more info.
+// Code is not to be reproduced or used in any commercial project, free or paid.
 import Foundation
 import Network
 @preconcurrency import NetworkExtension
@@ -136,7 +139,9 @@ final class NWConnectionTCPAdapter: Socks5TCPOutbound {
         case .ready:
             if !didLogReady {
                 didLogReady = true
-                logger.info("Outbound TCP ready. \(pathSummary(self.connection.currentPath), privacy: .public)")
+                if RelativeLog.isVerbose {
+                    logger.info("Outbound TCP ready. \(pathSummary(self.connection.currentPath), privacy: .public)")
+                }
             }
         case .waiting(let error):
             if !didLogWaiting {
@@ -220,7 +225,9 @@ final class NWConnectionUDPSessionAdapter: Socks5UDPSession {
         case .ready:
             if !didLogReady {
                 didLogReady = true
-                logger.info("Outbound UDP ready. \(pathSummary(self.connection.currentPath), privacy: .public)")
+                if RelativeLog.isVerbose {
+                    logger.info("Outbound UDP ready. \(pathSummary(self.connection.currentPath), privacy: .public)")
+                }
             }
         case .waiting(let error):
             if !didLogWaiting {
@@ -300,11 +307,15 @@ final class PacketTunnelProviderAdapter: Socks5ConnectionProvider {
         delegate: NWTCPConnectionAuthenticationDelegate?
     ) -> Socks5TCPOutbound {
         if let outbound = makeNWConnection(to: endpoint, enableTLS: enableTLS) {
-            logger.debug("Outbound TCP using NWConnection to \(endpoint.hostname, privacy: .public):\(endpoint.port, privacy: .public)")
+            if RelativeLog.isVerbose {
+                logger.debug("Outbound TCP using NWConnection to \(endpoint.hostname, privacy: .public):\(endpoint.port, privacy: .public)")
+            }
             return outbound
         }
 
-        logger.debug("Outbound TCP using createTCPConnectionThroughTunnel to \(endpoint.hostname, privacy: .public):\(endpoint.port, privacy: .public)")
+        if RelativeLog.isVerbose {
+            logger.debug("Outbound TCP using createTCPConnectionThroughTunnel to \(endpoint.hostname, privacy: .public):\(endpoint.port, privacy: .public)")
+        }
         let connection = provider.createTCPConnectionThroughTunnel(
             to: endpoint,
             enableTLS: enableTLS,
@@ -316,11 +327,15 @@ final class PacketTunnelProviderAdapter: Socks5ConnectionProvider {
 
     func makeUDPSession(to endpoint: NWHostEndpoint) -> Socks5UDPSession {
         if let outbound = makeNWUDPSession(to: endpoint) {
-            logger.debug("Outbound UDP using NWConnection to \(endpoint.hostname, privacy: .public):\(endpoint.port, privacy: .public)")
+            if RelativeLog.isVerbose {
+                logger.debug("Outbound UDP using NWConnection to \(endpoint.hostname, privacy: .public):\(endpoint.port, privacy: .public)")
+            }
             return outbound
         }
 
-        logger.debug("Outbound UDP using createUDPSessionThroughTunnel to \(endpoint.hostname, privacy: .public):\(endpoint.port, privacy: .public)")
+        if RelativeLog.isVerbose {
+            logger.debug("Outbound UDP using createUDPSessionThroughTunnel to \(endpoint.hostname, privacy: .public):\(endpoint.port, privacy: .public)")
+        }
         let session = provider.createUDPSessionThroughTunnel(to: endpoint, from: nil)
         return NWUDPSessionAdapter(session)
     }
@@ -335,7 +350,9 @@ final class PacketTunnelProviderAdapter: Socks5ConnectionProvider {
         if #available(iOS 18.0, macOS 15.0, *) {
             if let virtualInterface = provider.virtualInterface {
                 parameters.prohibitedInterfaces = [virtualInterface]
-                logger.debug("Outbound TCP prohibiting interface \(virtualInterface.name, privacy: .public)")
+                if RelativeLog.isVerbose {
+                    logger.debug("Outbound TCP prohibiting interface \(virtualInterface.name, privacy: .public)")
+                }
             }
         }
 
@@ -354,7 +371,9 @@ final class PacketTunnelProviderAdapter: Socks5ConnectionProvider {
         if #available(iOS 18.0, macOS 15.0, *) {
             if let virtualInterface = provider.virtualInterface {
                 parameters.prohibitedInterfaces = [virtualInterface]
-                logger.debug("Outbound UDP prohibiting interface \(virtualInterface.name, privacy: .public)")
+                if RelativeLog.isVerbose {
+                    logger.debug("Outbound UDP prohibiting interface \(virtualInterface.name, privacy: .public)")
+                }
             }
         }
 
@@ -415,11 +434,15 @@ final class Socks5Server {
                 guard let self else { return }
                 switch state {
                 case .setup:
-                    self.logger.debug("SOCKS5 listener state: setup")
-                    NSLog("Socks5Server: listener state setup")
+                    if RelativeLog.isVerbose {
+                        self.logger.debug("SOCKS5 listener state: setup")
+                        NSLog("Socks5Server: listener state setup")
+                    }
                 case .waiting(let error):
                     self.logger.error("SOCKS5 listener waiting: \(error.localizedDescription, privacy: .public)")
-                    NSLog("Socks5Server: listener waiting: \(error.localizedDescription)")
+                    if RelativeLog.isVerbose {
+                        NSLog("Socks5Server: listener waiting: \(error.localizedDescription)")
+                    }
                 case .ready:
                     if !didComplete {
                         didComplete = true
@@ -427,8 +450,10 @@ final class Socks5Server {
                         completion(.success(actualPort))
                     }
                     let actualPort = listener.port?.rawValue ?? port
-                    self.logger.info("SOCKS5 server listening on \(actualPort, privacy: .public)")
-                    NSLog("Socks5Server: listener ready on port \(actualPort)")
+                    if RelativeLog.isVerbose {
+                        self.logger.info("SOCKS5 server listening on \(actualPort, privacy: .public)")
+                        NSLog("Socks5Server: listener ready on port \(actualPort)")
+                    }
                     if !didProbe {
                         didProbe = true
                         self.probeLoopback(port: actualPort)
@@ -438,7 +463,9 @@ final class Socks5Server {
                         didComplete = true
                         let nextPort = self.pickEphemeralPort()
                         self.logger.error("SOCKS5 listener failed on port \(port, privacy: .public); retrying on port \(nextPort, privacy: .public)")
-                        NSLog("Socks5Server: listener failed on port \(port); retrying on port \(nextPort)")
+                        if RelativeLog.isVerbose {
+                            NSLog("Socks5Server: listener failed on port \(port); retrying on port \(nextPort)")
+                        }
                         listener.cancel()
                         self.listener = nil
                         self.startListener(port: nextPort, remainingAttempts: remainingAttempts - 1, completion: completion)
@@ -449,10 +476,14 @@ final class Socks5Server {
                         completion(.failure(error))
                     }
                     self.logger.error("SOCKS5 listener failed: \(error.localizedDescription, privacy: .public)")
-                    NSLog("Socks5Server: listener failed: \(error.localizedDescription)")
+                    if RelativeLog.isVerbose {
+                        NSLog("Socks5Server: listener failed: \(error.localizedDescription)")
+                    }
                 case .cancelled:
-                    self.logger.debug("SOCKS5 listener cancelled")
-                    NSLog("Socks5Server: listener cancelled")
+                    if RelativeLog.isVerbose {
+                        self.logger.debug("SOCKS5 listener cancelled")
+                        NSLog("Socks5Server: listener cancelled")
+                    }
                 default:
                     break
                 }
@@ -460,7 +491,9 @@ final class Socks5Server {
 
             listener.newConnectionHandler = { [weak self] connection in
                 guard let self else { return }
-                NSLog("Socks5Server: accepted connection \(String(describing: connection.endpoint))")
+                if RelativeLog.isVerbose {
+                    NSLog("Socks5Server: accepted connection \(String(describing: connection.endpoint))")
+                }
                 let session = Socks5Connection(
                     connection: NWConnectionAdapter(connection),
                     provider: self.provider,
@@ -510,13 +543,17 @@ final class Socks5Server {
                 case .ready:
                     if !finished {
                         finished = true
-                        NSLog("Socks5Server: loopback probe to \(label):\(port) succeeded")
+                        if RelativeLog.isVerbose {
+                            NSLog("Socks5Server: loopback probe to \(label):\(port) succeeded")
+                        }
                         connection.cancel()
                     }
                 case .failed(let error):
                     if !finished {
                         finished = true
-                        NSLog("Socks5Server: loopback probe to \(label):\(port) failed: \(error.localizedDescription)")
+                        if RelativeLog.isVerbose {
+                            NSLog("Socks5Server: loopback probe to \(label):\(port) failed: \(error.localizedDescription)")
+                        }
                         connection.cancel()
                     }
                 default:
@@ -528,7 +565,9 @@ final class Socks5Server {
             queue.asyncAfter(deadline: .now() + 1.0) {
                 if !finished {
                     finished = true
-                    NSLog("Socks5Server: loopback probe to \(label):\(port) timed out")
+                    if RelativeLog.isVerbose {
+                        NSLog("Socks5Server: loopback probe to \(label):\(port) timed out")
+                    }
                     connection.cancel()
                 }
             }
@@ -636,8 +675,10 @@ final class Socks5Connection {
         case .greeting:
             guard let methods = Socks5Codec.parseGreeting(&buffer) else { return }
             let method: UInt8 = methods.contains(0x00) ? 0x00 : 0xFF
-            logger.debug("SOCKS5 greeting methods: \(methods, privacy: .public) -> \(method, privacy: .public)")
-            NSLog("Socks5Connection: greeting methods=\(methods) selected=\(method)")
+            if RelativeLog.isVerbose {
+                logger.debug("SOCKS5 greeting methods: \(methods, privacy: .public) -> \(method, privacy: .public)")
+                NSLog("Socks5Connection: greeting methods=\(methods) selected=\(method)")
+            }
             connection.send(content: Socks5Codec.buildMethodSelection(method: method), completion: .contentProcessed { _ in })
             if method == 0x00 {
                 state = .request
@@ -647,8 +688,10 @@ final class Socks5Connection {
             }
         case .request:
             guard let request = Socks5Codec.parseRequest(&buffer) else { return }
-            logger.debug("SOCKS5 request \(String(describing: request.command), privacy: .public) \(String(describing: request.address), privacy: .public):\(request.port, privacy: .public)")
-            NSLog("Socks5Connection: request cmd=\(request.command) addr=\(request.address) port=\(request.port)")
+            if RelativeLog.isVerbose {
+                logger.debug("SOCKS5 request \(String(describing: request.command), privacy: .public) \(String(describing: request.address), privacy: .public):\(request.port, privacy: .public)")
+                NSLog("Socks5Connection: request cmd=\(request.command) addr=\(request.address) port=\(request.port)")
+            }
             handleRequest(request)
         case .tcpProxy(let outbound):
             if !buffer.isEmpty {
@@ -678,7 +721,9 @@ final class Socks5Connection {
             host = value
         }
         let endpoint = NWHostEndpoint(hostname: host, port: String(request.port))
-        NSLog("Socks5Connection: opening outbound to \(host):\(request.port)")
+        if RelativeLog.isVerbose {
+            NSLog("Socks5Connection: opening outbound to \(host):\(request.port)")
+        }
         let outbound = provider.makeTCPConnection(to: endpoint, enableTLS: false, tlsParameters: nil, delegate: nil)
 
         state = .tcpProxy(outbound)

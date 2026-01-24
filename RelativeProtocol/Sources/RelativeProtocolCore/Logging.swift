@@ -1,3 +1,7 @@
+// Created by Will Kusch 1/23/26
+// Property of Relative Companies Inc. See LICENSE for more info.
+// Code is not to be reproduced or used in any commercial project, free or paid.
+import Foundation
 import os
 
 public enum RelativeLogCategory: String {
@@ -8,6 +12,16 @@ public enum RelativeLogCategory: String {
 }
 
 public enum RelativeLog {
+    public static let isVerbose: Bool = {
+        let env = ProcessInfo.processInfo.environment["RELATIVE_VERBOSE_LOGS"]?.lowercased()
+        let enabled = env == "1" || env == "true" || env == "yes"
+        #if DEBUG
+        return enabled
+        #else
+        return false
+        #endif
+    }()
+
     public static func logger(_ category: RelativeLogCategory) -> Logger {
         Logger(subsystem: "com.relative.protocol", category: category.rawValue)
     }

@@ -1,6 +1,10 @@
+// Created by Will Kusch 1/23/26
+// Property of Relative Companies Inc. See LICENSE for more info.
+// Code is not to be reproduced or used in any commercial project, free or paid.
 import Combine
 import Darwin
 import RelativeProtocolCore
+import RelativeProtocolHost
 import SwiftUI
 
 enum DiagnosticStatus: Equatable {
@@ -22,19 +26,37 @@ struct DiagnosticCheck {
     let run: () -> DiagnosticStatus
 }
 
+struct PacketStreamDiagnostics: Equatable {
+    let appGroupID: String
+    let containerURL: URL?
+    let streamURL: URL?
+    let fileExists: Bool
+    let fileSizeBytes: Int?
+    let usesAppGroupContainer: Bool
+}
+
 @MainActor
 final class DiagnosticsViewModel: ObservableObject {
     @Published var items: [DiagnosticItem]
     @Published var isRunning = false
     @Published var lastRun: Date?
+    @Published var recentSamples: [PacketSample] = []
+    @Published var lastStreamUpdate: Date?
+    @Published var streamDiagnostics: PacketStreamDiagnostics
+    @Published var streamSampleCount: Int = 0
 
     private let checks: [DiagnosticCheck]
+    private let packetStreamClient: PacketStreamClient
+
+    private static let appGroupID = "group.relative-companies.Example"
 
     init() {
+        self.packetStreamClient = PacketStreamClient(appGroupID: Self.appGroupID)
         self.checks = DiagnosticsViewModel.makeChecks()
         self.items = checks.map {
             DiagnosticItem(name: $0.name, detail: $0.detail, status: .pending)
         }
+        self.streamDiagnostics = DiagnosticsViewModel.makeStreamDiagnostics()
     }
 
     func runAll() {
@@ -55,6 +77,37 @@ final class DiagnosticsViewModel: ObservableObject {
                 lastRun = Date()
             }
         }
+    }
+
+    func refreshPacketStream() {
+        let samples = packetStreamClient.readAll()
+        streamSampleCount = samples.count
+        recentSamples = Array(samples.suffix(10)).reversed()
+        lastStreamUpdate = Date()
+        streamDiagnostics = DiagnosticsViewModel.makeStreamDiagnostics()
+    }
+
+    static func makeStreamDiagnostics() -> PacketStreamDiagnostics {
+        let fileManager = FileManager.default
+        let containerURL = fileManager.containerURL(forSecurityApplicationGroupIdentifier: appGroupID)
+        let streamURL = PacketSampleStreamLocation.makeURL(appGroupID: appGroupID)
+        let fileExists = streamURL.map { fileManager.fileExists(atPath: $0.path) } ?? false
+        let fileSize: Int?
+        if let streamURL, fileExists,
+           let size = try? fileManager.attributesOfItem(atPath: streamURL.path)[.size] as? NSNumber {
+            fileSize = size.intValue
+        } else {
+            fileSize = nil
+        }
+        let usesAppGroupContainer = containerURL != nil
+        return PacketStreamDiagnostics(
+            appGroupID: appGroupID,
+            containerURL: containerURL,
+            streamURL: streamURL,
+            fileExists: fileExists,
+            fileSizeBytes: fileSize,
+            usesAppGroupContainer: usesAppGroupContainer
+        )
     }
 
     private static func makeChecks() -> [DiagnosticCheck] {
@@ -143,13 +196,9 @@ final class DiagnosticsViewModel: ObservableObject {
     }
 
     private static func checkMetricsStoreCap() -> DiagnosticStatus {
-        let suiteName = "diagnostics.metrics.\(UUID().uuidString)"
-        guard let defaults = UserDefaults(suiteName: suiteName) else {
-            return .failed("UserDefaults suite unavailable.")
-        }
-        defaults.removePersistentDomain(forName: suiteName)
-
-        let store = MetricsStore(appGroupID: suiteName, maxSnapshots: 2, maxBytes: 10_000)
+        let appGroupID = "diagnostics.metrics.\(UUID().uuidString)"
+        let store = MetricsStore(appGroupID: appGroupID, maxSnapshots: 2, maxBytes: 10_000)
+        store.clear()
         store.append(makeSnapshot(id: 1))
         store.append(makeSnapshot(id: 2))
         store.append(makeSnapshot(id: 3))
@@ -166,13 +215,9 @@ final class DiagnosticsViewModel: ObservableObject {
     }
 
     private static func checkMetricsStoreOversized() -> DiagnosticStatus {
-        let suiteName = "diagnostics.metrics.large.\(UUID().uuidString)"
-        guard let defaults = UserDefaults(suiteName: suiteName) else {
-            return .failed("UserDefaults suite unavailable.")
-        }
-        defaults.removePersistentDomain(forName: suiteName)
-
-        let store = MetricsStore(appGroupID: suiteName, maxSnapshots: 5, maxBytes: 256)
+        let appGroupID = "diagnostics.metrics.large.\(UUID().uuidString)"
+        let store = MetricsStore(appGroupID: appGroupID, maxSnapshots: 5, maxBytes: 256)
+        store.clear()
         store.append(makeSnapshot(id: 1, dnsNameLength: 512))
 
         guard store.load().isEmpty else {
@@ -190,9 +235,17 @@ final class DiagnosticsViewModel: ObservableObject {
             length: 64,
             flowId: id,
             burstId: 0,
+            srcAddress: "192.0.2.1",
+            dstAddress: "198.51.100.1",
             srcPort: 12000,
             dstPort: 53,
-            dnsQueryName: nil
+            dnsQueryName: nil,
+            dnsCname: nil,
+            registrableDomain: nil,
+            tlsServerName: nil,
+            quicVersion: nil,
+            quicDestinationConnectionId: nil,
+            quicSourceConnectionId: nil
         )
     }
 
@@ -206,9 +259,17 @@ final class DiagnosticsViewModel: ObservableObject {
             length: 120,
             flowId: id,
             burstId: 0,
+            srcAddress: "192.0.2.53",
+            dstAddress: "198.51.100.2",
             srcPort: 53,
             dstPort: 53000,
-            dnsQueryName: dnsName
+            dnsQueryName: dnsName,
+            dnsCname: nil,
+            registrableDomain: dnsName,
+            tlsServerName: nil,
+            quicVersion: nil,
+            quicDestinationConnectionId: nil,
+            quicSourceConnectionId: nil
         )
         return MetricsSnapshot(capturedAt: 1, samples: [sample])
     }
@@ -224,7 +285,13 @@ final class DiagnosticsViewModel: ObservableObject {
             srcPort: 12000,
             dstPort: 53,
             length: 60,
-            dnsQueryName: nil
+            dnsQueryName: nil,
+            dnsCname: nil,
+            registrableDomain: nil,
+            tlsServerName: nil,
+            quicVersion: nil,
+            quicDestinationConnectionId: nil,
+            quicSourceConnectionId: nil
         )
     }
 
@@ -342,12 +409,80 @@ struct DiagnosticsView: View {
                     .padding(.vertical, 4)
                 }
             }
+
+            Section {
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Packet Stream")
+                            .font(.headline)
+                        Text("Most recent packet samples from the tunnel stream.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                        if let lastUpdate = model.lastStreamUpdate {
+                            Text("Last refresh: \(lastUpdate.formatted(.dateTime.hour().minute().second()))")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer()
+                    Button("Refresh") {
+                        model.refreshPacketStream()
+                    }
+                    .buttonStyle(.borderless)
+                }
+
+                packetStreamDiagnosticsView(model.streamDiagnostics)
+
+                if model.recentSamples.isEmpty {
+                    Text("No packet samples available yet.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(Array(model.recentSamples.enumerated()), id: \.offset) { _, sample in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(packetHeadline(sample))
+                                .font(.subheadline)
+                                .monospaced()
+                            Text(packetDetail(sample))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            if let dnsLine = packetDNSLine(sample) {
+                                Text(dnsLine)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            if let classificationLine = packetClassificationLine(sample) {
+                                Text(classificationLine)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            if let burstLine = packetBurstLine(sample) {
+                                Text(burstLine)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            if let tlsLine = packetTLSLine(sample) {
+                                Text(tlsLine)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            if let quicLine = packetQuicLine(sample) {
+                                Text(quicLine)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.vertical, 6)
+                    }
+                }
+            }
         }
         .navigationTitle("Diagnostics")
         .onAppear {
             if model.lastRun == nil && model.items.allSatisfy({ $0.status == .pending }) {
                 model.runAll()
             }
+            model.refreshPacketStream()
         }
     }
 
@@ -371,5 +506,150 @@ struct DiagnosticsView: View {
         case .failed:
             return "Failed"
         }
+    }
+
+    private func packetHeadline(_ sample: PacketSample) -> String {
+        let timestamp = Date(timeIntervalSince1970: sample.timestamp)
+            .formatted(.dateTime.hour().minute().second())
+        return "\(timestamp)  \(directionLabel(sample.direction)) \(ipVersionLabel(sample.ipVersion))/\(transportLabel(sample.transport))  \(sample.length)B"
+    }
+
+    private func packetDetail(_ sample: PacketSample) -> String {
+        let srcPort = sample.srcPort.map(String.init) ?? "-"
+        let dstPort = sample.dstPort.map(String.init) ?? "-"
+        let srcAddress = sample.srcAddress ?? "-"
+        let dstAddress = sample.dstAddress ?? "-"
+        return "Flow \(sample.flowId)  Burst \(sample.burstId)  \(srcAddress):\(srcPort) → \(dstAddress):\(dstPort)"
+    }
+
+    private func packetDNSLine(_ sample: PacketSample) -> String? {
+        let parts = [
+            sample.dnsQueryName.map { "Query: \($0)" },
+            sample.dnsCname.map { "CNAME: \($0)" },
+            sample.dnsAnswerAddresses
+                .flatMap { $0.isEmpty ? nil : $0 }
+                .map { "Answers: \($0.joined(separator: ", "))" },
+            sample.registrableDomain.map { "Domain: \($0)" }
+        ].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: "  ")
+    }
+
+    private func packetClassificationLine(_ sample: PacketSample) -> String? {
+        guard let classification = sample.trafficClassification else { return nil }
+        let label = classification.label ?? "unknown"
+        let domain = classification.domain ?? "-"
+        let cdn = classification.cdn ?? "-"
+        let asn = classification.asn ?? "-"
+        let confidence = String(format: "%.2f", classification.confidence)
+        let reasons = classification.reasons.isEmpty ? "-" : classification.reasons.joined(separator: ",")
+        return "Guess: \(label) domain=\(domain) cdn=\(cdn) asn=\(asn) conf=\(confidence) reasons=\(reasons)"
+    }
+
+    private func packetBurstLine(_ sample: PacketSample) -> String? {
+        guard let burst = sample.burstMetrics else { return nil }
+        let pps = String(format: "%.1f", burst.packetsPerSecond)
+        let bps = String(format: "%.0f", burst.bytesPerSecond)
+        return "Burst: \(burst.packetCount)pkt \(burst.byteCount)B \(burst.durationMs)ms \(pps)p/s \(bps)B/s"
+    }
+
+    private func packetTLSLine(_ sample: PacketSample) -> String? {
+        guard let serverName = sample.tlsServerName else { return nil }
+        return "TLS SNI: \(serverName)"
+    }
+
+    private func packetQuicLine(_ sample: PacketSample) -> String? {
+        let hasQuic = sample.quicVersion != nil ||
+            sample.quicDestinationConnectionId != nil ||
+            sample.quicSourceConnectionId != nil
+        guard hasQuic else { return nil }
+        let version = sample.quicVersion.map { String(format: "0x%08X", $0) }
+        let dcid = sample.quicDestinationConnectionId
+        let scid = sample.quicSourceConnectionId
+        let parts = [
+            version.map { "QUIC v\($0)" },
+            dcid.map { "DCID: \($0)" },
+            scid.map { "SCID: \($0)" }
+        ].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: "  ")
+    }
+
+    private func directionLabel(_ direction: PacketDirection) -> String {
+        switch direction {
+        case .inbound:
+            return "IN"
+        case .outbound:
+            return "OUT"
+        }
+    }
+
+    private func ipVersionLabel(_ version: IPVersion) -> String {
+        switch version {
+        case .v4:
+            return "IPv4"
+        case .v6:
+            return "IPv6"
+        }
+    }
+
+    private func transportLabel(_ transport: TransportProtocol) -> String {
+        if transport == .tcp {
+            return "TCP"
+        }
+        if transport == .udp {
+            return "UDP"
+        }
+        if transport == .icmp {
+            return "ICMP"
+        }
+        if transport == .icmpv6 {
+            return "ICMPv6"
+        }
+        return "P\(transport.rawValue)"
+    }
+
+    @ViewBuilder
+    private func packetStreamDiagnosticsView(_ info: PacketStreamDiagnostics) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("App Group: \(info.appGroupID)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("Decoded samples: \(model.streamSampleCount)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if info.usesAppGroupContainer {
+                Text("App group container: available")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("App group container: unavailable (entitlement missing at runtime)")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+            if let streamURL = info.streamURL {
+                Text("Stream path: \(streamURL.path)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Stream path: unavailable")
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+            }
+            if info.fileExists {
+                if let size = info.fileSizeBytes {
+                    Text("Stream size: \(size) bytes")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Stream size: unknown")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Text("Stream file: not found")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 4)
     }
 }

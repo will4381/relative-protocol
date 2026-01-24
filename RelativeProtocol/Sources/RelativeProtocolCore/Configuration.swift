@@ -1,3 +1,6 @@
+// Created by Will Kusch 1/23/26
+// Property of Relative Companies Inc. See LICENSE for more info.
+// Code is not to be reproduced or used in any commercial project, free or paid.
 import Foundation
 
 public struct TunnelConfiguration: Sendable {
@@ -14,10 +17,14 @@ public struct TunnelConfiguration: Sendable {
     public let metricsEnabled: Bool
     public let metricsRingBufferSize: Int
     public let metricsSnapshotInterval: TimeInterval
+    public let metricsStoreFormat: MetricsStoreFormat
     public let burstThresholdMs: Int
     public let flowTTLSeconds: Int
     public let maxTrackedFlows: Int
     public let maxPendingAnalytics: Int
+    public let packetStreamEnabled: Bool
+    public let packetStreamMaxBytes: Int
+    public let signatureFileName: String
 
     public let ipv4Address: String
     public let ipv4SubnetMask: String
@@ -40,10 +47,14 @@ public struct TunnelConfiguration: Sendable {
         metricsEnabled = Self.bool(providerConfiguration["metricsEnabled"], default: true)
         metricsRingBufferSize = Self.int(providerConfiguration["metricsRingBufferSize"], default: 2048)
         metricsSnapshotInterval = Self.double(providerConfiguration["metricsSnapshotInterval"], default: 1.0)
+        metricsStoreFormat = Self.metricsFormat(providerConfiguration["metricsStoreFormat"])
         burstThresholdMs = Self.int(providerConfiguration["burstThresholdMs"], default: 350)
         flowTTLSeconds = Self.int(providerConfiguration["flowTTLSeconds"], default: 300)
         maxTrackedFlows = Self.int(providerConfiguration["maxTrackedFlows"], default: 2048)
         maxPendingAnalytics = Self.int(providerConfiguration["maxPendingAnalytics"], default: 512)
+        packetStreamEnabled = Self.bool(providerConfiguration["packetStreamEnabled"], default: false)
+        packetStreamMaxBytes = Self.int(providerConfiguration["packetStreamMaxBytes"], default: 5_000_000)
+        signatureFileName = Self.string(providerConfiguration["signatureFileName"], default: AppSignatureStore.defaultFileName)
 
         ipv4Address = Self.string(providerConfiguration["ipv4Address"], default: "10.0.0.2")
         ipv4SubnetMask = Self.string(providerConfiguration["ipv4SubnetMask"], default: "255.255.255.0")
@@ -107,5 +118,15 @@ public struct TunnelConfiguration: Sendable {
             return value.compactMap { $0 as? String }
         }
         return defaultValue
+    }
+
+    private static func metricsFormat(_ value: Any?) -> MetricsStoreFormat {
+        if let value = value as? MetricsStoreFormat {
+            return value
+        }
+        if let value = value as? String, let format = MetricsStoreFormat(rawValue: value.lowercased()) {
+            return format
+        }
+        return .json
     }
 }

@@ -1,3 +1,6 @@
+// Created by Will Kusch 1/23/26
+// Property of Relative Companies Inc. See LICENSE for more info.
+// Code is not to be reproduced or used in any commercial project, free or paid.
 import Darwin
 import Foundation
 
@@ -27,6 +30,12 @@ public enum PacketDirection: String, Codable, Sendable {
 public struct IPAddress: Hashable, Codable, Sendable {
     public let bytes: Data
 
+    private static let stringCache: NSCache<NSData, NSString> = {
+        let cache = NSCache<NSData, NSString>()
+        cache.countLimit = 4096
+        return cache
+    }()
+
     public init?(bytes: Data) {
         guard bytes.count == 4 || bytes.count == 16 else { return nil }
         self.bytes = bytes
@@ -37,7 +46,11 @@ public struct IPAddress: Hashable, Codable, Sendable {
     }
 
     public var stringValue: String {
-        bytes.withUnsafeBytes { rawBuffer in
+        let key = bytes as NSData
+        if let cached = Self.stringCache.object(forKey: key) {
+            return cached as String
+        }
+        let value = bytes.withUnsafeBytes { rawBuffer in
             guard let baseAddress = rawBuffer.baseAddress else {
                 return ""
             }
@@ -56,6 +69,10 @@ public struct IPAddress: Hashable, Codable, Sendable {
                 return result == nil ? "" : String(cString: buffer)
             }
         }
+        if !value.isEmpty {
+            Self.stringCache.setObject(value as NSString, forKey: key)
+        }
+        return value
     }
 }
 
@@ -77,6 +94,13 @@ public struct PacketMetadata: Sendable {
     public let dstPort: UInt16?
     public let length: Int
     public let dnsQueryName: String?
+    public let dnsCname: String?
+    public let dnsAnswerAddresses: [IPAddress]?
+    public let registrableDomain: String?
+    public let tlsServerName: String?
+    public let quicVersion: UInt32?
+    public let quicDestinationConnectionId: String?
+    public let quicSourceConnectionId: String?
 
     public init(
         ipVersion: IPVersion,
@@ -86,7 +110,14 @@ public struct PacketMetadata: Sendable {
         srcPort: UInt16?,
         dstPort: UInt16?,
         length: Int,
-        dnsQueryName: String?
+        dnsQueryName: String?,
+        dnsCname: String?,
+        dnsAnswerAddresses: [IPAddress]? = nil,
+        registrableDomain: String?,
+        tlsServerName: String?,
+        quicVersion: UInt32?,
+        quicDestinationConnectionId: String?,
+        quicSourceConnectionId: String?
     ) {
         self.ipVersion = ipVersion
         self.transport = transport
@@ -96,6 +127,13 @@ public struct PacketMetadata: Sendable {
         self.dstPort = dstPort
         self.length = length
         self.dnsQueryName = dnsQueryName
+        self.dnsCname = dnsCname
+        self.dnsAnswerAddresses = dnsAnswerAddresses
+        self.registrableDomain = registrableDomain
+        self.tlsServerName = tlsServerName
+        self.quicVersion = quicVersion
+        self.quicDestinationConnectionId = quicDestinationConnectionId
+        self.quicSourceConnectionId = quicSourceConnectionId
     }
 }
 
@@ -107,9 +145,20 @@ public struct PacketSample: Codable, Hashable, Sendable {
     public let length: Int
     public let flowId: UInt64
     public let burstId: UInt32
+    public let srcAddress: String?
+    public let dstAddress: String?
     public let srcPort: UInt16?
     public let dstPort: UInt16?
     public let dnsQueryName: String?
+    public let dnsCname: String?
+    public let dnsAnswerAddresses: [String]?
+    public let registrableDomain: String?
+    public let tlsServerName: String?
+    public let quicVersion: UInt32?
+    public let quicDestinationConnectionId: String?
+    public let quicSourceConnectionId: String?
+    public let burstMetrics: BurstMetrics?
+    public let trafficClassification: TrafficClassification?
 
     public init(
         timestamp: TimeInterval,
@@ -119,9 +168,20 @@ public struct PacketSample: Codable, Hashable, Sendable {
         length: Int,
         flowId: UInt64,
         burstId: UInt32,
+        srcAddress: String?,
+        dstAddress: String?,
         srcPort: UInt16?,
         dstPort: UInt16?,
-        dnsQueryName: String?
+        dnsQueryName: String?,
+        dnsCname: String?,
+        dnsAnswerAddresses: [String]? = nil,
+        registrableDomain: String?,
+        tlsServerName: String?,
+        quicVersion: UInt32?,
+        quicDestinationConnectionId: String?,
+        quicSourceConnectionId: String?,
+        burstMetrics: BurstMetrics? = nil,
+        trafficClassification: TrafficClassification? = nil
     ) {
         self.timestamp = timestamp
         self.direction = direction
@@ -130,9 +190,20 @@ public struct PacketSample: Codable, Hashable, Sendable {
         self.length = length
         self.flowId = flowId
         self.burstId = burstId
+        self.srcAddress = srcAddress
+        self.dstAddress = dstAddress
         self.srcPort = srcPort
         self.dstPort = dstPort
         self.dnsQueryName = dnsQueryName
+        self.dnsCname = dnsCname
+        self.dnsAnswerAddresses = dnsAnswerAddresses
+        self.registrableDomain = registrableDomain
+        self.tlsServerName = tlsServerName
+        self.quicVersion = quicVersion
+        self.quicDestinationConnectionId = quicDestinationConnectionId
+        self.quicSourceConnectionId = quicSourceConnectionId
+        self.burstMetrics = burstMetrics
+        self.trafficClassification = trafficClassification
     }
 }
 
