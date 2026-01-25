@@ -51,6 +51,7 @@ public enum PacketParser {
         var registrableDomain: String?
         var tlsServerName: String?
         var quicVersion: UInt32?
+        var quicPacketType: QuicPacketType?
         var quicDestinationConnectionId: String?
         var quicSourceConnectionId: String?
 
@@ -74,10 +75,11 @@ public enum PacketParser {
                     let payloadOffset = ihl + 8
                     if data.count > payloadOffset, let quicInfo = parseQuicHeader(data, payloadOffset: payloadOffset) {
                         quicVersion = quicInfo.version
+                        quicPacketType = mapQuicPacketType(version: quicInfo.version, packetType: quicInfo.packetType)
                         quicDestinationConnectionId = quicInfo.dcid
                         quicSourceConnectionId = quicInfo.scid
                         if tlsServerName == nil,
-                           isQuicInitial(version: quicInfo.version, packetType: quicInfo.packetType),
+                           quicPacketType == .initial,
                            let quicVersion = quicInfo.version,
                            let dcidData = quicInfo.dcidData {
                             tlsServerName = decryptQuicInitialServerName(
@@ -116,6 +118,7 @@ public enum PacketParser {
             registrableDomain: registrableDomain,
             tlsServerName: tlsServerName,
             quicVersion: quicVersion,
+            quicPacketType: quicPacketType,
             quicDestinationConnectionId: quicDestinationConnectionId,
             quicSourceConnectionId: quicSourceConnectionId
         )
@@ -162,6 +165,7 @@ public enum PacketParser {
                     registrableDomain: nil,
                     tlsServerName: nil,
                     quicVersion: nil,
+                    quicPacketType: nil,
                     quicDestinationConnectionId: nil,
                     quicSourceConnectionId: nil
                 )
@@ -183,6 +187,7 @@ public enum PacketParser {
         var registrableDomain: String?
         var tlsServerName: String?
         var quicVersion: UInt32?
+        var quicPacketType: QuicPacketType?
         var quicDestinationConnectionId: String?
         var quicSourceConnectionId: String?
 
@@ -206,10 +211,11 @@ public enum PacketParser {
                     let payloadOffset = offset + 8
                     if data.count > payloadOffset, let quicInfo = parseQuicHeader(data, payloadOffset: payloadOffset) {
                         quicVersion = quicInfo.version
+                        quicPacketType = mapQuicPacketType(version: quicInfo.version, packetType: quicInfo.packetType)
                         quicDestinationConnectionId = quicInfo.dcid
                         quicSourceConnectionId = quicInfo.scid
                         if tlsServerName == nil,
-                           isQuicInitial(version: quicInfo.version, packetType: quicInfo.packetType),
+                           quicPacketType == .initial,
                            let quicVersion = quicInfo.version,
                            let dcidData = quicInfo.dcidData {
                             tlsServerName = decryptQuicInitialServerName(
@@ -248,6 +254,7 @@ public enum PacketParser {
             registrableDomain: registrableDomain,
             tlsServerName: tlsServerName,
             quicVersion: quicVersion,
+            quicPacketType: quicPacketType,
             quicDestinationConnectionId: quicDestinationConnectionId,
             quicSourceConnectionId: quicSourceConnectionId
         )
@@ -331,15 +338,29 @@ public enum PacketParser {
         )
     }
 
-    private static func isQuicInitial(version: UInt32?, packetType: UInt8?) -> Bool {
-        guard let version, let packetType else { return false }
-        if version == quicV1Version {
-            return packetType == 0
+    private static func mapQuicPacketType(version: UInt32?, packetType: UInt8?) -> QuicPacketType? {
+        guard let version, let packetType else { return nil }
+        switch version {
+        case quicV1Version:
+            switch packetType {
+            case 0: return .initial
+            case 1: return .zeroRTT
+            case 2: return .handshake
+            case 3: return .retry
+            default: return nil
+            }
+        case quicV2Version:
+            // QUIC v2 long header mapping: 0=Retry, 1=Initial, 2=0-RTT, 3=Handshake
+            switch packetType {
+            case 0: return .retry
+            case 1: return .initial
+            case 2: return .zeroRTT
+            case 3: return .handshake
+            default: return nil
+            }
+        default:
+            return nil
         }
-        if version == quicV2Version {
-            return packetType == 1
-        }
-        return false
     }
 
     private static func parseTLSServerName(_ data: Data, payloadOffset: Int) -> String? {

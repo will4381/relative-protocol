@@ -75,10 +75,11 @@ public final class TrafficClassifier {
         let tlsName = metadata.tlsServerName
         let registrable = DomainNormalizer.registrableDomain(from: tlsName ?? dnsName ?? metadata.registrableDomain)
 
-        if let answers = metadata.dnsAnswerAddresses, let domain = DomainNormalizer.registrableDomain(from: dnsName ?? metadata.registrableDomain) {
+        if let answers = metadata.dnsAnswerAddresses,
+           let domain = DomainNormalizer.registrableDomain(from: dnsName ?? metadata.registrableDomain) {
             let cdn = cdnProvider(for: dnsName ?? domain)
             let asn = asnForProvider(cdn)
-            let label = appLabel(for: domain)
+            let label = appLabel(for: dnsName ?? domain)
             for address in answers {
                 updateCache(
                     ip: address.stringValue,
@@ -98,7 +99,7 @@ public final class TrafficClassifier {
             let domain = DomainNormalizer.registrableDomain(from: tlsName) ?? tlsName
             let cdn = cdnProvider(for: tlsName)
             let asn = asnForProvider(cdn)
-            let label = appLabel(for: domain)
+            let label = appLabel(for: tlsName)
             updateCache(
                 ip: remoteIP,
                 domain: domain,
@@ -115,7 +116,7 @@ public final class TrafficClassifier {
         var reasons: [String] = []
         var confidence: Double = 0.0
         var domain = registrable
-        var label = domain.flatMap(appLabel(for:))
+        var label = appLabel(for: tlsName ?? dnsName ?? domain)
         var cdn = cdnProvider(for: tlsName ?? dnsName ?? domain)
         var asn = asnForProvider(cdn)
 
@@ -244,8 +245,58 @@ public final class TrafficClassifier {
     }
 
     private func matchesDomain(_ candidate: String, signatureDomain: String) -> Bool {
+        if signatureDomain.contains("*") {
+            return wildcardMatch(candidate, pattern: signatureDomain)
+        }
         if candidate == signatureDomain { return true }
         return candidate.hasSuffix("." + signatureDomain)
+    }
+
+    private func wildcardMatch(_ candidate: String, pattern: String) -> Bool {
+        let candidateLabels = candidate.split(separator: ".")
+        let patternLabels = pattern.split(separator: ".")
+        guard candidateLabels.count == patternLabels.count else { return false }
+
+        for (candidateLabel, patternLabel) in zip(candidateLabels, patternLabels) {
+            if !wildcardMatchLabel(candidateLabel, pattern: patternLabel) {
+                return false
+            }
+        }
+        return true
+    }
+
+    private func wildcardMatchLabel(_ candidate: Substring, pattern: Substring) -> Bool {
+        var cIndex = candidate.startIndex
+        var pIndex = pattern.startIndex
+        var starIndex: Substring.Index?
+        var matchIndex: Substring.Index?
+
+        while cIndex < candidate.endIndex {
+            if pIndex < pattern.endIndex, pattern[pIndex] == candidate[cIndex] {
+                cIndex = candidate.index(after: cIndex)
+                pIndex = pattern.index(after: pIndex)
+                continue
+            }
+            if pIndex < pattern.endIndex, pattern[pIndex] == "*" {
+                starIndex = pIndex
+                matchIndex = cIndex
+                pIndex = pattern.index(after: pIndex)
+                continue
+            }
+            if let star = starIndex, let match = matchIndex {
+                pIndex = pattern.index(after: star)
+                let nextMatch = candidate.index(after: match)
+                matchIndex = nextMatch
+                cIndex = nextMatch
+                continue
+            }
+            return false
+        }
+
+        while pIndex < pattern.endIndex, pattern[pIndex] == "*" {
+            pIndex = pattern.index(after: pIndex)
+        }
+        return pIndex == pattern.endIndex
     }
 
     private func cdnProvider(for domain: String?) -> String? {

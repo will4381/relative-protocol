@@ -55,6 +55,7 @@ final class PacketParserTests: XCTestCase {
 
         let metadata = PacketParser.parse(packet, ipVersionHint: AF_INET)
         XCTAssertEqual(metadata?.quicVersion, 0x00000001)
+        XCTAssertEqual(metadata?.quicPacketType, .initial)
         XCTAssertEqual(metadata?.quicDestinationConnectionId, "8394c8f03e515708")
         XCTAssertEqual(metadata?.tlsServerName, "example.com")
     }
@@ -76,6 +77,7 @@ final class PacketParserTests: XCTestCase {
 
         let metadata = PacketParser.parse(packet, ipVersionHint: AF_INET)
         XCTAssertEqual(metadata?.quicVersion, 0x00000001)
+        XCTAssertEqual(metadata?.quicPacketType, .zeroRTT)
         XCTAssertEqual(metadata?.quicDestinationConnectionId, "deadbeef01020304")
         XCTAssertNil(metadata?.tlsServerName)
     }
@@ -97,6 +99,7 @@ final class PacketParserTests: XCTestCase {
 
         let metadata = PacketParser.parse(packet, ipVersionHint: AF_INET)
         XCTAssertEqual(metadata?.quicVersion, 0x6b3343cf)
+        XCTAssertEqual(metadata?.quicPacketType, .initial)
         XCTAssertEqual(metadata?.quicDestinationConnectionId, "1122334455667788")
         XCTAssertNil(metadata?.tlsServerName)
     }
@@ -118,6 +121,7 @@ final class PacketParserTests: XCTestCase {
 
         let metadata = PacketParser.parse(packet, ipVersionHint: AF_INET)
         XCTAssertEqual(metadata?.quicVersion, 0x6b3343cf)
+        XCTAssertEqual(metadata?.quicPacketType, .zeroRTT)
         XCTAssertEqual(metadata?.quicDestinationConnectionId, "0a0b0c0d0e0f1011")
         XCTAssertNil(metadata?.tlsServerName)
     }

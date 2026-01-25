@@ -131,6 +131,7 @@ Example JSON:
 - non-empty labels (labels are case-insensitive for uniqueness)
 - non-empty domain list
 - domains are lowercase/trimmed, contain a dot, no scheme (`://`), no `/`, no spaces, no leading/trailing `.`
+- wildcard `*` is allowed inside domains (glob-style match). Wildcards are applied per-label and do not cross dots.
 
 On load, the tunnel uses `loadValidated`. Invalid files are ignored.
 
@@ -162,6 +163,8 @@ PacketStream/<key>.ndjson
 The file is capped by `packetStreamMaxBytes` and is reset when it exceeds the limit.
 Use `PacketStreamCursor` with `PacketSampleStreamReader.readNew(cursor:)` to safely resume across rotations.
 
+Each `PacketSample` includes DNS/TLS/QUIC metadata (including `quicPacketType`) and burst/classification fields when available.
+
 ## Diagnostics
 
 The Example app ships with a diagnostics screen that reads metrics + the packet stream, showing recent packet samples, DNS/TLS/QUIC metadata, burst metrics, and classification.
@@ -185,6 +188,8 @@ swift test
 ## Notes
 
 - Classification matches exact domains or subdomains (e.g. `api.tiktok.com` matches `tiktok.com`, but `notiktok.com` does not).
+- Signature domains can include `*` wildcards (e.g. `p*.tiktokcdn*.com`) and are matched against the full hostname using per-label matching.
+- QUIC packet types are surfaced (`initial`, `zeroRTT`, `handshake`, `retry`). SNI extraction is only attempted on Initial packets; 0‑RTT is not decrypted.
 - The tunnel only uses metadata (DNS/TLS/QUIC headers and flow timing). No payload capture is performed.
 
 ## Troubleshooting

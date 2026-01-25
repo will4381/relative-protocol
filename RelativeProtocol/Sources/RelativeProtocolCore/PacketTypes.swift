@@ -28,6 +28,13 @@ public enum PacketDirection: String, Codable, Sendable {
     case inbound
 }
 
+public enum QuicPacketType: String, Codable, Sendable {
+    case initial
+    case zeroRTT
+    case handshake
+    case retry
+}
+
 public struct IPAddress: Hashable, Codable, Sendable {
     public let bytes: Data
 
@@ -100,6 +107,7 @@ public struct PacketMetadata: Sendable {
     public let registrableDomain: String?
     public let tlsServerName: String?
     public let quicVersion: UInt32?
+    public let quicPacketType: QuicPacketType?
     public let quicDestinationConnectionId: String?
     public let quicSourceConnectionId: String?
 
@@ -117,6 +125,7 @@ public struct PacketMetadata: Sendable {
         registrableDomain: String?,
         tlsServerName: String?,
         quicVersion: UInt32?,
+        quicPacketType: QuicPacketType?,
         quicDestinationConnectionId: String?,
         quicSourceConnectionId: String?
     ) {
@@ -133,6 +142,7 @@ public struct PacketMetadata: Sendable {
         self.registrableDomain = registrableDomain
         self.tlsServerName = tlsServerName
         self.quicVersion = quicVersion
+        self.quicPacketType = quicPacketType
         self.quicDestinationConnectionId = quicDestinationConnectionId
         self.quicSourceConnectionId = quicSourceConnectionId
     }
@@ -156,6 +166,7 @@ public struct PacketSample: Codable, Hashable, Sendable {
     public let registrableDomain: String?
     public let tlsServerName: String?
     public let quicVersion: UInt32?
+    public let quicPacketType: QuicPacketType?
     public let quicDestinationConnectionId: String?
     public let quicSourceConnectionId: String?
     public let burstMetrics: BurstMetrics?
@@ -179,6 +190,7 @@ public struct PacketSample: Codable, Hashable, Sendable {
         registrableDomain: String?,
         tlsServerName: String?,
         quicVersion: UInt32?,
+        quicPacketType: QuicPacketType?,
         quicDestinationConnectionId: String?,
         quicSourceConnectionId: String?,
         burstMetrics: BurstMetrics? = nil,
@@ -201,6 +213,7 @@ public struct PacketSample: Codable, Hashable, Sendable {
         self.registrableDomain = registrableDomain
         self.tlsServerName = tlsServerName
         self.quicVersion = quicVersion
+        self.quicPacketType = quicPacketType
         self.quicDestinationConnectionId = quicDestinationConnectionId
         self.quicSourceConnectionId = quicSourceConnectionId
         self.burstMetrics = burstMetrics

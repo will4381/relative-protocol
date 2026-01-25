@@ -33,6 +33,7 @@ final class MetricsStoreTests: XCTestCase {
             registrableDomain: nil,
             tlsServerName: nil,
             quicVersion: nil,
+            quicPacketType: nil,
             quicDestinationConnectionId: nil,
             quicSourceConnectionId: nil,
             burstMetrics: nil,

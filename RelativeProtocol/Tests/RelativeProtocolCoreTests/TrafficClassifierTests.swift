@@ -88,6 +88,30 @@ final class TrafficClassifierTests: XCTestCase {
         XCTAssertEqual(good?.label, "tiktok")
     }
 
+    func testWildcardDomainMatching() {
+        let classifier = TrafficClassifier(signatures: [
+            AppSignature(label: "tiktok", domains: ["p*.tiktokcdn*.com"])
+        ])
+        let matchMetadata = makeMetadata(
+            dstAddress: [203, 0, 113, 30],
+            dnsQuery: "p16.tiktokcdn-us.com",
+            tlsServerName: nil
+        )
+        let nonMatchMetadata = makeMetadata(
+            dstAddress: [203, 0, 113, 31],
+            dnsQuery: "p16.tiktokcdn-us.com.evil.com",
+            tlsServerName: nil
+        )
+
+        let match = classifier.classify(metadata: matchMetadata, direction: .outbound, timestamp: 3.0)
+        XCTAssertNotNil(match)
+        XCTAssertEqual(match?.label, "tiktok")
+
+        let nonMatch = classifier.classify(metadata: nonMatchMetadata, direction: .outbound, timestamp: 4.0)
+        XCTAssertNotNil(nonMatch)
+        XCTAssertNil(nonMatch?.label)
+    }
+
     private func makeMetadata(dstAddress: [UInt8], dnsQuery: String?, tlsServerName: String?) -> PacketMetadata {
         let src = IPAddress(bytes: Data([192, 0, 2, 1]))!
         let dst = IPAddress(bytes: Data(dstAddress))!
@@ -106,6 +130,7 @@ final class TrafficClassifierTests: XCTestCase {
             registrableDomain: nil,
             tlsServerName: tlsServerName,
             quicVersion: nil,
+            quicPacketType: nil,
             quicDestinationConnectionId: nil,
             quicSourceConnectionId: nil
         )
