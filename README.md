@@ -1,6 +1,6 @@
-# VPN-Bridge
+# Relative Protocol
 
-VPN-Bridge provides a Packet Tunnel + tun2socks stack with packet metadata sampling, burst analytics, and optional app signature classification. It’s split into three SwiftPM libraries:
+Relative Protocol provides a Packet Tunnel + tun2socks stack with packet metadata sampling, burst analytics, and optional app signature classification. It’s split into three SwiftPM libraries:
 
 - **RelativeProtocolCore** — packet parsing, packet samples, metrics store, burst tracking, signature validation/classification.
 - **RelativeProtocolTunnel** — `NEPacketTunnelProvider` implementation + tun2socks engine + sampling.
