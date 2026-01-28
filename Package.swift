@@ -2,7 +2,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "VPN-Bridge",
+    name: "relative-protocol",
     platforms: [
         .iOS(.v15),
         .macOS(.v14)
