@@ -15,17 +15,20 @@ final class TunSocketBridge {
     private var readSource: DispatchSourceRead?
     private var writeSource: DispatchSourceWrite?
     private var writeSourceActive = false
-    private var pendingWrites: [Data] = []
+    private var pendingWrites: ArraySlice<Data> = []
     private var pendingBytes: Int = 0
     private var droppedWrites: UInt64 = 0
     private let maxPendingBytes: Int
     private let backpressureThreshold: Int
+    private var readBuffer: [UInt8]
+    var onBackpressureRelieved: (() -> Void)?
 
     init(mtu: Int, queue: DispatchQueue) throws {
         self.mtu = max(256, mtu)
         self.queue = queue
         self.maxPendingBytes = max(4_194_304, self.mtu * 1024)
         self.backpressureThreshold = maxPendingBytes * 3 / 4
+        self.readBuffer = [UInt8](repeating: 0, count: self.mtu + MemoryLayout<UInt32>.size)
 
         var fds = [Int32](repeating: 0, count: 2)
         let result = socketpair(AF_UNIX, SOCK_DGRAM, 0, &fds)
@@ -67,30 +70,23 @@ final class TunSocketBridge {
             family = packet.first.map { (($0 >> 4) & 0x0F) == 6 ? AF_INET6 : AF_INET } ?? AF_INET
         }
 
-        var header = UInt32(family).bigEndian
-        var buffer = Data(capacity: MemoryLayout<UInt32>.size + packet.count)
-        withUnsafeBytes(of: &header) { headerPtr in
-            buffer.append(headerPtr.bindMemory(to: UInt8.self))
-        }
-        buffer.append(packet)
-
         if pendingWrites.isEmpty {
-            let result = buffer.withUnsafeBytes { ptr -> ssize_t in
-                guard let base = ptr.baseAddress else { return -1 }
-                return write(appFD, base, buffer.count)
-            }
-            if result == buffer.count {
+            let expectedLength = MemoryLayout<UInt32>.size + packet.count
+            let result = writePacketImmediate(packet, family: family)
+            if result == expectedLength {
                 return true
             }
             if result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
-                return enqueueWrite(buffer)
+                return enqueueWrite(framedPacket(packet, family: family))
             }
             if result < 0 {
                 logger.error("tun write failed: errno=\(errno, privacy: .public)")
+            } else {
+                logger.error("tun write failed: partial datagram write (\(result, privacy: .public) of \(expectedLength, privacy: .public))")
             }
             return false
         } else {
-            return enqueueWrite(buffer)
+            return enqueueWrite(framedPacket(packet, family: family))
         }
     }
 
@@ -114,12 +110,17 @@ final class TunSocketBridge {
             writeSource.cancel()
             self.writeSource = nil
         }
+        pendingWrites.removeAll(keepingCapacity: false)
+        pendingBytes = 0
+        onBackpressureRelieved = nil
         close(engineFD)
     }
 
     private func drainReadable(handler: @escaping ([Data], [Int32]) -> Void) {
         let bufferSize = mtu + MemoryLayout<UInt32>.size
-        var buffer = [UInt8](repeating: 0, count: bufferSize)
+        if readBuffer.count != bufferSize {
+            readBuffer = [UInt8](repeating: 0, count: bufferSize)
+        }
         let batchLimit = 32
         var packets: [Data] = []
         var families: [Int32] = []
@@ -127,7 +128,10 @@ final class TunSocketBridge {
         families.reserveCapacity(batchLimit)
 
         while true {
-            let bytesRead = recv(appFD, &buffer, buffer.count, 0)
+            let bytesRead = readBuffer.withUnsafeMutableBufferPointer { bufferPtr -> Int in
+                guard let base = bufferPtr.baseAddress else { return -1 }
+                return recv(appFD, base, bufferPtr.count, 0)
+            }
             if bytesRead < 0 {
                 if errno == EAGAIN || errno == EWOULDBLOCK {
                     break
@@ -140,13 +144,12 @@ final class TunSocketBridge {
 
             let headerSize = MemoryLayout<UInt32>.size
             let payloadRange = headerSize..<bytesRead
-            let payload = Data(buffer[payloadRange])
-            let headerBytes = buffer[0..<headerSize]
-            var familyValue: UInt32 = 0
-            withUnsafeMutableBytes(of: &familyValue) { ptr in
-                ptr.copyBytes(from: headerBytes)
-            }
-            var family = Int32(UInt32(bigEndian: familyValue))
+            let payload = Data(readBuffer[payloadRange])
+            let familyRaw = (UInt32(readBuffer[0]) << 24)
+                | (UInt32(readBuffer[1]) << 16)
+                | (UInt32(readBuffer[2]) << 8)
+                | UInt32(readBuffer[3])
+            var family = Int32(familyRaw)
             if family != AF_INET && family != AF_INET6 {
                 family = payload.first.map { (($0 >> 4) & 0x0F) == 6 ? AF_INET6 : AF_INET } ?? AF_INET
             }
@@ -179,8 +182,9 @@ final class TunSocketBridge {
     }
 
     private func drainWritable() {
-        while !pendingWrites.isEmpty {
-            let next = pendingWrites[0]
+        let wasBackpressured = pendingBytes >= backpressureThreshold
+
+        while let next = pendingWrites.first {
             let result = next.withUnsafeBytes { ptr -> ssize_t in
                 guard let base = ptr.baseAddress else { return -1 }
                 return write(appFD, base, next.count)
@@ -199,11 +203,18 @@ final class TunSocketBridge {
                 pendingBytes -= next.count
                 continue
             }
+            logger.error("tun write failed while draining: partial datagram write (\(result, privacy: .public) of \(next.count, privacy: .public))")
             break
         }
 
         if pendingWrites.isEmpty {
             stopWriteSourceIfNeeded()
+            pendingWrites.removeAll(keepingCapacity: false)
+        }
+
+        let isBackpressured = pendingBytes >= backpressureThreshold
+        if wasBackpressured && !isBackpressured, let onBackpressureRelieved {
+            onBackpressureRelieved()
         }
     }
 
@@ -241,4 +252,66 @@ final class TunSocketBridge {
             throw POSIXError(.init(rawValue: errno) ?? .EINVAL)
         }
     }
+
+    private func framedPacket(_ packet: Data, family: Int32) -> Data {
+        var header = UInt32(family).bigEndian
+        var buffer = Data(capacity: MemoryLayout<UInt32>.size + packet.count)
+        withUnsafeBytes(of: &header) { headerPtr in
+            buffer.append(headerPtr.bindMemory(to: UInt8.self))
+        }
+        buffer.append(packet)
+        return buffer
+    }
+
+    private func writePacketImmediate(_ packet: Data, family: Int32) -> Int {
+        var header = UInt32(family).bigEndian
+        return withUnsafeBytes(of: &header) { headerPtr -> Int in
+            packet.withUnsafeBytes { packetPtr -> Int in
+                var iov = [
+                    iovec(
+                        iov_base: UnsafeMutableRawPointer(mutating: headerPtr.baseAddress),
+                        iov_len: headerPtr.count
+                    ),
+                    iovec(
+                        iov_base: UnsafeMutableRawPointer(mutating: packetPtr.baseAddress),
+                        iov_len: packetPtr.count
+                    )
+                ]
+                return writev(appFD, &iov, Int32(iov.count))
+            }
+        }
+    }
 }
+
+#if DEBUG
+extension TunSocketBridge {
+    func _test_enqueueWrite(_ data: Data) -> Bool {
+        enqueueWrite(data)
+    }
+
+    func _test_seedPendingWrites(_ writes: [Data]) {
+        pendingWrites = ArraySlice(writes)
+        pendingBytes = writes.reduce(0) { $0 + $1.count }
+    }
+
+    func _test_drainWritable() {
+        drainWritable()
+    }
+
+    var _test_pendingWriteCount: Int {
+        pendingWrites.count
+    }
+
+    var _test_pendingBytes: Int {
+        pendingBytes
+    }
+
+    var _test_maxPendingBytes: Int {
+        maxPendingBytes
+    }
+
+    var _test_droppedWrites: UInt64 {
+        droppedWrites
+    }
+}
+#endif

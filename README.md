@@ -185,6 +185,29 @@ Run unit tests:
 swift test
 ```
 
+Generate coverage reports:
+
+```
+swift test --enable-code-coverage
+./Scripts/coverage.sh
+```
+
+Coverage outputs:
+
+- `.build/coverage/coverage.txt` (human-readable table)
+- `.build/coverage/coverage.json` (`llvm-cov` export)
+- `.build/coverage/source_summary.txt` (source-only totals + lowest covered files)
+
+## Changelog
+
+### 2/11/26
+
+- Hardened tunnel/runtime performance paths in core flow tracking, burst tracking, metrics persistence, packet stream handling, and classification logic to reduce unnecessary work and long-run memory pressure.
+- Added safety guards in tunnel-side components (`RelativePacketTunnelProvider`, SOCKS codec/server/relay, tun2socks engine, and tunnel socket bridge) to improve resilience under sustained traffic and edge conditions.
+- Preserved classification/data quality behavior while tightening parsing and buffering code paths to avoid regressions in metadata capture and downstream model inputs.
+- Expanded the test suite with broad edge-case coverage across core and tunnel modules (including parser/stream/flow/classifier/tunnel/SOCKS paths).
+- Added coverage tooling in `Scripts/coverage.sh` and documented coverage report outputs for repeatable coverage checks.
+
 ## Notes
 
 - Classification matches exact domains or subdomains (e.g. `api.tiktok.com` matches `tiktok.com`, but `notiktok.com` does not).

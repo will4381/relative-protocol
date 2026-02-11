@@ -27,17 +27,85 @@ public struct FlowObservation: Sendable {
 }
 
 public final class FlowTracker {
+    private struct LastSeenHeap {
+        struct Entry {
+            let key: FlowKey
+            let lastSeen: TimeInterval
+            let revision: UInt64
+        }
+
+        private var storage: [Entry] = []
+
+        var isEmpty: Bool { storage.isEmpty }
+
+        mutating func push(_ entry: Entry) {
+            storage.append(entry)
+            siftUp(from: storage.count - 1)
+        }
+
+        mutating func popMin() -> Entry? {
+            guard !storage.isEmpty else { return nil }
+            if storage.count == 1 {
+                return storage.removeLast()
+            }
+            let minEntry = storage[0]
+            storage[0] = storage.removeLast()
+            siftDown(from: 0)
+            return minEntry
+        }
+
+        mutating func removeAll() {
+            storage.removeAll(keepingCapacity: false)
+        }
+
+        private mutating func siftUp(from index: Int) {
+            var child = index
+            while child > 0 {
+                let parent = (child - 1) / 2
+                if storage[child].lastSeen >= storage[parent].lastSeen {
+                    break
+                }
+                storage.swapAt(child, parent)
+                child = parent
+            }
+        }
+
+        private mutating func siftDown(from index: Int) {
+            var parent = index
+            while true {
+                let left = 2 * parent + 1
+                let right = left + 1
+                var candidate = parent
+
+                if left < storage.count && storage[left].lastSeen < storage[candidate].lastSeen {
+                    candidate = left
+                }
+                if right < storage.count && storage[right].lastSeen < storage[candidate].lastSeen {
+                    candidate = right
+                }
+                if candidate == parent {
+                    return
+                }
+                storage.swapAt(parent, candidate)
+                parent = candidate
+            }
+        }
+    }
+
     private struct FlowState {
         var baseHash: UInt64
         var generation: UInt32
         var flowId: UInt64
         var lastSeen: TimeInterval
+        var revision: UInt64
         var currentBurstId: UInt32
         var lastBurstTimestamp: TimeInterval
     }
 
     private let configuration: FlowTrackerConfiguration
     private var states: [FlowKey: FlowState] = [:]
+    private var lastSeenHeap = LastSeenHeap()
+    private var nextRevision: UInt64 = 0
 
     public init(configuration: FlowTrackerConfiguration) {
         self.configuration = configuration
@@ -67,22 +135,27 @@ public final class FlowTracker {
                 state.currentBurstId = state.currentBurstId &+ 1
                 state.lastBurstTimestamp = timestamp
             }
+            state.revision = makeRevision()
             state.lastSeen = timestamp
             states[flowKey] = state
+            lastSeenHeap.push(.init(key: flowKey, lastSeen: timestamp, revision: state.revision))
             pruneIfNeeded(now: timestamp, excluding: flowKey)
             return FlowObservation(flowId: state.flowId, burstId: state.currentBurstId)
         } else {
             let baseHash = hash(flowKey)
             let flowId = makeFlowId(baseHash: baseHash, generation: 0)
+            let revision = makeRevision()
             let state = FlowState(
                 baseHash: baseHash,
                 generation: 0,
                 flowId: flowId,
                 lastSeen: timestamp,
+                revision: revision,
                 currentBurstId: 0,
                 lastBurstTimestamp: timestamp
             )
             states[flowKey] = state
+            lastSeenHeap.push(.init(key: flowKey, lastSeen: timestamp, revision: revision))
             pruneIfNeeded(now: timestamp, excluding: flowKey)
             return FlowObservation(flowId: flowId, burstId: 0)
         }
@@ -90,20 +163,55 @@ public final class FlowTracker {
 
     public func reset() {
         states.removeAll()
+        lastSeenHeap.removeAll()
+        nextRevision = 0
     }
 
     private func pruneIfNeeded(now: TimeInterval, excluding flowKey: FlowKey) {
         if states.count >= configuration.maxTrackedFlows {
-            if let oldest = states
-                .filter({ $0.key != flowKey })
-                .min(by: { $0.value.lastSeen < $1.value.lastSeen })?.key {
-                states.removeValue(forKey: oldest)
-            }
+            evictOldest(excluding: flowKey)
         }
 
-        let expired = states.filter { $0.key != flowKey && now - $0.value.lastSeen > configuration.flowTTL }
-        if !expired.isEmpty {
-            expired.keys.forEach { states.removeValue(forKey: $0) }
+        pruneExpired(now: now, excluding: flowKey)
+    }
+
+    private func evictOldest(excluding flowKey: FlowKey) {
+        var skipped: [LastSeenHeap.Entry] = []
+        while let candidate = lastSeenHeap.popMin() {
+            guard let state = states[candidate.key], state.revision == candidate.revision else {
+                continue
+            }
+            if candidate.key == flowKey {
+                skipped.append(candidate)
+                continue
+            }
+            states.removeValue(forKey: candidate.key)
+            break
+        }
+        if !skipped.isEmpty {
+            skipped.forEach { lastSeenHeap.push($0) }
+        }
+    }
+
+    private func pruneExpired(now: TimeInterval, excluding flowKey: FlowKey) {
+        var skipped: [LastSeenHeap.Entry] = []
+        while let candidate = lastSeenHeap.popMin() {
+            guard let state = states[candidate.key], state.revision == candidate.revision else {
+                continue
+            }
+            if candidate.key == flowKey {
+                skipped.append(candidate)
+                continue
+            }
+            if now - state.lastSeen > configuration.flowTTL {
+                states.removeValue(forKey: candidate.key)
+                continue
+            }
+            lastSeenHeap.push(candidate)
+            break
+        }
+        if !skipped.isEmpty {
+            skipped.forEach { lastSeenHeap.push($0) }
         }
     }
 
@@ -127,5 +235,10 @@ public final class FlowTracker {
 
     private func makeFlowId(baseHash: UInt64, generation: UInt32) -> UInt64 {
         baseHash ^ (UInt64(generation) << 32)
+    }
+
+    private func makeRevision() -> UInt64 {
+        nextRevision &+= 1
+        return nextRevision
     }
 }

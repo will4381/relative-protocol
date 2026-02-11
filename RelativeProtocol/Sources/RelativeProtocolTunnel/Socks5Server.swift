@@ -457,7 +457,9 @@ final class Socks5Server {
                     }
                     if !didProbe {
                         didProbe = true
-                        self.probeLoopback(port: actualPort)
+                        if RelativeLog.isVerbose {
+                            self.probeLoopback(port: actualPort)
+                        }
                     }
                 case .failed(let error):
                     if self.isAddressInUse(error), remainingAttempts > 0 {
@@ -583,6 +585,30 @@ final class Socks5Server {
         connections.removeAll()
     }
 }
+
+#if DEBUG
+func _test_interfaceTypeName(_ type: Network.NWInterface.InterfaceType) -> String {
+    interfaceTypeName(type)
+}
+
+func _test_pathStatusName(_ status: Network.NWPath.Status) -> String {
+    pathStatusName(status)
+}
+
+func _test_pathSummary(_ path: Network.NWPath?) -> String {
+    pathSummary(path)
+}
+
+extension Socks5Server {
+    func _test_probeLoopback(port: UInt16) {
+        probeLoopback(port: port)
+    }
+
+    func _test_isAddressInUse(_ error: NWError) -> Bool {
+        isAddressInUse(error)
+    }
+}
+#endif
 
 enum Socks5ServerError: Error {
     case invalidPort

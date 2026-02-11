@@ -92,6 +92,57 @@ final class Socks5ConnectionTests: XCTestCase {
         XCTAssertEqual(parsed.port, relay.port)
         XCTAssertTrue(relay.started)
     }
+
+    func testTCPProxyForwardsOutboundReadsAndStopsOnReadError() {
+        let queue = DispatchQueue(label: "socks5.connection.test.outbound.read")
+        let inbound = FakeInboundConnection()
+        let outbound = FakeTCPOutbound()
+        let provider = FakeProvider(outbound: outbound)
+
+        let connection = Socks5Connection(connection: inbound, provider: provider, queue: queue, mtu: 1400)
+        connection.start()
+
+        var handshake = Data([0x05, 0x01, 0x00])
+        handshake.append(buildDomainConnectRequest(host: "example.com", port: 443))
+        inbound.enqueueInbound(handshake)
+        waitOnQueue(queue)
+
+        outbound.emitRead(Data([0xCA, 0xFE]), error: nil)
+        waitOnQueue(queue)
+
+        XCTAssertTrue(inbound.sent.contains(Data([0xCA, 0xFE])))
+
+        outbound.emitRead(Data([0xBA]), error: NSError(domain: "test", code: 99))
+        waitOnQueue(queue)
+        XCTAssertTrue(inbound.cancelled)
+    }
+
+    func testStopInUDPProxyStateStopsRelay() {
+        let queue = DispatchQueue(label: "socks5.connection.test.udp.stop")
+        let inbound = FakeInboundConnection()
+        let provider = FakeProvider(outbound: FakeTCPOutbound())
+        let relay = FakeUDPRelay(port: 43210)
+
+        let connection = Socks5Connection(
+            connection: inbound,
+            provider: provider,
+            queue: queue,
+            mtu: 1400,
+            udpRelayFactory: { _, _, _ in relay }
+        )
+        connection.start()
+
+        var handshake = Data([0x05, 0x01, 0x00])
+        handshake.append(buildUDPAssociateRequest())
+        inbound.enqueueInbound(handshake)
+        waitOnQueue(queue)
+
+        inbound.enqueueInbound(Data([0x01, 0x02, 0x03, 0x04]))
+        waitOnQueue(queue)
+
+        connection.stop()
+        XCTAssertTrue(relay.stopped)
+    }
 }
 
 private final class FakeInboundConnection: Socks5InboundConnection {
@@ -172,6 +223,10 @@ private final class FakeTCPOutbound: Socks5TCPOutbound {
 
     func cancel() {
         cancelled = true
+    }
+
+    func emitRead(_ data: Data?, error: Error?) {
+        readHandler?(data, error)
     }
 }
 

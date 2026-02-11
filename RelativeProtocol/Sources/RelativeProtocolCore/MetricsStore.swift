@@ -16,6 +16,7 @@ public final class MetricsStore {
     private let useLock: Bool
     private let lock = NSLock()
     private var cachedSnapshots: [MetricsSnapshot] = []
+    private var cachedEncodedSnapshots: [Data] = []
     private var cachedFileModificationDate: Date?
     private var hasCache = false
 
@@ -38,13 +39,15 @@ public final class MetricsStore {
         withLock {
             guard let fileURL else { return }
 
-        guard let snapshotData = try? encoder.encode(snapshot) else { return }
-        guard snapshotData.count <= maxBytes else { return }
+            guard let snapshotData = try? encoder.encode(snapshot) else { return }
+            guard snapshotData.count <= maxBytes else { return }
 
-        var snapshots = loadSnapshotsLocked(from: fileURL)
-        snapshots.append(snapshot)
-        trimSnapshots(&snapshots)
-            writeSnapshotsLocked(snapshots, to: fileURL)
+            var snapshots = loadSnapshotsLocked(from: fileURL)
+            var encodedSnapshots = encodedSnapshotsForCurrentCache(fallingBackTo: snapshots)
+            snapshots.append(snapshot)
+            encodedSnapshots.append(snapshotData)
+            trimSnapshots(&snapshots, encodedSnapshots: &encodedSnapshots)
+            writeSnapshotsLocked(snapshots, encodedSnapshots: encodedSnapshots, to: fileURL)
         }
     }
 
@@ -60,6 +63,7 @@ public final class MetricsStore {
             guard let fileURL else { return }
             try? FileManager.default.removeItem(at: fileURL)
             cachedSnapshots = []
+            cachedEncodedSnapshots = []
             cachedFileModificationDate = nil
             hasCache = true
         }
@@ -98,21 +102,31 @@ public final class MetricsStore {
             snapshots = decodeNDJSON(data)
         }
         cachedSnapshots = snapshots
+        cachedEncodedSnapshots = snapshots.compactMap { try? encoder.encode($0) }
         cachedFileModificationDate = modificationDate
         hasCache = true
         return snapshots
     }
 
-    private func writeSnapshotsLocked(_ snapshots: [MetricsSnapshot], to url: URL) {
+    private func writeSnapshotsLocked(_ snapshots: [MetricsSnapshot], encodedSnapshots: [Data], to url: URL) {
         switch format {
         case .json:
-            guard let data = try? encoder.encode(snapshots) else { return }
+            var data = Data()
+            data.reserveCapacity(serializedSize(of: encodedSnapshots))
+            data.append(0x5B) // [
+            for (index, encoded) in encodedSnapshots.enumerated() {
+                if index > 0 {
+                    data.append(0x2C) // ,
+                }
+                data.append(encoded)
+            }
+            data.append(0x5D) // ]
             guard data.count <= maxBytes else { return }
             try? data.write(to: url, options: [.atomic])
         case .ndjson:
             var data = Data()
-            for snapshot in snapshots {
-                guard let encoded = try? encoder.encode(snapshot) else { continue }
+            data.reserveCapacity(serializedSize(of: encodedSnapshots))
+            for encoded in encodedSnapshots {
                 data.append(encoded)
                 data.append(0x0A)
             }
@@ -120,20 +134,22 @@ public final class MetricsStore {
             try? data.write(to: url, options: [.atomic])
         }
         cachedSnapshots = snapshots
+        cachedEncodedSnapshots = encodedSnapshots
         let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
         cachedFileModificationDate = attributes?[.modificationDate] as? Date
         hasCache = true
     }
 
-    private func trimSnapshots(_ snapshots: inout [MetricsSnapshot]) {
+    private func trimSnapshots(_ snapshots: inout [MetricsSnapshot], encodedSnapshots: inout [Data]) {
         if snapshots.count > maxSnapshots {
-            snapshots.removeFirst(snapshots.count - maxSnapshots)
+            let removeCount = snapshots.count - maxSnapshots
+            snapshots.removeFirst(removeCount)
+            encodedSnapshots.removeFirst(removeCount)
         }
 
-        while !snapshots.isEmpty {
-            guard let data = try? encoder.encode(snapshots) else { return }
-            if data.count <= maxBytes { return }
+        while !snapshots.isEmpty && serializedSize(of: encodedSnapshots) > maxBytes {
             snapshots.removeFirst()
+            encodedSnapshots.removeFirst()
         }
     }
 
@@ -175,6 +191,25 @@ public final class MetricsStore {
             }
         }
         return snapshots
+    }
+
+    private func encodedSnapshotsForCurrentCache(fallingBackTo snapshots: [MetricsSnapshot]) -> [Data] {
+        if cachedEncodedSnapshots.count == snapshots.count {
+            return cachedEncodedSnapshots
+        }
+        return snapshots.compactMap { try? encoder.encode($0) }
+    }
+
+    private func serializedSize(of encodedSnapshots: [Data]) -> Int {
+        switch format {
+        case .json:
+            guard !encodedSnapshots.isEmpty else { return 2 }
+            let payloadBytes = encodedSnapshots.reduce(0) { $0 + $1.count }
+            let commaCount = max(0, encodedSnapshots.count - 1)
+            return 2 + payloadBytes + commaCount
+        case .ndjson:
+            return encodedSnapshots.reduce(0) { $0 + $1.count + 1 }
+        }
     }
 }
 

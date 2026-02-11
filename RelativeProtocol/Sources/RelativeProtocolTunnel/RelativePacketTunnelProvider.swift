@@ -35,6 +35,7 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
     private var didWarnRelay = false
     private let logPrefix = "RelativePacketTunnelProvider"
     private var didCallStartCompletion = false
+    private var waitingForBackpressureRelief = false
 
     public override func startTunnel(options: [String: NSObject]? = nil, completionHandler: @escaping (Error?) -> Void) {
         if RelativeLog.isVerbose {
@@ -104,6 +105,7 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
                 self.metricsSnapshotLimit = 0
             }
             self.didCallStartCompletion = false
+            self.waitingForBackpressureRelief = false
             if RelativeLog.isVerbose {
                 self.logger.info("Tunnel stopped with reason: \(reason.rawValue, privacy: .public)")
                 NSLog("\(self.logPrefix): stopTunnel reason=\(reason.rawValue)")
@@ -236,15 +238,14 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func startPacketReadLoop() {
+        guard !waitingForBackpressureRelief else { return }
         packetFlow.readPackets { [weak self] packets, protocols in
             guard let self else { return }
             self.ioQueue.async {
                 guard !self.isStopping else { return }
                 self.handlePackets(packets, protocols: protocols)
                 if let tunBridge = self.tunBridge, tunBridge.isBackpressured() {
-                    self.ioQueue.asyncAfter(deadline: .now() + 0.005) { [weak self] in
-                        self?.startPacketReadLoop()
-                    }
+                    self.waitingForBackpressureRelief = true
                 } else {
                     self.startPacketReadLoop()
                 }
@@ -261,10 +262,8 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
 
-        let packetBatch = packets
-        let protoBatch = protocols
         metricsQueue.async { [weak self] in
-            self?.recordOutboundPackets(packetBatch, protocols: protoBatch, timestamp: timestamp)
+            self?.recordOutboundPackets(packets, protocols: protocols, timestamp: timestamp)
         }
     }
 
@@ -285,11 +284,14 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
                 case .success(let port):
                     if RelativeLog.isVerbose {
                         NSLog("\(self.logPrefix): SOCKS5 server ready on port \(port)")
+                        self.probeSocksPort(port)
                     }
                     do {
-                        self.probeSocksPort(port)
                         let bridge = try TunSocketBridge(mtu: config.mtu, queue: self.ioQueue)
                         self.tunBridge = bridge
+                        bridge.onBackpressureRelieved = { [weak self] in
+                            self?.resumePacketReadLoopIfNeeded()
+                        }
                         bridge.startReadLoop { [weak self] packets, families in
                             self?.handleInboundPackets(packets, families: families)
                         }
@@ -542,4 +544,24 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
         logger.error("Relay engine not configured. Packets are observed but not forwarded.")
         logger.error("Provide a tun2socks or lwIP engine to enable full connectivity.")
     }
+
+    private func resumePacketReadLoopIfNeeded() {
+        ioQueue.async { [weak self] in
+            guard let self else { return }
+            guard self.waitingForBackpressureRelief, !self.isStopping else { return }
+            if let tunBridge = self.tunBridge, tunBridge.isBackpressured() {
+                return
+            }
+            self.waitingForBackpressureRelief = false
+            self.startPacketReadLoop()
+        }
+    }
 }
+
+#if DEBUG
+extension RelativePacketTunnelProvider {
+    func _test_makeNetworkSettings(from config: TunnelConfiguration) -> NEPacketTunnelNetworkSettings {
+        makeNetworkSettings(from: config)
+    }
+}
+#endif

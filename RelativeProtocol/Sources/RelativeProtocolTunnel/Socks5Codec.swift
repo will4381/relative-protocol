@@ -60,17 +60,26 @@ enum Socks5Codec {
     }
 
     static func parseUDPPacket(_ data: Data) -> Socks5UDPPacket? {
-        guard data.count >= 4 else { return nil }
-        guard data[data.startIndex] == 0, data[data.startIndex + 1] == 0 else { return nil }
-        let frag = data[data.startIndex + 2]
-        guard frag == 0 else { return nil }
-        let atyp = data[data.startIndex + 3]
-        var index = data.startIndex + 4
+        return data.withUnsafeBytes { rawBuffer in
+            guard let base = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return nil }
+            let buffer = UnsafeBufferPointer(start: base, count: data.count)
+            return parseUDPPacket(buffer, count: data.count)
+        }
+    }
 
-        guard let address = parseAddress(from: data, atyp: atyp, index: &index) else { return nil }
-        guard data.count >= index + 2 else { return nil }
+    static func parseUDPPacket(_ data: UnsafeBufferPointer<UInt8>, count: Int) -> Socks5UDPPacket? {
+        guard count >= 4 else { return nil }
+        guard data[0] == 0, data[1] == 0 else { return nil }
+        let frag = data[2]
+        guard frag == 0 else { return nil }
+        let atyp = data[3]
+        var index = 4
+
+        guard let address = parseAddress(from: data, count: count, atyp: atyp, index: &index) else { return nil }
+        guard count >= index + 2 else { return nil }
         let port = UInt16(data[index]) << 8 | UInt16(data[index + 1])
-        let payload = data.subdata(in: index + 2..<data.endIndex)
+        let payloadStart = index + 2
+        let payload = Data(data[payloadStart..<count])
         return Socks5UDPPacket(address: address, port: port, payload: payload)
     }
 
@@ -99,24 +108,51 @@ enum Socks5Codec {
         switch atyp {
         case 0x01:
             guard data.count >= index + 4 else { return nil }
-            let addrData = data.subdata(in: index..<index + 4)
+            guard let address = parseIPv4Address(from: data, index: index) else { return nil }
             index += 4
-            guard let address = IPAddress(bytes: addrData) else { return nil }
             return .ipv4(address.stringValue)
         case 0x04:
             guard data.count >= index + 16 else { return nil }
-            let addrData = data.subdata(in: index..<index + 16)
+            guard let address = parseIPv6Address(from: data, index: index) else { return nil }
             index += 16
-            guard let address = IPAddress(bytes: addrData) else { return nil }
             return .ipv6(address.stringValue)
         case 0x03:
             guard data.count > index else { return nil }
             let length = Int(data[index])
             index += 1
             guard data.count >= index + length else { return nil }
-            let domainData = data.subdata(in: index..<index + length)
+            guard let domain = decodeUTF8(data, start: index, length: length) else { return nil }
             index += length
-            guard let domain = String(data: domainData, encoding: .utf8) else { return nil }
+            return .domain(domain)
+        default:
+            return nil
+        }
+    }
+
+    private static func parseAddress(
+        from data: UnsafeBufferPointer<UInt8>,
+        count: Int,
+        atyp: UInt8,
+        index: inout Int
+    ) -> Socks5Address? {
+        switch atyp {
+        case 0x01:
+            guard count >= index + 4 else { return nil }
+            guard let address = parseIPv4Address(from: data, index: index) else { return nil }
+            index += 4
+            return .ipv4(address.stringValue)
+        case 0x04:
+            guard count >= index + 16 else { return nil }
+            guard let address = parseIPv6Address(from: data, index: index) else { return nil }
+            index += 16
+            return .ipv6(address.stringValue)
+        case 0x03:
+            guard count > index else { return nil }
+            let length = Int(data[index])
+            index += 1
+            guard count >= index + length else { return nil }
+            guard let domain = decodeUTF8(data, start: index, length: length) else { return nil }
+            index += length
             return .domain(domain)
         default:
             return nil
@@ -153,5 +189,46 @@ enum Socks5Codec {
         var addr = in6_addr()
         guard string.withCString({ inet_pton(AF_INET6, $0, &addr) }) == 1 else { return nil }
         return Data(bytes: &addr, count: MemoryLayout<in6_addr>.size)
+    }
+
+    private static func parseIPv4Address(from data: Data, index: Int) -> IPAddress? {
+        guard data.count >= index + 4 else { return nil }
+        return data.withUnsafeBytes { rawBuffer in
+            guard let base = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return nil }
+            return IPAddress(bytes: Data(bytes: base.advanced(by: index), count: 4))
+        }
+    }
+
+    private static func parseIPv6Address(from data: Data, index: Int) -> IPAddress? {
+        guard data.count >= index + 16 else { return nil }
+        return data.withUnsafeBytes { rawBuffer in
+            guard let base = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return nil }
+            return IPAddress(bytes: Data(bytes: base.advanced(by: index), count: 16))
+        }
+    }
+
+    private static func parseIPv4Address(from data: UnsafeBufferPointer<UInt8>, index: Int) -> IPAddress? {
+        guard data.count >= index + 4 else { return nil }
+        return IPAddress(bytes: Data(data[index..<index + 4]))
+    }
+
+    private static func parseIPv6Address(from data: UnsafeBufferPointer<UInt8>, index: Int) -> IPAddress? {
+        guard data.count >= index + 16 else { return nil }
+        return IPAddress(bytes: Data(data[index..<index + 16]))
+    }
+
+    private static func decodeUTF8(_ data: Data, start: Int, length: Int) -> String? {
+        guard length >= 0, start >= 0, data.count >= start + length else { return nil }
+        return data.withUnsafeBytes { rawBuffer in
+            guard let base = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return nil }
+            let buffer = UnsafeBufferPointer(start: base.advanced(by: start), count: length)
+            return String(decoding: buffer, as: UTF8.self)
+        }
+    }
+
+    private static func decodeUTF8(_ data: UnsafeBufferPointer<UInt8>, start: Int, length: Int) -> String? {
+        guard length >= 0, start >= 0, data.count >= start + length else { return nil }
+        let buffer = UnsafeBufferPointer(start: data.baseAddress?.advanced(by: start), count: length)
+        return String(decoding: buffer, as: UTF8.self)
     }
 }

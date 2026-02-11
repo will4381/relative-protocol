@@ -23,6 +23,132 @@ public struct TrafficClassification: Codable, Hashable, Sendable {
 }
 
 public final class TrafficClassifier {
+    private struct LastSeenHeap {
+        struct Entry {
+            let key: String
+            let lastSeen: TimeInterval
+            let revision: UInt64
+        }
+
+        private var storage: [Entry] = []
+
+        mutating func push(_ entry: Entry) {
+            storage.append(entry)
+            siftUp(from: storage.count - 1)
+        }
+
+        mutating func popMin() -> Entry? {
+            guard !storage.isEmpty else { return nil }
+            if storage.count == 1 {
+                return storage.removeLast()
+            }
+            let minEntry = storage[0]
+            storage[0] = storage.removeLast()
+            siftDown(from: 0)
+            return minEntry
+        }
+
+        mutating func removeAll() {
+            storage.removeAll(keepingCapacity: false)
+        }
+
+        private mutating func siftUp(from index: Int) {
+            var child = index
+            while child > 0 {
+                let parent = (child - 1) / 2
+                if storage[child].lastSeen >= storage[parent].lastSeen {
+                    break
+                }
+                storage.swapAt(child, parent)
+                child = parent
+            }
+        }
+
+        private mutating func siftDown(from index: Int) {
+            var parent = index
+            while true {
+                let left = 2 * parent + 1
+                let right = left + 1
+                var candidate = parent
+
+                if left < storage.count && storage[left].lastSeen < storage[candidate].lastSeen {
+                    candidate = left
+                }
+                if right < storage.count && storage[right].lastSeen < storage[candidate].lastSeen {
+                    candidate = right
+                }
+                if candidate == parent {
+                    return
+                }
+                storage.swapAt(parent, candidate)
+                parent = candidate
+            }
+        }
+    }
+
+    private struct ExpiryHeap {
+        struct Entry {
+            let key: String
+            let expiresAt: TimeInterval
+            let revision: UInt64
+        }
+
+        private var storage: [Entry] = []
+
+        mutating func push(_ entry: Entry) {
+            storage.append(entry)
+            siftUp(from: storage.count - 1)
+        }
+
+        mutating func popMin() -> Entry? {
+            guard !storage.isEmpty else { return nil }
+            if storage.count == 1 {
+                return storage.removeLast()
+            }
+            let minEntry = storage[0]
+            storage[0] = storage.removeLast()
+            siftDown(from: 0)
+            return minEntry
+        }
+
+        mutating func removeAll() {
+            storage.removeAll(keepingCapacity: false)
+        }
+
+        private mutating func siftUp(from index: Int) {
+            var child = index
+            while child > 0 {
+                let parent = (child - 1) / 2
+                if storage[child].expiresAt >= storage[parent].expiresAt {
+                    break
+                }
+                storage.swapAt(child, parent)
+                child = parent
+            }
+        }
+
+        private mutating func siftDown(from index: Int) {
+            var parent = index
+            while true {
+                let left = 2 * parent + 1
+                let right = left + 1
+                var candidate = parent
+
+                if left < storage.count && storage[left].expiresAt < storage[candidate].expiresAt {
+                    candidate = left
+                }
+                if right < storage.count && storage[right].expiresAt < storage[candidate].expiresAt {
+                    candidate = right
+                }
+                if candidate == parent {
+                    return
+                }
+                storage.swapAt(parent, candidate)
+                parent = candidate
+            }
+        }
+    }
+
     private struct CacheEntry {
         var domain: String
         var label: String?
@@ -31,6 +157,7 @@ public final class TrafficClassifier {
         var confidence: Double
         var lastSeen: TimeInterval
         var expiresAt: TimeInterval
+        var revision: UInt64
         var source: String
     }
 
@@ -39,10 +166,17 @@ public final class TrafficClassifier {
     private let ttlCache: TimeInterval
     private let maxEntries: Int
     private var ipCache: [String: CacheEntry] = [:]
+    private var lastSeenHeap = LastSeenHeap()
+    private var expiryHeap = ExpiryHeap()
+    private var nextRevision: UInt64 = 0
     private var signatures: [AppSignature]
+    private var labelLookupCache: [String: String?] = [:]
+    private var cdnLookupCache: [String: String?] = [:]
+    private var asnLookupCache: [String: String?] = [:]
+    private let lookupCacheLimit = 4096
     private let signatureFileURL: URL?
     private var signatureFileModified: Date?
-    private var lastSignatureCheck: TimeInterval = 0
+    private var nextSignatureCheckAt: TimeInterval = 0
     private let signatureCheckInterval: TimeInterval
 
     public init(
@@ -68,12 +202,15 @@ public final class TrafficClassifier {
 
     public func classify(metadata: PacketMetadata, direction: PacketDirection, timestamp: TimeInterval) -> TrafficClassification? {
         prune(now: timestamp)
-        reloadSignaturesIfNeeded(now: timestamp, force: false)
+        if signatureFileURL != nil, timestamp >= nextSignatureCheckAt {
+            reloadSignaturesIfNeeded(now: timestamp, force: false)
+        }
 
         let remoteIP = remoteAddress(for: metadata, direction: direction)
         let dnsName = metadata.dnsCname ?? metadata.dnsQueryName
         let tlsName = metadata.tlsServerName
-        let registrable = DomainNormalizer.registrableDomain(from: tlsName ?? dnsName ?? metadata.registrableDomain)
+        let primaryName = tlsName ?? dnsName ?? metadata.registrableDomain
+        let registrable = DomainNormalizer.registrableDomain(from: primaryName)
 
         if let answers = metadata.dnsAnswerAddresses,
            let domain = DomainNormalizer.registrableDomain(from: dnsName ?? metadata.registrableDomain) {
@@ -165,10 +302,17 @@ public final class TrafficClassifier {
 
     public func reset() {
         ipCache.removeAll()
+        lastSeenHeap.removeAll()
+        expiryHeap.removeAll()
+        nextRevision = 0
+        labelLookupCache.removeAll(keepingCapacity: false)
+        cdnLookupCache.removeAll(keepingCapacity: false)
+        asnLookupCache.removeAll(keepingCapacity: false)
     }
 
     public func updateSignatures(_ signatures: [AppSignature]) {
         self.signatures = Self.normalizeSignatures(signatures)
+        labelLookupCache.removeAll(keepingCapacity: false)
     }
 
     public func reloadSignatures() {
@@ -201,6 +345,7 @@ public final class TrafficClassifier {
         source: String
     ) {
         guard !ip.isEmpty else { return }
+        let revision = makeRevision()
         let entry = CacheEntry(
             domain: domain,
             label: label,
@@ -209,38 +354,60 @@ public final class TrafficClassifier {
             confidence: confidence,
             lastSeen: timestamp,
             expiresAt: timestamp + ttl,
+            revision: revision,
             source: source
         )
         ipCache[ip] = entry
+        lastSeenHeap.push(.init(key: ip, lastSeen: timestamp, revision: revision))
+        expiryHeap.push(.init(key: ip, expiresAt: timestamp + ttl, revision: revision))
         if ipCache.count > maxEntries {
-            prune(now: timestamp)
+            pruneOverflow()
         }
     }
 
     private func prune(now: TimeInterval) {
-        if ipCache.count > maxEntries {
-            let sorted = ipCache.sorted { $0.value.lastSeen < $1.value.lastSeen }
-            let overflow = max(0, ipCache.count - maxEntries)
-            if overflow > 0 {
-                for idx in 0..<overflow {
-                    ipCache.removeValue(forKey: sorted[idx].key)
-                }
+        pruneOverflow()
+        pruneExpired(now: now)
+    }
+
+    private func pruneOverflow() {
+        var overflow = max(0, ipCache.count - maxEntries)
+        while overflow > 0, let candidate = lastSeenHeap.popMin() {
+            guard let entry = ipCache[candidate.key], entry.revision == candidate.revision else {
+                continue
             }
+            ipCache.removeValue(forKey: candidate.key)
+            overflow -= 1
         }
-        let expired = ipCache.filter { now > $0.value.expiresAt }
-        if !expired.isEmpty {
-            expired.keys.forEach { ipCache.removeValue(forKey: $0) }
+    }
+
+    private func pruneExpired(now: TimeInterval) {
+        while let candidate = expiryHeap.popMin() {
+            guard let entry = ipCache[candidate.key], entry.revision == candidate.revision else {
+                continue
+            }
+            if now > entry.expiresAt {
+                ipCache.removeValue(forKey: candidate.key)
+                continue
+            }
+            expiryHeap.push(candidate)
+            break
         }
     }
 
     private func appLabel(for domain: String?) -> String? {
         guard let domain else { return nil }
         let lower = domain.lowercased()
+        if let cached = labelLookupCache[lower] {
+            return cached
+        }
         for signature in signatures {
             if signature.domains.contains(where: { matchesDomain(lower, signatureDomain: $0) }) {
+                cacheLookup(&labelLookupCache, key: lower, value: signature.label)
                 return signature.label
             }
         }
+        cacheLookup(&labelLookupCache, key: lower, value: nil)
         return nil
     }
 
@@ -302,31 +469,42 @@ public final class TrafficClassifier {
     private func cdnProvider(for domain: String?) -> String? {
         guard let domain else { return nil }
         let lower = domain.lowercased()
+        if let cached = cdnLookupCache[lower] {
+            return cached
+        }
         for provider in CDNProvider.providers {
             if provider.suffixes.contains(where: { lower.hasSuffix($0) }) {
+                cacheLookup(&cdnLookupCache, key: lower, value: provider.name)
                 return provider.name
             }
         }
+        cacheLookup(&cdnLookupCache, key: lower, value: nil)
         return nil
     }
 
     private func asnForProvider(_ provider: String?) -> String? {
         guard let provider else { return nil }
-        return CDNProvider.providers.first { $0.name == provider }?.asn
+        if let cached = asnLookupCache[provider] {
+            return cached
+        }
+        let asn = CDNProvider.providers.first { $0.name == provider }?.asn
+        cacheLookup(&asnLookupCache, key: provider, value: asn)
+        return asn
     }
 
     private func reloadSignaturesIfNeeded(now: TimeInterval, force: Bool) {
         guard let signatureFileURL else { return }
-        if !force, now - lastSignatureCheck < signatureCheckInterval {
+        if !force, now < nextSignatureCheckAt {
             return
         }
-        lastSignatureCheck = now
+        nextSignatureCheckAt = now + signatureCheckInterval
         let attributes = try? FileManager.default.attributesOfItem(atPath: signatureFileURL.path)
         let modified = attributes?[.modificationDate] as? Date
         if force || modified != signatureFileModified {
             let loaded = AppSignatureStore.loadValidated(from: signatureFileURL)
             if !loaded.isEmpty {
                 signatures = Self.normalizeSignatures(loaded)
+                labelLookupCache.removeAll(keepingCapacity: false)
             }
             if let modified {
                 signatureFileModified = modified
@@ -341,6 +519,18 @@ public final class TrafficClassifier {
                 .filter { !$0.isEmpty }
             return AppSignature(label: signature.label, domains: domains)
         }
+    }
+
+    private func cacheLookup(_ cache: inout [String: String?], key: String, value: String?) {
+        cache[key] = value
+        if cache.count > lookupCacheLimit {
+            cache.removeAll(keepingCapacity: true)
+        }
+    }
+
+    private func makeRevision() -> UInt64 {
+        nextRevision &+= 1
+        return nextRevision
     }
 }
 

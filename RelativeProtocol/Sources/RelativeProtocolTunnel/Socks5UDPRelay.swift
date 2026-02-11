@@ -82,8 +82,9 @@ final class Socks5UDPRelay {
             }
             guard bytes > 0 else { break }
 
-            let data = Data(buffer[0..<bytes])
-            guard let packet = Socks5Codec.parseUDPPacket(data) else { continue }
+            guard let packet = buffer.withUnsafeBufferPointer({ ptr in
+                Socks5Codec.parseUDPPacket(ptr, count: bytes)
+            }) else { continue }
             clientAddress = addr
             clientAddressLen = addrLen
 

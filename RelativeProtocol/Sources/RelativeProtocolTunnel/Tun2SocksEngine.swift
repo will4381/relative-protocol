@@ -8,9 +8,25 @@ import RelativeProtocolCore
 
 final class Tun2SocksEngine {
     private let logger = RelativeLog.logger(.tunnel)
-    private let queue = DispatchQueue(label: "com.relative.protocol.tun2socks")
+    private let queue: DispatchQueue
+    private let runMain: (_ bytes: UnsafePointer<UInt8>, _ count: UInt32, _ tunFD: Int32) -> Int32
+    private let quitMain: () -> Void
     private var configData: Data?
     private var isRunning = false
+
+    init(
+        queue: DispatchQueue = DispatchQueue(label: "com.relative.protocol.tun2socks"),
+        runMain: @escaping (_ bytes: UnsafePointer<UInt8>, _ count: UInt32, _ tunFD: Int32) -> Int32 = { bytes, count, tunFD in
+            hev_socks5_tunnel_main_from_str(bytes, count, tunFD)
+        },
+        quitMain: @escaping () -> Void = {
+            hev_socks5_tunnel_quit()
+        }
+    ) {
+        self.queue = queue
+        self.runMain = runMain
+        self.quitMain = quitMain
+    }
 
     func start(configuration: TunnelConfiguration, tunFD: Int32, socksPort: UInt16) {
         guard !isRunning else { return }
@@ -30,7 +46,7 @@ final class Tun2SocksEngine {
                 guard let base = rawBuffer.bindMemory(to: UInt8.self).baseAddress else {
                     return -1
                 }
-                return hev_socks5_tunnel_main_from_str(base, UInt32(data.count), tunFD)
+                return self.runMain(base, UInt32(data.count), tunFD)
             }
             if RelativeLog.isVerbose {
                 self.logger.info("tun2socks exited with code \(result, privacy: .public)")
@@ -45,7 +61,7 @@ final class Tun2SocksEngine {
         if RelativeLog.isVerbose {
             NSLog("Tun2SocksEngine: stop requested")
         }
-        hev_socks5_tunnel_quit()
+        quitMain()
         isRunning = false
         configData = nil
     }
@@ -87,3 +103,16 @@ final class Tun2SocksEngine {
         return lines.joined(separator: "\n")
     }
 }
+
+#if DEBUG
+extension Tun2SocksEngine {
+    var _test_isRunning: Bool {
+        isRunning
+    }
+
+    var _test_configString: String? {
+        guard let configData else { return nil }
+        return String(data: configData, encoding: .utf8)
+    }
+}
+#endif

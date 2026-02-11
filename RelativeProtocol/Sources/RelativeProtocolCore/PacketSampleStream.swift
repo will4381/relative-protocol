@@ -74,24 +74,11 @@ public final class PacketSampleStreamWriter {
             }
             guard !payloadBuffer.isEmpty else { return }
 
-            let fileManager = FileManager.default
-            if !fileManager.fileExists(atPath: fileURL.path) {
-                fileManager.createFile(atPath: fileURL.path, contents: nil)
-                currentSize = 0
-            }
+            guard let handle = ensureWritableHandle(fileURL: fileURL) else { return }
             if currentSize + payloadBuffer.count > maxBytes {
-                fileHandle?.closeFile()
-                fileHandle = nil
-                try? fileManager.removeItem(at: fileURL)
-                fileManager.createFile(atPath: fileURL.path, contents: nil)
-                currentSize = 0
+                rotateCurrentFile(handle: handle)
             }
 
-            if fileHandle == nil {
-                fileHandle = try? FileHandle(forWritingTo: fileURL)
-                fileHandle?.seekToEndOfFile()
-            }
-            guard let handle = fileHandle else { return }
             handle.write(payloadBuffer)
             currentSize += payloadBuffer.count
             if payloadBuffer.count > maxBytes {
@@ -120,6 +107,28 @@ public final class PacketSampleStreamWriter {
     private static func fileSize(at url: URL) -> Int {
         let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
         return (attributes?[.size] as? NSNumber)?.intValue ?? 0
+    }
+
+    private func ensureWritableHandle(fileURL: URL) -> FileHandle? {
+        if let fileHandle {
+            return fileHandle
+        }
+
+        let fileManager = FileManager.default
+        if !fileManager.fileExists(atPath: fileURL.path) {
+            fileManager.createFile(atPath: fileURL.path, contents: nil)
+            currentSize = 0
+        }
+        let handle = try? FileHandle(forWritingTo: fileURL)
+        handle?.seekToEndOfFile()
+        fileHandle = handle
+        return handle
+    }
+
+    private func rotateCurrentFile(handle: FileHandle) {
+        handle.truncateFile(atOffset: 0)
+        handle.seek(toFileOffset: 0)
+        currentSize = 0
     }
 }
 
@@ -174,18 +183,12 @@ public struct PacketSampleStreamReader {
         guard let fileURL, let handle = try? FileHandle(forReadingFrom: fileURL) else {
             return ([], offset)
         }
-        let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
-        let fileSize = (attributes?[.size] as? NSNumber)?.uint64Value
+        let fileSize = handle.seekToEndOfFile()
         var startOffset = offset
-        if let fileSize, offset > fileSize {
+        if offset > fileSize {
             startOffset = 0
         }
-        do {
-            try handle.seek(toOffset: startOffset)
-        } catch {
-            startOffset = 0
-            _ = try? handle.seek(toOffset: 0)
-        }
+        handle.seek(toFileOffset: startOffset)
         let data = handle.readDataToEndOfFile()
         handle.closeFile()
         guard let newlineIndex = data.lastIndex(of: 0x0A) else {
