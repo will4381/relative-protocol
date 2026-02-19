@@ -44,7 +44,9 @@ public final class MetricsRingBuffer {
     }
 
     public func clear() {
-        storage = Array(repeating: nil, count: capacity)
+        for index in storage.indices {
+            storage[index] = nil
+        }
         head = 0
         count = 0
     }

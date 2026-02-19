@@ -27,70 +27,7 @@ public struct FlowObservation: Sendable {
 }
 
 public final class FlowTracker {
-    private struct LastSeenHeap {
-        struct Entry {
-            let key: FlowKey
-            let lastSeen: TimeInterval
-            let revision: UInt64
-        }
-
-        private var storage: [Entry] = []
-
-        var isEmpty: Bool { storage.isEmpty }
-
-        mutating func push(_ entry: Entry) {
-            storage.append(entry)
-            siftUp(from: storage.count - 1)
-        }
-
-        mutating func popMin() -> Entry? {
-            guard !storage.isEmpty else { return nil }
-            if storage.count == 1 {
-                return storage.removeLast()
-            }
-            let minEntry = storage[0]
-            storage[0] = storage.removeLast()
-            siftDown(from: 0)
-            return minEntry
-        }
-
-        mutating func removeAll() {
-            storage.removeAll(keepingCapacity: false)
-        }
-
-        private mutating func siftUp(from index: Int) {
-            var child = index
-            while child > 0 {
-                let parent = (child - 1) / 2
-                if storage[child].lastSeen >= storage[parent].lastSeen {
-                    break
-                }
-                storage.swapAt(child, parent)
-                child = parent
-            }
-        }
-
-        private mutating func siftDown(from index: Int) {
-            var parent = index
-            while true {
-                let left = 2 * parent + 1
-                let right = left + 1
-                var candidate = parent
-
-                if left < storage.count && storage[left].lastSeen < storage[candidate].lastSeen {
-                    candidate = left
-                }
-                if right < storage.count && storage[right].lastSeen < storage[candidate].lastSeen {
-                    candidate = right
-                }
-                if candidate == parent {
-                    return
-                }
-                storage.swapAt(parent, candidate)
-                parent = candidate
-            }
-        }
-    }
+    private typealias HeapEntry = LastSeenHeap<FlowKey>.Entry
 
     private struct FlowState {
         var baseHash: UInt64
@@ -104,8 +41,9 @@ public final class FlowTracker {
 
     private let configuration: FlowTrackerConfiguration
     private var states: [FlowKey: FlowState] = [:]
-    private var lastSeenHeap = LastSeenHeap()
+    private var lastSeenHeap = LastSeenHeap<FlowKey>()
     private var nextRevision: UInt64 = 0
+    private static let minimumHeapCompactionThreshold = 1024
 
     public init(configuration: FlowTrackerConfiguration) {
         self.configuration = configuration
@@ -139,6 +77,7 @@ public final class FlowTracker {
             state.lastSeen = timestamp
             states[flowKey] = state
             lastSeenHeap.push(.init(key: flowKey, lastSeen: timestamp, revision: state.revision))
+            compactHeapIfNeeded()
             pruneIfNeeded(now: timestamp, excluding: flowKey)
             return FlowObservation(flowId: state.flowId, burstId: state.currentBurstId)
         } else {
@@ -156,6 +95,7 @@ public final class FlowTracker {
             )
             states[flowKey] = state
             lastSeenHeap.push(.init(key: flowKey, lastSeen: timestamp, revision: revision))
+            compactHeapIfNeeded()
             pruneIfNeeded(now: timestamp, excluding: flowKey)
             return FlowObservation(flowId: flowId, burstId: 0)
         }
@@ -176,7 +116,7 @@ public final class FlowTracker {
     }
 
     private func evictOldest(excluding flowKey: FlowKey) {
-        var skipped: [LastSeenHeap.Entry] = []
+        var skipped: [HeapEntry] = []
         while let candidate = lastSeenHeap.popMin() {
             guard let state = states[candidate.key], state.revision == candidate.revision else {
                 continue
@@ -194,7 +134,7 @@ public final class FlowTracker {
     }
 
     private func pruneExpired(now: TimeInterval, excluding flowKey: FlowKey) {
-        var skipped: [LastSeenHeap.Entry] = []
+        var skipped: [HeapEntry] = []
         while let candidate = lastSeenHeap.popMin() {
             guard let state = states[candidate.key], state.revision == candidate.revision else {
                 continue
@@ -241,4 +181,26 @@ public final class FlowTracker {
         nextRevision &+= 1
         return nextRevision
     }
+
+    private func compactHeapIfNeeded() {
+        let activeFlows = max(1, states.count)
+        let threshold = max(Self.minimumHeapCompactionThreshold, activeFlows * 4)
+        guard lastSeenHeap.count > threshold else { return }
+        rebuildHeapFromCurrentState()
+    }
+
+    private func rebuildHeapFromCurrentState() {
+        lastSeenHeap.removeAll()
+        for (key, state) in states {
+            lastSeenHeap.push(.init(key: key, lastSeen: state.lastSeen, revision: state.revision))
+        }
+    }
 }
+
+#if DEBUG
+extension FlowTracker {
+    var _test_heapEntryCount: Int {
+        lastSeenHeap.count
+    }
+}
+#endif

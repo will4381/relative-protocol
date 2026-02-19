@@ -27,6 +27,7 @@ final class RelativePacketTunnelProviderEdgeTests: XCTestCase {
         XCTAssertEqual(settings.ipv6Settings?.addresses, ["fd00:1:1:1::9"])
         XCTAssertEqual(settings.dnsSettings?.servers, ["1.1.1.1", "8.8.8.8"])
         XCTAssertEqual(settings.mtu?.intValue, 1420)
+        XCTAssertEqual(settings.tunnelOverheadBytes?.intValue, 80)
     }
 
     func testMakeNetworkSettingsOmitsIPv6WhenDisabled() {
@@ -41,5 +42,33 @@ final class RelativePacketTunnelProviderEdgeTests: XCTestCase {
         XCTAssertNil(settings.ipv6Settings)
         XCTAssertNil(settings.dnsSettings)
         XCTAssertEqual(settings.mtu?.intValue, 1300)
+        XCTAssertEqual(settings.tunnelOverheadBytes?.intValue, 80)
+    }
+
+    func testAppMessageCommandParserDefaultsToStatus() throws {
+        let message = try JSONSerialization.data(withJSONObject: [:], options: [])
+        let command = RelativePacketTunnelProvider._test_parseAppMessageCommand(message)
+        XCTAssertEqual(command, "status")
+    }
+
+    func testAppMessageCommandParserUsesActionAliasAndNormalizesCase() throws {
+        let message = try JSONSerialization.data(withJSONObject: ["action": "  ReStartRelay  "], options: [])
+        let command = RelativePacketTunnelProvider._test_parseAppMessageCommand(message)
+        XCTAssertEqual(command, "restartrelay")
+    }
+
+    func testPathSignatureIncludesInterfaceFingerprint() {
+        let provider = RelativePacketTunnelProvider()
+        let signature = provider._test_buildPathSignature(
+            status: "satisfied",
+            isExpensive: true,
+            isConstrained: false,
+            interfaces: ["wifi", "cellular"]
+        )
+
+        XCTAssertEqual(
+            signature,
+            "satisfied|exp=true|con=false|if=wifi,cellular"
+        )
     }
 }

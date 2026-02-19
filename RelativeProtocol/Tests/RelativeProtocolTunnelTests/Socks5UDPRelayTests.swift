@@ -64,6 +64,32 @@ final class Socks5UDPRelayTests: XCTestCase {
         XCTAssertEqual(parsed?.port, 53)
         XCTAssertEqual(parsed?.payload, responsePayload)
     }
+
+    func testRelayHandlesBurstWrites() throws {
+        let queue = DispatchQueue(label: "socks5.udp.relay.burst")
+        let session = CapturingUDPSession()
+        let provider = FakeUDPProvider(session: session)
+        let relay = try Socks5UDPRelay(provider: provider, queue: queue, mtu: 1500)
+        relay.start()
+        defer { relay.stop() }
+
+        let client = try UDPTestClient()
+        defer { client.close() }
+
+        let burstCount = 10
+        let writeExpectation = expectation(description: "udp burst writes")
+        writeExpectation.expectedFulfillmentCount = burstCount
+        session.writeExpectation = writeExpectation
+
+        for index in 0..<burstCount {
+            let payload = Data([UInt8(index), 0xAA, 0xBB, 0xCC])
+            let packet = Socks5Codec.buildUDPPacket(address: .ipv4("8.8.8.8"), port: 53, payload: payload)
+            try client.send(to: relay.port, data: packet)
+        }
+
+        wait(for: [writeExpectation], timeout: 1.5)
+        XCTAssertEqual(session.writes.count, burstCount)
+    }
 }
 
 private final class CapturingUDPSession: Socks5UDPSession {

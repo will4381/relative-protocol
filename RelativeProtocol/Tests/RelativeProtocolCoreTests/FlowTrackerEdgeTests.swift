@@ -2,7 +2,7 @@
 // See LICENSE for terms.
 
 import XCTest
-import RelativeProtocolCore
+@testable import RelativeProtocolCore
 
 final class FlowTrackerEdgeTests: XCTestCase {
     func testBurstDoesNotAdvanceAtExactThreshold() {
@@ -177,6 +177,20 @@ final class FlowTrackerEdgeTests: XCTestCase {
         }
 
         XCTAssertEqual(nonZeroObservations, 20_000)
+    }
+
+    func testHeapCompactionPreventsUnboundedGrowth() {
+        let tracker = FlowTracker(configuration: .init(
+            burstThreshold: 5.0,
+            flowTTL: 300,
+            maxTrackedFlows: 16
+        ))
+        let metadata = makeMetadata(flow: 77)
+        for _ in 0..<20_000 {
+            _ = tracker.record(metadata: metadata, timestamp: 1.0)
+        }
+
+        XCTAssertLessThanOrEqual(tracker._test_heapEntryCount, 1_024)
     }
 
     private func makeMetadata(flow: UInt8) -> PacketMetadata {

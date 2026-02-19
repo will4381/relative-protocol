@@ -12,6 +12,7 @@
 #include <sys/socket.h>
 #include <lwip/tcp.h>
 #include <yaml.h>
+#include <string.h>
 
 #include "hev-logger.h"
 #include "hev-config.h"
@@ -114,6 +115,22 @@ hev_config_parse_tunnel_ipv6 (yaml_document_t *doc, yaml_node_t *base)
     return 0;
 }
 
+static void
+hev_config_copy_string (char *dst, size_t cap, const char *value)
+{
+    size_t len;
+
+    if (!dst || cap == 0 || !value)
+        return;
+
+    len = strlen (value);
+    if (len >= cap)
+        len = cap - 1;
+
+    memcpy (dst, value, len);
+    dst[len] = '\0';
+}
+
 static int
 hev_config_parse_tunnel (yaml_document_t *doc, yaml_node_t *base)
 {
@@ -153,9 +170,13 @@ hev_config_parse_tunnel (yaml_document_t *doc, yaml_node_t *base)
             else if (0 == strcmp (key, "ipv6"))
                 strncpy (tun_ipv6_address, value, 64 - 1);
             else if (0 == strcmp (key, "post-up-script"))
-                strncpy (tun_post_up_script, value, 64 - 1);
+                hev_config_copy_string (tun_post_up_script,
+                                        sizeof (tun_post_up_script),
+                                        value);
             else if (0 == strcmp (key, "pre-down-script"))
-                strncpy (tun_pre_down_script, value, 64 - 1);
+                hev_config_copy_string (tun_pre_down_script,
+                                        sizeof (tun_pre_down_script),
+                                        value);
         } else {
             if (0 == strcmp (key, "ipv4"))
                 hev_config_parse_tunnel_ipv4 (doc, node);
@@ -431,6 +452,11 @@ hev_config_parse_doc (yaml_document_t *doc)
 
     if (tcp_buffer_size > TCP_SND_BUF)
         tcp_buffer_size = TCP_SND_BUF;
+
+    if (udp_copy_buffer_nums < 1)
+        udp_copy_buffer_nums = 1;
+    else if (udp_copy_buffer_nums > UDP_COPY_BUFFER_NUMS_MAX)
+        udp_copy_buffer_nums = UDP_COPY_BUFFER_NUMS_MAX;
 
     udp_buffer_size = UDP_BUF_SIZE * udp_copy_buffer_nums;
 

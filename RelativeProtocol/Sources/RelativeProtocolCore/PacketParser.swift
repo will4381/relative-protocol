@@ -5,6 +5,9 @@
 import CryptoKit
 import Darwin
 import Foundation
+#if canImport(CommonCrypto)
+import CommonCrypto
+#endif
 
 public enum PacketParser {
     private static let dnsPort: UInt16 = 53
@@ -592,6 +595,29 @@ public enum PacketParser {
 
     private static func aes128EncryptBlock(key: Data, block: Data) -> Data? {
         guard key.count == 16, block.count == 16 else { return nil }
+        #if canImport(CommonCrypto)
+        var encrypted = [UInt8](repeating: 0, count: 16)
+        var outputLength: size_t = 0
+        let status = key.withUnsafeBytes { keyPtr in
+            block.withUnsafeBytes { blockPtr in
+                CCCrypt(
+                    CCOperation(kCCEncrypt),
+                    CCAlgorithm(kCCAlgorithmAES),
+                    CCOptions(kCCOptionECBMode),
+                    keyPtr.baseAddress,
+                    key.count,
+                    nil,
+                    blockPtr.baseAddress,
+                    block.count,
+                    &encrypted,
+                    encrypted.count,
+                    &outputLength
+                )
+            }
+        }
+        guard status == kCCSuccess, outputLength == encrypted.count else { return nil }
+        return Data(encrypted)
+        #else
         let expandedKey = aes128ExpandKey(Array(key))
         var state = Array(block)
         addRoundKey(&state, roundKey: expandedKey, round: 0)
@@ -605,8 +631,10 @@ public enum PacketParser {
         shiftRows(&state)
         addRoundKey(&state, roundKey: expandedKey, round: 10)
         return Data(state)
+        #endif
     }
 
+    #if !canImport(CommonCrypto)
     private static func aes128ExpandKey(_ key: [UInt8]) -> [UInt8] {
         var expanded = key
         expanded.reserveCapacity(176)
@@ -729,6 +757,7 @@ public enum PacketParser {
         0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
         0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16
     ]
+    #endif
 
     private static func decryptQuicInitialServerName(
         _ data: Data,
@@ -909,8 +938,16 @@ public enum PacketParser {
 
     private static func hexString(_ data: Data) -> String? {
         guard !data.isEmpty else { return nil }
-        return data.map { String(format: "%02x", $0) }.joined()
+        var bytes = [UInt8]()
+        bytes.reserveCapacity(data.count * 2)
+        for value in data {
+            bytes.append(hexLUT[Int(value >> 4)])
+            bytes.append(hexLUT[Int(value & 0x0F)])
+        }
+        return String(decoding: bytes, as: UTF8.self)
     }
+
+    private static let hexLUT: [UInt8] = Array("0123456789abcdef".utf8)
 
     private struct DNSParseResult {
         let query: String?

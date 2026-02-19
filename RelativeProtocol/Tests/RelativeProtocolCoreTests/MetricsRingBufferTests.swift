@@ -26,6 +26,21 @@ final class MetricsRingBufferTests: XCTestCase {
         XCTAssertTrue(buffer.snapshot().isEmpty)
     }
 
+    func testClearAllowsReuseAcrossCycles() {
+        let buffer = MetricsRingBuffer(capacity: 3)
+
+        for cycle in 0..<5 {
+            buffer.append(makeSample(id: UInt64(cycle * 2 + 1)))
+            buffer.append(makeSample(id: UInt64(cycle * 2 + 2)))
+            XCTAssertEqual(buffer.snapshot().count, 2)
+            buffer.clear()
+            XCTAssertTrue(buffer.snapshot().isEmpty)
+        }
+
+        buffer.append(makeSample(id: 99))
+        XCTAssertEqual(buffer.snapshot().map(\.flowId), [99])
+    }
+
     private func makeSample(id: UInt64) -> PacketSample {
         PacketSample(
             timestamp: 1,

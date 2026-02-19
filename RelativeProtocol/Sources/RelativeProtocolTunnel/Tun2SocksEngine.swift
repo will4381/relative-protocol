@@ -9,10 +9,11 @@ import RelativeProtocolCore
 final class Tun2SocksEngine {
     private let logger = RelativeLog.logger(.tunnel)
     private let queue: DispatchQueue
+    private let stateQueue = DispatchQueue(label: "com.relative.protocol.tun2socks.state")
     private let runMain: (_ bytes: UnsafePointer<UInt8>, _ count: UInt32, _ tunFD: Int32) -> Int32
     private let quitMain: () -> Void
     private var configData: Data?
-    private var isRunning = false
+    private var running = false
 
     init(
         queue: DispatchQueue = DispatchQueue(label: "com.relative.protocol.tun2socks"),
@@ -29,8 +30,8 @@ final class Tun2SocksEngine {
     }
 
     func start(configuration: TunnelConfiguration, tunFD: Int32, socksPort: UInt16) {
-        guard !isRunning else { return }
-        isRunning = true
+        guard !isRunning() else { return }
+        setRunning(true)
 
         let configString = buildConfigString(configuration: configuration, socksPort: socksPort)
         if RelativeLog.isVerbose {
@@ -52,21 +53,34 @@ final class Tun2SocksEngine {
                 self.logger.info("tun2socks exited with code \(result, privacy: .public)")
                 NSLog("Tun2SocksEngine: exited with code \(result)")
             }
-            self.isRunning = false
+            self.setRunning(false)
         }
     }
 
     func stop() {
-        guard isRunning else { return }
+        guard isRunning() else { return }
         if RelativeLog.isVerbose {
             NSLog("Tun2SocksEngine: stop requested")
         }
         quitMain()
-        isRunning = false
+        setRunning(false)
         configData = nil
     }
 
+    private func isRunning() -> Bool {
+        stateQueue.sync { running }
+    }
+
+    private func setRunning(_ value: Bool) {
+        stateQueue.sync {
+            running = value
+        }
+    }
+
     private func buildConfigString(configuration: TunnelConfiguration, socksPort: UInt16) -> String {
+        let tcpBufferSize = Self.clamp(configuration.enginePerFlowBufferBytes, min: 4_096, max: 1_048_576)
+        let udpRecvBufferSize = Self.clamp(configuration.enginePacketPoolBytes, min: 65_536, max: 16_777_216)
+        let maxSessionCount = max(0, configuration.engineMaxFlows)
         let logLevel = configuration.engineLogLevel.lowercased()
         let mappedLevel: String
         if logLevel.contains("debug") {
@@ -95,6 +109,9 @@ final class Tun2SocksEngine {
         lines.append("  udp: 'udp'")
         lines.append("")
         lines.append("misc:")
+        lines.append("  tcp-buffer-size: \(tcpBufferSize)")
+        lines.append("  udp-recv-buffer-size: \(udpRecvBufferSize)")
+        lines.append("  max-session-count: \(maxSessionCount)")
         lines.append("  log-file: stderr")
         lines.append("  log-level: \(mappedLevel)")
         lines.append("  connect-timeout: 10000")
@@ -102,12 +119,22 @@ final class Tun2SocksEngine {
         lines.append("  udp-read-write-timeout: 60000")
         return lines.joined(separator: "\n")
     }
+
+    private static func clamp(_ value: Int, min minValue: Int, max maxValue: Int) -> Int {
+        if value < minValue {
+            return minValue
+        }
+        if value > maxValue {
+            return maxValue
+        }
+        return value
+    }
 }
 
 #if DEBUG
 extension Tun2SocksEngine {
     var _test_isRunning: Bool {
-        isRunning
+        isRunning()
     }
 
     var _test_configString: String? {

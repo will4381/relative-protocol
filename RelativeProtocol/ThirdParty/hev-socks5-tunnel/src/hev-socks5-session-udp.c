@@ -111,9 +111,22 @@ hev_socks5_session_udp_fwd_f (HevSocks5SessionUDP *self, unsigned int num)
 static int
 hev_socks5_session_udp_fwd_b (HevSocks5SessionUDP *self, unsigned int num)
 {
-    char buf[UDP_BUF_SIZE * num];
-    HevSocks5UDPMsg msgv[num];
+    char *buf;
+    HevSocks5UDPMsg *msgv;
     int i, res;
+
+    if (num < 1)
+        return 0;
+    if (num > UDP_COPY_BUFFER_NUMS_MAX)
+        num = UDP_COPY_BUFFER_NUMS_MAX;
+
+    buf = hev_malloc (UDP_BUF_SIZE * num);
+    msgv = hev_malloc (sizeof (HevSocks5UDPMsg) * num);
+    if (!buf || !msgv) {
+        hev_free (buf);
+        hev_free (msgv);
+        return -1;
+    }
 
     for (i = 0; i < num; i++) {
         msgv[i].buf = buf + UDP_BUF_SIZE * i;
@@ -123,9 +136,10 @@ hev_socks5_session_udp_fwd_b (HevSocks5SessionUDP *self, unsigned int num)
     res = hev_socks5_udp_recvmmsg (HEV_SOCKS5_UDP (self), msgv, num, 1);
     if (res <= 0) {
         if (res == -1 && errno == EAGAIN)
-            return 0;
-        LOG_D ("%p socks5 session udp fwd b recv", self);
-        return -1;
+            res = 0;
+        else
+            LOG_D ("%p socks5 session udp fwd b recv", self);
+        goto exit_free;
     }
 
     for (i = 0; i < res; i++) {
@@ -142,14 +156,16 @@ hev_socks5_session_udp_fwd_b (HevSocks5SessionUDP *self, unsigned int num)
             ret = hev_socks5_addr_into_lwip (msgv[i].addr, &saddr, &port);
             if (ret < 0) {
                 LOG_D ("%p socks5 session udp fwd b addr", self);
-                return -1;
+                res = -1;
+                goto exit_free;
             }
         }
 
         b = pbuf_alloc_reference (msgv[i].buf, msgv[i].len, PBUF_REF);
         if (!b) {
             LOG_D ("%p socks5 session udp fwd b buf", self);
-            return -1;
+            res = -1;
+            goto exit_free;
         }
 
         hev_task_mutex_lock (self->mutex);
@@ -159,11 +175,17 @@ hev_socks5_session_udp_fwd_b (HevSocks5SessionUDP *self, unsigned int num)
         pbuf_free (b);
         if (err != ERR_OK) {
             LOG_D ("%p socks5 session udp fwd b send", self);
-            return -1;
+            res = -1;
+            goto exit_free;
         }
     }
 
-    return 1;
+    res = 1;
+
+exit_free:
+    hev_free (msgv);
+    hev_free (buf);
+    return res;
 }
 
 static void
@@ -294,6 +316,11 @@ hev_socks5_session_udp_splice (HevSocks5Session *base)
     LOG_D ("%p socks5 session udp splice", self);
 
     num = hev_config_get_misc_udp_copy_buffer_nums ();
+    if (num < 1)
+        num = 1;
+    else if (num > UDP_COPY_BUFFER_NUMS_MAX)
+        num = UDP_COPY_BUFFER_NUMS_MAX;
+
     fd = hev_socks5_udp_get_fd (HEV_SOCKS5_UDP (self));
     if (hev_task_mod_fd (task, fd, POLLIN | POLLOUT) < 0)
         hev_task_add_fd (task, fd, POLLIN | POLLOUT);

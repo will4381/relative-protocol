@@ -14,6 +14,7 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
     private let queue = DispatchQueue(label: "com.relative.protocol.tunnel")
     private let ioQueue = DispatchQueue(label: "com.relative.protocol.tunnel.io", qos: .userInitiated)
     private let metricsQueue = DispatchQueue(label: "com.relative.protocol.tunnel.metrics", qos: .utility)
+    private let stateQueue = DispatchQueue(label: "com.relative.protocol.tunnel.state")
 
     private var configuration: TunnelConfiguration?
     private var flowTracker: FlowTracker?
@@ -26,6 +27,8 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
     private var metricsSampleLimit: Int = 0
     private var metricsSnapshotLimit: Int = 0
     private var packetStreamWriter: PacketSampleStreamWriter?
+    private var outboundStreamSampleBuffer: [PacketSample] = []
+    private var inboundStreamSampleBuffer: [PacketSample] = []
     private var socksServer: Socks5Server?
     private var tunBridge: TunSocketBridge?
     private var engine: Tun2SocksEngine?
@@ -34,47 +37,73 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
     private var inboundPacketCount: UInt64 = 0
     private var didWarnRelay = false
     private let logPrefix = "RelativePacketTunnelProvider"
-    private var didCallStartCompletion = false
     private var waitingForBackpressureRelief = false
+    private var relayRestartInProgress = false
+    private var defaultPathMonitorTimer: DispatchSourceTimer?
+    private var keepaliveTimer: DispatchSourceTimer?
+    private var lastObservedPathSignature: String?
+    private var reassertingState = false
+
+    private static let keepaliveEndpoint = NWHostEndpoint(hostname: "1.1.1.1", port: "53")
+    private static let keepaliveDNSQuery = Data([
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x07, 0x65, 0x78, 0x61,
+        0x6d, 0x70, 0x6c, 0x65, 0x03, 0x63, 0x6f, 0x6d,
+        0x00, 0x00, 0x01, 0x00, 0x01
+    ])
 
     public override func startTunnel(options: [String: NSObject]? = nil, completionHandler: @escaping (Error?) -> Void) {
         if RelativeLog.isVerbose {
             NSLog("\(logPrefix): startTunnel invoked")
         }
         queue.async {
+            self.setIsStopping(false)
+            self.setWaitingForBackpressureRelief(false)
+            self.relayRestartInProgress = false
             let config = self.loadConfiguration()
             self.configuration = config
             let settings = self.makeNetworkSettings(from: config)
+            var didCompleteStart = false
+            let completeStart: (Error?) -> Void = { error in
+                guard !didCompleteStart else { return }
+                didCompleteStart = true
+                completionHandler(error)
+            }
 
             self.setTunnelNetworkSettings(settings) { [weak self] error in
                 guard let self else { return }
-                if let error {
-                    self.logger.error("Failed to apply network settings: \(error.localizedDescription, privacy: .public)")
-                    if RelativeLog.isVerbose {
-                        NSLog("\(self.logPrefix): setTunnelNetworkSettings failed: \(error.localizedDescription)")
-                    }
-                    completionHandler(error)
-                    return
-                }
-
-                if RelativeLog.isVerbose {
-                    self.logger.info("Tunnel network settings applied. IPv6 enabled: \(config.ipv6Enabled, privacy: .public)")
-                    NSLog("\(self.logPrefix): network settings applied, starting relay")
-                }
-                if !self.didCallStartCompletion {
-                    self.didCallStartCompletion = true
-                    completionHandler(nil)
-                }
-                self.setupPacketStream(using: config)
-                self.setupMetrics(using: config)
-                self.startRelay(using: config) { [weak self] error in
-                    guard let self else { return }
+                self.queue.async {
                     if let error {
-                        self.logger.error("Relay start failed after tunnel setup: \(error.localizedDescription, privacy: .public)")
+                        self.logger.error("Failed to apply network settings: \(error.localizedDescription, privacy: .public)")
                         if RelativeLog.isVerbose {
-                            NSLog("\(self.logPrefix): relay start failed after setup: \(error.localizedDescription)")
+                            NSLog("\(self.logPrefix): setTunnelNetworkSettings failed: \(error.localizedDescription)")
                         }
-                        self.cancelTunnelWithError(error)
+                        completeStart(error)
+                        return
+                    }
+
+                    if RelativeLog.isVerbose {
+                        self.logger.info("Tunnel network settings applied. IPv6 enabled: \(config.ipv6Enabled, privacy: .public)")
+                        NSLog("\(self.logPrefix): network settings applied, starting relay")
+                    }
+                    self.setupPacketStream(using: config)
+                    self.setupMetrics(using: config)
+                    self.startRelay(using: config) { [weak self] error in
+                        guard let self else { return }
+                        self.queue.async {
+                            if let error {
+                                self.logger.error("Relay start failed after tunnel setup: \(error.localizedDescription, privacy: .public)")
+                                if RelativeLog.isVerbose {
+                                    NSLog("\(self.logPrefix): relay start failed after setup: \(error.localizedDescription)")
+                                }
+                                completeStart(error)
+                                return
+                            }
+
+                            self.startDefaultPathMonitor()
+                            self.startKeepaliveTimer(using: config)
+                            completeStart(nil)
+                        }
                     }
                 }
             }
@@ -83,13 +112,11 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
 
     public override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         queue.async {
-            self.isStopping = true
-            self.engine?.stop()
-            self.engine = nil
-            self.tunBridge?.stop()
-            self.tunBridge = nil
-            self.socksServer?.stop()
-            self.socksServer = nil
+            self.setIsStopping(true)
+            self.stopDefaultPathMonitor()
+            self.stopKeepaliveTimer()
+            self.relayRestartInProgress = false
+            self.stopRelayComponents()
             self.metricsQueue.sync {
                 self.flushMetricsInternal()
                 self.metricsTimer?.cancel()
@@ -98,20 +125,77 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
                 self.metricsStore = nil
                 self.packetStreamWriter?.close()
                 self.packetStreamWriter = nil
+                self.outboundStreamSampleBuffer.removeAll(keepingCapacity: false)
+                self.inboundStreamSampleBuffer.removeAll(keepingCapacity: false)
                 self.flowTracker = nil
                 self.burstTracker = nil
                 self.trafficClassifier = nil
                 self.metricsSampleLimit = 0
                 self.metricsSnapshotLimit = 0
             }
-            self.didCallStartCompletion = false
-            self.waitingForBackpressureRelief = false
+            self.setWaitingForBackpressureRelief(false)
+            self.setReasserting(false)
             if RelativeLog.isVerbose {
                 self.logger.info("Tunnel stopped with reason: \(reason.rawValue, privacy: .public)")
                 NSLog("\(self.logPrefix): stopTunnel reason=\(reason.rawValue)")
             }
             completionHandler()
         }
+    }
+
+    public override func sleep(completionHandler: @escaping () -> Void) {
+        queue.async {
+            self.stopDefaultPathMonitor()
+            self.stopKeepaliveTimer()
+            if RelativeLog.isVerbose {
+                self.logger.info("Provider entering sleep; timers paused.")
+                NSLog("\(self.logPrefix): sleep received")
+            }
+            completionHandler()
+        }
+    }
+
+    public override func wake() {
+        queue.async {
+            guard !self.isStoppingState() else { return }
+            guard let config = self.configuration else { return }
+            self.startDefaultPathMonitor()
+            self.startKeepaliveTimer(using: config)
+            self.restartRelay(reason: "wake")
+        }
+    }
+
+    public override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)? = nil) {
+        queue.async {
+            completionHandler?(self.handleAppMessageOnQueue(messageData))
+        }
+    }
+
+    private func handleAppMessageOnQueue(_ messageData: Data) -> Data? {
+        let command = Self.parseAppMessageCommand(from: messageData)
+
+        switch command {
+        case "status", "diagnostics":
+            return makeAppMessageResponse(command: command, ok: true)
+        case "flushmetrics":
+            flushMetrics()
+            return makeAppMessageResponse(command: command, ok: true)
+        case "restartrelay":
+            restartRelay(reason: "app-message")
+            return makeAppMessageResponse(command: command, ok: true)
+        case "reloadconfiguration":
+            configuration = loadConfiguration()
+            return makeAppMessageResponse(command: command, ok: true)
+        default:
+            return makeAppMessageResponse(command: command, ok: false, error: "unsupported-command")
+        }
+    }
+
+    private static func parseAppMessageCommand(from messageData: Data) -> String {
+        let payload = (try? JSONSerialization.jsonObject(with: messageData)) as? [String: Any]
+        return (payload?["command"] as? String ?? payload?["action"] as? String ?? "status")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
     }
 
     private func loadConfiguration() -> TunnelConfiguration {
@@ -148,7 +232,7 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
         }
 
         settings.mtu = NSNumber(value: config.mtu)
-        settings.tunnelOverheadBytes = 0
+        settings.tunnelOverheadBytes = NSNumber(value: config.tunnelOverheadBytes)
         return settings
     }
 
@@ -181,7 +265,7 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
                 maxSnapshots: snapshotLimit,
                 maxBytes: 1_500_000,
                 format: config.metricsStoreFormat,
-                useLock: false
+                useLock: true
             )
         }
 
@@ -210,7 +294,7 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
             packetStreamWriter = PacketSampleStreamWriter(
                 appGroupID: config.appGroupID,
                 maxBytes: config.packetStreamMaxBytes,
-                useLock: false
+                useLock: true
             )
         }
         metricsLogger.info("Packet stream enabled. Max bytes: \(config.packetStreamMaxBytes, privacy: .public). Container: \(containerURL?.path ?? "nil", privacy: .public). Stream: \(streamURL?.path ?? "nil", privacy: .public)")
@@ -228,7 +312,7 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
         let samples = metricsBuffer.snapshot(limit: metricsSampleLimit > 0 ? metricsSampleLimit : nil)
         metricsBuffer.clear()
         guard !samples.isEmpty else { return }
-        let snapshot = MetricsSnapshot(capturedAt: Date().timeIntervalSince1970, samples: samples)
+        let snapshot = MetricsSnapshot(capturedAt: TunnelTime.nowEpochSeconds(), samples: samples)
         metricsWriteQueue.async {
             metricsStore.append(snapshot)
         }
@@ -238,14 +322,14 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func startPacketReadLoop() {
-        guard !waitingForBackpressureRelief else { return }
+        guard !waitingForBackpressureReliefState() else { return }
         packetFlow.readPackets { [weak self] packets, protocols in
             guard let self else { return }
             self.ioQueue.async {
-                guard !self.isStopping else { return }
+                guard !self.isStoppingState() else { return }
                 self.handlePackets(packets, protocols: protocols)
                 if let tunBridge = self.tunBridge, tunBridge.isBackpressured() {
-                    self.waitingForBackpressureRelief = true
+                    self.setWaitingForBackpressureRelief(true)
                 } else {
                     self.startPacketReadLoop()
                 }
@@ -254,7 +338,7 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func handlePackets(_ packets: [Data], protocols: [NSNumber]) {
-        let timestamp = Date().timeIntervalSince1970
+        let timestamp = TunnelTime.nowEpochSeconds()
         for (index, packet) in packets.enumerated() {
             let protoHint = protocols.indices.contains(index) ? protocols[index].int32Value : 0
             if let tunBridge {
@@ -330,8 +414,132 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
+    private func stopRelayComponents() {
+        engine?.stop()
+        engine = nil
+        tunBridge?.stop()
+        tunBridge = nil
+        socksServer?.stop()
+        socksServer = nil
+    }
+
+    private func startDefaultPathMonitor() {
+        stopDefaultPathMonitor()
+        lastObservedPathSignature = defaultPathSignature(defaultPath)
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 2, repeating: 2)
+        timer.setEventHandler { [weak self] in
+            self?.handleDefaultPathMonitorTick()
+        }
+        timer.resume()
+        defaultPathMonitorTimer = timer
+    }
+
+    private func stopDefaultPathMonitor() {
+        defaultPathMonitorTimer?.cancel()
+        defaultPathMonitorTimer = nil
+        lastObservedPathSignature = nil
+    }
+
+    private func startKeepaliveTimer(using config: TunnelConfiguration) {
+        stopKeepaliveTimer()
+        guard config.relayMode == "tun2socks" else { return }
+        guard config.keepaliveIntervalSeconds > 0 else { return }
+        let interval = max(10, config.keepaliveIntervalSeconds)
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + interval, repeating: interval)
+        timer.setEventHandler { [weak self] in
+            self?.sendKeepaliveProbeIfNeeded()
+        }
+        timer.resume()
+        keepaliveTimer = timer
+    }
+
+    private func stopKeepaliveTimer() {
+        keepaliveTimer?.cancel()
+        keepaliveTimer = nil
+    }
+
+    private func sendKeepaliveProbeIfNeeded() {
+        guard !isStoppingState(), !relayRestartInProgress else { return }
+        guard let config = configuration, config.relayMode == "tun2socks" else { return }
+        guard config.keepaliveIntervalSeconds > 0 else { return }
+        let session = createUDPSessionThroughTunnel(to: Self.keepaliveEndpoint, from: nil)
+        session.writeDatagram(Self.keepaliveDNSQuery) { [weak self] error in
+            if let error, RelativeLog.isVerbose {
+                self?.logger.warning("Keepalive probe failed: \(error.localizedDescription, privacy: .public)")
+            }
+            session.cancel()
+        }
+    }
+
+    private func handleDefaultPathMonitorTick() {
+        guard !isStoppingState() else { return }
+        let currentPath = defaultPath
+        let currentSignature = defaultPathSignature(currentPath)
+        guard currentSignature != lastObservedPathSignature else { return }
+        lastObservedPathSignature = currentSignature
+        guard currentPath?.status == .satisfied else { return }
+        restartRelay(reason: "path-change")
+    }
+
+    private func restartRelay(reason: String) {
+        guard !relayRestartInProgress, !isStoppingState() else { return }
+        guard let config = configuration, config.relayMode == "tun2socks" else { return }
+        relayRestartInProgress = true
+        setWaitingForBackpressureRelief(false)
+        setReasserting(true)
+        stopKeepaliveTimer()
+        if RelativeLog.isVerbose {
+            logger.info("Re-establishing relay due to \(reason, privacy: .public).")
+            NSLog("\(logPrefix): restarting relay, reason=\(reason)")
+        }
+
+        stopRelayComponents()
+        startRelay(using: config) { [weak self] error in
+            guard let self else { return }
+            self.queue.async {
+                self.relayRestartInProgress = false
+                self.setReasserting(false)
+                if let error {
+                    self.logger.error("Failed to restart relay (\(reason, privacy: .public)): \(error.localizedDescription, privacy: .public)")
+                    if RelativeLog.isVerbose {
+                        NSLog("\(self.logPrefix): relay restart failed, reason=\(reason), error=\(error.localizedDescription)")
+                    }
+                    self.cancelTunnelWithError(error)
+                    return
+                }
+                self.startKeepaliveTimer(using: config)
+            }
+        }
+    }
+
+    private func defaultPathSignature(_ path: NWPath?) -> String {
+        guard let path else { return "path:nil" }
+        let status: String
+        switch path.status {
+        case .satisfied:
+            status = "satisfied"
+        case .unsatisfied:
+            status = "unsatisfied"
+        case .satisfiable:
+            status = "satisfiable"
+        case .invalid:
+            status = "invalid"
+        @unknown default:
+            status = "unknown"
+        }
+        let interfaces = [pathDescriptorFingerprint(for: path)]
+        return buildPathSignature(
+            status: status,
+            isExpensive: path.isExpensive,
+            isConstrained: path.isConstrained,
+            interfaces: interfaces
+        )
+    }
+
     private func handleInboundPackets(_ packets: [Data], families: [Int32]) {
-        guard !isStopping else { return }
+        guard !isStoppingState() else { return }
         guard !packets.isEmpty else { return }
 
         var protocols: [NSNumber] = []
@@ -350,7 +558,7 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
             logger.error("Failed to write inbound packets to flow.")
         }
 
-        let timestamp = Date().timeIntervalSince1970
+        let timestamp = TunnelTime.nowEpochSeconds()
         metricsQueue.async { [weak self] in
             self?.recordInboundPackets(packets, families: families, timestamp: timestamp)
         }
@@ -359,10 +567,9 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
     private func recordOutboundPackets(_ packets: [Data], protocols: [NSNumber], timestamp: TimeInterval) {
         guard let metricsBuffer else { return }
         let writer = packetStreamWriter
-        var streamSamples: [PacketSample]?
         if writer != nil {
-            streamSamples = []
-            streamSamples?.reserveCapacity(packets.count)
+            outboundStreamSampleBuffer.removeAll(keepingCapacity: true)
+            outboundStreamSampleBuffer.reserveCapacity(packets.count)
         }
 
         for (index, packet) in packets.enumerated() {
@@ -380,9 +587,6 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
                     direction: .outbound,
                     timestamp: timestamp
                 )
-                let dnsAnswers = metadata.dnsAnswerAddresses?.map { $0.stringValue }
-                let srcString = metadata.srcAddress.stringValue
-                let dstString = metadata.dstAddress.stringValue
                 let sample = PacketSample(
                     timestamp: timestamp,
                     direction: .outbound,
@@ -391,13 +595,13 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
                     length: metadata.length,
                     flowId: observation.flowId,
                     burstId: observation.burstId,
-                    srcAddress: srcString.isEmpty ? nil : srcString,
-                    dstAddress: dstString.isEmpty ? nil : dstString,
+                    srcIPAddress: metadata.srcAddress,
+                    dstIPAddress: metadata.dstAddress,
                     srcPort: metadata.srcPort,
                     dstPort: metadata.dstPort,
                     dnsQueryName: metadata.dnsQueryName,
                     dnsCname: metadata.dnsCname,
-                    dnsAnswerAddresses: dnsAnswers,
+                    dnsAnswerIPAddresses: metadata.dnsAnswerAddresses,
                     registrableDomain: metadata.registrableDomain,
                     tlsServerName: metadata.tlsServerName,
                     quicVersion: metadata.quicVersion,
@@ -408,7 +612,9 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
                     trafficClassification: classification
                 )
                 metricsBuffer.append(sample)
-                streamSamples?.append(sample)
+                if writer != nil {
+                    outboundStreamSampleBuffer.append(sample)
+                }
                 self.packetCount &+= 1
                 if self.packetCount % 500 == 0 {
                     if RelativeLog.isVerbose {
@@ -425,18 +631,17 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
 
-        if let writer, let streamSamples, !streamSamples.isEmpty {
-            writer.append(streamSamples)
+        if let writer, !outboundStreamSampleBuffer.isEmpty {
+            writer.append(outboundStreamSampleBuffer)
         }
     }
 
     private func recordInboundPackets(_ packets: [Data], families: [Int32], timestamp: TimeInterval) {
         guard let metricsBuffer else { return }
         let writer = packetStreamWriter
-        var streamSamples: [PacketSample]?
         if writer != nil {
-            streamSamples = []
-            streamSamples?.reserveCapacity(packets.count)
+            inboundStreamSampleBuffer.removeAll(keepingCapacity: true)
+            inboundStreamSampleBuffer.reserveCapacity(packets.count)
         }
 
         for (index, packet) in packets.enumerated() {
@@ -454,9 +659,6 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
                     direction: .inbound,
                     timestamp: timestamp
                 )
-                let dnsAnswers = metadata.dnsAnswerAddresses?.map { $0.stringValue }
-                let srcString = metadata.srcAddress.stringValue
-                let dstString = metadata.dstAddress.stringValue
                 let sample = PacketSample(
                     timestamp: timestamp,
                     direction: .inbound,
@@ -465,13 +667,13 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
                     length: metadata.length,
                     flowId: observation.flowId,
                     burstId: observation.burstId,
-                    srcAddress: srcString.isEmpty ? nil : srcString,
-                    dstAddress: dstString.isEmpty ? nil : dstString,
+                    srcIPAddress: metadata.srcAddress,
+                    dstIPAddress: metadata.dstAddress,
                     srcPort: metadata.srcPort,
                     dstPort: metadata.dstPort,
                     dnsQueryName: metadata.dnsQueryName,
                     dnsCname: metadata.dnsCname,
-                    dnsAnswerAddresses: dnsAnswers,
+                    dnsAnswerIPAddresses: metadata.dnsAnswerAddresses,
                     registrableDomain: metadata.registrableDomain,
                     tlsServerName: metadata.tlsServerName,
                     quicVersion: metadata.quicVersion,
@@ -482,7 +684,9 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
                     trafficClassification: classification
                 )
                 metricsBuffer.append(sample)
-                streamSamples?.append(sample)
+                if writer != nil {
+                    inboundStreamSampleBuffer.append(sample)
+                }
                 self.inboundPacketCount &+= 1
                 if self.inboundPacketCount % 500 == 0 {
                     if RelativeLog.isVerbose {
@@ -492,8 +696,8 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
 
-        if let writer, let streamSamples, !streamSamples.isEmpty {
-            writer.append(streamSamples)
+        if let writer, !inboundStreamSampleBuffer.isEmpty {
+            writer.append(inboundStreamSampleBuffer)
         }
     }
 
@@ -548,13 +752,92 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
     private func resumePacketReadLoopIfNeeded() {
         ioQueue.async { [weak self] in
             guard let self else { return }
-            guard self.waitingForBackpressureRelief, !self.isStopping else { return }
+            guard self.waitingForBackpressureReliefState(), !self.isStoppingState() else { return }
             if let tunBridge = self.tunBridge, tunBridge.isBackpressured() {
                 return
             }
-            self.waitingForBackpressureRelief = false
+            self.setWaitingForBackpressureRelief(false)
             self.startPacketReadLoop()
         }
+    }
+
+    private func setIsStopping(_ value: Bool) {
+        stateQueue.sync {
+            isStopping = value
+        }
+    }
+
+    private func isStoppingState() -> Bool {
+        stateQueue.sync {
+            isStopping
+        }
+    }
+
+    private func setWaitingForBackpressureRelief(_ value: Bool) {
+        stateQueue.sync {
+            waitingForBackpressureRelief = value
+        }
+    }
+
+    private func waitingForBackpressureReliefState() -> Bool {
+        stateQueue.sync {
+            waitingForBackpressureRelief
+        }
+    }
+
+    private func setReasserting(_ value: Bool) {
+        reassertingState = value
+        reasserting = value
+    }
+
+    private func makeAppMessageResponse(command: String, ok: Bool, error: String? = nil) -> Data? {
+        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
+            let payload: [String: Any] = [
+                "ok": ok,
+                "command": command,
+                "error": error ?? NSNull(),
+                "timestamp": TunnelTime.nowEpochSeconds(),
+                "defaultPathSignature": "path:unavailable"
+            ]
+            return try? JSONSerialization.data(withJSONObject: payload, options: [])
+        }
+
+        var packetCounts: (outbound: UInt64, inbound: UInt64) = (0, 0)
+        metricsQueue.sync {
+            packetCounts = (packetCount, inboundPacketCount)
+        }
+        let payload: [String: Any] = [
+            "ok": ok,
+            "command": command,
+            "error": error ?? NSNull(),
+            "timestamp": TunnelTime.nowEpochSeconds(),
+            "isStopping": isStoppingState(),
+            "waitingForBackpressureRelief": waitingForBackpressureReliefState(),
+            "relayRestartInProgress": relayRestartInProgress,
+            "reasserting": reassertingState,
+            "relayMode": configuration?.relayMode ?? "",
+            // Avoid touching defaultPath when the provider is not running in an extension context.
+            "defaultPathSignature": lastObservedPathSignature ?? "path:unavailable",
+            "lastObservedPathSignature": lastObservedPathSignature as Any,
+            "outboundPacketCount": packetCounts.outbound,
+            "inboundPacketCount": packetCounts.inbound
+        ]
+        return try? JSONSerialization.data(withJSONObject: payload, options: [])
+    }
+
+    private func pathDescriptorFingerprint(for path: NWPath) -> String {
+        let descriptor = String(describing: path)
+        let digest = UInt64(bitPattern: Int64(descriptor.hashValue))
+        return String(digest, radix: 16)
+    }
+
+    private func buildPathSignature(
+        status: String,
+        isExpensive: Bool,
+        isConstrained: Bool,
+        interfaces: [String]
+    ) -> String {
+        "\(status)|exp=\(isExpensive)|con=\(isConstrained)|if=\(interfaces.joined(separator: ","))"
     }
 }
 
@@ -562,6 +845,24 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
 extension RelativePacketTunnelProvider {
     func _test_makeNetworkSettings(from config: TunnelConfiguration) -> NEPacketTunnelNetworkSettings {
         makeNetworkSettings(from: config)
+    }
+
+    func _test_buildPathSignature(
+        status: String,
+        isExpensive: Bool,
+        isConstrained: Bool,
+        interfaces: [String]
+    ) -> String {
+        buildPathSignature(
+            status: status,
+            isExpensive: isExpensive,
+            isConstrained: isConstrained,
+            interfaces: interfaces
+        )
+    }
+
+    static func _test_parseAppMessageCommand(_ messageData: Data) -> String {
+        parseAppMessageCommand(from: messageData)
     }
 }
 #endif

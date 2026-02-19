@@ -89,10 +89,11 @@ final class Socks5CodecEdgeTests: XCTestCase {
         XCTAssertEqual(parsed?.payload, validPayload)
     }
 
-    func testBuildReplyFallsBackToZeroAddressForInvalidIPv4String() {
+    func testBuildReplyFallsBackToDomainAddressForInvalidIPAddressString() {
         let reply = Socks5Codec.buildReply(code: 0x00, bindAddress: .ipv4("not-an-ip"), bindPort: 8080)
-        XCTAssertEqual(reply.count, 10)
-        XCTAssertEqual(reply[3], 0x01)
-        XCTAssertEqual(Array(reply[4...7]), [0, 0, 0, 0])
+        XCTAssertEqual(reply[3], 0x03)
+        XCTAssertEqual(reply[4], UInt8("not-an-ip".utf8.count))
+        let domainBytes = Data("not-an-ip".utf8)
+        XCTAssertEqual(reply.subdata(in: 5..<(5 + domainBytes.count)), domainBytes)
     }
 }

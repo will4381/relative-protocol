@@ -36,6 +36,20 @@
 
 static char tun_name[IFNAMSIZ];
 
+static void
+copy_ifname (char *dst, size_t dst_len, const char *src)
+{
+    if (!dst || !dst_len)
+        return;
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+
+    strncpy (dst, src, dst_len - 1);
+    dst[dst_len - 1] = '\0';
+}
+
 int
 hev_tunnel_open (const char *name, int multi_queue)
 {
@@ -64,9 +78,11 @@ hev_tunnel_open (const char *name, int multi_queue)
     sc.ss_sysaddr = AF_SYS_CONTROL;
     sc.sc_unit = 0;
 
-    res = sscanf (name, "utun%u", &sc.sc_unit);
-    if (res > 0)
-        sc.sc_unit += 1;
+    if (name) {
+        res = sscanf (name, "utun%u", &sc.sc_unit);
+        if (res > 0)
+            sc.sc_unit += 1;
+    }
 
     res = connect (fd, (struct sockaddr *)&sc, sizeof (sc));
     if (res < 0)
@@ -157,7 +173,7 @@ hev_tunnel_set_ipv4 (const char *addr, unsigned int prefix)
     if (fd < 0)
         goto exit;
 
-    strcpy (ifra.ifra_name, tun_name);
+    copy_ifname (ifra.ifra_name, sizeof (ifra.ifra_name), tun_name);
 
     pa = (struct sockaddr_in *)&ifra.ifra_addr;
     pa->sin_len = sizeof (ifra.ifra_addr);
@@ -171,7 +187,12 @@ hev_tunnel_set_ipv4 (const char *addr, unsigned int prefix)
     pa = (struct sockaddr_in *)&ifra.ifra_mask;
     pa->sin_len = sizeof (ifra.ifra_addr);
     pa->sin_family = AF_INET;
-    pa->sin_addr.s_addr = htonl (((unsigned int)(-1)) << (32 - prefix));
+    if (prefix > 32)
+        prefix = 32;
+    if (prefix == 0)
+        pa->sin_addr.s_addr = 0;
+    else
+        pa->sin_addr.s_addr = htonl (((unsigned int)(-1)) << (32 - prefix));
 
     res = ioctl (fd, SIOCAIFADDR, &ifra);
 
@@ -199,7 +220,7 @@ hev_tunnel_set_ipv6 (const char *addr, unsigned int prefix)
     if (fd < 0)
         goto exit;
 
-    strcpy (ifra.ifra_name, tun_name);
+    copy_ifname (ifra.ifra_name, sizeof (ifra.ifra_name), tun_name);
 
     ifra.ifra_addr.sin6_len = sizeof (ifra.ifra_addr);
     ifra.ifra_addr.sin6_family = AF_INET6;
@@ -210,11 +231,13 @@ hev_tunnel_set_ipv6 (const char *addr, unsigned int prefix)
     ifra.ifra_prefixmask.sin6_len = sizeof (ifra.ifra_prefixmask);
     ifra.ifra_prefixmask.sin6_family = AF_INET6;
     bytes = (uint8_t *)&ifra.ifra_prefixmask.sin6_addr;
-    memset (bytes, 0xFF, 16);
-    bytes[prefix / 8] <<= prefix % 8;
-    prefix += prefix % 8;
-    for (i = prefix / 8; i < 16; i++)
-        bytes[i] = 0;
+    memset (bytes, 0, 16);
+    if (prefix > 128)
+        prefix = 128;
+    for (i = 0; i < (int)(prefix / 8); i++)
+        bytes[i] = 0xFF;
+    if ((prefix % 8) && ((prefix / 8) < 16))
+        bytes[prefix / 8] = (uint8_t)(0xFF << (8 - (prefix % 8)));
 
     res = ioctl (fd, SIOCAIFADDR_IN6, &ifra);
 

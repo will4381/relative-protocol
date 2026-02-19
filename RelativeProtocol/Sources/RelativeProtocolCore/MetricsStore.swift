@@ -2,6 +2,7 @@
 // See LICENSE for terms.
 // Created by Will Kusch 1/23/26
 
+import Darwin
 import Foundation
 
 public final class MetricsStore {
@@ -11,6 +12,7 @@ public final class MetricsStore {
     private let maxSnapshots: Int
     private let maxBytes: Int
     private let format: MetricsStoreFormat
+    private let lockFileURL: URL?
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private let useLock: Bool
@@ -31,6 +33,7 @@ public final class MetricsStore {
         self.maxSnapshots = max(1, maxSnapshots)
         self.maxBytes = max(1, maxBytes)
         self.fileURL = MetricsStore.makeStoreURL(appGroupID: appGroupID, key: key)
+        self.lockFileURL = self.fileURL?.appendingPathExtension("lock")
         self.format = format
         self.useLock = useLock
     }
@@ -71,11 +74,22 @@ public final class MetricsStore {
 
     private func withLock<T>(_ body: () -> T) -> T {
         if useLock {
-            lock.lock()
-            let result = body()
-            lock.unlock()
-            return result
+            return withFileLock {
+                lock.lock()
+                defer { lock.unlock() }
+                return body()
+            }
         }
+        return withFileLock(body)
+    }
+
+    private func withFileLock<T>(_ body: () -> T) -> T {
+        guard let lockFileURL else { return body() }
+        let fd = open(lockFileURL.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        guard fd >= 0 else { return body() }
+        defer { close(fd) }
+        guard flock(fd, LOCK_EX) == 0 else { return body() }
+        defer { _ = flock(fd, LOCK_UN) }
         return body()
     }
 

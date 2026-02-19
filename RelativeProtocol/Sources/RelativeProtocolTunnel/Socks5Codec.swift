@@ -162,21 +162,30 @@ enum Socks5Codec {
     private static func addressBytes(_ address: Socks5Address) -> [UInt8] {
         switch address {
         case .ipv4(let value):
-            var bytes = [UInt8](repeating: 0, count: 4)
-            if let data = ipv4Data(from: value) {
-                data.copyBytes(to: &bytes, count: 4)
+            guard let data = ipv4Data(from: value) else {
+                return domainAddressBytes(value)
             }
+            var bytes = [UInt8](repeating: 0, count: 4)
+            data.copyBytes(to: &bytes, count: 4)
             return [0x01] + bytes
         case .ipv6(let value):
-            var bytes = [UInt8](repeating: 0, count: 16)
-            if let data = ipv6Data(from: value) {
-                data.copyBytes(to: &bytes, count: 16)
+            guard let data = ipv6Data(from: value) else {
+                return domainAddressBytes(value)
             }
+            var bytes = [UInt8](repeating: 0, count: 16)
+            data.copyBytes(to: &bytes, count: 16)
             return [0x04] + bytes
         case .domain(let domain):
-            let utf8 = Array(domain.utf8)
-            return [0x03, UInt8(utf8.count)] + utf8
+            return domainAddressBytes(domain)
         }
+    }
+
+    private static func domainAddressBytes(_ value: String) -> [UInt8] {
+        var utf8 = Array(value.utf8)
+        if utf8.count > 255 {
+            utf8 = Array(utf8.prefix(255))
+        }
+        return [0x03, UInt8(utf8.count)] + utf8
     }
 
     private static func ipv4Data(from string: String) -> Data? {

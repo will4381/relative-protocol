@@ -11,7 +11,7 @@ final class TunnelConfigurationTests: XCTestCase {
 
         XCTAssertEqual(config.appGroupID, "")
         XCTAssertEqual(config.relayMode, "tun2socks")
-        XCTAssertEqual(config.mtu, 1500)
+        XCTAssertEqual(config.mtu, 1400)
         XCTAssertTrue(config.ipv6Enabled)
         XCTAssertEqual(config.dnsServers, [])
         XCTAssertEqual(config.enginePacketPoolBytes, 2_097_152)
@@ -21,7 +21,8 @@ final class TunnelConfigurationTests: XCTestCase {
         XCTAssertEqual(config.engineLogLevel, "")
         XCTAssertTrue(config.metricsEnabled)
         XCTAssertEqual(config.metricsRingBufferSize, 2048)
-        XCTAssertEqual(config.metricsSnapshotInterval, 1.0)
+        XCTAssertEqual(config.metricsSnapshotInterval, 5.0)
+        XCTAssertEqual(config.keepaliveIntervalSeconds, 25.0)
         XCTAssertEqual(config.metricsStoreFormat, .json)
         XCTAssertEqual(config.burstThresholdMs, 350)
         XCTAssertEqual(config.flowTTLSeconds, 300)
@@ -36,6 +37,7 @@ final class TunnelConfigurationTests: XCTestCase {
         XCTAssertEqual(config.ipv6Address, "fd00:1:1:1::2")
         XCTAssertEqual(config.ipv6PrefixLength, 64)
         XCTAssertEqual(config.tunnelRemoteAddress, "127.0.0.1")
+        XCTAssertEqual(config.tunnelOverheadBytes, 80)
     }
 
     func testParsesMixedTypes() {
@@ -53,6 +55,7 @@ final class TunnelConfigurationTests: XCTestCase {
             "metricsEnabled": NSNumber(value: 0),
             "metricsRingBufferSize": "128",
             "metricsSnapshotInterval": "2.5",
+            "keepaliveIntervalSeconds": "18",
             "metricsStoreFormat": "ndjson",
             "burstThresholdMs": "400",
             "flowTTLSeconds": NSNumber(value: 120),
@@ -65,7 +68,8 @@ final class TunnelConfigurationTests: XCTestCase {
             "ipv4Router": "10.1.0.1",
             "ipv6Address": "fd00::1",
             "ipv6PrefixLength": "72",
-            "tunnelRemoteAddress": "10.0.0.1"
+            "tunnelRemoteAddress": "10.0.0.1",
+            "tunnelOverheadBytes": "96"
         ])
 
         XCTAssertEqual(config.appGroupID, "group.test")
@@ -81,6 +85,7 @@ final class TunnelConfigurationTests: XCTestCase {
         XCTAssertFalse(config.metricsEnabled)
         XCTAssertEqual(config.metricsRingBufferSize, 128)
         XCTAssertEqual(config.metricsSnapshotInterval, 2.5)
+        XCTAssertEqual(config.keepaliveIntervalSeconds, 18)
         XCTAssertEqual(config.metricsStoreFormat, .ndjson)
         XCTAssertEqual(config.burstThresholdMs, 400)
         XCTAssertEqual(config.flowTTLSeconds, 120)
@@ -94,6 +99,7 @@ final class TunnelConfigurationTests: XCTestCase {
         XCTAssertEqual(config.ipv6Address, "fd00::1")
         XCTAssertEqual(config.ipv6PrefixLength, 72)
         XCTAssertEqual(config.tunnelRemoteAddress, "10.0.0.1")
+        XCTAssertEqual(config.tunnelOverheadBytes, 96)
     }
 
     func testStringArrayFiltersNonStrings() {

@@ -2,6 +2,7 @@
 // See LICENSE for terms.
 // Created by Will Kusch 1/23/26
 
+import Darwin
 import Foundation
 
 public struct PacketSampleStreamLocation {
@@ -38,6 +39,7 @@ public struct PacketSampleStreamLocation {
 
 public final class PacketSampleStreamWriter {
     private let fileURL: URL?
+    private let lockFileURL: URL?
     private let maxBytes: Int
     private let encoder = JSONEncoder()
     private let useLock: Bool
@@ -53,6 +55,7 @@ public final class PacketSampleStreamWriter {
         useLock: Bool = true
     ) {
         self.fileURL = PacketSampleStreamLocation.makeURL(appGroupID: appGroupID, key: key)
+        self.lockFileURL = self.fileURL?.appendingPathExtension("lock")
         self.maxBytes = max(1, maxBytes)
         self.useLock = useLock
         if let fileURL {
@@ -96,11 +99,23 @@ public final class PacketSampleStreamWriter {
 
     private func withLock<T>(_ body: () -> T) -> T {
         if useLock {
-            lock.lock()
-            let result = body()
-            lock.unlock()
-            return result
+            return withFileLock {
+                lock.lock()
+                let result = body()
+                lock.unlock()
+                return result
+            }
         }
+        return body()
+    }
+
+    private func withFileLock<T>(_ body: () -> T) -> T {
+        guard let lockFileURL else { return body() }
+        let fd = open(lockFileURL.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        guard fd >= 0 else { return body() }
+        defer { Darwin.close(fd) }
+        guard flock(fd, LOCK_EX) == 0 else { return body() }
+        defer { _ = flock(fd, LOCK_UN) }
         return body()
     }
 

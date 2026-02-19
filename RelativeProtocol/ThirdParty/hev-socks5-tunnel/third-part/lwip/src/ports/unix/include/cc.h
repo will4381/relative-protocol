@@ -79,6 +79,15 @@ typedef __kernel_fd_set fd_set;
 #define LWIP_DONT_PROVIDE_BYTEORDER_FUNCTIONS
 #endif
 
+/*
+ * On iOS, ld64 caps segment alignment at 0x4000. Large lwIP memp common
+ * symbols can otherwise request 0x8000 alignment and trigger linker warnings.
+ */
+#if defined(__APPLE__) && !defined(LWIP_DECLARE_MEMORY_ALIGNED)
+#define LWIP_DECLARE_MEMORY_ALIGNED(variable_name, size) \
+  u8_t variable_name[LWIP_MEM_ALIGN_BUFFER(size)] __attribute__((aligned(0x4000)))
+#endif
+
 struct sio_status_s;
 typedef struct sio_status_s sio_status_t;
 #define sio_fd_t sio_status_t*

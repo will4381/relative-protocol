@@ -21,68 +21,7 @@ public struct BurstMetrics: Codable, Hashable, Sendable {
 }
 
 public final class BurstTracker {
-    private struct LastSeenHeap {
-        struct Entry {
-            let key: BurstKey
-            let lastSeen: TimeInterval
-            let revision: UInt64
-        }
-
-        private var storage: [Entry] = []
-
-        mutating func push(_ entry: Entry) {
-            storage.append(entry)
-            siftUp(from: storage.count - 1)
-        }
-
-        mutating func popMin() -> Entry? {
-            guard !storage.isEmpty else { return nil }
-            if storage.count == 1 {
-                return storage.removeLast()
-            }
-            let minEntry = storage[0]
-            storage[0] = storage.removeLast()
-            siftDown(from: 0)
-            return minEntry
-        }
-
-        mutating func removeAll() {
-            storage.removeAll(keepingCapacity: false)
-        }
-
-        private mutating func siftUp(from index: Int) {
-            var child = index
-            while child > 0 {
-                let parent = (child - 1) / 2
-                if storage[child].lastSeen >= storage[parent].lastSeen {
-                    break
-                }
-                storage.swapAt(child, parent)
-                child = parent
-            }
-        }
-
-        private mutating func siftDown(from index: Int) {
-            var parent = index
-            while true {
-                let left = 2 * parent + 1
-                let right = left + 1
-                var candidate = parent
-
-                if left < storage.count && storage[left].lastSeen < storage[candidate].lastSeen {
-                    candidate = left
-                }
-                if right < storage.count && storage[right].lastSeen < storage[candidate].lastSeen {
-                    candidate = right
-                }
-                if candidate == parent {
-                    return
-                }
-                storage.swapAt(parent, candidate)
-                parent = candidate
-            }
-        }
-    }
+    private typealias HeapEntry = LastSeenHeap<BurstKey>.Entry
 
     private struct BurstKey: Hashable {
         let flowId: UInt64
@@ -100,8 +39,9 @@ public final class BurstTracker {
     private let ttl: TimeInterval
     private let maxBursts: Int
     private var states: [BurstKey: BurstState] = [:]
-    private var lastSeenHeap = LastSeenHeap()
+    private var lastSeenHeap = LastSeenHeap<BurstKey>()
     private var nextRevision: UInt64 = 0
+    private static let minimumHeapCompactionThreshold = 1024
 
     public init(ttl: TimeInterval, maxBursts: Int) {
         self.ttl = ttl
@@ -129,6 +69,7 @@ public final class BurstTracker {
             }
             states[key] = state
             lastSeenHeap.push(.init(key: key, lastSeen: state.last, revision: state.revision))
+            compactHeapIfNeeded()
             pruneIfNeeded(now: timestamp, excluding: key)
             return makeMetrics(from: state)
         } else {
@@ -141,6 +82,7 @@ public final class BurstTracker {
             )
             states[key] = state
             lastSeenHeap.push(.init(key: key, lastSeen: state.last, revision: state.revision))
+            compactHeapIfNeeded()
             pruneIfNeeded(now: timestamp, excluding: key)
             return makeMetrics(from: state)
         }
@@ -175,7 +117,7 @@ public final class BurstTracker {
     }
 
     private func evictOldest(excluding key: BurstKey) {
-        var skipped: [LastSeenHeap.Entry] = []
+        var skipped: [HeapEntry] = []
         while let candidate = lastSeenHeap.popMin() {
             guard let state = states[candidate.key], state.revision == candidate.revision else {
                 continue
@@ -193,7 +135,7 @@ public final class BurstTracker {
     }
 
     private func pruneExpired(now: TimeInterval, excluding key: BurstKey) {
-        var skipped: [LastSeenHeap.Entry] = []
+        var skipped: [HeapEntry] = []
         while let candidate = lastSeenHeap.popMin() {
             guard let state = states[candidate.key], state.revision == candidate.revision else {
                 continue
@@ -218,4 +160,26 @@ public final class BurstTracker {
         nextRevision &+= 1
         return nextRevision
     }
+
+    private func compactHeapIfNeeded() {
+        let activeBursts = max(1, states.count)
+        let threshold = max(Self.minimumHeapCompactionThreshold, activeBursts * 4)
+        guard lastSeenHeap.count > threshold else { return }
+        rebuildHeapFromCurrentState()
+    }
+
+    private func rebuildHeapFromCurrentState() {
+        lastSeenHeap.removeAll()
+        for (key, state) in states {
+            lastSeenHeap.push(.init(key: key, lastSeen: state.last, revision: state.revision))
+        }
+    }
 }
+
+#if DEBUG
+extension BurstTracker {
+    var _test_heapEntryCount: Int {
+        lastSeenHeap.count
+    }
+}
+#endif

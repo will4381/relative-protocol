@@ -35,14 +35,16 @@ manager.loadFromPreferences { error in
     proto.providerConfiguration = [
         "appGroupID": "group.com.example.vpn",
         "relayMode": "tun2socks",
-        "mtu": 1500,
+        "mtu": 1400,
         "ipv6Enabled": true,
         "dnsServers": ["1.1.1.1", "8.8.8.8"],
         "signatureFileName": "app_signatures.json",
         "packetStreamEnabled": true,
         "packetStreamMaxBytes": 5_000_000,
         "metricsEnabled": true,
-        "metricsSnapshotInterval": 1.0,
+        "metricsSnapshotInterval": 5.0,
+        "keepaliveIntervalSeconds": 25.0, // 0 disables keepalive
+        "tunnelOverheadBytes": 80,
         "metricsStoreFormat": "json", // or "ndjson"
         // Addressing used by the tunnel interface:
         "ipv4Address": "10.0.0.2",
@@ -61,7 +63,15 @@ manager.loadFromPreferences { error in
 }
 ```
 
-Optional: configure On-Demand rules via `manager.onDemandRules` and `manager.isOnDemandEnabled`.
+Optional: configure On-Demand rules via `manager.onDemandRules` and `manager.isOnDemandEnabled`. Recommended default is off until you validate reconnect behavior on your target app/network mix.
+
+### On-Demand best practices (per app profile)
+
+- Default `isOnDemandEnabled` to `false` for first-run and opt in later.
+- Prefer explicit interface rules (`.wiFi`, `.cellular`) over broad `.any` connect rules.
+- On manual disconnect, disable On-Demand (`isOnDemandEnabled = false`, `onDemandRules = []`), save/load preferences, then stop the tunnel.
+- Be careful with `includeAllNetworks = true` plus On-Demand: it can reassert aggressively across network changes.
+- Keep these choices app-specific. Different apps and traffic patterns behave differently under On-Demand.
 
 3) **Provider configuration keys**
 
@@ -71,12 +81,14 @@ Common keys:
 
 - `appGroupID` (String, required)
 - `relayMode` (String, default `tun2socks`)
-- `mtu` (Int, default `1500`)
+- `mtu` (Int, default `1400`)
+- `tunnelOverheadBytes` (Int, default `80`)
 - `ipv6Enabled` (Bool, default `true`)
 - `dnsServers` ([String], default `[]`)
 - `metricsEnabled` (Bool, default `true`)
 - `metricsRingBufferSize` (Int, default `2048`)
-- `metricsSnapshotInterval` (Double, default `1.0`)
+- `metricsSnapshotInterval` (Double, default `5.0`)
+- `keepaliveIntervalSeconds` (Double, default `25.0`, `0` disables keepalive)
 - `metricsStoreFormat` (String, default `json`, options: `json`, `ndjson`)
 - `burstThresholdMs` (Int, default `350`)
 - `flowTTLSeconds` (Int, default `300`)
@@ -87,6 +99,41 @@ Common keys:
 - `signatureFileName` (String, default `app_signatures.json`)
 
 There are additional engine tuning keys (buffer sizes, socks port, etc.) in `TunnelConfiguration`.
+Invalid or out-of-range values are validated and clamped in `TunnelConfiguration` (for example, MTU, ports, intervals, and IP address fields).
+
+### Migration notes (from earlier defaults)
+
+Upgrade baseline references:
+
+- `v1.1` (`b02f4cce88cebf892731d662b3ad8e8b07b46d55`)
+- `v1.0.9` (`eae812c7df6cc7a9458423ed595c8e3affa91f87`)
+
+If you are upgrading from either of the versions above (or older), review these changes:
+
+- `mtu` default changed from `1500` to `1400`.
+- `tunnelOverheadBytes` now defaults to `80` (previously commonly configured as `0` or omitted).
+- `metricsSnapshotInterval` default changed from `1.0` to `5.0`.
+- `keepaliveIntervalSeconds` is now available and defaults to `25.0` (`0` disables keepalive).
+
+Behavioral changes to account for:
+
+- Path-change monitoring runs every `2` seconds and restarts relay components when the path signature changes and status is satisfied.
+- `sleep()`/`wake()` lifecycle handling is active; `wake()` resumes timers and triggers relay restart.
+- Outbound SOCKS `.waiting` timeout is `30` seconds (TCP and UDP adapters).
+- SOCKS listener bind retry policy is `7` attempts with `0.2s` retry delay.
+- UDP relay session lifecycle is bounded: idle timeout `60s`, cleanup sweep every `15s`, max sessions `256`.
+- SOCKS5 `BIND` is supported.
+
+If you depend on legacy behavior, set explicit values in `providerConfiguration` instead of relying on defaults.
+
+### Runtime resilience behavior
+
+- Default path changes are polled every 2 seconds; when the signature changes and path is satisfied, the relay is restarted.
+- Keepalive probes run in `tun2socks` mode when `keepaliveIntervalSeconds > 0` (minimum effective interval is 10s).
+- `sleep()` pauses path/keepalive timers; `wake()` resumes timers and proactively restarts relay components.
+- Outbound SOCKS TCP/UDP connections in `.waiting` are cancelled after 30 seconds.
+- SOCKS listener bind retries use 7 attempts with a short backoff to reduce transient bind failures on restart.
+- UDP relay sessions are bounded and cleaned up (idle timeout + periodic sweep + session cap).
 
 4) **App signatures file**
 
@@ -169,6 +216,22 @@ Each `PacketSample` includes DNS/TLS/QUIC metadata (including `quicPacketType`) 
 
 The Example app ships with a diagnostics screen that reads metrics + the packet stream, showing recent packet samples, DNS/TLS/QUIC metadata, burst metrics, and classification.
 
+### Host-to-tunnel app messages
+
+`RelativePacketTunnelProvider.handleAppMessage` accepts JSON with either `command` or `action` (case-insensitive):
+
+- `status` / `diagnostics`
+- `flushMetrics`
+- `restartRelay`
+- `reloadConfiguration`
+
+Responses are JSON packets with at least:
+
+- `ok` (Bool)
+- `command` (String)
+- `error` (`NSNull` or String)
+- `timestamp` (seconds since UNIX epoch)
+
 ## Public API Surface (Core)
 
 - `PacketParser`, `PacketMetadata`, `PacketSample`, `PacketSampleStreamWriter`, `PacketSampleStreamReader`
@@ -200,6 +263,13 @@ Coverage outputs:
 
 ## Changelog
 
+### 2/19/26
+
+- Updated tunnel defaults and docs (`mtu: 1400`, `tunnelOverheadBytes: 80`, `metricsSnapshotInterval: 5.0`, `keepaliveIntervalSeconds: 25.0`).
+- Added path-change monitoring, sleep/wake handling, keepalive behavior, SOCKS waiting timeout, and listener retry policy documentation.
+- Documented host-to-tunnel app message commands and response shape.
+- Added timestamp hot-path cleanup using monotonic-backed epoch helpers in tunnel runtime paths.
+
 ### 2/11/26
 
 - Hardened tunnel/runtime performance paths in core flow tracking, burst tracking, metrics persistence, packet stream handling, and classification logic to reduce unnecessary work and long-run memory pressure.
@@ -213,6 +283,7 @@ Coverage outputs:
 - Classification matches exact domains or subdomains (e.g. `api.tiktok.com` matches `tiktok.com`, but `notiktok.com` does not).
 - Signature domains can include `*` wildcards (e.g. `p*.tiktokcdn*.com`) and are matched against the full hostname using per-label matching.
 - QUIC packet types are surfaced (`initial`, `zeroRTT`, `handshake`, `retry`). SNI extraction is only attempted on Initial packets; 0‑RTT is not decrypted.
+- SOCKS5 `CONNECT`, `UDP ASSOCIATE`, and `BIND` are supported.
 - The tunnel only uses metadata (DNS/TLS/QUIC headers and flow timing). No payload capture is performed.
 
 ## Troubleshooting
@@ -242,3 +313,8 @@ Coverage outputs:
 
 - **On‑Demand reconnects**
   - If `isOnDemandEnabled` is true, the system may reconnect automatically on network changes.
+
+- **Device loses normal Wi‑Fi after long VPN sessions**
+  - Disable On-Demand and clear rules before stopping the tunnel, then save/load preferences before `stopVPNTunnel()`.
+  - Avoid broad `.any` connect rules unless required.
+  - If you use `includeAllNetworks`, test long-session disconnect/reconnect flows on both Wi‑Fi and cellular.

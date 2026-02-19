@@ -2,7 +2,7 @@
 // See LICENSE for terms.
 
 import XCTest
-import RelativeProtocolCore
+@testable import RelativeProtocolCore
 
 final class BurstTrackerEdgeTests: XCTestCase {
     func testZeroFlowIdReturnsNil() {
@@ -101,5 +101,14 @@ final class BurstTrackerEdgeTests: XCTestCase {
 
         XCTAssertEqual(metrics?.packetCount, 5_000)
         XCTAssertEqual(metrics?.byteCount, 50_000)
+    }
+
+    func testHeapCompactionPreventsUnboundedGrowth() {
+        let tracker = BurstTracker(ttl: 300, maxBursts: 16)
+        for _ in 0..<20_000 {
+            _ = tracker.record(flowId: 88, burstId: 1, timestamp: 1.0, length: 10)
+        }
+
+        XCTAssertLessThanOrEqual(tracker._test_heapEntryCount, 1_024)
     }
 }

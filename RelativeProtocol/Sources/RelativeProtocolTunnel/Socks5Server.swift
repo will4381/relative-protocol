@@ -47,8 +47,7 @@ private func pathSummary(_ path: Network.NWPath?) -> String {
     if path.usesInterfaceType(.wiredEthernet) { uses.append("wired") }
     if path.usesInterfaceType(.loopback) { uses.append("loopback") }
     if uses.isEmpty { uses.append("other") }
-    let available = path.availableInterfaces.map { "\(interfaceTypeName($0.type)):\($0.name)" }.joined(separator: ",")
-    return "status=\(pathStatusName(path.status)) uses=\(uses.joined(separator: ",")) available=\(available) expensive=\(path.isExpensive) constrained=\(path.isConstrained) ipv4=\(path.supportsIPv4) ipv6=\(path.supportsIPv6)"
+    return "status=\(pathStatusName(path.status)) uses=\(uses.joined(separator: ",")) expensive=\(path.isExpensive) constrained=\(path.isConstrained)"
 }
 
 protocol Socks5InboundConnection: AnyObject {
@@ -99,12 +98,15 @@ protocol Socks5TCPOutbound: AnyObject {
 }
 
 final class NWConnectionTCPAdapter: Socks5TCPOutbound {
+    private static let waitingStateTimeout: TimeInterval = 30
+
     private let connection: NWConnection
     private let queue: DispatchQueue
     private let logger = RelativeLog.logger(.tunnel)
     private var didLogReady = false
     private var didLogWaiting = false
     private var didLogFailed = false
+    private var waitingTimeoutTimer: DispatchSourceTimer?
 
     init(_ connection: NWConnection, queue: DispatchQueue) {
         self.connection = connection
@@ -132,12 +134,15 @@ final class NWConnectionTCPAdapter: Socks5TCPOutbound {
     }
 
     func cancel() {
+        cancelWaitingTimeoutTimer()
         connection.cancel()
     }
 
     private func handleState(_ state: NWConnection.State) {
         switch state {
         case .ready:
+            cancelWaitingTimeoutTimer()
+            didLogWaiting = false
             if !didLogReady {
                 didLogReady = true
                 if RelativeLog.isVerbose {
@@ -149,14 +154,37 @@ final class NWConnectionTCPAdapter: Socks5TCPOutbound {
                 didLogWaiting = true
                 logger.warning("Outbound TCP waiting: \(error.localizedDescription, privacy: .public). \(pathSummary(self.connection.currentPath), privacy: .public)")
             }
+            scheduleWaitingTimeoutTimer()
         case .failed(let error):
+            cancelWaitingTimeoutTimer()
             if !didLogFailed {
                 didLogFailed = true
                 logger.error("Outbound TCP failed: \(error.localizedDescription, privacy: .public). \(pathSummary(self.connection.currentPath), privacy: .public)")
             }
+        case .cancelled:
+            cancelWaitingTimeoutTimer()
         default:
             break
         }
+    }
+
+    private func scheduleWaitingTimeoutTimer() {
+        guard waitingTimeoutTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + Self.waitingStateTimeout)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.waitingTimeoutTimer = nil
+            self.logger.warning("Outbound TCP remained in waiting state for \(Self.waitingStateTimeout, privacy: .public)s; cancelling connection.")
+            self.connection.cancel()
+        }
+        timer.resume()
+        waitingTimeoutTimer = timer
+    }
+
+    private func cancelWaitingTimeoutTimer() {
+        waitingTimeoutTimer?.cancel()
+        waitingTimeoutTimer = nil
     }
 }
 
@@ -187,6 +215,8 @@ protocol Socks5UDPSession: AnyObject {
 }
 
 final class NWConnectionUDPSessionAdapter: Socks5UDPSession {
+    private static let waitingStateTimeout: TimeInterval = 30
+
     private let connection: NWConnection
     private let queue: DispatchQueue
     private var readHandler: (([Data]?, Error?) -> Void)?
@@ -195,6 +225,7 @@ final class NWConnectionUDPSessionAdapter: Socks5UDPSession {
     private var didLogReady = false
     private var didLogWaiting = false
     private var didLogFailed = false
+    private var waitingTimeoutTimer: DispatchSourceTimer?
 
     init(_ connection: NWConnection, queue: DispatchQueue) {
         self.connection = connection
@@ -218,12 +249,15 @@ final class NWConnectionUDPSessionAdapter: Socks5UDPSession {
 
     func cancel() {
         isCancelled = true
+        cancelWaitingTimeoutTimer()
         connection.cancel()
     }
 
     private func handleState(_ state: NWConnection.State) {
         switch state {
         case .ready:
+            cancelWaitingTimeoutTimer()
+            didLogWaiting = false
             if !didLogReady {
                 didLogReady = true
                 if RelativeLog.isVerbose {
@@ -235,14 +269,38 @@ final class NWConnectionUDPSessionAdapter: Socks5UDPSession {
                 didLogWaiting = true
                 logger.warning("Outbound UDP waiting: \(error.localizedDescription, privacy: .public). \(pathSummary(self.connection.currentPath), privacy: .public)")
             }
+            scheduleWaitingTimeoutTimer()
         case .failed(let error):
+            cancelWaitingTimeoutTimer()
             if !didLogFailed {
                 didLogFailed = true
                 logger.error("Outbound UDP failed: \(error.localizedDescription, privacy: .public). \(pathSummary(self.connection.currentPath), privacy: .public)")
             }
+        case .cancelled:
+            cancelWaitingTimeoutTimer()
         default:
             break
         }
+    }
+
+    private func scheduleWaitingTimeoutTimer() {
+        guard waitingTimeoutTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + Self.waitingStateTimeout)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.waitingTimeoutTimer = nil
+            guard !self.isCancelled else { return }
+            self.logger.warning("Outbound UDP remained in waiting state for \(Self.waitingStateTimeout, privacy: .public)s; cancelling connection.")
+            self.connection.cancel()
+        }
+        timer.resume()
+        waitingTimeoutTimer = timer
+    }
+
+    private func cancelWaitingTimeoutTimer() {
+        waitingTimeoutTimer?.cancel()
+        waitingTimeoutTimer = nil
     }
 
     private func receiveNext() {
@@ -385,12 +443,17 @@ final class PacketTunnelProviderAdapter: Socks5ConnectionProvider {
 }
 
 final class Socks5Server {
+    private static let listenerBindRetryAttempts = 7
+    private static let listenerBindRetryDelay: TimeInterval = 0.2
+
     private let logger = RelativeLog.logger(.tunnel)
     private let provider: Socks5ConnectionProvider
     private let queue: DispatchQueue
     private let mtu: Int
     private var listener: NWListener?
     private var connections: [ObjectIdentifier: Socks5Connection] = [:]
+    private var listenerGeneration: UInt64 = 0
+    private var isStopped = true
 
     init(provider: Socks5ConnectionProvider, queue: DispatchQueue, mtu: Int) {
         self.provider = provider
@@ -403,11 +466,25 @@ final class Socks5Server {
     }
 
     func start(port: UInt16, completion: @escaping (Result<UInt16, Error>) -> Void) {
+        isStopped = false
+        listenerGeneration &+= 1
+        let generation = listenerGeneration
         let initialPort = port == 0 ? pickEphemeralPort() : port
-        startListener(port: initialPort, remainingAttempts: 3, completion: completion)
+        startListener(
+            port: initialPort,
+            remainingAttempts: Self.listenerBindRetryAttempts,
+            generation: generation,
+            completion: completion
+        )
     }
 
-    private func startListener(port: UInt16, remainingAttempts: Int, completion: @escaping (Result<UInt16, Error>) -> Void) {
+    private func startListener(
+        port: UInt16,
+        remainingAttempts: Int,
+        generation: UInt64,
+        completion: @escaping (Result<UInt16, Error>) -> Void
+    ) {
+        guard !isStopped, generation == listenerGeneration else { return }
         guard let listenPort = NWEndpoint.Port(rawValue: port) else {
             completion(.failure(Socks5ServerError.invalidPort))
             return
@@ -471,7 +548,15 @@ final class Socks5Server {
                         }
                         listener.cancel()
                         self.listener = nil
-                        self.startListener(port: nextPort, remainingAttempts: remainingAttempts - 1, completion: completion)
+                        self.queue.asyncAfter(deadline: .now() + Self.listenerBindRetryDelay) {
+                            guard !self.isStopped, generation == self.listenerGeneration else { return }
+                            self.startListener(
+                                port: nextPort,
+                                remainingAttempts: remainingAttempts - 1,
+                                generation: generation,
+                                completion: completion
+                            )
+                        }
                         return
                     }
                     if !didComplete {
@@ -579,6 +664,8 @@ final class Socks5Server {
 
 
     func stop() {
+        isStopped = true
+        listenerGeneration &+= 1
         listener?.cancel()
         listener = nil
         connections.values.forEach { $0.stop() }
@@ -618,10 +705,12 @@ final class Socks5Connection {
     private enum State {
         case greeting
         case request
+        case bindPending
         case tcpProxy(Socks5TCPOutbound)
         case udpProxy(Socks5UDPRelayProtocol)
     }
 
+    private static let maxBufferBytes = 64 * 1024
     private let logger = RelativeLog.logger(.tunnel)
     private let connection: Socks5InboundConnection
     private let provider: Socks5ConnectionProvider
@@ -631,6 +720,7 @@ final class Socks5Connection {
     private var buffer = Data()
     private var state: State = .greeting
     private var isClosed = false
+    private var bindListener: NWListener?
 
     var onClose: (() -> Void)?
 
@@ -675,6 +765,9 @@ final class Socks5Connection {
             outbound.cancel()
         case .udpProxy(let relay):
             relay.stop()
+        case .bindPending:
+            bindListener?.cancel()
+            bindListener = nil
         default:
             break
         }
@@ -687,6 +780,11 @@ final class Socks5Connection {
             guard let self else { return }
             if let data, !data.isEmpty {
                 self.buffer.append(data)
+                if self.buffer.count > Self.maxBufferBytes {
+                    self.logger.error("SOCKS5 connection exceeded max buffer size (\(Self.maxBufferBytes, privacy: .public)); closing.")
+                    self.stop()
+                    return
+                }
                 self.processBuffer()
             }
             if isComplete || error != nil {
@@ -725,6 +823,8 @@ final class Socks5Connection {
                 forwardToOutbound(buffer, outbound: outbound)
                 buffer.removeAll()
             }
+        case .bindPending:
+            break
         case .udpProxy:
             buffer.removeAll()
         }
@@ -737,7 +837,7 @@ final class Socks5Connection {
         case .udpAssociate:
             startUDPRelay()
         case .bind:
-            sendFailure()
+            startBindRelay(request)
         }
     }
 
@@ -798,6 +898,80 @@ final class Socks5Connection {
             logger.error("SOCKS5 UDP relay failed: \(error.localizedDescription, privacy: .public)")
             sendFailure()
         }
+    }
+
+    private func startBindRelay(_ request: Socks5Request) {
+        if request.port != 0, NWEndpoint.Port(rawValue: request.port) == nil {
+            sendFailure()
+            return
+        }
+
+        let parameters = NWParameters.tcp
+        parameters.allowLocalEndpointReuse = true
+        parameters.requiredInterfaceType = .loopback
+        if request.port != 0,
+           let loopback = IPv4Address("127.0.0.1"),
+           let bindPort = NWEndpoint.Port(rawValue: request.port) {
+            parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(loopback), port: bindPort)
+        }
+
+        let listener: NWListener
+        do {
+            listener = try NWListener(using: parameters, on: .any)
+        } catch {
+            logger.error("SOCKS5 BIND listener creation failed: \(error.localizedDescription, privacy: .public)")
+            sendFailure()
+            return
+        }
+
+        bindListener = listener
+        state = .bindPending
+        var didSendFirstReply = false
+        let sendFirstReply: () -> Void = { [weak self, weak listener] in
+            guard let self, let listener else { return }
+            guard !didSendFirstReply else { return }
+            didSendFirstReply = true
+            let port = listener.port?.rawValue ?? request.port
+            self.connection.send(
+                content: Socks5Codec.buildReply(code: 0x00, bindAddress: .ipv4("127.0.0.1"), bindPort: port),
+                completion: .contentProcessed { _ in }
+            )
+        }
+
+        listener.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .ready:
+                sendFirstReply()
+            case .failed(let error):
+                self.logger.error("SOCKS5 BIND listener failed: \(error.localizedDescription, privacy: .public)")
+                self.sendFailure()
+            case .cancelled:
+                break
+            default:
+                break
+            }
+        }
+
+        listener.newConnectionHandler = { [weak self, weak listener] inboundConnection in
+            guard let self else { return }
+            sendFirstReply()
+            listener?.cancel()
+            self.bindListener = nil
+
+            let outbound = NWConnectionTCPAdapter(inboundConnection, queue: self.queue)
+            self.state = .tcpProxy(outbound)
+            let port = listener?.port?.rawValue ?? request.port
+            self.connection.send(
+                content: Socks5Codec.buildReply(code: 0x00, bindAddress: .ipv4("127.0.0.1"), bindPort: port),
+                completion: .contentProcessed { _ in
+                    self.readOutbound(outbound)
+                    self.processBuffer()
+                }
+            )
+        }
+
+        listener.start(queue: queue)
     }
 
     private func sendFailure() {

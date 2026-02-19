@@ -96,7 +96,7 @@ let package = Package(
         ),
         .testTarget(
             name: "RelativeProtocolCoreTests",
-            dependencies: ["RelativeProtocolCore"],
+            dependencies: ["RelativeProtocolCore", "RelativeProtocolHost"],
             path: "RelativeProtocol/Tests/RelativeProtocolCoreTests"
         ),
         .testTarget(

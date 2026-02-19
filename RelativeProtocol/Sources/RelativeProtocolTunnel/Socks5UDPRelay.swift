@@ -24,14 +24,20 @@ final class Socks5UDPRelay {
         let address: Socks5Address
         let port: UInt16
         let session: Socks5UDPSession
+        var lastActivity: TimeInterval
     }
 
     private let logger = RelativeLog.logger(.tunnel)
     private let provider: Socks5ConnectionProvider
     private let queue: DispatchQueue
     private let mtu: Int
+    private let sessionIdleTimeout: TimeInterval = 60
+    private let sessionCleanupInterval: TimeInterval = 15
+    private let maxSessions = 256
+    private var readBuffer: [UInt8]
     private var socketFD: Int32 = -1
     private var readSource: DispatchSourceRead?
+    private var cleanupTimer: DispatchSourceTimer?
     private var sessions: [SessionKey: SessionEntry] = [:]
     private var clientAddress = sockaddr_storage()
     private var clientAddressLen: socklen_t = 0
@@ -41,6 +47,7 @@ final class Socks5UDPRelay {
         self.provider = provider
         self.queue = queue
         self.mtu = max(256, mtu)
+        self.readBuffer = Array(repeating: 0, count: self.mtu + 256)
         try openSocket()
     }
 
@@ -55,24 +62,28 @@ final class Socks5UDPRelay {
         }
         source.resume()
         readSource = source
+        startSessionCleanupTimer()
     }
 
     func stop() {
         readSource?.cancel()
         readSource = nil
+        cleanupTimer?.cancel()
+        cleanupTimer = nil
         sessions.values.forEach { $0.session.cancel() }
         sessions.removeAll()
     }
 
     private func drainReadable() {
-        let bufferSize = mtu + 256
-        var buffer = [UInt8](repeating: 0, count: bufferSize)
         while true {
             var addr = sockaddr_storage()
             var addrLen = socklen_t(MemoryLayout<sockaddr_storage>.size)
-            let bytes = recvfrom(socketFD, &buffer, buffer.count, 0, withUnsafeMutablePointer(to: &addr) {
-                UnsafeMutableRawPointer($0).assumingMemoryBound(to: sockaddr.self)
-            }, &addrLen)
+            let bytes = readBuffer.withUnsafeMutableBytes { rawBuffer -> ssize_t in
+                guard let baseAddress = rawBuffer.baseAddress else { return -1 }
+                return recvfrom(socketFD, baseAddress, rawBuffer.count, 0, withUnsafeMutablePointer(to: &addr) {
+                    UnsafeMutableRawPointer($0).assumingMemoryBound(to: sockaddr.self)
+                }, &addrLen)
+            }
             if bytes < 0 {
                 if errno == EAGAIN || errno == EWOULDBLOCK {
                     break
@@ -82,17 +93,24 @@ final class Socks5UDPRelay {
             }
             guard bytes > 0 else { break }
 
-            guard let packet = buffer.withUnsafeBufferPointer({ ptr in
+            guard let packet = readBuffer.withUnsafeBufferPointer({ ptr in
                 Socks5Codec.parseUDPPacket(ptr, count: bytes)
             }) else { continue }
             clientAddress = addr
             clientAddressLen = addrLen
 
             let key = SessionKey(address: packet.address, port: packet.port)
-            let entry = sessions[key] ?? createSession(for: key)
+            if sessions[key] == nil {
+                _ = createSession(for: key)
+            }
+            touchSession(for: key)
+            guard let entry = sessions[key] else { continue }
             entry.session.writeDatagram(packet.payload) { error in
                 if let error {
                     self.logger.error("udp relay write failed: \(error.localizedDescription, privacy: .public)")
+                    self.queue.async {
+                        self.removeSession(for: key)
+                    }
                 }
             }
         }
@@ -108,20 +126,75 @@ final class Socks5UDPRelay {
         let session = provider.makeUDPSession(to: endpoint)
         session.setReadHandler({ [weak self] (datagrams: [Data]?, error: Error?) in
             guard let self else { return }
-            if let error {
-                self.logger.error("udp relay read error: \(error.localizedDescription, privacy: .public)")
-                return
-            }
-            guard let datagrams, !datagrams.isEmpty else { return }
-            for datagram in datagrams {
-                let response = Socks5Codec.buildUDPPacket(address: key.address, port: key.port, payload: datagram)
-                self.sendToClient(response)
+            self.queue.async {
+                if let error {
+                    self.logger.error("udp relay read error: \(error.localizedDescription, privacy: .public)")
+                    self.removeSession(for: key)
+                    return
+                }
+                guard let datagrams, !datagrams.isEmpty else { return }
+                self.touchSession(for: key)
+                for datagram in datagrams {
+                    let response = Socks5Codec.buildUDPPacket(address: key.address, port: key.port, payload: datagram)
+                    self.sendToClient(response)
+                }
             }
         }, maxDatagrams: 32)
 
-        let entry = SessionEntry(address: key.address, port: key.port, session: session)
+        evictSessionsIfNeeded()
+        let entry = SessionEntry(
+            address: key.address,
+            port: key.port,
+            session: session,
+            lastActivity: TunnelTime.nowMonotonicSeconds()
+        )
         sessions[key] = entry
         return entry
+    }
+
+    private func startSessionCleanupTimer() {
+        cleanupTimer?.cancel()
+        cleanupTimer = nil
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(
+            deadline: .now() + sessionCleanupInterval,
+            repeating: sessionCleanupInterval
+        )
+        timer.setEventHandler { [weak self] in
+            self?.pruneIdleSessions()
+        }
+        timer.resume()
+        cleanupTimer = timer
+    }
+
+    private func touchSession(for key: SessionKey) {
+        guard var entry = sessions[key] else { return }
+        entry.lastActivity = TunnelTime.nowMonotonicSeconds()
+        sessions[key] = entry
+    }
+
+    private func removeSession(for key: SessionKey) {
+        guard let entry = sessions.removeValue(forKey: key) else { return }
+        entry.session.cancel()
+    }
+
+    private func pruneIdleSessions() {
+        let now = TunnelTime.nowMonotonicSeconds()
+        let expiredKeys = sessions.compactMap { (key, entry) -> SessionKey? in
+            now - entry.lastActivity >= sessionIdleTimeout ? key : nil
+        }
+        for key in expiredKeys {
+            removeSession(for: key)
+        }
+    }
+
+    private func evictSessionsIfNeeded() {
+        while sessions.count >= maxSessions {
+            guard let oldestKey = sessions.min(by: { $0.value.lastActivity < $1.value.lastActivity })?.key else {
+                break
+            }
+            removeSession(for: oldestKey)
+        }
     }
 
     private func sendToClient(_ data: Data) {

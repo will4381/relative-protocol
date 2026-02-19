@@ -23,6 +23,14 @@ public struct TrafficClassification: Codable, Hashable, Sendable {
 }
 
 public final class TrafficClassifier {
+    // Approximate UNIX epoch from monotonic uptime to avoid repeated Date allocations.
+    private static let epochOffset = Date().timeIntervalSince1970 - ProcessInfo.processInfo.systemUptime
+
+    @inline(__always)
+    private static func nowEpochSeconds() -> TimeInterval {
+        ProcessInfo.processInfo.systemUptime + epochOffset
+    }
+
     private struct LastSeenHeap {
         struct Entry {
             let key: String
@@ -196,7 +204,7 @@ public final class TrafficClassifier {
         self.signatureFileURL = signatureFileURL
         self.signatureCheckInterval = signatureCheckInterval
         if signatureFileURL != nil {
-            reloadSignaturesIfNeeded(now: Date().timeIntervalSince1970, force: true)
+            reloadSignaturesIfNeeded(now: Self.nowEpochSeconds(), force: true)
         }
     }
 
@@ -316,7 +324,7 @@ public final class TrafficClassifier {
     }
 
     public func reloadSignatures() {
-        reloadSignaturesIfNeeded(now: Date().timeIntervalSince1970, force: true)
+        reloadSignaturesIfNeeded(now: Self.nowEpochSeconds(), force: true)
     }
 
     private func remoteAddress(for metadata: PacketMetadata, direction: PacketDirection) -> String {

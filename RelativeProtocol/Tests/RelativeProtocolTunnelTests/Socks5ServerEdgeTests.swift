@@ -9,26 +9,50 @@ import XCTest
 @testable import RelativeProtocolTunnel
 
 final class Socks5ServerEdgeTests: XCTestCase {
-    func testConnectionRejectsBindCommand() {
+    func testConnectionAcceptsBindCommandAndReturnsFirstReply() {
         let queue = DispatchQueue(label: "socks5.connection.bind")
         let inbound = EdgeFakeInboundConnection()
         let outbound = EdgeFakeTCPOutbound()
         let provider = EdgeFakeProvider(outbound: outbound)
         let connection = Socks5Connection(connection: inbound, provider: provider, queue: queue, mtu: 1200)
         connection.start()
+        defer { connection.stop() }
 
         var handshake = Data([0x05, 0x01, 0x00])
         handshake.append(buildBindRequest())
         inbound.enqueueInbound(handshake)
 
-        flush(queue)
+        for _ in 0..<50 {
+            flush(queue)
+            if inbound.sent.count >= 2 {
+                break
+            }
+            usleep(20_000)
+        }
 
         XCTAssertEqual(inbound.sent.count, 2)
         XCTAssertEqual(inbound.sent.first, Socks5Codec.buildMethodSelection(method: 0x00))
         guard let reply = inbound.sent.last else {
-            return XCTFail("Expected failure reply")
+            return XCTFail("Expected BIND reply")
         }
-        XCTAssertEqual(reply[1], 0x07)
+        XCTAssertEqual(reply[1], 0x00)
+        XCTAssertFalse(inbound.cancelled)
+    }
+
+    func testConnectionClosesWhenInputBufferExceedsMaximum() {
+        let queue = DispatchQueue(label: "socks5.connection.buffer.limit")
+        let inbound = EdgeFakeInboundConnection()
+        let outbound = EdgeFakeTCPOutbound()
+        let provider = EdgeFakeProvider(outbound: outbound)
+        let connection = Socks5Connection(connection: inbound, provider: provider, queue: queue, mtu: 1200)
+        connection.start()
+
+        var payload = Data([0x05, 0x01, 0x00]) // valid greeting
+        payload.append(contentsOf: [0x05, 0x01, 0x00, 0x09]) // invalid ATYP keeps parse blocked
+        payload.append(Data(repeating: 0xAA, count: 70_000))
+        inbound.enqueueInbound(payload)
+        flush(queue)
+
         XCTAssertTrue(inbound.cancelled)
     }
 
@@ -173,6 +197,61 @@ final class Socks5ServerEdgeTests: XCTestCase {
         XCTAssertEqual(provider.lastPort, "80")
     }
 
+    func testBindCommandAcceptsInboundConnectionAndRelaysTraffic() throws {
+        let queue = DispatchQueue(label: "socks5.server.edge.bind")
+        let provider = EdgeRecordingProvider(outbound: EdgeFakeTCPOutbound())
+        let server = Socks5Server(provider: provider, queue: queue, mtu: 1500)
+
+        var startedPort: UInt16?
+        let started = expectation(description: "server started")
+        server.start(port: 0) { result in
+            if case .success(let port) = result {
+                startedPort = port
+            }
+            started.fulfill()
+        }
+        wait(for: [started], timeout: 2.0)
+
+        guard let port = startedPort else {
+            server.stop()
+            return XCTFail("Missing started port")
+        }
+
+        let socksClient = try EdgeTCPClient(port: port)
+        defer {
+            socksClient.close()
+            server.stop()
+        }
+
+        var handshake = Data([0x05, 0x01, 0x00])
+        handshake.append(buildBindRequest())
+        try socksClient.send(handshake)
+
+        let methodSelection = try socksClient.receive(expectedLength: 2)
+        XCTAssertEqual(methodSelection, Socks5Codec.buildMethodSelection(method: 0x00))
+
+        let firstReply = try socksClient.receive(expectedLength: 10, timeout: 2.0)
+        XCTAssertEqual(firstReply[1], 0x00)
+        let bindPort = UInt16(firstReply[8]) << 8 | UInt16(firstReply[9])
+        XCTAssertGreaterThan(bindPort, 0)
+
+        let inboundPeer = try EdgeTCPClient(port: bindPort)
+        defer { inboundPeer.close() }
+
+        let secondReply = try socksClient.receive(expectedLength: 10, timeout: 2.0)
+        XCTAssertEqual(secondReply[1], 0x00)
+
+        let messageToPeer = Data("hello-bind".utf8)
+        try socksClient.send(messageToPeer)
+        let peerData = try inboundPeer.receive(expectedLength: 64, timeout: 2.0)
+        XCTAssertEqual(peerData, messageToPeer)
+
+        let messageToSocks = Data("reply-bind".utf8)
+        try inboundPeer.send(messageToSocks)
+        let socksData = try socksClient.receive(expectedLength: 64, timeout: 2.0)
+        XCTAssertEqual(socksData, messageToSocks)
+    }
+
     func testServerStopIsSafeWithoutStart() {
         let server = Socks5Server(
             provider: EdgeFakeProvider(outbound: EdgeFakeTCPOutbound()),
@@ -204,6 +283,25 @@ final class Socks5ServerEdgeTests: XCTestCase {
 
         let port = try XCTUnwrap(resolvedPort)
         XCTAssertNotEqual(port, occupied.port)
+    }
+
+    func testServerStopPreventsDelayedRetryRebind() throws {
+        let occupied = try EdgeTCPListener()
+        defer { occupied.close() }
+
+        let queue = DispatchQueue(label: "socks5.server.retry.cancelled")
+        let provider = EdgeRecordingProvider(outbound: EdgeFakeTCPOutbound())
+        let server = Socks5Server(provider: provider, queue: queue, mtu: 1200)
+
+        let completion = expectation(description: "start completion should not fire after stop")
+        completion.isInverted = true
+
+        server.start(port: occupied.port) { _ in
+            completion.fulfill()
+        }
+        server.stop()
+
+        wait(for: [completion], timeout: 0.7)
     }
 
     func testProbeLoopbackHelperExecutesWithoutCrashing() throws {
@@ -491,7 +589,7 @@ private func buildBindRequest() -> Data {
     Data([
         0x05, 0x02, 0x00, 0x01,
         0x00, 0x00, 0x00, 0x00,
-        0x00, 0x50
+        0x00, 0x00
     ])
 }
 

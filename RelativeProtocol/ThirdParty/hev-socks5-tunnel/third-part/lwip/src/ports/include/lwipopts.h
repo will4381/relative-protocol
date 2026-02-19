@@ -90,7 +90,11 @@
  *    4 byte alignment -> #define MEM_ALIGNMENT 4
  *    2 byte alignment -> #define MEM_ALIGNMENT 2
  */
+#if defined(__LP64__) || defined(_LP64)
+#define MEM_ALIGNMENT                   8U
+#else
 #define MEM_ALIGNMENT                   4U
+#endif
 
 /**
  * MEM_CUSTOM_ALLOCATOR==1: Use malloc/free/realloc provided by a custom
@@ -155,7 +159,7 @@ void *hev_calloc (size_t nmemb, size_t size);
  * MEMP_NUM_REASSDATA: the number of simultaneously IP packets queued for
  * reassembly (whole packets, not fragments!)
  */
-#define MEMP_NUM_REASSDATA              1
+#define MEMP_NUM_REASSDATA              4
 
 /**
  * MEMP_NUM_ARP_QUEUE: the number of simulateously queued outgoing
@@ -484,27 +488,27 @@ void *hev_calloc (size_t nmemb, size_t size);
 /**
  * CHECKSUM_CHECK_IP==1: Check checksums in software for incoming IP packets.
  */
-#define CHECKSUM_CHECK_IP               0
+#define CHECKSUM_CHECK_IP               1
 
 /**
  * CHECKSUM_CHECK_UDP==1: Check checksums in software for incoming UDP packets.
  */
-#define CHECKSUM_CHECK_UDP              0
+#define CHECKSUM_CHECK_UDP              1
 
 /**
  * CHECKSUM_CHECK_TCP==1: Check checksums in software for incoming TCP packets.
  */
-#define CHECKSUM_CHECK_TCP              0
+#define CHECKSUM_CHECK_TCP              1
 
 /**
  * CHECKSUM_CHECK_ICMP==1: Check checksums in software for incoming ICMP packets.
  */
-#define CHECKSUM_CHECK_ICMP             0
+#define CHECKSUM_CHECK_ICMP             1
 
 /**
  * CHECKSUM_CHECK_ICMP6==1: Check checksums in software for incoming ICMPv6 packets
  */
-#define CHECKSUM_CHECK_ICMP6            0
+#define CHECKSUM_CHECK_ICMP6            1
 
 /**
  * LWIP_CHECKSUM_ON_COPY==1: Calculate checksum when copying data from

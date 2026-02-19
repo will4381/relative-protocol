@@ -692,6 +692,7 @@ hev_socks5_tunnel_stop (void)
 {
     int res;
     int fd;
+    unsigned char stop_signal = 1;
 
     LOG_D ("socks5 tunnel stop");
 
@@ -703,8 +704,13 @@ hev_socks5_tunnel_stop (void)
         usleep (100 * 1000);
     }
 
-    res = write (fd, &res, 1);
-    assert (res > 0 && "socks5 tunnel write event");
+    res = write (fd, &stop_signal, sizeof (stop_signal));
+    if (res < 0) {
+        int err = errno;
+        LOG_E ("socks5 tunnel write event (%s)", strerror (err));
+    } else if (res != (int)sizeof (stop_signal)) {
+        LOG_E ("socks5 tunnel write event short write (%d)", res);
+    }
 }
 
 void
