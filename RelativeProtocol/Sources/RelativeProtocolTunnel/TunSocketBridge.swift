@@ -26,7 +26,7 @@ final class TunSocketBridge {
     init(mtu: Int, queue: DispatchQueue) throws {
         self.mtu = max(256, mtu)
         self.queue = queue
-        self.maxPendingBytes = max(4_194_304, self.mtu * 1024)
+        self.maxPendingBytes = max(524_288, self.mtu * 256)
         self.backpressureThreshold = maxPendingBytes * 3 / 4
         self.readBuffer = [UInt8](repeating: 0, count: self.mtu + MemoryLayout<UInt32>.size)
 

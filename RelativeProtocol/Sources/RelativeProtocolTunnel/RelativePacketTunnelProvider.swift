@@ -41,10 +41,16 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
     private var relayRestartInProgress = false
     private var defaultPathMonitorTimer: DispatchSourceTimer?
     private var keepaliveTimer: DispatchSourceTimer?
+    private var keepaliveSession: NWUDPSession?
     private var lastObservedPathSignature: String?
+    private var lastObservedPathForRestart: NWPath?
+    private var pathBeforeSleep: NWPath?
+    private var relayRestartAttempts: Int = 0
+    private var relayRestartRetryWorkItem: DispatchWorkItem?
     private var reassertingState = false
 
     private static let keepaliveEndpoint = NWHostEndpoint(hostname: "1.1.1.1", port: "53")
+    private static let maxRelayRestartAttempts = 3
     private static let keepaliveDNSQuery = Data([
         0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x07, 0x65, 0x78, 0x61,
@@ -60,6 +66,9 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
             self.setIsStopping(false)
             self.setWaitingForBackpressureRelief(false)
             self.relayRestartInProgress = false
+            self.relayRestartAttempts = 0
+            self.pathBeforeSleep = nil
+            self.cancelRelayRestartRetryWorkItem()
             let config = self.loadConfiguration()
             self.configuration = config
             let settings = self.makeNetworkSettings(from: config)
@@ -116,6 +125,9 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
             self.stopDefaultPathMonitor()
             self.stopKeepaliveTimer()
             self.relayRestartInProgress = false
+            self.relayRestartAttempts = 0
+            self.pathBeforeSleep = nil
+            self.cancelRelayRestartRetryWorkItem()
             self.stopRelayComponents()
             self.metricsQueue.sync {
                 self.flushMetricsInternal()
@@ -145,6 +157,7 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
 
     public override func sleep(completionHandler: @escaping () -> Void) {
         queue.async {
+            self.pathBeforeSleep = self.defaultPath
             self.stopDefaultPathMonitor()
             self.stopKeepaliveTimer()
             if RelativeLog.isVerbose {
@@ -161,7 +174,24 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
             guard let config = self.configuration else { return }
             self.startDefaultPathMonitor()
             self.startKeepaliveTimer(using: config)
-            self.restartRelay(reason: "wake")
+            let currentPath = self.defaultPath
+            let pathChanged: Bool
+            switch (self.pathBeforeSleep, currentPath) {
+            case let (before?, current?):
+                pathChanged = !current.isEqual(before)
+            case (nil, nil):
+                pathChanged = false
+            default:
+                pathChanged = true
+            }
+            self.pathBeforeSleep = nil
+
+            if pathChanged {
+                self.restartRelay(reason: "wake")
+            } else if RelativeLog.isVerbose {
+                self.logger.info("Wake: path unchanged, skipping relay restart.")
+                NSLog("\(self.logPrefix): wake path unchanged, no restart")
+            }
         }
     }
 
@@ -181,6 +211,8 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
             flushMetrics()
             return makeAppMessageResponse(command: command, ok: true)
         case "restartrelay":
+            relayRestartAttempts = 0
+            cancelRelayRestartRetryWorkItem()
             restartRelay(reason: "app-message")
             return makeAppMessageResponse(command: command, ok: true)
         case "reloadconfiguration":
@@ -421,11 +453,15 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
         tunBridge = nil
         socksServer?.stop()
         socksServer = nil
+        keepaliveSession?.cancel()
+        keepaliveSession = nil
     }
 
     private func startDefaultPathMonitor() {
         stopDefaultPathMonitor()
-        lastObservedPathSignature = defaultPathSignature(defaultPath)
+        let currentPath = defaultPath
+        lastObservedPathSignature = defaultPathSignature(currentPath)
+        lastObservedPathForRestart = currentPath
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 2, repeating: 2)
         timer.setEventHandler { [weak self] in
@@ -439,12 +475,14 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
         defaultPathMonitorTimer?.cancel()
         defaultPathMonitorTimer = nil
         lastObservedPathSignature = nil
+        lastObservedPathForRestart = nil
     }
 
     private func startKeepaliveTimer(using config: TunnelConfiguration) {
         stopKeepaliveTimer()
         guard config.relayMode == "tun2socks" else { return }
         guard config.keepaliveIntervalSeconds > 0 else { return }
+        keepaliveSession = createUDPSessionThroughTunnel(to: Self.keepaliveEndpoint, from: nil)
         let interval = max(10, config.keepaliveIntervalSeconds)
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + interval, repeating: interval)
@@ -458,34 +496,59 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
     private func stopKeepaliveTimer() {
         keepaliveTimer?.cancel()
         keepaliveTimer = nil
+        keepaliveSession?.cancel()
+        keepaliveSession = nil
     }
 
     private func sendKeepaliveProbeIfNeeded() {
         guard !isStoppingState(), !relayRestartInProgress else { return }
         guard let config = configuration, config.relayMode == "tun2socks" else { return }
         guard config.keepaliveIntervalSeconds > 0 else { return }
-        let session = createUDPSessionThroughTunnel(to: Self.keepaliveEndpoint, from: nil)
-        session.writeDatagram(Self.keepaliveDNSQuery) { [weak self] error in
-            if let error, RelativeLog.isVerbose {
-                self?.logger.warning("Keepalive probe failed: \(error.localizedDescription, privacy: .public)")
+
+        if keepaliveSession == nil {
+            keepaliveSession = createUDPSessionThroughTunnel(to: Self.keepaliveEndpoint, from: nil)
+        }
+        guard let session = keepaliveSession else { return }
+        session.writeDatagram(Self.keepaliveDNSQuery) { [weak self, session] error in
+            guard let self else { return }
+            guard let error else { return }
+            self.queue.async {
+                if RelativeLog.isVerbose {
+                    self.logger.warning("Keepalive probe failed: \(error.localizedDescription, privacy: .public)")
+                }
+                if let current = self.keepaliveSession, current === session {
+                    self.keepaliveSession?.cancel()
+                    self.keepaliveSession = nil
+                }
             }
-            session.cancel()
         }
     }
 
     private func handleDefaultPathMonitorTick() {
         guard !isStoppingState() else { return }
-        let currentPath = defaultPath
-        let currentSignature = defaultPathSignature(currentPath)
-        guard currentSignature != lastObservedPathSignature else { return }
-        lastObservedPathSignature = currentSignature
-        guard currentPath?.status == .satisfied else { return }
+        guard let currentPath = defaultPath else { return }
+        let diagnosticSignature = defaultPathSignature(currentPath)
+        if diagnosticSignature != lastObservedPathSignature {
+            lastObservedPathSignature = diagnosticSignature
+        }
+
+        guard currentPath.status == .satisfied else { return }
+        if let previousPath = lastObservedPathForRestart, currentPath.isEqual(previousPath) {
+            return
+        }
+
+        lastObservedPathForRestart = currentPath
         restartRelay(reason: "path-change")
     }
 
     private func restartRelay(reason: String) {
         guard !relayRestartInProgress, !isStoppingState() else { return }
         guard let config = configuration, config.relayMode == "tun2socks" else { return }
+        let isRetryAttempt = reason.contains("-retry")
+        if !isRetryAttempt {
+            relayRestartAttempts = 0
+        }
+        cancelRelayRestartRetryWorkItem()
         relayRestartInProgress = true
         setWaitingForBackpressureRelief(false)
         setReasserting(true)
@@ -500,16 +563,40 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
             guard let self else { return }
             self.queue.async {
                 self.relayRestartInProgress = false
-                self.setReasserting(false)
                 if let error {
                     self.logger.error("Failed to restart relay (\(reason, privacy: .public)): \(error.localizedDescription, privacy: .public)")
                     if RelativeLog.isVerbose {
                         NSLog("\(self.logPrefix): relay restart failed, reason=\(reason), error=\(error.localizedDescription)")
                     }
+                    self.relayRestartAttempts += 1
+                    if self.relayRestartAttempts <= Self.maxRelayRestartAttempts {
+                        let delay = pow(2.0, Double(self.relayRestartAttempts))
+                        self.logger.warning(
+                            "Relay restart failed (attempt \(self.relayRestartAttempts, privacy: .public)/\(Self.maxRelayRestartAttempts, privacy: .public)); retrying in \(delay, privacy: .public)s"
+                        )
+                        let retryReason = "\(reason)-retry\(self.relayRestartAttempts)"
+                        let workItem = DispatchWorkItem { [weak self] in
+                            guard let self else { return }
+                            self.relayRestartRetryWorkItem = nil
+                            self.restartRelay(reason: retryReason)
+                        }
+                        self.relayRestartRetryWorkItem = workItem
+                        self.queue.asyncAfter(deadline: .now() + delay, execute: workItem)
+                        return
+                    }
+
+                    self.logger.error("Relay restart exhausted \(Self.maxRelayRestartAttempts, privacy: .public) attempts; cancelling tunnel.")
+                    self.relayRestartAttempts = 0
+                    self.cancelRelayRestartRetryWorkItem()
+                    self.setReasserting(false)
                     self.cancelTunnelWithError(error)
                     return
                 }
+
+                self.relayRestartAttempts = 0
+                self.cancelRelayRestartRetryWorkItem()
                 self.startKeepaliveTimer(using: config)
+                self.setReasserting(false)
             }
         }
     }
@@ -788,6 +875,11 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
     private func setReasserting(_ value: Bool) {
         reassertingState = value
         reasserting = value
+    }
+
+    private func cancelRelayRestartRetryWorkItem() {
+        relayRestartRetryWorkItem?.cancel()
+        relayRestartRetryWorkItem = nil
     }
 
     private func makeAppMessageResponse(command: String, ok: Bool, error: String? = nil) -> Data? {

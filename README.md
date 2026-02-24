@@ -39,7 +39,7 @@ manager.loadFromPreferences { error in
         "ipv6Enabled": true,
         "dnsServers": ["1.1.1.1", "8.8.8.8"],
         "signatureFileName": "app_signatures.json",
-        "packetStreamEnabled": true,
+        "packetStreamEnabled": false, // enable only when actively debugging
         "packetStreamMaxBytes": 5_000_000,
         "metricsEnabled": true,
         "metricsSnapshotInterval": 5.0,
@@ -117,7 +117,8 @@ If you are upgrading from either of the versions above (or older), review these 
 
 Behavioral changes to account for:
 
-- Path-change monitoring runs every `2` seconds and restarts relay components when the path signature changes and status is satisfied.
+- Path-change monitoring runs every `2` seconds and restarts relay components when the underlying default path changes and status is satisfied.
+- Path-change restarts are cooldown-limited to once every `15` seconds to reduce flapping on transient path updates.
 - `sleep()`/`wake()` lifecycle handling is active; `wake()` resumes timers and triggers relay restart.
 - Outbound SOCKS `.waiting` timeout is `30` seconds (TCP and UDP adapters).
 - SOCKS listener bind retry policy is `7` attempts with `0.2s` retry delay.
@@ -128,7 +129,8 @@ If you depend on legacy behavior, set explicit values in `providerConfiguration`
 
 ### Runtime resilience behavior
 
-- Default path changes are polled every 2 seconds; when the signature changes and path is satisfied, the relay is restarted.
+- Default path changes are polled every 2 seconds; when the underlying default path changes and path is satisfied, the relay is restarted.
+- Path-change restarts are throttled (minimum 15s between path-triggered restarts) to avoid rapid reassert cycles.
 - Keepalive probes run in `tun2socks` mode when `keepaliveIntervalSeconds > 0` (minimum effective interval is 10s).
 - `sleep()` pauses path/keepalive timers; `wake()` resumes timers and proactively restarts relay components.
 - Outbound SOCKS TCP/UDP connections in `.waiting` are cancelled after 30 seconds.
@@ -262,6 +264,11 @@ Coverage outputs:
 - `.build/coverage/source_summary.txt` (source-only totals + lowest covered files)
 
 ## Changelog
+
+### 2/24/26
+
+- Stabilized path-change restarts by using path-content equality checks and adding a 15s restart cooldown.
+- Updated Example defaults for normal operation (`engineLogLevel: warn`, `packetStreamEnabled: false`) to reduce high-throughput media regressions.
 
 ### 2/19/26
 
