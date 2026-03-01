@@ -10,7 +10,8 @@ let package = Package(
     products: [
         .library(name: "RelativeProtocolCore", targets: ["RelativeProtocolCore"]),
         .library(name: "RelativeProtocolHost", targets: ["RelativeProtocolHost"]),
-        .library(name: "RelativeProtocolTunnel", targets: ["RelativeProtocolTunnel"])
+        .library(name: "RelativeProtocolTunnel", targets: ["RelativeProtocolTunnel"]),
+        .executable(name: "Standalone", targets: ["Standalone"])
     ],
     targets: [
         .target(
@@ -93,6 +94,11 @@ let package = Package(
             name: "RelativeProtocolTunnel",
             dependencies: ["RelativeProtocolCore", "HevSocks5Tunnel"],
             path: "RelativeProtocol/Sources/RelativeProtocolTunnel"
+        ),
+        .executableTarget(
+            name: "Standalone",
+            dependencies: ["RelativeProtocolCore", "RelativeProtocolTunnel"],
+            path: "RelativeProtocol/Sources/Standalone"
         ),
         .testTarget(
             name: "RelativeProtocolCoreTests",
