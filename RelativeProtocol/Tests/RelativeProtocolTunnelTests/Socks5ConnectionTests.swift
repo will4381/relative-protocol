@@ -117,6 +117,78 @@ final class Socks5ConnectionTests: XCTestCase {
         XCTAssertTrue(inbound.cancelled)
     }
 
+    func testConnectFailureBeforeReadySendsFailureReply() {
+        let queue = DispatchQueue(label: "socks5.connection.test.connect.failure")
+        let inbound = FakeInboundConnection()
+        let outbound = FakeTCPOutbound()
+        outbound.readyResult = .failure(NWError.posix(.ECONNREFUSED))
+        let provider = FakeProvider(outbound: outbound)
+
+        let connection = Socks5Connection(connection: inbound, provider: provider, queue: queue, mtu: 1400)
+        connection.start()
+
+        var handshake = Data([0x05, 0x01, 0x00])
+        handshake.append(buildDomainConnectRequest(host: "example.com", port: 443))
+        inbound.enqueueInbound(handshake)
+        waitOnQueue(queue)
+
+        XCTAssertEqual(inbound.sent.count, 2)
+        XCTAssertEqual(inbound.sent.first, Socks5Codec.buildMethodSelection(method: 0x00))
+        guard let failureReply = inbound.sent.last else {
+            XCTFail("Missing failure reply")
+            return
+        }
+        XCTAssertEqual(parseReply(failureReply)?.code, 0x05)
+        XCTAssertTrue(inbound.cancelled)
+    }
+
+    func testConnectIPv6RouteUnavailableSendsNetworkUnreachableReply() {
+        let queue = DispatchQueue(label: "socks5.connection.test.connect.ipv6noroute")
+        let inbound = FakeInboundConnection()
+        let outbound = FakeTCPOutbound()
+        outbound.readyResult = .failure(Socks5OutboundError.ipv6RouteUnavailable("2600:1402:8000:3::1700:a2f4"))
+        let provider = FakeProvider(outbound: outbound)
+
+        let connection = Socks5Connection(connection: inbound, provider: provider, queue: queue, mtu: 1400)
+        connection.start()
+
+        var handshake = Data([0x05, 0x01, 0x00])
+        handshake.append(buildDomainConnectRequest(host: "example.com", port: 443))
+        inbound.enqueueInbound(handshake)
+        waitOnQueue(queue)
+
+        XCTAssertEqual(inbound.sent.count, 2)
+        XCTAssertEqual(inbound.sent.first, Socks5Codec.buildMethodSelection(method: 0x00))
+        guard let failureReply = inbound.sent.last else {
+            XCTFail("Missing failure reply")
+            return
+        }
+        XCTAssertEqual(parseReply(failureReply)?.code, 0x03)
+        XCTAssertTrue(inbound.cancelled)
+    }
+
+    func testInvalidRequestCommandSendsCommandNotSupportedReply() {
+        let queue = DispatchQueue(label: "socks5.connection.test.invalid.command")
+        let inbound = FakeInboundConnection()
+        let provider = FakeProvider(outbound: FakeTCPOutbound())
+        let connection = Socks5Connection(connection: inbound, provider: provider, queue: queue, mtu: 1400)
+        connection.start()
+
+        var payload = Data([0x05, 0x01, 0x00])
+        payload.append(contentsOf: [0x05, 0x09, 0x00, 0x01, 0x7F, 0x00, 0x00, 0x01, 0x00, 0x50])
+        inbound.enqueueInbound(payload)
+        waitOnQueue(queue)
+
+        XCTAssertEqual(inbound.sent.count, 2)
+        XCTAssertEqual(inbound.sent.first, Socks5Codec.buildMethodSelection(method: 0x00))
+        guard let failureReply = inbound.sent.last else {
+            XCTFail("Missing failure reply")
+            return
+        }
+        XCTAssertEqual(parseReply(failureReply)?.code, 0x07)
+        XCTAssertTrue(inbound.cancelled)
+    }
+
     func testStopInUDPProxyStateStopsRelay() {
         let queue = DispatchQueue(label: "socks5.connection.test.udp.stop")
         let inbound = FakeInboundConnection()
@@ -211,6 +283,11 @@ private final class FakeTCPOutbound: Socks5TCPOutbound {
     private(set) var writes: [Data] = []
     private var readHandler: ((Data?, Error?) -> Void)?
     private(set) var cancelled = false
+    var readyResult: Result<Void, Error> = .success(())
+
+    func onReady(_ completion: @escaping (Result<Void, Error>) -> Void) {
+        completion(readyResult)
+    }
 
     func readMinimumLength(_ minimumLength: Int, maximumLength: Int, completionHandler: @escaping (Data?, Error?) -> Void) {
         readHandler = completionHandler

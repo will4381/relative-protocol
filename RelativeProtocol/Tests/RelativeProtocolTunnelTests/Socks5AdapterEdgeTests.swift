@@ -73,7 +73,7 @@ final class Socks5AdapterEdgeTests: XCTestCase {
         XCTAssertTrue(session.cancelled)
     }
 
-    func testPacketTunnelProviderAdapterUsesNWConnectionsForValidPorts() {
+    func testPacketTunnelProviderAdapterUsesNWConnectionsWhenVirtualInterfaceUnavailable() {
         let provider = RelativePacketTunnelProvider()
         let adapter = PacketTunnelProviderAdapter(provider: provider, queue: DispatchQueue(label: "adapter.valid"))
 
@@ -104,8 +104,8 @@ final class Socks5AdapterEdgeTests: XCTestCase {
         )
         let udp = adapter.makeUDPSession(to: NWHostEndpoint(hostname: "example.com", port: "still-invalid"))
 
-        XCTAssertTrue(tcp is NWTCPConnectionAdapter)
-        XCTAssertTrue(udp is NWUDPSessionAdapter)
+        XCTAssertTrue(tcp is AdapterFailedTCPOutbound)
+        XCTAssertTrue(udp is AdapterFailedUDPSession)
 
         tcp.cancel()
         udp.cancel()

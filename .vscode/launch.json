@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VPN-Bridge}",
+            "name": "Debug Standalone",
+            "target": "Standalone",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug Standalone"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VPN-Bridge}",
+            "name": "Release Standalone",
+            "target": "Standalone",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release Standalone"
+        }
+    ]
+}

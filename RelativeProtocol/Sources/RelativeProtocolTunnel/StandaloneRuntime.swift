@@ -5,20 +5,32 @@ import Foundation
 import Network
 @preconcurrency import NetworkExtension
 import RelativeProtocolCore
+#if canImport(Darwin)
+import Darwin
+#endif
 
 public struct StandaloneRuntimeOptions: Sendable, Codable {
     public var socksPort: UInt16
     public var mtu: Int
     public var engineLogLevel: String
+    public var metricsEnabled: Bool
+    public var packetStreamEnabled: Bool
+    public var keepaliveIntervalSeconds: Int
 
     public init(
         socksPort: UInt16 = 1080,
         mtu: Int = 1400,
-        engineLogLevel: String = "warn"
+        engineLogLevel: String = "warn",
+        metricsEnabled: Bool = false,
+        packetStreamEnabled: Bool = false,
+        keepaliveIntervalSeconds: Int = 0
     ) {
         self.socksPort = socksPort
         self.mtu = mtu
         self.engineLogLevel = engineLogLevel
+        self.metricsEnabled = metricsEnabled
+        self.packetStreamEnabled = packetStreamEnabled
+        self.keepaliveIntervalSeconds = max(0, keepaliveIntervalSeconds)
     }
 }
 
@@ -28,6 +40,9 @@ public struct StandaloneRuntimeStatus: Sendable, Codable {
     public let socksPort: UInt16
     public let mtu: Int
     public let engineLogLevel: String
+    public let metricsEnabled: Bool
+    public let packetStreamEnabled: Bool
+    public let keepaliveIntervalSeconds: Int
     public let restartCount: Int
     public let backpressured: Bool
     public let inboundPacketCount: UInt64
@@ -36,6 +51,11 @@ public struct StandaloneRuntimeStatus: Sendable, Codable {
     public let outboundBytes: UInt64
     public let uptimeSeconds: Int
     public let lastError: String?
+    public let residentMemoryBytes: UInt64
+    public let peakResidentMemoryBytes: UInt64
+    public let socketSendBufferBytes: Int
+    public let socketReceiveBufferBytes: Int
+    public let socketBufferCapped: Bool
     public let timestamp: TimeInterval
 }
 
@@ -55,6 +75,7 @@ public final class StandaloneTunnelRuntime {
     private var inboundBytes: UInt64 = 0
     private var outboundPacketCount: UInt64 = 0
     private var outboundBytes: UInt64 = 0
+    private var peakResidentMemoryBytes: UInt64 = 0
 
     private var activeSocksPort: UInt16
     private var socksServer: Socks5Server?
@@ -165,12 +186,18 @@ public final class StandaloneTunnelRuntime {
         } else {
             uptime = 0
         }
+        let residentMemoryBytes = currentResidentMemoryBytes()
+        peakResidentMemoryBytes = max(peakResidentMemoryBytes, residentMemoryBytes)
+        let socketStats = tunBridge?.socketBufferStats()
         return StandaloneRuntimeStatus(
             running: running,
             restarting: restarting,
             socksPort: activeSocksPort,
             mtu: options.mtu,
             engineLogLevel: options.engineLogLevel,
+            metricsEnabled: options.metricsEnabled,
+            packetStreamEnabled: options.packetStreamEnabled,
+            keepaliveIntervalSeconds: options.keepaliveIntervalSeconds,
             restartCount: restartCount,
             backpressured: tunBridge?.isBackpressured() ?? false,
             inboundPacketCount: inboundPacketCount,
@@ -179,6 +206,11 @@ public final class StandaloneTunnelRuntime {
             outboundBytes: outboundBytes,
             uptimeSeconds: uptime,
             lastError: lastError,
+            residentMemoryBytes: residentMemoryBytes,
+            peakResidentMemoryBytes: peakResidentMemoryBytes,
+            socketSendBufferBytes: socketStats?.effectiveSendBytes ?? 0,
+            socketReceiveBufferBytes: socketStats?.effectiveReceiveBytes ?? 0,
+            socketBufferCapped: socketStats?.wasCapped ?? false,
             timestamp: TunnelTime.nowEpochSeconds()
         )
     }
@@ -242,6 +274,8 @@ public final class StandaloneTunnelRuntime {
         socksServer?.stop()
         socksServer = nil
         provider = nil
+        running = false
+        activeSocksPort = options.socksPort
     }
 
     private func makeConfiguration(socksPort: Int, mtu: Int, engineLogLevel: String) -> TunnelConfiguration {
@@ -259,10 +293,26 @@ public final class StandaloneTunnelRuntime {
             "tunnelRemoteAddress": "127.0.0.1",
             "engineSocksPort": socksPort,
             "engineLogLevel": engineLogLevel,
-            "metricsEnabled": false,
-            "packetStreamEnabled": false,
-            "keepaliveIntervalSeconds": 0
+            "metricsEnabled": options.metricsEnabled,
+            "packetStreamEnabled": options.packetStreamEnabled,
+            "keepaliveIntervalSeconds": options.keepaliveIntervalSeconds
         ])
+    }
+
+    private func currentResidentMemoryBytes() -> UInt64 {
+        #if canImport(Darwin)
+        var info = mach_task_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info_data_t>.size / MemoryLayout<natural_t>.size)
+        let result: kern_return_t = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { reboundPointer in
+                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), reboundPointer, &count)
+            }
+        }
+        if result == KERN_SUCCESS {
+            return UInt64(info.resident_size)
+        }
+        #endif
+        return 0
     }
 }
 
@@ -286,6 +336,7 @@ private final class StandaloneConnectionProvider: Socks5ConnectionProvider {
             return FailedTCPOutbound(error: StandaloneRuntimeError.invalidEndpoint)
         }
         let parameters = enableTLS ? NWParameters.tls : NWParameters.tcp
+        applyPreferredIPVersion(to: parameters, endpointHost: endpoint.hostname)
         let host = NWEndpoint.Host(endpoint.hostname)
         let connection = NWConnection(host: host, port: port, using: parameters)
         return NWConnectionTCPAdapter(connection, queue: queue)
@@ -297,9 +348,22 @@ private final class StandaloneConnectionProvider: Socks5ConnectionProvider {
             return FailedUDPSession(error: StandaloneRuntimeError.invalidEndpoint)
         }
         let parameters = NWParameters.udp
+        applyPreferredIPVersion(to: parameters, endpointHost: endpoint.hostname)
         let host = NWEndpoint.Host(endpoint.hostname)
         let connection = NWConnection(host: host, port: port, using: parameters)
         return NWConnectionUDPSessionAdapter(connection, queue: queue)
+    }
+
+    private func applyPreferredIPVersion(to parameters: NWParameters, endpointHost: String) {
+        guard let ipOptions = parameters.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options else {
+            return
+        }
+
+        if IPv6Address(endpointHost.trimmingCharacters(in: .whitespacesAndNewlines)) != nil {
+            ipOptions.version = .v6
+            return
+        }
+        ipOptions.version = .v4
     }
 }
 
@@ -308,6 +372,10 @@ private final class FailedTCPOutbound: Socks5TCPOutbound {
 
     init(error: Error) {
         self.error = error
+    }
+
+    func onReady(_ completion: @escaping (Result<Void, Error>) -> Void) {
+        completion(.failure(error))
     }
 
     func readMinimumLength(

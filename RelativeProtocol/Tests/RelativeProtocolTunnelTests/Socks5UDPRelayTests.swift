@@ -90,6 +90,42 @@ final class Socks5UDPRelayTests: XCTestCase {
         wait(for: [writeExpectation], timeout: 1.5)
         XCTAssertEqual(session.writes.count, burstCount)
     }
+
+    func testRelayAllowsLoopbackClientPortRebind() throws {
+        let queue = DispatchQueue(label: "socks5.udp.relay.rebind")
+        let session = CapturingUDPSession()
+        let provider = FakeUDPProvider(session: session)
+        let relay = try Socks5UDPRelay(provider: provider, queue: queue, mtu: 1500)
+        relay.start()
+        defer { relay.stop() }
+
+        let firstClient = try UDPTestClient()
+        defer { firstClient.close() }
+        let secondClient = try UDPTestClient()
+        defer { secondClient.close() }
+
+        let firstPayload = Data([0x01, 0xAA])
+        let secondPayload = Data([0x02, 0xBB])
+        let packetA = Socks5Codec.buildUDPPacket(address: .ipv4("8.8.8.8"), port: 53, payload: firstPayload)
+        let packetB = Socks5Codec.buildUDPPacket(address: .ipv4("8.8.8.8"), port: 53, payload: secondPayload)
+
+        let writes = expectation(description: "relay accepted writes from both client ports")
+        writes.expectedFulfillmentCount = 2
+        session.writeExpectation = writes
+
+        try firstClient.send(to: relay.port, data: packetA)
+        try secondClient.send(to: relay.port, data: packetB)
+
+        wait(for: [writes], timeout: 1.5)
+        XCTAssertEqual(session.writes.count, 2)
+
+        let responsePayload = Data([0xCC, 0xDD])
+        session.simulateIncoming([responsePayload])
+
+        let response = try secondClient.receive(maxSize: 2048, timeout: 1.0)
+        let parsed = Socks5Codec.parseUDPPacket(response)
+        XCTAssertEqual(parsed?.payload, responsePayload)
+    }
 }
 
 private final class CapturingUDPSession: Socks5UDPSession {
@@ -140,6 +176,10 @@ private final class FakeUDPProvider: Socks5ConnectionProvider {
 }
 
 private final class FakeTCPOutbound: Socks5TCPOutbound {
+    func onReady(_ completion: @escaping (Result<Void, Error>) -> Void) {
+        completion(.success(()))
+    }
+
     func readMinimumLength(_ minimumLength: Int, maximumLength: Int, completionHandler: @escaping (Data?, Error?) -> Void) {}
     func write(_ data: Data, completionHandler: @escaping (Error?) -> Void) { completionHandler(nil) }
     func cancel() {}

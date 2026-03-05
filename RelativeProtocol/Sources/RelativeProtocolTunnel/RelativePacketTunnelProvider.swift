@@ -41,15 +41,30 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
     private var relayRestartInProgress = false
     private var defaultPathMonitorTimer: DispatchSourceTimer?
     private var keepaliveTimer: DispatchSourceTimer?
-    private var keepaliveSession: NWUDPSession?
+    private var keepaliveSession: Socks5UDPSession?
+    private var keepaliveProbeHosts: [String] = []
+    private var keepaliveProbeHostIndex = 0
     private var lastObservedPathSignature: String?
     private var lastObservedPathForRestart: NWPath?
     private var pathBeforeSleep: NWPath?
     private var relayRestartAttempts: Int = 0
     private var relayRestartRetryWorkItem: DispatchWorkItem?
     private var reassertingState = false
+    private var firstUDPWaitingCapture: UDPWaitingCapture?
+    private var lastProviderStopCapture: ProviderStopCapture?
+    private var currentRunID: String = UUID().uuidString
+    private var currentRunBootCount: Int = 0
+    private var previousRunUncleanlyTerminated = false
+    private var previousRunID: String?
+    private var previousRunStartEpoch: TimeInterval?
+    private var previousRunStopEpoch: TimeInterval?
 
-    private static let keepaliveEndpoint = NWHostEndpoint(hostname: "1.1.1.1", port: "53")
+    private static let keepaliveFallbackHosts = [
+        "1.1.1.1",
+        "8.8.8.8",
+        "2606:4700:4700::1111",
+        "2001:4860:4860::8888"
+    ]
     private static let maxRelayRestartAttempts = 3
     private static let keepaliveDNSQuery = Data([
         0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
@@ -57,12 +72,54 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
         0x6d, 0x70, 0x6c, 0x65, 0x03, 0x63, 0x6f, 0x6d,
         0x00, 0x00, 0x01, 0x00, 0x01
     ])
+    private static let lifecycleBootCountKey = "RelativePacketTunnelProvider.lifecycle.bootCount"
+    private static let lifecycleLastRunIDKey = "RelativePacketTunnelProvider.lifecycle.lastRunID"
+    private static let lifecycleLastRunStartEpochKey = "RelativePacketTunnelProvider.lifecycle.lastRunStartEpoch"
+    private static let lifecycleLastRunStopEpochKey = "RelativePacketTunnelProvider.lifecycle.lastRunStopEpoch"
+    private static let lifecycleLastRunStopReasonKey = "RelativePacketTunnelProvider.lifecycle.lastRunStopReason"
+    private static let lifecycleLastRunCleanStopKey = "RelativePacketTunnelProvider.lifecycle.lastRunCleanStop"
+
+    private struct UDPWaitingCapture: Sendable {
+        let timestampEpoch: TimeInterval
+        let level: String
+        let component: String
+        let message: String
+        let pathSignature: String
+
+        var payload: [String: Any] {
+            [
+                "timestampEpoch": timestampEpoch,
+                "level": level,
+                "component": component,
+                "message": message,
+                "pathSignature": pathSignature
+            ]
+        }
+    }
+
+    private struct ProviderStopCapture: Sendable {
+        let timestampEpoch: TimeInterval
+        let reasonRawValue: Int
+        let reasonName: String
+        let pathSignature: String
+
+        var payload: [String: Any] {
+            [
+                "timestampEpoch": timestampEpoch,
+                "reasonRawValue": reasonRawValue,
+                "reasonName": reasonName,
+                "pathSignature": pathSignature
+            ]
+        }
+    }
 
     public override func startTunnel(options: [String: NSObject]? = nil, completionHandler: @escaping (Error?) -> Void) {
         if RelativeLog.isVerbose {
             NSLog("\(logPrefix): startTunnel invoked")
         }
         queue.async {
+            self.firstUDPWaitingCapture = nil
+            self.lastProviderStopCapture = nil
             self.setIsStopping(false)
             self.setWaitingForBackpressureRelief(false)
             self.relayRestartInProgress = false
@@ -71,6 +128,15 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
             self.cancelRelayRestartRetryWorkItem()
             let config = self.loadConfiguration()
             self.configuration = config
+            let lifecycleMetadata = self.recordLifecycleStart(appGroupID: config.appGroupID)
+            self.logTunnelEvent(
+                level: self.previousRunUncleanlyTerminated ? "warning" : "info",
+                phase: "lifecycle",
+                message: self.previousRunUncleanlyTerminated
+                    ? "Tunnel started after previous run ended without clean stop."
+                    : "Tunnel start.",
+                metadata: lifecycleMetadata
+            )
             let settings = self.makeNetworkSettings(from: config)
             var didCompleteStart = false
             let completeStart: (Error?) -> Void = { error in
@@ -122,6 +188,29 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
     public override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         queue.async {
             self.setIsStopping(true)
+            let stopCapture = ProviderStopCapture(
+                timestampEpoch: TunnelTime.nowEpochSeconds(),
+                reasonRawValue: reason.rawValue,
+                reasonName: String(describing: reason),
+                pathSignature: self.lastObservedPathSignature ?? "path:unavailable"
+            )
+            self.lastProviderStopCapture = stopCapture
+            self.recordLifecycleStop(appGroupID: self.configuration?.appGroupID ?? "", reason: reason)
+            var stopMetadata: [String: Any] = [
+                "providerStopReason": stopCapture.reasonName,
+                "providerStopReasonRaw": stopCapture.reasonRawValue,
+                "providerStopCapture": stopCapture.payload,
+                "lifecycle": self.makeLifecycleMetadata()
+            ]
+            if let firstUDPWaitingCapture = self.firstUDPWaitingCapture {
+                stopMetadata["firstUDPWaitingCapture"] = firstUDPWaitingCapture.payload
+            }
+            self.logTunnelEvent(
+                level: "info",
+                phase: "stop",
+                message: "Tunnel stopping.",
+                metadata: stopMetadata
+            )
             self.stopDefaultPathMonitor()
             self.stopKeepaliveTimer()
             self.relayRestartInProgress = false
@@ -187,7 +276,14 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
             self.pathBeforeSleep = nil
 
             if pathChanged {
-                self.restartRelay(reason: "wake")
+                if self.isRelayActive() {
+                    if RelativeLog.isVerbose {
+                        self.logger.info("Wake: path changed; keeping relay active without forced restart.")
+                        NSLog("\(self.logPrefix): wake path changed; relay kept active")
+                    }
+                } else {
+                    self.restartRelay(reason: "wake-relay-inactive")
+                }
             } else if RelativeLog.isVerbose {
                 self.logger.info("Wake: path unchanged, skipping relay restart.")
                 NSLog("\(self.logPrefix): wake path unchanged, no restart")
@@ -202,7 +298,8 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func handleAppMessageOnQueue(_ messageData: Data) -> Data? {
-        let command = Self.parseAppMessageCommand(from: messageData)
+        let payload = Self.parseAppMessagePayload(from: messageData)
+        let command = Self.parseAppMessageCommand(from: payload)
 
         switch command {
         case "status", "diagnostics":
@@ -223,11 +320,18 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    private static func parseAppMessageCommand(from messageData: Data) -> String {
-        let payload = (try? JSONSerialization.jsonObject(with: messageData)) as? [String: Any]
-        return (payload?["command"] as? String ?? payload?["action"] as? String ?? "status")
+    private static func parseAppMessagePayload(from messageData: Data) -> [String: Any]? {
+        (try? JSONSerialization.jsonObject(with: messageData)) as? [String: Any]
+    }
+
+    private static func parseAppMessageCommand(from payload: [String: Any]?) -> String {
+        (payload?["command"] as? String ?? payload?["action"] as? String ?? "status")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
+    }
+
+    private static func parseAppMessageCommand(from messageData: Data) -> String {
+        parseAppMessageCommand(from: parseAppMessagePayload(from: messageData))
     }
 
     private func loadConfiguration() -> TunnelConfiguration {
@@ -240,6 +344,146 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
             logger.error("Missing appGroupID; metrics will be disabled.")
         }
         return config
+    }
+
+    private func logTunnelEvent(
+        level: String,
+        phase: String,
+        message: String,
+        metadata: [String: Any] = [:]
+    ) {
+        let metadataString: String
+        if metadata.isEmpty {
+            metadataString = "{}"
+        } else if JSONSerialization.isValidJSONObject(metadata),
+                  let data = try? JSONSerialization.data(withJSONObject: metadata, options: [.sortedKeys]),
+                  let string = String(data: data, encoding: .utf8) {
+            metadataString = string
+        } else {
+            metadataString = "\(metadata)"
+        }
+        switch level.lowercased() {
+        case "error":
+            logger.error("phase=\(phase, privacy: .public) message=\(message, privacy: .public) metadata=\(metadataString, privacy: .public)")
+        case "warning":
+            logger.warning("phase=\(phase, privacy: .public) message=\(message, privacy: .public) metadata=\(metadataString, privacy: .public)")
+        default:
+            logger.info("phase=\(phase, privacy: .public) message=\(message, privacy: .public) metadata=\(metadataString, privacy: .public)")
+        }
+    }
+
+    private func currentTunQueueStats() -> TunSocketQueueStats? {
+        currentTunBridge()?.queueStats()
+    }
+
+    private func currentSocksConnectionCount() -> Int {
+        currentSocksServer()?.activeConnectionCount() ?? 0
+    }
+
+    private func recordSocksDiagnostic(component: String, level: String, message: String) {
+        let normalizedLevel = level.lowercased()
+        let formatted = "SOCKS5 \(component): \(message)"
+        if component == "udp",
+           firstUDPWaitingCapture == nil,
+           message.contains("waiting error=") {
+            firstUDPWaitingCapture = UDPWaitingCapture(
+                timestampEpoch: TunnelTime.nowEpochSeconds(),
+                level: normalizedLevel,
+                component: component,
+                message: formatted,
+                pathSignature: lastObservedPathSignature ?? "path:unavailable"
+            )
+        }
+        if RelativeLog.isVerbose {
+            logger.debug("SOCKS5 diagnostic event: \(formatted, privacy: .public)")
+        }
+
+        guard normalizedLevel == "warning" || normalizedLevel == "error" else {
+            return
+        }
+        logTunnelEvent(
+            level: normalizedLevel,
+            phase: "network",
+            message: formatted,
+            metadata: [
+                "path": lastObservedPathSignature ?? "path:unavailable",
+                "relayRestartInProgress": relayRestartInProgress,
+                "reasserting": reassertingState
+            ]
+        )
+    }
+
+    private func lifecycleDefaults(appGroupID: String) -> UserDefaults? {
+        guard !appGroupID.isEmpty else { return nil }
+        return UserDefaults(suiteName: appGroupID)
+    }
+
+    private func makeLifecycleMetadata() -> [String: Any] {
+        var metadata: [String: Any] = [
+            "runID": currentRunID,
+            "bootCount": currentRunBootCount,
+            "previousRunUnclean": previousRunUncleanlyTerminated
+        ]
+        if let previousRunID {
+            metadata["previousRunID"] = previousRunID
+        }
+        if let previousRunStartEpoch {
+            metadata["previousRunStartEpoch"] = previousRunStartEpoch
+        }
+        if let previousRunStopEpoch {
+            metadata["previousRunStopEpoch"] = previousRunStopEpoch
+        }
+        return metadata
+    }
+
+    @discardableResult
+    private func recordLifecycleStart(appGroupID: String) -> [String: Any] {
+        let now = TunnelTime.nowEpochSeconds()
+        let newRunID = UUID().uuidString
+        var bootCount = 1
+        var priorRunID: String?
+        var priorRunCleanStop = true
+        var priorRunStartEpoch: TimeInterval?
+        var priorRunStopEpoch: TimeInterval?
+
+        if let defaults = lifecycleDefaults(appGroupID: appGroupID) {
+            priorRunID = defaults.string(forKey: Self.lifecycleLastRunIDKey)
+            if defaults.object(forKey: Self.lifecycleLastRunCleanStopKey) != nil {
+                priorRunCleanStop = defaults.bool(forKey: Self.lifecycleLastRunCleanStopKey)
+            }
+            if defaults.object(forKey: Self.lifecycleLastRunStartEpochKey) != nil {
+                priorRunStartEpoch = defaults.double(forKey: Self.lifecycleLastRunStartEpochKey)
+            }
+            if defaults.object(forKey: Self.lifecycleLastRunStopEpochKey) != nil {
+                priorRunStopEpoch = defaults.double(forKey: Self.lifecycleLastRunStopEpochKey)
+            }
+            bootCount = defaults.integer(forKey: Self.lifecycleBootCountKey) + 1
+            defaults.set(bootCount, forKey: Self.lifecycleBootCountKey)
+            defaults.set(newRunID, forKey: Self.lifecycleLastRunIDKey)
+            defaults.set(now, forKey: Self.lifecycleLastRunStartEpochKey)
+            defaults.removeObject(forKey: Self.lifecycleLastRunStopEpochKey)
+            defaults.removeObject(forKey: Self.lifecycleLastRunStopReasonKey)
+            defaults.set(false, forKey: Self.lifecycleLastRunCleanStopKey)
+        }
+
+        currentRunID = newRunID
+        currentRunBootCount = bootCount
+        previousRunID = priorRunID
+        previousRunStartEpoch = priorRunStartEpoch
+        previousRunStopEpoch = priorRunStopEpoch
+        previousRunUncleanlyTerminated = priorRunID != nil && !priorRunCleanStop
+        return makeLifecycleMetadata()
+    }
+
+    private func recordLifecycleStop(appGroupID: String, reason: NEProviderStopReason) {
+        previousRunUncleanlyTerminated = false
+        previousRunID = nil
+        previousRunStartEpoch = nil
+        previousRunStopEpoch = nil
+        guard let defaults = lifecycleDefaults(appGroupID: appGroupID) else { return }
+        defaults.set(TunnelTime.nowEpochSeconds(), forKey: Self.lifecycleLastRunStopEpochKey)
+        defaults.set(String(describing: reason), forKey: Self.lifecycleLastRunStopReasonKey)
+        defaults.set(true, forKey: Self.lifecycleLastRunCleanStopKey)
     }
 
     private func makeNetworkSettings(from config: TunnelConfiguration) -> NEPacketTunnelNetworkSettings {
@@ -259,8 +503,21 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
             settings.ipv6Settings = ipv6
         }
 
-        if !config.dnsServers.isEmpty {
-            settings.dnsSettings = NEDNSSettings(servers: config.dnsServers)
+        let allowIPv6Hosts = shouldAllowLiteralIPv6Hosts(for: config)
+        let dnsFilter = sanitizeHosts(config.dnsServers, allowIPv6Literals: allowIPv6Hosts)
+        if dnsFilter.droppedIPv6Count > 0 {
+            logger.warning(
+                "Filtered \(dnsFilter.droppedIPv6Count, privacy: .public) IPv6 DNS server(s); ipv6Enabled=\(config.ipv6Enabled, privacy: .public) defaultPath=\(self.safeDefaultPathSignatureForLogs(), privacy: .public)"
+            )
+        }
+        if !dnsFilter.hosts.isEmpty {
+            let dnsSettings = NEDNSSettings(servers: dnsFilter.hosts)
+            if isRunningInsideExtensionRuntime() {
+                // Explicitly scope this resolver to all domains for full-tunnel behavior.
+                dnsSettings.matchDomains = [""]
+                dnsSettings.matchDomainsNoSearch = true
+            }
+            settings.dnsSettings = dnsSettings
         }
 
         settings.mtu = NSNumber(value: config.mtu)
@@ -360,7 +617,7 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
             self.ioQueue.async {
                 guard !self.isStoppingState() else { return }
                 self.handlePackets(packets, protocols: protocols)
-                if let tunBridge = self.tunBridge, tunBridge.isBackpressured() {
+                if let tunBridge = self.currentTunBridge(), tunBridge.isBackpressured() {
                     self.setWaitingForBackpressureRelief(true)
                 } else {
                     self.startPacketReadLoop()
@@ -373,7 +630,7 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
         let timestamp = TunnelTime.nowEpochSeconds()
         for (index, packet) in packets.enumerated() {
             let protoHint = protocols.indices.contains(index) ? protocols[index].int32Value : 0
-            if let tunBridge {
+            if let tunBridge = currentTunBridge() {
                 _ = tunBridge.writePacket(packet, ipVersionHint: protoHint)
             }
         }
@@ -391,8 +648,12 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
         }
 
         let socksPort = UInt16(clamping: config.engineSocksPort)
-        let socksServer = Socks5Server(provider: self, queue: ioQueue, mtu: config.mtu)
-        self.socksServer = socksServer
+        let socksServer = Socks5Server(provider: self, queue: ioQueue, mtu: config.mtu) { [weak self] component, level, message in
+            self?.queue.async {
+                self?.recordSocksDiagnostic(component: component, level: level, message: message)
+            }
+        }
+        self.setSocksServer(socksServer)
         socksServer.start(port: socksPort) { [weak self] result in
             guard let self else { return }
             self.queue.async {
@@ -404,7 +665,7 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
                     }
                     do {
                         let bridge = try TunSocketBridge(mtu: config.mtu, queue: self.ioQueue)
-                        self.tunBridge = bridge
+                        self.setTunBridge(bridge)
                         bridge.onBackpressureRelieved = { [weak self] in
                             self?.resumePacketReadLoopIfNeeded()
                         }
@@ -413,7 +674,7 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
                         }
 
                         let engine = Tun2SocksEngine()
-                        self.engine = engine
+                        self.setEngine(engine)
                         engine.start(configuration: config, tunFD: bridge.engineFD, socksPort: port)
 
                         if RelativeLog.isVerbose {
@@ -425,8 +686,8 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
                         }
                         completion(nil)
                     } catch {
-                        self.socksServer?.stop()
-                        self.socksServer = nil
+                        self.currentSocksServer()?.stop()
+                        self.setSocksServer(nil)
                         self.logger.error("Failed to start tun bridge: \(error.localizedDescription, privacy: .public)")
                         if RelativeLog.isVerbose {
                             NSLog("\(self.logPrefix): Failed to start tun bridge: \(error.localizedDescription)")
@@ -438,8 +699,8 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
                     if RelativeLog.isVerbose {
                         NSLog("\(self.logPrefix): SOCKS5 server failed: \(error.localizedDescription)")
                     }
-                    self.socksServer?.stop()
-                    self.socksServer = nil
+                    self.currentSocksServer()?.stop()
+                    self.setSocksServer(nil)
                     completion(error)
                 }
             }
@@ -447,12 +708,12 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func stopRelayComponents() {
-        engine?.stop()
-        engine = nil
-        tunBridge?.stop()
-        tunBridge = nil
-        socksServer?.stop()
-        socksServer = nil
+        currentEngine()?.stop()
+        setEngine(nil)
+        currentTunBridge()?.stop()
+        setTunBridge(nil)
+        currentSocksServer()?.stop()
+        setSocksServer(nil)
         keepaliveSession?.cancel()
         keepaliveSession = nil
     }
@@ -482,7 +743,8 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
         stopKeepaliveTimer()
         guard config.relayMode == "tun2socks" else { return }
         guard config.keepaliveIntervalSeconds > 0 else { return }
-        keepaliveSession = createUDPSessionThroughTunnel(to: Self.keepaliveEndpoint, from: nil)
+        keepaliveProbeHosts = keepaliveHosts(for: config)
+        keepaliveProbeHostIndex = 0
         let interval = max(10, config.keepaliveIntervalSeconds)
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + interval, repeating: interval)
@@ -498,15 +760,30 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
         keepaliveTimer = nil
         keepaliveSession?.cancel()
         keepaliveSession = nil
+        keepaliveProbeHosts = []
+        keepaliveProbeHostIndex = 0
     }
 
     private func sendKeepaliveProbeIfNeeded() {
         guard !isStoppingState(), !relayRestartInProgress else { return }
         guard let config = configuration, config.relayMode == "tun2socks" else { return }
         guard config.keepaliveIntervalSeconds > 0 else { return }
+        guard let path = defaultPath, path.status == .satisfied else {
+            keepaliveSession?.cancel()
+            keepaliveSession = nil
+            if RelativeLog.isVerbose {
+                logger.debug("Skipping keepalive probe while default path is unsatisfied.")
+            }
+            return
+        }
 
         if keepaliveSession == nil {
-            keepaliveSession = createUDPSessionThroughTunnel(to: Self.keepaliveEndpoint, from: nil)
+            if keepaliveProbeHosts.isEmpty {
+                keepaliveProbeHosts = keepaliveHosts(for: config)
+                keepaliveProbeHostIndex = 0
+            }
+            guard let endpoint = currentKeepaliveEndpoint() else { return }
+            keepaliveSession = makeKeepaliveSession(to: endpoint)
         }
         guard let session = keepaliveSession else { return }
         session.writeDatagram(Self.keepaliveDNSQuery) { [weak self, session] error in
@@ -519,8 +796,103 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
                 if let current = self.keepaliveSession, current === session {
                     self.keepaliveSession?.cancel()
                     self.keepaliveSession = nil
+                    self.rotateKeepaliveProbeHost()
                 }
             }
+        }
+    }
+
+    private func makeKeepaliveSession(to endpoint: NWHostEndpoint) -> Socks5UDPSession? {
+        guard let portValue = UInt16(endpoint.port),
+              let port = Network.NWEndpoint.Port(rawValue: portValue) else {
+            if RelativeLog.isVerbose {
+                logger.warning("Skipping keepalive probe due to invalid endpoint port \(endpoint.port, privacy: .public).")
+            }
+            return nil
+        }
+
+        let parameters = Network.NWParameters.udp
+        if #available(iOS 18.0, macOS 15.0, *) {
+            if let virtualInterface = virtualInterface {
+                parameters.prohibitedInterfaces = [virtualInterface]
+                if RelativeLog.isVerbose {
+                    logger.debug("Keepalive UDP prohibiting interface \(virtualInterface.name, privacy: .public)")
+                }
+            }
+        }
+
+        let host = Network.NWEndpoint.Host(endpoint.hostname)
+        let connection = Network.NWConnection(host: host, port: port, using: parameters)
+        return NWConnectionUDPSessionAdapter(connection, queue: queue)
+    }
+
+    private func keepaliveHosts(for config: TunnelConfiguration) -> [String] {
+        let allowIPv6Hosts = shouldAllowLiteralIPv6Hosts(for: config)
+        let configured = sanitizeHosts(config.dnsServers, allowIPv6Literals: allowIPv6Hosts).hosts
+        if !configured.isEmpty {
+            return configured
+        }
+        return sanitizeHosts(Self.keepaliveFallbackHosts, allowIPv6Literals: allowIPv6Hosts).hosts
+    }
+
+    private func shouldAllowLiteralIPv6Hosts(for config: TunnelConfiguration) -> Bool {
+        // Follow tunnel configuration for IPv6 literals. `defaultPath` here is NetworkExtension.NWPath,
+        // which doesn't expose per-family routing capability like Network.NWPath.supportsIPv6.
+        config.ipv6Enabled
+    }
+
+    private func sanitizeHosts(
+        _ hosts: [String],
+        allowIPv6Literals: Bool
+    ) -> (hosts: [String], droppedIPv6Count: Int) {
+        var seen = Set<String>()
+        var sanitized: [String] = []
+        var droppedIPv6Count = 0
+        sanitized.reserveCapacity(hosts.count)
+
+        for host in hosts {
+            let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+
+            if !allowIPv6Literals && Self.isLiteralIPv6Address(trimmed) {
+                droppedIPv6Count += 1
+                continue
+            }
+
+            let key = trimmed.lowercased()
+            guard seen.insert(key).inserted else { continue }
+            sanitized.append(trimmed)
+        }
+
+        return (sanitized, droppedIPv6Count)
+    }
+
+    private static func isLiteralIPv6Address(_ value: String) -> Bool {
+        var address = in6_addr()
+        return value.withCString { inet_pton(AF_INET6, $0, &address) == 1 }
+    }
+
+    private func safeDefaultPathSignatureForLogs() -> String {
+        guard isRunningInsideExtensionRuntime() else { return "path:unavailable" }
+        return defaultPathSignature(defaultPath)
+    }
+
+    private func isRunningInsideExtensionRuntime() -> Bool {
+        Bundle.main.bundlePath.hasSuffix(".appex")
+    }
+
+    private func currentKeepaliveEndpoint() -> NWHostEndpoint? {
+        guard keepaliveProbeHosts.indices.contains(keepaliveProbeHostIndex) else { return nil }
+        let host = keepaliveProbeHosts[keepaliveProbeHostIndex]
+        return NWHostEndpoint(hostname: host, port: "53")
+    }
+
+    private func rotateKeepaliveProbeHost() {
+        guard !keepaliveProbeHosts.isEmpty else { return }
+        keepaliveProbeHostIndex = (keepaliveProbeHostIndex + 1) % keepaliveProbeHosts.count
+        if RelativeLog.isVerbose {
+            let host = keepaliveProbeHosts[keepaliveProbeHostIndex]
+            logger.info("Rotated keepalive probe host to \(host, privacy: .public)")
         }
     }
 
@@ -538,12 +910,21 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
         }
 
         lastObservedPathForRestart = currentPath
-        restartRelay(reason: "path-change")
+        if isRelayActive() {
+            if RelativeLog.isVerbose {
+                logger.info("Path changed; relay remains active without restart.")
+                NSLog("\(logPrefix): path changed; relay kept active")
+            }
+            return
+        }
+
+        restartRelay(reason: "path-change-relay-inactive")
     }
 
     private func restartRelay(reason: String) {
         guard !relayRestartInProgress, !isStoppingState() else { return }
         guard let config = configuration, config.relayMode == "tun2socks" else { return }
+        logTunnelEvent(level: "info", phase: "restart", message: "Relay restart requested.", metadata: ["reason": reason])
         let isRetryAttempt = reason.contains("-retry")
         if !isRetryAttempt {
             relayRestartAttempts = 0
@@ -568,11 +949,31 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
                     if RelativeLog.isVerbose {
                         NSLog("\(self.logPrefix): relay restart failed, reason=\(reason), error=\(error.localizedDescription)")
                     }
+                    self.logTunnelEvent(
+                        level: "error",
+                        phase: "restart",
+                        message: "Relay restart failed.",
+                        metadata: [
+                            "reason": reason,
+                            "error": error.localizedDescription
+                        ]
+                    )
                     self.relayRestartAttempts += 1
                     if self.relayRestartAttempts <= Self.maxRelayRestartAttempts {
                         let delay = pow(2.0, Double(self.relayRestartAttempts))
                         self.logger.warning(
                             "Relay restart failed (attempt \(self.relayRestartAttempts, privacy: .public)/\(Self.maxRelayRestartAttempts, privacy: .public)); retrying in \(delay, privacy: .public)s"
+                        )
+                        self.logTunnelEvent(
+                            level: "warning",
+                            phase: "restart",
+                            message: "Relay restart retry scheduled.",
+                            metadata: [
+                                "reason": reason,
+                                "attempt": self.relayRestartAttempts,
+                                "maxAttempts": Self.maxRelayRestartAttempts,
+                                "delaySeconds": delay
+                            ]
                         )
                         let retryReason = "\(reason)-retry\(self.relayRestartAttempts)"
                         let workItem = DispatchWorkItem { [weak self] in
@@ -589,6 +990,12 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
                     self.relayRestartAttempts = 0
                     self.cancelRelayRestartRetryWorkItem()
                     self.setReasserting(false)
+                    self.logTunnelEvent(
+                        level: "error",
+                        phase: "restart",
+                        message: "Relay restart exhausted retries; cancelling tunnel.",
+                        metadata: ["reason": reason]
+                    )
                     self.cancelTunnelWithError(error)
                     return
                 }
@@ -597,6 +1004,12 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
                 self.cancelRelayRestartRetryWorkItem()
                 self.startKeepaliveTimer(using: config)
                 self.setReasserting(false)
+                self.logTunnelEvent(
+                    level: "info",
+                    phase: "restart",
+                    message: "Relay restart completed.",
+                    metadata: ["reason": reason]
+                )
             }
         }
     }
@@ -836,15 +1249,55 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
         logger.error("Provide a tun2socks or lwIP engine to enable full connectivity.")
     }
 
+    private func isRelayActive() -> Bool {
+        currentSocksServer() != nil && currentTunBridge() != nil && currentEngine() != nil
+    }
+
     private func resumePacketReadLoopIfNeeded() {
         ioQueue.async { [weak self] in
             guard let self else { return }
             guard self.waitingForBackpressureReliefState(), !self.isStoppingState() else { return }
-            if let tunBridge = self.tunBridge, tunBridge.isBackpressured() {
+            if let tunBridge = self.currentTunBridge(), tunBridge.isBackpressured() {
                 return
             }
             self.setWaitingForBackpressureRelief(false)
             self.startPacketReadLoop()
+        }
+    }
+
+    private func setSocksServer(_ value: Socks5Server?) {
+        stateQueue.sync {
+            socksServer = value
+        }
+    }
+
+    private func currentSocksServer() -> Socks5Server? {
+        stateQueue.sync {
+            socksServer
+        }
+    }
+
+    private func setTunBridge(_ value: TunSocketBridge?) {
+        stateQueue.sync {
+            tunBridge = value
+        }
+    }
+
+    private func currentTunBridge() -> TunSocketBridge? {
+        stateQueue.sync {
+            tunBridge
+        }
+    }
+
+    private func setEngine(_ value: Tun2SocksEngine?) {
+        stateQueue.sync {
+            engine = value
+        }
+    }
+
+    private func currentEngine() -> Tun2SocksEngine? {
+        stateQueue.sync {
+            engine
         }
     }
 
@@ -884,13 +1337,20 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
 
     private func makeAppMessageResponse(command: String, ok: Bool, error: String? = nil) -> Data? {
         if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
-            let payload: [String: Any] = [
+            var payload: [String: Any] = [
                 "ok": ok,
                 "command": command,
                 "error": error ?? NSNull(),
                 "timestamp": TunnelTime.nowEpochSeconds(),
-                "defaultPathSignature": "path:unavailable"
+                "defaultPathSignature": "path:unavailable",
+                "lifecycle": makeLifecycleMetadata()
             ]
+            if let firstUDPWaitingCapture {
+                payload["firstUDPWaitingCapture"] = firstUDPWaitingCapture.payload
+            }
+            if let lastProviderStopCapture {
+                payload["lastProviderStopCapture"] = lastProviderStopCapture.payload
+            }
             return try? JSONSerialization.data(withJSONObject: payload, options: [])
         }
 
@@ -898,7 +1358,9 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
         metricsQueue.sync {
             packetCounts = (packetCount, inboundPacketCount)
         }
-        let payload: [String: Any] = [
+        let socksConnections = currentSocksConnectionCount()
+        let tunQueueStats = currentTunQueueStats()
+        var payload: [String: Any] = [
             "ok": ok,
             "command": command,
             "error": error ?? NSNull(),
@@ -912,8 +1374,23 @@ open class RelativePacketTunnelProvider: NEPacketTunnelProvider {
             "defaultPathSignature": lastObservedPathSignature ?? "path:unavailable",
             "lastObservedPathSignature": lastObservedPathSignature as Any,
             "outboundPacketCount": packetCounts.outbound,
-            "inboundPacketCount": packetCounts.inbound
+            "inboundPacketCount": packetCounts.inbound,
+            "socksActiveConnections": socksConnections,
+            "lifecycle": makeLifecycleMetadata()
         ]
+        if let tunQueueStats {
+            payload["tunPendingPackets"] = tunQueueStats.pendingPackets
+            payload["tunPendingBytes"] = tunQueueStats.pendingBytes
+            payload["tunDroppedWrites"] = tunQueueStats.droppedWrites
+            payload["tunBackpressured"] = tunQueueStats.backpressured
+            payload["tunMaxPendingBytes"] = tunQueueStats.maxPendingBytes
+        }
+        if let firstUDPWaitingCapture {
+            payload["firstUDPWaitingCapture"] = firstUDPWaitingCapture.payload
+        }
+        if let lastProviderStopCapture {
+            payload["lastProviderStopCapture"] = lastProviderStopCapture.payload
+        }
         return try? JSONSerialization.data(withJSONObject: payload, options: [])
     }
 
@@ -951,6 +1428,10 @@ extension RelativePacketTunnelProvider {
             isConstrained: isConstrained,
             interfaces: interfaces
         )
+    }
+
+    func _test_keepaliveHosts(for config: TunnelConfiguration) -> [String] {
+        keepaliveHosts(for: config)
     }
 
     static func _test_parseAppMessageCommand(_ messageData: Data) -> String {

@@ -6,28 +6,17 @@ import Darwin
 import Foundation
 
 public enum DomainNormalizer {
-    private static let twoPartTlds: Set<String> = [
-        "ac.uk",
-        "co.uk",
-        "gov.uk",
-        "org.uk",
-        "co.jp",
-        "co.kr",
-        "co.in",
-        "co.nz",
-        "com.au",
-        "net.au",
-        "org.au",
-        "com.br",
-        "com.mx",
-        "com.ar",
-        "com.cn",
-        "com.hk",
-        "com.tw",
-        "com.my",
-        "com.sg",
-        "com.tr",
-        "com.sa"
+    private static let commonSecondLevelPublicSuffixes: Set<String> = [
+        "ac",
+        "co",
+        "com",
+        "edu",
+        "gov",
+        "mil",
+        "net",
+        "nom",
+        "org",
+        "sch"
     ]
 
     public static func registrableDomain(from name: String?) -> String? {
@@ -39,9 +28,12 @@ public enum DomainNormalizer {
         let labels = name.split(separator: ".").map(String.init)
         guard labels.count >= 2 else { return name }
 
-        let suffix = labels.suffix(2).joined(separator: ".")
-        let needsThreeLabels = twoPartTlds.contains(suffix)
-        if needsThreeLabels, labels.count >= 3 {
+        let topLevelDomain = labels[labels.count - 1]
+        let secondLevelDomain = labels[labels.count - 2]
+        let needsThreeLabels = labels.count >= 3
+            && topLevelDomain.count == 2
+            && commonSecondLevelPublicSuffixes.contains(secondLevelDomain)
+        if needsThreeLabels {
             return labels.suffix(3).joined(separator: ".")
         }
         return labels.suffix(2).joined(separator: ".")

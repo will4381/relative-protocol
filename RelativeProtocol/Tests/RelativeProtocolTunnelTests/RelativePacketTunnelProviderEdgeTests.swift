@@ -45,6 +45,17 @@ final class RelativePacketTunnelProviderEdgeTests: XCTestCase {
         XCTAssertEqual(settings.tunnelOverheadBytes?.intValue, 80)
     }
 
+    func testMakeNetworkSettingsFiltersIPv6DNSServersWhenIPv6Disabled() {
+        let provider = RelativePacketTunnelProvider()
+        let config = TunnelConfiguration(providerConfiguration: [
+            "ipv6Enabled": false,
+            "dnsServers": ["1.1.1.1", "2606:4700:4700::1111", "8.8.8.8", "2001:4860:4860::8888"]
+        ])
+
+        let settings = provider._test_makeNetworkSettings(from: config)
+        XCTAssertEqual(settings.dnsSettings?.servers, ["1.1.1.1", "8.8.8.8"])
+    }
+
     func testAppMessageCommandParserDefaultsToStatus() throws {
         let message = try JSONSerialization.data(withJSONObject: [:], options: [])
         let command = RelativePacketTunnelProvider._test_parseAppMessageCommand(message)
@@ -70,5 +81,34 @@ final class RelativePacketTunnelProviderEdgeTests: XCTestCase {
             signature,
             "satisfied|exp=true|con=false|if=wifi,cellular"
         )
+    }
+
+    func testKeepaliveHostsUseConfiguredDNSServersWithDedupe() {
+        let provider = RelativePacketTunnelProvider()
+        let config = TunnelConfiguration(providerConfiguration: [
+            "dnsServers": ["1.1.1.1", "8.8.8.8", "1.1.1.1", " 8.8.8.8 "]
+        ])
+
+        XCTAssertEqual(provider._test_keepaliveHosts(for: config), ["1.1.1.1", "8.8.8.8"])
+    }
+
+    func testKeepaliveHostsFallbackWhenDNSConfigMissing() {
+        let provider = RelativePacketTunnelProvider()
+        let config = TunnelConfiguration(providerConfiguration: [:])
+
+        XCTAssertEqual(
+            provider._test_keepaliveHosts(for: config),
+            ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111", "2001:4860:4860::8888"]
+        )
+    }
+
+    func testKeepaliveHostsFilterIPv6WhenIPv6Disabled() {
+        let provider = RelativePacketTunnelProvider()
+        let config = TunnelConfiguration(providerConfiguration: [
+            "ipv6Enabled": false,
+            "dnsServers": ["1.1.1.1", "2606:4700:4700::1111", "8.8.8.8"]
+        ])
+
+        XCTAssertEqual(provider._test_keepaliveHosts(for: config), ["1.1.1.1", "8.8.8.8"])
     }
 }

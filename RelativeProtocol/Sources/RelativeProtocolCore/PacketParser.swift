@@ -38,6 +38,9 @@ public enum PacketParser {
         guard version == 4 else { return nil }
         let ihl = Int(versionAndIHL & 0x0F) * 4
         guard ihl >= 20, data.count >= ihl else { return nil }
+        let fragmentField = readUInt16(data, offset: 6)
+        let fragmentOffsetWords = fragmentField & 0x1FFF
+        let isNonInitialFragment = fragmentOffsetWords != 0
 
         let protocolByte = data[data.startIndex + 9]
         let transport = TransportProtocol(rawValue: protocolByte)
@@ -58,7 +61,7 @@ public enum PacketParser {
         var quicDestinationConnectionId: String?
         var quicSourceConnectionId: String?
 
-        if transport == .tcp || transport == .udp {
+        if (transport == .tcp || transport == .udp) && !isNonInitialFragment {
             guard data.count >= ihl + 4 else { return nil }
             srcPort = readUInt16(data, offset: ihl)
             dstPort = readUInt16(data, offset: ihl + 2)
@@ -134,6 +137,7 @@ public enum PacketParser {
 
         var nextHeader = data[data.startIndex + 6]
         var offset = 40
+        var hasNonInitialFragment = false
 
         guard let srcAddress = readIPAddress(data, offset: 8, length: 16),
               let dstAddress = readIPAddress(data, offset: 24, length: 16) else {
@@ -151,6 +155,11 @@ public enum PacketParser {
             switch currentHeader {
             case 44: // Fragment
                 headerLength = 8
+                let fragmentField = readUInt16(data, offset: offset + 2)
+                let fragmentOffset = (fragmentField & 0xFFF8) >> 3
+                if fragmentOffset != 0 {
+                    hasNonInitialFragment = true
+                }
             case 51: // AH
                 headerLength = (Int(lengthField) + 2) * 4
             case 50: // ESP
@@ -194,7 +203,7 @@ public enum PacketParser {
         var quicDestinationConnectionId: String?
         var quicSourceConnectionId: String?
 
-        if transport == .tcp || transport == .udp {
+        if (transport == .tcp || transport == .udp) && !hasNonInitialFragment {
             guard data.count >= offset + 4 else { return nil }
             srcPort = readUInt16(data, offset: offset)
             dstPort = readUInt16(data, offset: offset + 2)
@@ -924,16 +933,65 @@ public enum PacketParser {
                 index += cryptoLength
             } else if frameType == 0x00 || frameType == 0x01 {
                 continue
-            } else {
-                // Skip unknown frame using length if present (best-effort).
-                if let lengthInfo = readQuicVarInt(data, offset: index) {
-                    index = lengthInfo.nextIndex + lengthInfo.value
-                } else {
+            } else if frameType == 0x02 || frameType == 0x03 {
+                guard let nextIndex = skipQuicAckFrame(data, offset: index, includesECN: frameType == 0x03) else {
                     return nil
                 }
+                index = nextIndex
+            } else if frameType == 0x1C {
+                guard let nextIndex = skipQuicConnectionCloseFrame(data, offset: index, includesFrameType: true) else {
+                    return nil
+                }
+                index = nextIndex
+            } else if frameType == 0x1D {
+                guard let nextIndex = skipQuicConnectionCloseFrame(data, offset: index, includesFrameType: false) else {
+                    return nil
+                }
+                index = nextIndex
+            } else {
+                return nil
             }
         }
         return nil
+    }
+
+    private static func skipQuicAckFrame(_ data: Data, offset: Int, includesECN: Bool) -> Int? {
+        guard let largestAcked = readQuicVarInt(data, offset: offset),
+              let ackDelay = readQuicVarInt(data, offset: largestAcked.nextIndex),
+              let ackRangeCount = readQuicVarInt(data, offset: ackDelay.nextIndex),
+              let firstAckRange = readQuicVarInt(data, offset: ackRangeCount.nextIndex) else {
+            return nil
+        }
+        var index = firstAckRange.nextIndex
+        for _ in 0..<ackRangeCount.value {
+            guard let gap = readQuicVarInt(data, offset: index),
+                  let ackRange = readQuicVarInt(data, offset: gap.nextIndex) else {
+                return nil
+            }
+            index = ackRange.nextIndex
+        }
+        if includesECN {
+            guard let ect0 = readQuicVarInt(data, offset: index),
+                  let ect1 = readQuicVarInt(data, offset: ect0.nextIndex),
+                  let ce = readQuicVarInt(data, offset: ect1.nextIndex) else {
+                return nil
+            }
+            index = ce.nextIndex
+        }
+        return index
+    }
+
+    private static func skipQuicConnectionCloseFrame(_ data: Data, offset: Int, includesFrameType: Bool) -> Int? {
+        guard let errorCode = readQuicVarInt(data, offset: offset) else { return nil }
+        var index = errorCode.nextIndex
+        if includesFrameType {
+            guard let frameType = readQuicVarInt(data, offset: index) else { return nil }
+            index = frameType.nextIndex
+        }
+        guard let reasonLength = readQuicVarInt(data, offset: index) else { return nil }
+        index = reasonLength.nextIndex
+        guard index + reasonLength.value <= data.count else { return nil }
+        return index + reasonLength.value
     }
 
     private static func hexString(_ data: Data) -> String? {

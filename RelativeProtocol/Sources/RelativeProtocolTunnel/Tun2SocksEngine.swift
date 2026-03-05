@@ -9,6 +9,7 @@ import RelativeProtocolCore
 final class Tun2SocksEngine {
     private let logger = RelativeLog.logger(.tunnel)
     private let queue: DispatchQueue
+    private let queueKey = DispatchSpecificKey<Void>()
     private let stateQueue = DispatchQueue(label: "com.relative.protocol.tun2socks.state")
     private let runMain: (_ bytes: UnsafePointer<UInt8>, _ count: UInt32, _ tunFD: Int32) -> Int32
     private let quitMain: () -> Void
@@ -27,11 +28,11 @@ final class Tun2SocksEngine {
         self.queue = queue
         self.runMain = runMain
         self.quitMain = quitMain
+        self.queue.setSpecific(key: queueKey, value: ())
     }
 
     func start(configuration: TunnelConfiguration, tunFD: Int32, socksPort: UInt16) {
-        guard !isRunning() else { return }
-        setRunning(true)
+        guard beginRunIfStopped() else { return }
 
         let configString = buildConfigString(configuration: configuration, socksPort: socksPort)
         if RelativeLog.isVerbose {
@@ -63,12 +64,26 @@ final class Tun2SocksEngine {
             NSLog("Tun2SocksEngine: stop requested")
         }
         quitMain()
+        // Block until the run loop closure has fully exited to avoid
+        // re-initializing lwIP global state while the previous instance
+        // is still tearing down.
+        if DispatchQueue.getSpecific(key: queueKey) == nil {
+            queue.sync {}
+        }
         setRunning(false)
         configData = nil
     }
 
     private func isRunning() -> Bool {
         stateQueue.sync { running }
+    }
+
+    private func beginRunIfStopped() -> Bool {
+        stateQueue.sync {
+            guard !running else { return false }
+            running = true
+            return true
+        }
     }
 
     private func setRunning(_ value: Bool) {

@@ -6,10 +6,42 @@ import Darwin
 import Foundation
 import RelativeProtocolCore
 
+struct TunSocketBufferStats: Sendable {
+    let requestedBytes: Int
+    let appSendBytes: Int
+    let appReceiveBytes: Int
+    let engineSendBytes: Int
+    let engineReceiveBytes: Int
+
+    var effectiveSendBytes: Int {
+        min(appSendBytes, engineSendBytes)
+    }
+
+    var effectiveReceiveBytes: Int {
+        min(appReceiveBytes, engineReceiveBytes)
+    }
+
+    var wasCapped: Bool {
+        appSendBytes < requestedBytes
+            || appReceiveBytes < requestedBytes
+            || engineSendBytes < requestedBytes
+            || engineReceiveBytes < requestedBytes
+    }
+}
+
+struct TunSocketQueueStats: Sendable {
+    let pendingPackets: Int
+    let pendingBytes: Int
+    let droppedWrites: UInt64
+    let backpressured: Bool
+    let maxPendingBytes: Int
+}
+
 final class TunSocketBridge {
     private let logger = RelativeLog.logger(.tunnel)
     private let mtu: Int
     private let queue: DispatchQueue
+    private let queueKey = DispatchSpecificKey<Void>()
     private let appFD: Int32
     let engineFD: Int32
     private var readSource: DispatchSourceRead?
@@ -20,6 +52,7 @@ final class TunSocketBridge {
     private var droppedWrites: UInt64 = 0
     private let maxPendingBytes: Int
     private let backpressureThreshold: Int
+    private var socketBufferStatsValue: TunSocketBufferStats
     private var readBuffer: [UInt8]
     var onBackpressureRelieved: (() -> Void)?
 
@@ -29,6 +62,13 @@ final class TunSocketBridge {
         self.maxPendingBytes = max(524_288, self.mtu * 256)
         self.backpressureThreshold = maxPendingBytes * 3 / 4
         self.readBuffer = [UInt8](repeating: 0, count: self.mtu + MemoryLayout<UInt32>.size)
+        self.socketBufferStatsValue = TunSocketBufferStats(
+            requestedBytes: maxPendingBytes,
+            appSendBytes: maxPendingBytes,
+            appReceiveBytes: maxPendingBytes,
+            engineSendBytes: maxPendingBytes,
+            engineReceiveBytes: maxPendingBytes
+        )
 
         var fds = [Int32](repeating: 0, count: 2)
         let result = socketpair(AF_UNIX, SOCK_DGRAM, 0, &fds)
@@ -39,8 +79,20 @@ final class TunSocketBridge {
         engineFD = fds[0]
         appFD = fds[1]
 
-        setSocketBuffer(fd: engineFD)
-        setSocketBuffer(fd: appFD)
+        let engineBuffers = setSocketBuffer(fd: engineFD)
+        let appBuffers = setSocketBuffer(fd: appFD)
+        self.socketBufferStatsValue = TunSocketBufferStats(
+            requestedBytes: maxPendingBytes,
+            appSendBytes: appBuffers.send,
+            appReceiveBytes: appBuffers.recv,
+            engineSendBytes: engineBuffers.send,
+            engineReceiveBytes: engineBuffers.recv
+        )
+        if socketBufferStatsValue.wasCapped {
+            logger.warning(
+                "tun socket buffers capped by kernel requested=\(self.maxPendingBytes, privacy: .public) appSend=\(appBuffers.send, privacy: .public) appRecv=\(appBuffers.recv, privacy: .public) engineSend=\(engineBuffers.send, privacy: .public) engineRecv=\(engineBuffers.recv, privacy: .public)"
+            )
+        }
 
         try setNonBlocking(fd: engineFD)
         try setNonBlocking(fd: appFD)
@@ -50,70 +102,104 @@ final class TunSocketBridge {
             self?.drainWritable()
         }
         self.writeSource = writeSource
+        self.queue.setSpecific(key: queueKey, value: ())
     }
 
     func startReadLoop(handler: @escaping ([Data], [Int32]) -> Void) {
-        let source = DispatchSource.makeReadSource(fileDescriptor: appFD, queue: queue)
-        source.setEventHandler { [weak self] in
-            self?.drainReadable(handler: handler)
+        runSyncOnQueue {
+            let source = DispatchSource.makeReadSource(fileDescriptor: appFD, queue: queue)
+            source.setEventHandler { [weak self] in
+                self?.drainReadable(handler: handler)
+            }
+            source.setCancelHandler { [appFD] in
+                close(appFD)
+            }
+            source.resume()
+            readSource = source
         }
-        source.setCancelHandler { [appFD] in
-            close(appFD)
-        }
-        source.resume()
-        readSource = source
     }
 
     func writePacket(_ packet: Data, ipVersionHint: Int32) -> Bool {
-        var family: Int32 = ipVersionHint
-        if family != AF_INET && family != AF_INET6 {
-            family = packet.first.map { (($0 >> 4) & 0x0F) == 6 ? AF_INET6 : AF_INET } ?? AF_INET
-        }
-
-        if pendingWrites.isEmpty {
-            let expectedLength = MemoryLayout<UInt32>.size + packet.count
-            let result = writePacketImmediate(packet, family: family)
-            if result == expectedLength {
-                return true
+        runSyncOnQueue {
+            var family: Int32 = ipVersionHint
+            if family != AF_INET && family != AF_INET6 {
+                family = packet.first.map { (($0 >> 4) & 0x0F) == 6 ? AF_INET6 : AF_INET } ?? AF_INET
             }
-            if result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
+
+            if pendingWrites.isEmpty {
+                let expectedLength = MemoryLayout<UInt32>.size + packet.count
+                let result = writePacketImmediate(packet, family: family)
+                if result == expectedLength {
+                    return true
+                }
+                if result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
+                    return enqueueWrite(framedPacket(packet, family: family))
+                }
+                if result < 0 {
+                    logger.error("tun write failed: errno=\(errno, privacy: .public)")
+                } else {
+                    logger.error("tun write failed: partial datagram write (\(result, privacy: .public) of \(expectedLength, privacy: .public))")
+                }
+                return false
+            } else {
                 return enqueueWrite(framedPacket(packet, family: family))
             }
-            if result < 0 {
-                logger.error("tun write failed: errno=\(errno, privacy: .public)")
-            } else {
-                logger.error("tun write failed: partial datagram write (\(result, privacy: .public) of \(expectedLength, privacy: .public))")
-            }
-            return false
-        } else {
-            return enqueueWrite(framedPacket(packet, family: family))
         }
     }
 
     func isBackpressured() -> Bool {
-        pendingBytes >= backpressureThreshold
+        runSyncOnQueue {
+            pendingBytes >= backpressureThreshold
+        }
+    }
+
+    func socketBufferStats() -> TunSocketBufferStats {
+        runSyncOnQueue {
+            socketBufferStatsValue
+        }
+    }
+
+    func queueStats() -> TunSocketQueueStats {
+        runSyncOnQueue {
+            TunSocketQueueStats(
+                pendingPackets: pendingWrites.count,
+                pendingBytes: pendingBytes,
+                droppedWrites: droppedWrites,
+                backpressured: pendingBytes >= backpressureThreshold,
+                maxPendingBytes: maxPendingBytes
+            )
+        }
     }
 
     func stop() {
-        let source = readSource
-        readSource = nil
-        if let source {
-            source.cancel()
-        } else {
-            close(appFD)
-        }
-        if let writeSource {
-            if !writeSourceActive {
-                writeSource.resume()
-                writeSourceActive = true
+        runSyncOnQueue {
+            let source = readSource
+            readSource = nil
+            if let source {
+                source.cancel()
+            } else {
+                close(appFD)
             }
-            writeSource.cancel()
-            self.writeSource = nil
+            if let writeSource {
+                if !writeSourceActive {
+                    writeSource.resume()
+                    writeSourceActive = true
+                }
+                writeSource.cancel()
+                self.writeSource = nil
+            }
+            pendingWrites.removeAll(keepingCapacity: false)
+            pendingBytes = 0
+            onBackpressureRelieved = nil
+            close(engineFD)
         }
-        pendingWrites.removeAll(keepingCapacity: false)
-        pendingBytes = 0
-        onBackpressureRelieved = nil
-        close(engineFD)
+    }
+
+    private func runSyncOnQueue<T>(_ work: () -> T) -> T {
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
+            return work()
+        }
+        return queue.sync(execute: work)
     }
 
     private func drainReadable(handler: @escaping ([Data], [Int32]) -> Void) {
@@ -230,7 +316,8 @@ final class TunSocketBridge {
         writeSourceActive = false
     }
 
-    private func setSocketBuffer(fd: Int32) {
+    @discardableResult
+    private func setSocketBuffer(fd: Int32) -> (send: Int, recv: Int) {
         var size = Int32(maxPendingBytes)
         let result = setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, socklen_t(MemoryLayout<Int32>.size))
         if result != 0 {
@@ -241,6 +328,20 @@ final class TunSocketBridge {
         if recvResult != 0 {
             logger.error("tun setsockopt SO_RCVBUF failed: errno=\(errno, privacy: .public)")
         }
+        let actualSend = socketBufferValue(fd: fd, option: SO_SNDBUF) ?? maxPendingBytes
+        let actualRecv = socketBufferValue(fd: fd, option: SO_RCVBUF) ?? maxPendingBytes
+        return (send: actualSend, recv: actualRecv)
+    }
+
+    private func socketBufferValue(fd: Int32, option: Int32) -> Int? {
+        var value: Int32 = 0
+        var length = socklen_t(MemoryLayout<Int32>.size)
+        let rc = getsockopt(fd, SOL_SOCKET, option, &value, &length)
+        guard rc == 0 else {
+            logger.error("tun getsockopt failed option=\(option, privacy: .public) errno=\(errno, privacy: .public)")
+            return nil
+        }
+        return Int(value)
     }
 
     private func setNonBlocking(fd: Int32) throws {

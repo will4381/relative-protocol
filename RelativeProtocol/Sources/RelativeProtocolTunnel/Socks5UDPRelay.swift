@@ -42,6 +42,7 @@ final class Socks5UDPRelay {
     private var clientAddress = sockaddr_storage()
     private var clientAddressLen: socklen_t = 0
     private(set) var port: UInt16 = 0
+    private var isStopped = false
 
     init(provider: Socks5ConnectionProvider, queue: DispatchQueue, mtu: Int) throws {
         self.provider = provider
@@ -53,6 +54,7 @@ final class Socks5UDPRelay {
 
     func start() {
         guard socketFD >= 0 else { return }
+        isStopped = false
         let source = DispatchSource.makeReadSource(fileDescriptor: socketFD, queue: queue)
         source.setEventHandler { [weak self] in
             self?.drainReadable()
@@ -66,15 +68,24 @@ final class Socks5UDPRelay {
     }
 
     func stop() {
+        isStopped = true
+        let fd = socketFD
+        socketFD = -1
+        let hadReadSource = readSource != nil
         readSource?.cancel()
         readSource = nil
         cleanupTimer?.cancel()
         cleanupTimer = nil
         sessions.values.forEach { $0.session.cancel() }
         sessions.removeAll()
+        clientAddressLen = 0
+        if !hadReadSource, fd >= 0 {
+            close(fd)
+        }
     }
 
     private func drainReadable() {
+        guard !isStopped, socketFD >= 0 else { return }
         while true {
             var addr = sockaddr_storage()
             var addrLen = socklen_t(MemoryLayout<sockaddr_storage>.size)
@@ -96,8 +107,7 @@ final class Socks5UDPRelay {
             guard let packet = readBuffer.withUnsafeBufferPointer({ ptr in
                 Socks5Codec.parseUDPPacket(ptr, count: bytes)
             }) else { continue }
-            clientAddress = addr
-            clientAddressLen = addrLen
+            guard registerClientAddress(addr, len: addrLen) else { continue }
 
             let key = SessionKey(address: packet.address, port: packet.port)
             if sessions[key] == nil {
@@ -127,6 +137,7 @@ final class Socks5UDPRelay {
         session.setReadHandler({ [weak self] (datagrams: [Data]?, error: Error?) in
             guard let self else { return }
             self.queue.async {
+                guard !self.isStopped, self.socketFD >= 0 else { return }
                 if let error {
                     self.logger.error("udp relay read error: \(error.localizedDescription, privacy: .public)")
                     self.removeSession(for: key)
@@ -198,7 +209,7 @@ final class Socks5UDPRelay {
     }
 
     private func sendToClient(_ data: Data) {
-        guard clientAddressLen > 0 else { return }
+        guard !isStopped, socketFD >= 0, clientAddressLen > 0 else { return }
         data.withUnsafeBytes { ptr in
             guard let base = ptr.baseAddress else { return }
             let sent = withUnsafePointer(to: &clientAddress) {
@@ -237,11 +248,60 @@ final class Socks5UDPRelay {
         }
 
         let flags = fcntl(fd, F_GETFL, 0)
-        if flags >= 0 {
-            _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+        guard flags >= 0 else {
+            close(fd)
+            throw POSIXError(.init(rawValue: errno) ?? .EINVAL)
+        }
+        if fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 {
+            close(fd)
+            throw POSIXError(.init(rawValue: errno) ?? .EINVAL)
         }
 
         socketFD = fd
+    }
+
+    private func registerClientAddress(_ address: sockaddr_storage, len: socklen_t) -> Bool {
+        if clientAddressLen == 0 {
+            clientAddress = address
+            clientAddressLen = len
+            return true
+        }
+        if sockaddrStorageEqual(clientAddress, lenA: clientAddressLen, address, lenB: len) {
+            return true
+        }
+        // Some clients rebind their UDP source port while keeping the SOCKS5 control
+        // channel alive. Allow loopback-only rebinding so relay traffic continues.
+        if isLoopbackIPv4(clientAddress, len: clientAddressLen),
+           isLoopbackIPv4(address, len: len) {
+            clientAddress = address
+            clientAddressLen = len
+            return true
+        }
+        return false
+    }
+
+    private func sockaddrStorageEqual(
+        _ lhs: sockaddr_storage,
+        lenA: socklen_t,
+        _ rhs: sockaddr_storage,
+        lenB: socklen_t
+    ) -> Bool {
+        guard lenA == lenB else { return false }
+        return withUnsafePointer(to: lhs) { lhsPtr in
+            withUnsafePointer(to: rhs) { rhsPtr in
+                memcmp(lhsPtr, rhsPtr, Int(lenA)) == 0
+            }
+        }
+    }
+
+    private func isLoopbackIPv4(_ address: sockaddr_storage, len: socklen_t) -> Bool {
+        guard len >= socklen_t(MemoryLayout<sockaddr_in>.size) else { return false }
+        return withUnsafePointer(to: address) { ptr in
+            ptr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { ipv4Ptr in
+                guard ipv4Ptr.pointee.sin_family == sa_family_t(AF_INET) else { return false }
+                return ipv4Ptr.pointee.sin_addr.s_addr == in_addr_t(INADDR_LOOPBACK).bigEndian
+            }
+        }
     }
 }
 

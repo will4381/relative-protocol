@@ -8,6 +8,9 @@ private struct CLIOptions {
     var mtu: Int = 1400
     var engineLogLevel: String = "warn"
     var statusIntervalMs: Int = 2000
+    var metricsEnabled: Bool = false
+    var packetStreamEnabled: Bool = false
+    var keepaliveIntervalSeconds: Int = 0
 
     static func parse(arguments: [String]) throws -> CLIOptions {
         var options = CLIOptions()
@@ -33,6 +36,13 @@ private struct CLIOptions {
             case "--status-interval-ms":
                 index += 1
                 options.statusIntervalMs = try parseInt(arguments, at: index, name: "--status-interval-ms")
+            case "--enable-metrics":
+                options.metricsEnabled = true
+            case "--enable-packet-stream":
+                options.packetStreamEnabled = true
+            case "--keepalive-interval-seconds":
+                index += 1
+                options.keepaliveIntervalSeconds = try parseInt(arguments, at: index, name: "--keepalive-interval-seconds")
             default:
                 throw StandaloneError.invalidArgument(argument)
             }
@@ -44,6 +54,9 @@ private struct CLIOptions {
         }
         guard options.mtu >= 576 else {
             throw StandaloneError.invalidValue("--mtu", "\(options.mtu)")
+        }
+        guard options.keepaliveIntervalSeconds >= 0 else {
+            throw StandaloneError.invalidValue("--keepalive-interval-seconds", "\(options.keepaliveIntervalSeconds)")
         }
 
         return options
@@ -104,6 +117,9 @@ private struct ControlRequest: Decodable {
     let socksPort: UInt16?
     let mtu: Int?
     let engineLogLevel: String?
+    let metricsEnabled: Bool?
+    let packetStreamEnabled: Bool?
+    let keepaliveIntervalSeconds: Int?
 }
 
 private struct ControlEnvelope: Encodable {
@@ -171,7 +187,10 @@ private final class StandaloneController {
             let options = StandaloneRuntimeOptions(
                 socksPort: request.socksPort ?? runtime.status().socksPort,
                 mtu: request.mtu ?? runtime.status().mtu,
-                engineLogLevel: request.engineLogLevel ?? runtime.status().engineLogLevel
+                engineLogLevel: request.engineLogLevel ?? runtime.status().engineLogLevel,
+                metricsEnabled: request.metricsEnabled ?? runtime.status().metricsEnabled,
+                packetStreamEnabled: request.packetStreamEnabled ?? runtime.status().packetStreamEnabled,
+                keepaliveIntervalSeconds: request.keepaliveIntervalSeconds ?? runtime.status().keepaliveIntervalSeconds
             )
             runtime.reload(options: options) { [weak self] error in
                 guard let self else { return }
@@ -257,18 +276,33 @@ private final class StandaloneController {
 private final class ControlServer {
     private let controller: StandaloneController
     private let listener: NWListener
+    private let onFatalError: ((Error) -> Void)?
     private let queue = DispatchQueue(label: "com.relative.protocol.standalone.listener")
     private let parserQueue = DispatchQueue(label: "com.relative.protocol.standalone.listener.parser")
 
-    init(port: UInt16, controller: StandaloneController) throws {
+    init(
+        port: UInt16,
+        controller: StandaloneController,
+        onFatalError: ((Error) -> Void)? = nil
+    ) throws {
         guard let nwPort = NWEndpoint.Port(rawValue: port) else {
             throw StandaloneError.controlPortInvalid(port)
         }
         self.controller = controller
         self.listener = try NWListener(using: .tcp, on: nwPort)
+        self.onFatalError = onFatalError
     }
 
     func start() {
+        listener.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .failed(let error):
+                self.onFatalError?(error)
+            default:
+                break
+            }
+        }
         listener.newConnectionHandler = { [weak self] connection in
             self?.handleConnection(connection)
         }
@@ -281,34 +315,55 @@ private final class ControlServer {
 
     private func handleConnection(_ connection: NWConnection) {
         connection.start(queue: parserQueue)
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, _, error in
-            guard let self else { return }
-            guard error == nil else {
-                connection.cancel()
-                return
-            }
-            guard let data, !data.isEmpty else {
-                connection.cancel()
-                return
-            }
-            let payload: Data
-            if let newlineIndex = data.firstIndex(of: 0x0A) {
-                payload = data[..<newlineIndex]
-            } else {
-                payload = data
-            }
-            guard let request = try? JSONDecoder().decode(ControlRequest.self, from: payload) else {
-                connection.send(content: Data("{\"ok\":false,\"error\":\"invalid-json\"}\n".utf8), completion: .contentProcessed { _ in
+        let maxRequestBytes = 64 * 1024
+        var buffer = Data()
+
+        func receiveNextChunk() {
+            connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, isComplete, error in
+                guard let self else { return }
+                guard error == nil else {
                     connection.cancel()
-                })
-                return
-            }
-            self.controller.handle(request) { response in
-                connection.send(content: response, completion: .contentProcessed { _ in
+                    return
+                }
+                if let data, !data.isEmpty {
+                    buffer.append(data)
+                    if buffer.count > maxRequestBytes {
+                        connection.send(content: Data("{\"ok\":false,\"error\":\"request-too-large\"}\n".utf8), completion: .contentProcessed { _ in
+                            connection.cancel()
+                        })
+                        return
+                    }
+                }
+
+                let payload: Data?
+                if let newlineIndex = buffer.firstIndex(of: 0x0A) {
+                    payload = buffer[..<newlineIndex]
+                } else if isComplete, !buffer.isEmpty {
+                    payload = buffer
+                } else {
+                    receiveNextChunk()
+                    return
+                }
+
+                guard let payload else {
                     connection.cancel()
-                })
+                    return
+                }
+                guard let request = try? JSONDecoder().decode(ControlRequest.self, from: payload) else {
+                    connection.send(content: Data("{\"ok\":false,\"error\":\"invalid-json\"}\n".utf8), completion: .contentProcessed { _ in
+                        connection.cancel()
+                    })
+                    return
+                }
+                self.controller.handle(request) { response in
+                    connection.send(content: response, completion: .contentProcessed { _ in
+                        connection.cancel()
+                    })
+                }
             }
         }
+
+        receiveNextChunk()
     }
 }
 
@@ -322,6 +377,9 @@ Options:
   --mtu <bytes>                Tunnel MTU (default: 1400)
   --engine-log-level <level>   tun2socks log level (default: warn)
   --status-interval-ms <ms>    Health output interval in ms (default: 2000)
+  --enable-metrics             Enable parser/metrics pipeline in standalone config
+  --enable-packet-stream       Enable packet stream writer in standalone config
+  --keepalive-interval-seconds <s>  Keepalive probe interval (default: 0=off)
 """)
 }
 
@@ -330,12 +388,20 @@ private func emitHarnessStatus(_ status: StandaloneRuntimeStatus) {
         "running": status.running ? "true" : "false",
         "restarting": status.restarting ? "true" : "false",
         "socksPort": String(status.socksPort),
+        "metricsEnabled": status.metricsEnabled ? "true" : "false",
+        "packetStreamEnabled": status.packetStreamEnabled ? "true" : "false",
+        "keepaliveIntervalSeconds": String(status.keepaliveIntervalSeconds),
         "restartCount": String(status.restartCount),
         "backpressured": status.backpressured ? "true" : "false",
         "inboundPackets": String(status.inboundPacketCount),
         "outboundPackets": String(status.outboundPacketCount),
         "inboundBytes": String(status.inboundBytes),
         "outboundBytes": String(status.outboundBytes),
+        "residentMemoryBytes": String(status.residentMemoryBytes),
+        "peakResidentMemoryBytes": String(status.peakResidentMemoryBytes),
+        "socketSendBufferBytes": String(status.socketSendBufferBytes),
+        "socketReceiveBufferBytes": String(status.socketReceiveBufferBytes),
+        "socketBufferCapped": status.socketBufferCapped ? "true" : "false",
         "uptimeSeconds": String(status.uptimeSeconds),
         "lastError": status.lastError ?? "none"
     ]
@@ -343,14 +409,14 @@ private func emitHarnessStatus(_ status: StandaloneRuntimeStatus) {
     print("[HARNESS] \(line)")
 }
 
-private func installSignalHandlers(stop: @escaping () -> Void) -> [DispatchSourceSignal] {
+private func installSignalHandlers(on queue: DispatchQueue, stop: @escaping () -> Void) -> [DispatchSourceSignal] {
     signal(SIGINT, SIG_IGN)
     signal(SIGTERM, SIG_IGN)
-    let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+    let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: queue)
     sigint.setEventHandler(handler: stop)
     sigint.resume()
 
-    let sigterm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+    let sigterm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: queue)
     sigterm.setEventHandler(handler: stop)
     sigterm.resume()
 
@@ -362,12 +428,23 @@ do {
     let runtimeOptions = StandaloneRuntimeOptions(
         socksPort: options.socksPort,
         mtu: options.mtu,
-        engineLogLevel: options.engineLogLevel
+        engineLogLevel: options.engineLogLevel,
+        metricsEnabled: options.metricsEnabled,
+        packetStreamEnabled: options.packetStreamEnabled,
+        keepaliveIntervalSeconds: options.keepaliveIntervalSeconds
     )
     let runtime = StandaloneTunnelRuntime(options: runtimeOptions)
     let stopSemaphore = DispatchSemaphore(value: 0)
     let controller = StandaloneController(runtime: runtime, stopSemaphore: stopSemaphore)
-    let controlServer = try ControlServer(port: options.controlPort, controller: controller)
+    let controlServer = try ControlServer(
+        port: options.controlPort,
+        controller: controller,
+        onFatalError: { error in
+            fputs("[HARNESS] control listener failed: \(error.localizedDescription)\n", stderr)
+            runtime.stop()
+            stopSemaphore.signal()
+        }
+    )
 
     let startGroup = DispatchGroup()
     var startError: Error?
@@ -384,7 +461,9 @@ do {
     controlServer.start()
 
     print(
-        "[HARNESS] started socksPort=\(options.socksPort) controlPort=\(options.controlPort) mtu=\(options.mtu) engineLogLevel=\(options.engineLogLevel)"
+        "[HARNESS] started socksPort=\(options.socksPort) controlPort=\(options.controlPort) mtu=\(options.mtu) " +
+            "engineLogLevel=\(options.engineLogLevel) metricsEnabled=\(options.metricsEnabled) " +
+            "packetStreamEnabled=\(options.packetStreamEnabled) keepaliveIntervalSeconds=\(options.keepaliveIntervalSeconds)"
     )
 
     let statusTimer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
@@ -395,7 +474,8 @@ do {
     }
     statusTimer.resume()
 
-    let signalSources = installSignalHandlers {
+    let signalQueue = DispatchQueue(label: "com.relative.protocol.standalone.signals")
+    let signalSources = installSignalHandlers(on: signalQueue) {
         runtime.stop()
         stopSemaphore.signal()
     }

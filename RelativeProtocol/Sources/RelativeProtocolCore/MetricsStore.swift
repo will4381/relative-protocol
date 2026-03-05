@@ -123,6 +123,7 @@ public final class MetricsStore {
     }
 
     private func writeSnapshotsLocked(_ snapshots: [MetricsSnapshot], encodedSnapshots: [Data], to url: URL) {
+        var didWrite = false
         switch format {
         case .json:
             var data = Data()
@@ -136,7 +137,12 @@ public final class MetricsStore {
             }
             data.append(0x5D) // ]
             guard data.count <= maxBytes else { return }
-            try? data.write(to: url, options: [.atomic])
+            do {
+                try data.write(to: url, options: [.atomic])
+                didWrite = true
+            } catch {
+                return
+            }
         case .ndjson:
             var data = Data()
             data.reserveCapacity(serializedSize(of: encodedSnapshots))
@@ -145,8 +151,14 @@ public final class MetricsStore {
                 data.append(0x0A)
             }
             guard data.count <= maxBytes else { return }
-            try? data.write(to: url, options: [.atomic])
+            do {
+                try data.write(to: url, options: [.atomic])
+                didWrite = true
+            } catch {
+                return
+            }
         }
+        guard didWrite else { return }
         cachedSnapshots = snapshots
         cachedEncodedSnapshots = encodedSnapshots
         let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)

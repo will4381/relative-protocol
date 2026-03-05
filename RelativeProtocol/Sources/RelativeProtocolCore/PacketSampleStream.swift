@@ -45,7 +45,6 @@ public final class PacketSampleStreamWriter {
     private let useLock: Bool
     private let lock = NSLock()
     private var currentSize: Int
-    private var payloadBuffer = Data()
     private var fileHandle: FileHandle?
 
     public init(
@@ -68,24 +67,19 @@ public final class PacketSampleStreamWriter {
     public func append(_ samples: [PacketSample]) {
         withLock {
             guard let fileURL, !samples.isEmpty else { return }
-
-            payloadBuffer.removeAll(keepingCapacity: true)
+            guard let handle = ensureWritableHandle(fileURL: fileURL) else { return }
             for sample in samples {
                 guard let encoded = try? encoder.encode(sample) else { continue }
-                payloadBuffer.append(encoded)
-                payloadBuffer.append(0x0A)
-            }
-            guard !payloadBuffer.isEmpty else { return }
-
-            guard let handle = ensureWritableHandle(fileURL: fileURL) else { return }
-            if currentSize + payloadBuffer.count > maxBytes {
-                rotateCurrentFile(handle: handle)
-            }
-
-            handle.write(payloadBuffer)
-            currentSize += payloadBuffer.count
-            if payloadBuffer.count > maxBytes {
-                payloadBuffer = Data()
+                var line = Data()
+                line.reserveCapacity(encoded.count + 1)
+                line.append(encoded)
+                line.append(0x0A)
+                guard line.count <= maxBytes else { continue }
+                if currentSize + line.count > maxBytes {
+                    rotateCurrentFile(handle: handle)
+                }
+                handle.write(line)
+                currentSize += line.count
             }
         }
     }

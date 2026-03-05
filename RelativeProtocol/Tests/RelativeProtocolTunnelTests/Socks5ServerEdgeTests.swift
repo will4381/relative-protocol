@@ -402,6 +402,11 @@ private final class EdgeFakeTCPOutbound: Socks5TCPOutbound {
     private(set) var writes: [Data] = []
     private(set) var cancelled = false
     var nextWriteError: Error?
+    var readyResult: Result<Void, Error> = .success(())
+
+    func onReady(_ completion: @escaping (Result<Void, Error>) -> Void) {
+        completion(readyResult)
+    }
 
     func readMinimumLength(_ minimumLength: Int, maximumLength: Int, completionHandler: @escaping (Data?, Error?) -> Void) {
         readHandler = completionHandler

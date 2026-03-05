@@ -52,6 +52,17 @@ def parse_args() -> argparse.Namespace:
     p_apply = subparsers.add_parser("apply", help="Apply impairment profile")
     p_apply.add_argument("--profile", choices=sorted(PROFILES), required=True)
 
+    p_apply_custom = subparsers.add_parser("apply-custom", help="Apply custom impairment profile")
+    p_apply_custom.add_argument("--rate-mbit", type=float, required=True)
+    p_apply_custom.add_argument("--ceil-mbit", type=float, required=True)
+    p_apply_custom.add_argument("--latency-ms", type=float, required=True)
+    p_apply_custom.add_argument("--jitter-ms", type=float, required=True)
+    p_apply_custom.add_argument("--loss-pct", type=float, required=True)
+    p_apply_custom.add_argument("--reorder-pct", type=float, default=0.0)
+    p_apply_custom.add_argument("--reorder-corr-pct", type=float, default=0.0)
+    p_apply_custom.add_argument("--corrupt-pct", type=float, default=0.0)
+    p_apply_custom.add_argument("--duplicate-pct", type=float, default=0.0)
+
     p_stack = subparsers.add_parser("stack", help="Set IP stack mode")
     p_stack.add_argument("--mode", choices=["dual_stack", "ipv4_only", "ipv6_only"], required=True)
 
@@ -83,17 +94,37 @@ def netem_clause(profile: Profile) -> str:
     return " ".join(parts)
 
 
-def apply_profile(args: argparse.Namespace) -> None:
-    profile = PROFILES[args.profile]
+def apply_profile_spec(args: argparse.Namespace, profile: Profile) -> None:
     clause = netem_clause(profile)
+    # Pin class quantum close to MTU to avoid "quantum is big" warnings on high-rate links.
+    quantum_bytes = 1514
     script = f"""
 set -e
 sudo tc qdisc del dev {args.iface} root 2>/dev/null || true
-sudo tc qdisc add dev {args.iface} root handle 1: htb default 10
-sudo tc class add dev {args.iface} parent 1: classid 1:10 htb rate {profile.rate_mbit}mbit ceil {profile.ceil_mbit}mbit
+sudo tc qdisc add dev {args.iface} root handle 1: htb default 10 r2q 4096
+sudo tc class add dev {args.iface} parent 1: classid 1:10 htb rate {profile.rate_mbit}mbit ceil {profile.ceil_mbit}mbit quantum {quantum_bytes}
 sudo tc qdisc add dev {args.iface} parent 1:10 handle 10: netem {clause}
 """.strip()
     run_ssh(args.user, args.host, script, args.dry_run)
+
+
+def apply_profile(args: argparse.Namespace) -> None:
+    apply_profile_spec(args, PROFILES[args.profile])
+
+
+def apply_custom(args: argparse.Namespace) -> None:
+    profile = Profile(
+        rate_mbit=max(1, int(round(args.rate_mbit))),
+        ceil_mbit=max(1, int(round(args.ceil_mbit))),
+        latency_ms=max(0, int(round(args.latency_ms))),
+        jitter_ms=max(0, int(round(args.jitter_ms))),
+        loss_pct=max(0.0, float(args.loss_pct)),
+        reorder_pct=max(0.0, float(args.reorder_pct)),
+        reorder_corr_pct=max(0.0, float(args.reorder_corr_pct)),
+        corrupt_pct=max(0.0, float(args.corrupt_pct)),
+        duplicate_pct=max(0.0, float(args.duplicate_pct)),
+    )
+    apply_profile_spec(args, profile)
 
 
 def set_stack_mode(args: argparse.Namespace) -> None:
@@ -146,6 +177,8 @@ def main() -> int:
     args = parse_args()
     if args.cmd == "apply":
         apply_profile(args)
+    elif args.cmd == "apply-custom":
+        apply_custom(args)
     elif args.cmd == "stack":
         set_stack_mode(args)
     elif args.cmd == "clear":
