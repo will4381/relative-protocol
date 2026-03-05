@@ -5,20 +5,20 @@
             "request": "launch",
             "args": [],
             "cwd": "${workspaceFolder:VPN-Bridge}",
-            "name": "Debug Standalone",
-            "target": "Standalone",
+            "name": "Debug HarnessLocal",
+            "target": "HarnessLocal",
             "configuration": "debug",
-            "preLaunchTask": "swift: Build Debug Standalone"
+            "preLaunchTask": "swift: Build Debug HarnessLocal"
         },
         {
             "type": "swift",
             "request": "launch",
             "args": [],
             "cwd": "${workspaceFolder:VPN-Bridge}",
-            "name": "Release Standalone",
-            "target": "Standalone",
+            "name": "Release HarnessLocal",
+            "target": "HarnessLocal",
             "configuration": "release",
-            "preLaunchTask": "swift: Build Release Standalone"
+            "preLaunchTask": "swift: Build Release HarnessLocal"
         }
     ]
 }

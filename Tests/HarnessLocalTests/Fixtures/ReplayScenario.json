@@ -1,0 +1,24 @@
+{
+  "id": "replay-smoke",
+  "duration_seconds": 5,
+  "seed": 42,
+  "input_profile": "synthetic",
+  "timing": {
+    "start_time": "2026-03-04T00:00:00Z",
+    "step_interval_ms": 10
+  },
+  "steps": [
+    {
+      "event": "dns",
+      "payload_bytes": 72
+    },
+    {
+      "event": "tcp",
+      "payload_bytes": 128
+    },
+    {
+      "event": "udp",
+      "payload_bytes": 96
+    }
+  ]
+}

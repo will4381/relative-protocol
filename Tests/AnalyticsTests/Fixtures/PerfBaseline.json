@@ -1,0 +1,59 @@
+{
+  "baseline_name": "clean-room-local-baseline-v1",
+  "generated_at": "2026-03-04T00:00:00Z",
+  "runtime_profile": "phoneSmall",
+  "metrics": [
+    {
+      "name": "setup_latency_ms",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "baseline_value": 120.0
+    },
+    {
+      "name": "relay_latency_ms",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "baseline_value": 35.0
+    },
+    {
+      "name": "throughput_kbps",
+      "unit": "kbps",
+      "direction": "higher_is_better",
+      "baseline_value": 9500.0
+    }
+  ],
+  "tolerances": {
+    "setup_latency_ms": {
+      "warn_pct": 10.0,
+      "fail_pct": 25.0,
+      "warn_abs": 15.0,
+      "fail_abs": 35.0
+    },
+    "relay_latency_ms": {
+      "warn_pct": 12.0,
+      "fail_pct": 30.0,
+      "warn_abs": 5.0,
+      "fail_abs": 15.0
+    },
+    "throughput_kbps": {
+      "warn_pct": 8.0,
+      "fail_pct": 20.0,
+      "warn_abs": 500.0,
+      "fail_abs": 1500.0
+    }
+  },
+  "scenarios": [
+    {
+      "id": "local-smoke",
+      "duration_seconds": 20,
+      "seed": 11,
+      "input_profile": "loopback-mixed"
+    },
+    {
+      "id": "local-burst",
+      "duration_seconds": 30,
+      "seed": 23,
+      "input_profile": "burst-heavy"
+    }
+  ]
+}

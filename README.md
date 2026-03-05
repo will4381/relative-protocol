@@ -1,327 +1,45 @@
-# Relative Protocol
+# VPNBridgeTunnel (Clean-Room Rebuild)
 
-Relative Protocol provides a Packet Tunnel + tun2socks stack with packet metadata sampling, burst analytics, and optional app signature classification. It’s split into three SwiftPM libraries:
+This package is a clean-room tunnel architecture split into first-party Swift modules plus a minimal C dataplane bridge to vendored HEV.
 
-- **RelativeProtocolCore** — packet parsing, packet samples, metrics store, burst tracking, signature validation/classification.
-- **RelativeProtocolTunnel** — `NEPacketTunnelProvider` implementation + tun2socks engine + sampling.
-- **RelativeProtocolHost** — host-side helpers for configuring and controlling the tunnel.
+## Module Topology
 
-## Requirements
+- `HevSocks5Tunnel` (vendored C dataplane, non-strict warning policy)
+- `DataplaneFFI` (first-party C/Swift bridge and ABI guard)
+- `TunnelRuntime` (framework-agnostic actor state machine + deterministic primitives)
+- `PacketRelay` (`NWConnection`/`NWPathMonitor` relay orchestration)
+- `Analytics` (metrics ring/store, packet stream, signatures, flow/burst, path sampler, perf baseline schema)
+- `Observability` (structured envelope logging, signposts, JSONL sink with rotation)
+- `TunnelControl` (Network Extension shell and profile settings)
+- `HostClient` (app-facing diagnostics API)
+- `HarnessLocal` (deterministic local scenario runner)
 
-- iOS 15+ (Network Extension / Packet Tunnel)
-- App Group shared between the app and tunnel extension
-- Network Extension entitlements
+## Strictness Policy
 
-## Quick Start
+`Package.swift` defines:
 
-1) **App Group**
+- `strictSwiftSettings` for all first-party Swift targets + first-party test targets
+- `strictCSettings` for first-party C bridge target only (`DataplaneFFICBridge`)
+- No `-Werror` escalation on vendored `HevSocks5Tunnel`
 
-Add the same App Group to both the host app and the tunnel extension (e.g. `group.com.example.vpn`).
+## Locked Contracts
 
-2) **Host app setup (NEVPNManager)**
+- C ABI/API contract is defined in `Sources/DataplaneFFI/Bridge/include/rp_dataplane.h`
+- JSONL sink root path injection + rotation policy is in `Sources/Observability/JSONLLogSink.swift`
+- Immutable perf baseline schema is in `Sources/Analytics/PerfBaseline.swift`
+- Baseline file is `Config/PerfBaseline.json`
 
-You configure the tunnel in the host app using `NEVPNManager` + `NETunnelProviderProtocol`. The `localizedDescription` becomes the VPN name shown in Settings. `serverAddress` is required by the API but not used by the tunnel.
+## Local Gates
 
-```swift
-import NetworkExtension
+Run:
 
-let manager = NEVPNManager.shared()
-manager.loadFromPreferences { error in
-    guard error == nil else { return }
-
-    let proto = NETunnelProviderProtocol()
-    proto.providerBundleIdentifier = "com.example.app.Example-Tunnel"
-    proto.serverAddress = "127.0.0.1" // Required by NEVPNManager
-    proto.providerConfiguration = [
-        "appGroupID": "group.com.example.vpn",
-        "relayMode": "tun2socks",
-        "mtu": 1400,
-        "ipv6Enabled": true,
-        "dnsServers": ["1.1.1.1", "8.8.8.8"],
-        "signatureFileName": "app_signatures.json",
-        "packetStreamEnabled": false, // enable only when actively debugging
-        "packetStreamMaxBytes": 5_000_000,
-        "metricsEnabled": true,
-        "metricsSnapshotInterval": 5.0,
-        "keepaliveIntervalSeconds": 25.0, // 0 disables keepalive
-        "tunnelOverheadBytes": 80,
-        "metricsStoreFormat": "json", // or "ndjson"
-        // Addressing used by the tunnel interface:
-        "ipv4Address": "10.0.0.2",
-        "ipv4SubnetMask": "255.255.255.0",
-        "ipv4Router": "10.0.0.1",
-        "ipv6Address": "fd00:1:1:1::2",
-        "ipv6PrefixLength": 64,
-        "tunnelRemoteAddress": "127.0.0.1"
-    ]
-
-    manager.protocolConfiguration = proto
-    manager.localizedDescription = "Example VPN"
-    manager.isEnabled = true
-
-    manager.saveToPreferences { _ in }
-}
+```bash
+Scripts/quality-gate.sh
 ```
 
-Optional: configure On-Demand rules via `manager.onDemandRules` and `manager.isOnDemandEnabled`. Recommended default is off until you validate reconnect behavior on your target app/network mix.
-
-### On-Demand best practices (per app profile)
-
-- Default `isOnDemandEnabled` to `false` for first-run and opt in later.
-- Prefer explicit interface rules (`.wiFi`, `.cellular`) over broad `.any` connect rules.
-- On manual disconnect, disable On-Demand (`isOnDemandEnabled = false`, `onDemandRules = []`), save/load preferences, then stop the tunnel.
-- Be careful with `includeAllNetworks = true` plus On-Demand: it can reassert aggressively across network changes.
-- Keep these choices app-specific. Different apps and traffic patterns behave differently under On-Demand.
-
-3) **Provider configuration keys**
-
-Set `NETunnelProviderProtocol.providerConfiguration` with the keys you need. Defaults are applied when a key is omitted.
-
-Common keys:
-
-- `appGroupID` (String, required)
-- `relayMode` (String, default `tun2socks`)
-- `mtu` (Int, default `1400`)
-- `tunnelOverheadBytes` (Int, default `80`)
-- `ipv6Enabled` (Bool, default `true`)
-- `dnsServers` ([String], default `[]`)
-- `metricsEnabled` (Bool, default `true`)
-- `metricsRingBufferSize` (Int, default `2048`)
-- `metricsSnapshotInterval` (Double, default `5.0`)
-- `keepaliveIntervalSeconds` (Double, default `25.0`, `0` disables keepalive)
-- `metricsStoreFormat` (String, default `json`, options: `json`, `ndjson`)
-- `burstThresholdMs` (Int, default `350`)
-- `flowTTLSeconds` (Int, default `300`)
-- `maxTrackedFlows` (Int, default `2048`)
-- `maxPendingAnalytics` (Int, default `512`)
-- `packetStreamEnabled` (Bool, default `false`)
-- `packetStreamMaxBytes` (Int, default `5_000_000`)
-- `signatureFileName` (String, default `app_signatures.json`)
-
-There are additional engine tuning keys (buffer sizes, socks port, etc.) in `TunnelConfiguration`.
-Invalid or out-of-range values are validated and clamped in `TunnelConfiguration` (for example, MTU, ports, intervals, and IP address fields).
-
-### Migration notes (from earlier defaults)
-
-Upgrade baseline references:
-
-- `v1.1` (`b02f4cce88cebf892731d662b3ad8e8b07b46d55`)
-- `v1.0.9` (`eae812c7df6cc7a9458423ed595c8e3affa91f87`)
-
-If you are upgrading from either of the versions above (or older), review these changes:
-
-- `mtu` default changed from `1500` to `1400`.
-- `tunnelOverheadBytes` now defaults to `80` (previously commonly configured as `0` or omitted).
-- `metricsSnapshotInterval` default changed from `1.0` to `5.0`.
-- `keepaliveIntervalSeconds` is now available and defaults to `25.0` (`0` disables keepalive).
-
-Behavioral changes to account for:
-
-- Path-change monitoring runs every `2` seconds and restarts relay components when the underlying default path changes and status is satisfied.
-- Path-change restarts are cooldown-limited to once every `15` seconds to reduce flapping on transient path updates.
-- `sleep()`/`wake()` lifecycle handling is active; `wake()` resumes timers and triggers relay restart.
-- Outbound SOCKS `.waiting` timeout is `30` seconds (TCP and UDP adapters).
-- SOCKS listener bind retry policy is `7` attempts with `0.2s` retry delay.
-- UDP relay session lifecycle is bounded: idle timeout `60s`, cleanup sweep every `15s`, max sessions `256`.
-- SOCKS5 `BIND` is supported.
-
-If you depend on legacy behavior, set explicit values in `providerConfiguration` instead of relying on defaults.
-
-### Runtime resilience behavior
-
-- Default path changes are polled every 2 seconds; when the underlying default path changes and path is satisfied, the relay is restarted.
-- Path-change restarts are throttled (minimum 15s between path-triggered restarts) to avoid rapid reassert cycles.
-- Keepalive probes run in `tun2socks` mode when `keepaliveIntervalSeconds > 0` (minimum effective interval is 10s).
-- `sleep()` pauses path/keepalive timers; `wake()` resumes timers and proactively restarts relay components.
-- Outbound SOCKS TCP/UDP connections in `.waiting` are cancelled after 30 seconds.
-- SOCKS listener bind retries use 7 attempts with a short backoff to reduce transient bind failures on restart.
-- UDP relay sessions are bounded and cleaned up (idle timeout + periodic sweep + session cap).
-
-4) **App signatures file**
-
-Create an app signature JSON file in the app group container. The tunnel loads this to classify traffic. Use `AppSignatureStore.writeIfMissing` on the host side.
-
-Location (app group container):
-
-```
-AppSignatures/<signatureFileName>
-```
-
-Example JSON:
-
-```json
-{
-  "version": 1,
-  "updatedAt": "2026-01-24T12:00:00Z",
-  "signatures": [
-    {
-      "label": "short_form_video",
-      "domains": [
-        "example.com",
-        "video.example.com"
-      ]
-    },
-    {
-      "label": "social",
-      "domains": [
-        "social.example",
-        "images.example"
-      ]
-    }
-  ]
-}
-```
-
-### Signature validation rules
-
-`AppSignatureStore.validate` enforces:
-
-- non-empty signature list
-- non-empty labels (labels are case-insensitive for uniqueness)
-- non-empty domain list
-- domains are lowercase/trimmed, contain a dot, no scheme (`://`), no `/`, no spaces, no leading/trailing `.`
-- wildcard `*` is allowed inside domains (glob-style match). Wildcards are applied per-label and do not cross dots.
-
-On load, the tunnel uses `loadValidated`. Invalid files are ignored.
-
-## Metrics and Packet Stream
-
-### Metrics
-
-`MetricsStore` writes snapshots to:
-
-```
-MetricsStore/metrics.snapshots.json
-```
-
-If `metricsStoreFormat` is set to `ndjson`, each snapshot is written as one line of JSON for easier streaming/debugging.
-
-Snapshots are bounded by:
-
-- `maxSnapshots` (ring buffer behavior)
-- `maxBytes` (file size cap)
-
-### Packet sample stream
-
-`PacketSampleStreamWriter` writes NDJSON to:
-
-```
-PacketStream/<key>.ndjson
-```
-
-The file is capped by `packetStreamMaxBytes` and is reset when it exceeds the limit.
-Use `PacketStreamCursor` with `PacketSampleStreamReader.readNew(cursor:)` to safely resume across rotations.
-
-Each `PacketSample` includes DNS/TLS/QUIC metadata (including `quicPacketType`) and burst/classification fields when available.
-
-## Diagnostics
-
-The Example app ships with a diagnostics screen that reads metrics + the packet stream, showing recent packet samples, DNS/TLS/QUIC metadata, burst metrics, and classification.
-
-### Host-to-tunnel app messages
-
-`RelativePacketTunnelProvider.handleAppMessage` accepts JSON with either `command` or `action` (case-insensitive):
-
-- `status` / `diagnostics`
-- `flushMetrics`
-- `restartRelay`
-- `reloadConfiguration`
-
-Responses are JSON packets with at least:
-
-- `ok` (Bool)
-- `command` (String)
-- `error` (`NSNull` or String)
-- `timestamp` (seconds since UNIX epoch)
-
-## Public API Surface (Core)
-
-- `PacketParser`, `PacketMetadata`, `PacketSample`, `PacketSampleStreamWriter`, `PacketSampleStreamReader`
-- `PacketStreamCursor`, `PacketStreamFileSignature`
-- `MetricsStore`, `MetricsSnapshot`, `MetricsRingBuffer`, `MetricsStoreFormat`
-- `BurstTracker`, `BurstMetrics`
-- `TrafficClassifier`, `AppSignatureStore`, `AppSignatureValidationError`
-
-## Tests
-
-Run unit tests:
-
-```
-swift test
-```
-
-Generate coverage reports:
-
-```
-swift test --enable-code-coverage
-./Scripts/coverage.sh
-```
-
-Coverage outputs:
-
-- `.build/coverage/coverage.txt` (human-readable table)
-- `.build/coverage/coverage.json` (`llvm-cov` export)
-- `.build/coverage/source_summary.txt` (source-only totals + lowest covered files)
-
-## Changelog
-
-### 2/24/26
-
-- Stabilized path-change restarts by using path-content equality checks and adding a 15s restart cooldown.
-- Updated Example defaults for normal operation (`engineLogLevel: warn`, `packetStreamEnabled: false`) to reduce high-throughput media regressions.
-
-### 2/19/26
-
-- Updated tunnel defaults and docs (`mtu: 1400`, `tunnelOverheadBytes: 80`, `metricsSnapshotInterval: 5.0`, `keepaliveIntervalSeconds: 25.0`).
-- Added path-change monitoring, sleep/wake handling, keepalive behavior, SOCKS waiting timeout, and listener retry policy documentation.
-- Documented host-to-tunnel app message commands and response shape.
-- Added timestamp hot-path cleanup using monotonic-backed epoch helpers in tunnel runtime paths.
-
-### 2/11/26
-
-- Hardened tunnel/runtime performance paths in core flow tracking, burst tracking, metrics persistence, packet stream handling, and classification logic to reduce unnecessary work and long-run memory pressure.
-- Added safety guards in tunnel-side components (`RelativePacketTunnelProvider`, SOCKS codec/server/relay, tun2socks engine, and tunnel socket bridge) to improve resilience under sustained traffic and edge conditions.
-- Preserved classification/data quality behavior while tightening parsing and buffering code paths to avoid regressions in metadata capture and downstream model inputs.
-- Expanded the test suite with broad edge-case coverage across core and tunnel modules (including parser/stream/flow/classifier/tunnel/SOCKS paths).
-- Added coverage tooling in `Scripts/coverage.sh` and documented coverage report outputs for repeatable coverage checks.
-
-## Notes
-
-- Classification matches exact domains or subdomains (e.g. `api.tiktok.com` matches `tiktok.com`, but `notiktok.com` does not).
-- Signature domains can include `*` wildcards (e.g. `p*.tiktokcdn*.com`) and are matched against the full hostname using per-label matching.
-- QUIC packet types are surfaced (`initial`, `zeroRTT`, `handshake`, `retry`). SNI extraction is only attempted on Initial packets; 0‑RTT is not decrypted.
-- SOCKS5 `CONNECT`, `UDP ASSOCIATE`, and `BIND` are supported.
-- The tunnel only uses metadata (DNS/TLS/QUIC headers and flow timing). No payload capture is performed.
-
-## Troubleshooting
-
-- **App Group container not found / `client is not entitled`**
-  - Ensure the App Group entitlement is added to both the app target and the tunnel extension.
-  - Verify the App Group ID string matches exactly.
-  - On device, uninstall/reinstall the app after changing entitlements.
-
-- **VPN name not showing in Settings**
-  - Set `NEVPNManager.localizedDescription` before saving preferences.
-  - Call `saveToPreferences` and wait for completion.
-
-- **Tunnel connects but no traffic**
-  - Confirm `providerBundleIdentifier` matches the tunnel extension bundle ID.
-  - Ensure `NEPacketTunnelProvider` is in the extension and the extension is in the app bundle.
-  - Check the `ipv4Address`, `ipv4SubnetMask`, and `ipv4Router` settings.
-
-- **Packet stream file not appearing**
-  - `packetStreamEnabled` must be `true` in providerConfiguration.
-  - App Group entitlement must be valid.
-  - File is written to `AppGroup/PacketStream/<key>.ndjson` with size cap.
-
-- **Signature classification not working**
-  - Confirm `signatureFileName` matches the file in `AppGroup/AppSignatures/`.
-  - Validate JSON format and domains (see validation rules above).
-
-- **On‑Demand reconnects**
-  - If `isOnDemandEnabled` is true, the system may reconnect automatically on network changes.
-
-- **Device loses normal Wi‑Fi after long VPN sessions**
-  - Disable On-Demand and clear rules before stopping the tunnel, then save/load preferences before `stopVPNTunnel()`.
-  - Avoid broad `.any` connect rules unless required.
-  - If you use `includeAllNetworks`, test long-session disconnect/reconnect flows on both Wi‑Fi and cellular.
+This enforces:
+
+- `swift build`
+- `swift test`
+- first-party warning scan
+- optional perf baseline evaluation (`PERF_MEASUREMENTS_PATH`, `PERF_FAIL_MODE`)

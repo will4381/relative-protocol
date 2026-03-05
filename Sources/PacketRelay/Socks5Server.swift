@@ -1,0 +1,1059 @@
+import Foundation
+import Network
+@preconcurrency import NetworkExtension
+import Observability
+
+private func interfaceTypeName(_ type: Network.NWInterface.InterfaceType) -> String {
+    switch type {
+    case .cellular:
+        return "cellular"
+    case .wifi:
+        return "wifi"
+    case .wiredEthernet:
+        return "wired"
+    case .loopback:
+        return "loopback"
+    case .other:
+        return "other"
+    @unknown default:
+        return "unknown"
+    }
+}
+
+private func pathStatusName(_ status: Network.NWPath.Status) -> String {
+    switch status {
+    case .satisfied:
+        return "satisfied"
+    case .unsatisfied:
+        return "unsatisfied"
+    case .requiresConnection:
+        return "requires-connection"
+    @unknown default:
+        return "unknown"
+    }
+}
+
+private func pathSummary(_ path: Network.NWPath?) -> String {
+    guard let path else {
+        return "status=unknown uses=unknown"
+    }
+    var uses: [String] = []
+    if path.usesInterfaceType(.cellular) { uses.append("cellular") }
+    if path.usesInterfaceType(.wifi) { uses.append("wifi") }
+    if path.usesInterfaceType(.wiredEthernet) { uses.append("wired") }
+    if path.usesInterfaceType(.loopback) { uses.append("loopback") }
+    if uses.isEmpty { uses.append("other") }
+    let available = path.availableInterfaces.map { "\(interfaceTypeName($0.type)):\($0.name)" }.joined(separator: ",")
+    return "status=\(pathStatusName(path.status)) uses=\(uses.joined(separator: ",")) available=\(available) expensive=\(path.isExpensive) constrained=\(path.isConstrained) ipv4=\(path.supportsIPv4) ipv6=\(path.supportsIPv6)"
+}
+
+/// Abstraction over inbound SOCKS5 client connection transport.
+protocol Socks5InboundConnection: AnyObject {
+    var stateUpdateHandler: ((NWConnection.State) -> Void)? { get set }
+    func start(queue: DispatchQueue)
+    func receive(minimumIncompleteLength: Int, maximumLength: Int, completion: @escaping (Data?, NWConnection.ContentContext?, Bool, NWError?) -> Void)
+    func send(content: Data?, completion: NWConnection.SendCompletion)
+    func cancel()
+}
+
+/// Abstraction over outbound TCP channel used for SOCKS CONNECT.
+protocol Socks5TCPOutbound: AnyObject {
+    /// Waits until the outbound connection is established and ready for I/O.
+    /// Completion is delivered at most once per registration.
+    /// - Parameter completionHandler: Success when data transfer can begin, failure on terminal connection error.
+    func waitUntilReady(completionHandler: @escaping @Sendable (Result<Void, Error>) -> Void)
+    func readMinimumLength(_ minimumLength: Int, maximumLength: Int, completionHandler: @escaping (Data?, Error?) -> Void)
+    func write(_ data: Data, completionHandler: @escaping (Error?) -> Void)
+    func cancel()
+}
+
+/// Connection establishment errors surfaced before a SOCKS CONNECT reply is sent.
+private enum Socks5OutboundError: LocalizedError {
+    case failed(String)
+    case cancelled
+
+    var errorDescription: String? {
+        switch self {
+        case .failed(let description):
+            return description
+        case .cancelled:
+            return "Outbound connection cancelled"
+        }
+    }
+}
+
+/// Extended outbound provider for SOCKS TCP + UDP backends.
+protocol Socks5FullConnectionProvider: Socks5ConnectionProvider {
+    func makeTCPConnection(
+        to endpoint: NWHostEndpoint,
+        enableTLS: Bool,
+        tlsParameters: NWTLSParameters?,
+        delegate: NWTCPConnectionAuthenticationDelegate?
+    ) -> Socks5TCPOutbound
+}
+
+/// `Socks5InboundConnection` adapter for `NWConnection`.
+final class SocksInboundNWConnectionAdapter: Socks5InboundConnection {
+    // Docs: https://developer.apple.com/documentation/network/nwconnection
+    private let connection: NWConnection
+
+    /// - Parameter connection: Accepted inbound network connection.
+    init(_ connection: NWConnection) {
+        self.connection = connection
+    }
+
+    var stateUpdateHandler: ((NWConnection.State) -> Void)? {
+        get { connection.stateUpdateHandler }
+        set { connection.stateUpdateHandler = newValue }
+    }
+
+    func start(queue: DispatchQueue) {
+        // Docs: https://developer.apple.com/documentation/network/nwconnection/start(queue:)
+        connection.start(queue: queue)
+    }
+
+    func receive(
+        minimumIncompleteLength: Int,
+        maximumLength: Int,
+        completion: @escaping (Data?, NWConnection.ContentContext?, Bool, NWError?) -> Void
+    ) {
+        // Docs: https://developer.apple.com/documentation/network/nwconnection/receive(minimumincompletelength:maximumlength:completion:)
+        connection.receive(minimumIncompleteLength: minimumIncompleteLength, maximumLength: maximumLength, completion: completion)
+    }
+
+    func send(content: Data?, completion: NWConnection.SendCompletion) {
+        // Docs: https://developer.apple.com/documentation/network/nwconnection/send(content:contentcontext:iscomplete:completion:)
+        connection.send(content: content, completion: completion)
+    }
+
+    func cancel() {
+        connection.cancel()
+    }
+}
+
+final class NWConnectionTCPAdapter: Socks5TCPOutbound {
+    private let connection: NWConnection
+    private let queue: DispatchQueue
+    private let logger: StructuredLogger
+    private var readyHandlers: [(@Sendable (Result<Void, Error>) -> Void)] = []
+    private var readyResult: Result<Void, Error>?
+    private var didStart = false
+
+    /// - Parameters:
+    ///   - connection: Outbound Network.framework connection.
+    ///   - queue: Queue used for connection callbacks.
+    ///   - logger: Structured logger for state transitions.
+    init(_ connection: NWConnection, queue: DispatchQueue, logger: StructuredLogger) {
+        self.connection = connection
+        self.queue = queue
+        self.logger = logger
+        connection.stateUpdateHandler = { [weak self] state in
+            self?.handleState(state)
+        }
+    }
+
+    func waitUntilReady(completionHandler: @escaping @Sendable (Result<Void, Error>) -> Void) {
+        if let readyResult {
+            completionHandler(readyResult)
+            return
+        }
+
+        readyHandlers.append(completionHandler)
+        startIfNeeded()
+    }
+
+    func readMinimumLength(_ minimumLength: Int, maximumLength: Int, completionHandler: @escaping (Data?, Error?) -> Void) {
+        startIfNeeded()
+        connection.receive(minimumIncompleteLength: minimumLength, maximumLength: maximumLength) { data, _, isComplete, error in
+            if isComplete && (data == nil || data?.isEmpty == true) {
+                completionHandler(nil, error)
+                return
+            }
+            completionHandler(data, error)
+        }
+    }
+
+    func write(_ data: Data, completionHandler: @escaping (Error?) -> Void) {
+        startIfNeeded()
+        connection.send(content: data, completion: .contentProcessed { error in
+            completionHandler(error)
+        })
+    }
+
+    func cancel() {
+        finishReadyHandlers(with: .failure(Socks5OutboundError.cancelled))
+        connection.cancel()
+    }
+
+    private func startIfNeeded() {
+        guard !didStart else { return }
+        didStart = true
+        // Docs: https://developer.apple.com/documentation/network/nwconnection/start(queue:)
+        connection.start(queue: queue)
+    }
+
+    private func handleState(_ state: NWConnection.State) {
+        switch state {
+        case .ready:
+            finishReadyHandlers(with: .success(()))
+            Task {
+                await logger.log(
+                    level: .debug,
+                    phase: .relay,
+                    category: .relayTCP,
+                    component: "NWConnectionTCPAdapter",
+                    event: "ready",
+                    message: "Outbound TCP ready",
+                    metadata: ["path": pathSummary(connection.currentPath)]
+                )
+            }
+        case .waiting(let error):
+            Task {
+                await logger.log(
+                    level: .warning,
+                    phase: .relay,
+                    category: .relayTCP,
+                    component: "NWConnectionTCPAdapter",
+                    event: "waiting",
+                    errorCode: error.localizedDescription,
+                    message: "Outbound TCP waiting",
+                    metadata: ["path": pathSummary(connection.currentPath)]
+                )
+            }
+        case .failed(let error):
+            finishReadyHandlers(with: .failure(error))
+            Task {
+                await logger.log(
+                    level: .error,
+                    phase: .relay,
+                    category: .relayTCP,
+                    component: "NWConnectionTCPAdapter",
+                    event: "failed",
+                    errorCode: error.localizedDescription,
+                    message: "Outbound TCP failed",
+                    metadata: ["path": pathSummary(connection.currentPath)]
+                )
+            }
+        case .cancelled:
+            finishReadyHandlers(with: .failure(Socks5OutboundError.cancelled))
+        default:
+            break
+        }
+    }
+
+    private func finishReadyHandlers(with result: Result<Void, Error>) {
+        guard readyResult == nil else {
+            return
+        }
+        readyResult = result
+        let handlers = readyHandlers
+        readyHandlers.removeAll(keepingCapacity: false)
+        for handler in handlers {
+            handler(result)
+        }
+    }
+}
+
+final class NWTCPConnectionAdapter: Socks5TCPOutbound {
+    private let connection: NWTCPConnection
+    private let queue: DispatchQueue
+    private let logger: StructuredLogger
+    private var readyHandlers: [(@Sendable (Result<Void, Error>) -> Void)] = []
+    private var readyResult: Result<Void, Error>?
+    private var stateMonitor: DispatchSourceTimer?
+    private var lastObservedState: NWTCPConnectionState?
+
+    /// - Parameters:
+    ///   - connection: Tunnel-provider TCP connection object.
+    ///   - queue: Queue used to poll connection state without crossing provider callback contexts.
+    ///   - logger: Structured logger for fallback outbound state changes.
+    init(_ connection: NWTCPConnection, queue: DispatchQueue, logger: StructuredLogger) {
+        self.connection = connection
+        self.queue = queue
+        self.logger = logger
+    }
+
+    func waitUntilReady(completionHandler: @escaping @Sendable (Result<Void, Error>) -> Void) {
+        if let readyResult {
+            completionHandler(readyResult)
+            return
+        }
+
+        readyHandlers.append(completionHandler)
+        startMonitoringIfNeeded()
+    }
+
+    func readMinimumLength(_ minimumLength: Int, maximumLength: Int, completionHandler: @escaping (Data?, Error?) -> Void) {
+        connection.readMinimumLength(minimumLength, maximumLength: maximumLength, completionHandler: completionHandler)
+    }
+
+    func write(_ data: Data, completionHandler: @escaping (Error?) -> Void) {
+        connection.write(data, completionHandler: completionHandler)
+    }
+
+    func cancel() {
+        finishReadyHandlers(with: .failure(Socks5OutboundError.cancelled))
+        stopMonitoring()
+        connection.cancel()
+    }
+
+    private func startMonitoringIfNeeded() {
+        guard stateMonitor == nil else { return }
+
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(100))
+        timer.setEventHandler { [weak self] in
+            self?.pollState()
+        }
+        stateMonitor = timer
+        timer.resume()
+    }
+
+    private func stopMonitoring() {
+        stateMonitor?.cancel()
+        stateMonitor = nil
+    }
+
+    private func pollState() {
+        // Docs: https://developer.apple.com/documentation/networkextension/nwtcpconnection/state
+        // Docs: https://developer.apple.com/documentation/networkextension/nwtcpconnectionstate/connected
+        let state = connection.state
+        if state != lastObservedState {
+            lastObservedState = state
+            logStateTransition(state)
+        }
+
+        switch state {
+        case .connected:
+            finishReadyHandlers(with: .success(()))
+            stopMonitoring()
+        case .disconnected:
+            finishReadyHandlers(with: .failure(Socks5OutboundError.failed("Outbound TCP disconnected before CONNECT reply")))
+            stopMonitoring()
+        case .cancelled:
+            finishReadyHandlers(with: .failure(Socks5OutboundError.cancelled))
+            stopMonitoring()
+        case .invalid:
+            finishReadyHandlers(with: .failure(Socks5OutboundError.failed("Outbound TCP entered invalid state before CONNECT reply")))
+            stopMonitoring()
+        case .connecting, .waiting:
+            break
+        @unknown default:
+            finishReadyHandlers(with: .failure(Socks5OutboundError.failed("Outbound TCP entered unknown state before CONNECT reply")))
+            stopMonitoring()
+        }
+    }
+
+    private func logStateTransition(_ state: NWTCPConnectionState) {
+        switch state {
+        case .connected:
+            Task {
+                await logger.log(
+                    level: .debug,
+                    phase: .relay,
+                    category: .relayTCP,
+                    component: "NWTCPConnectionAdapter",
+                    event: "ready",
+                    message: "Outbound TCP ready"
+                )
+            }
+        case .waiting:
+            Task {
+                await logger.log(
+                    level: .warning,
+                    phase: .relay,
+                    category: .relayTCP,
+                    component: "NWTCPConnectionAdapter",
+                    event: "waiting",
+                    message: "Outbound TCP waiting"
+                )
+            }
+        case .disconnected:
+            Task {
+                await logger.log(
+                    level: .error,
+                    phase: .relay,
+                    category: .relayTCP,
+                    component: "NWTCPConnectionAdapter",
+                    event: "disconnected",
+                    message: "Outbound TCP disconnected"
+                )
+            }
+        case .invalid:
+            Task {
+                await logger.log(
+                    level: .error,
+                    phase: .relay,
+                    category: .relayTCP,
+                    component: "NWTCPConnectionAdapter",
+                    event: "invalid",
+                    message: "Outbound TCP invalid"
+                )
+            }
+        case .cancelled:
+            Task {
+                await logger.log(
+                    level: .debug,
+                    phase: .relay,
+                    category: .relayTCP,
+                    component: "NWTCPConnectionAdapter",
+                    event: "cancelled",
+                    message: "Outbound TCP cancelled"
+                )
+            }
+        case .connecting:
+            break
+        @unknown default:
+            Task {
+                await logger.log(
+                    level: .warning,
+                    phase: .relay,
+                    category: .relayTCP,
+                    component: "NWTCPConnectionAdapter",
+                    event: "unknown-state",
+                    message: "Outbound TCP entered unknown state"
+                )
+            }
+        }
+    }
+
+    private func finishReadyHandlers(with result: Result<Void, Error>) {
+        guard readyResult == nil else {
+            return
+        }
+        readyResult = result
+        let handlers = readyHandlers
+        readyHandlers.removeAll(keepingCapacity: false)
+        for handler in handlers {
+            handler(result)
+        }
+    }
+}
+
+final class NWConnectionUDPSessionAdapter: Socks5UDPSession {
+    private let connection: NWConnection
+    private let logger: StructuredLogger
+    private var readHandler: (([Data]?, Error?) -> Void)?
+    private var isCancelled = false
+
+    /// - Parameters:
+    ///   - connection: Outbound UDP connection.
+    ///   - queue: Queue used for callback delivery.
+    ///   - logger: Structured logger for state changes.
+    init(_ connection: NWConnection, queue: DispatchQueue, logger: StructuredLogger) {
+        self.connection = connection
+        self.logger = logger
+        connection.stateUpdateHandler = { [weak self] state in
+            self?.handleState(state)
+        }
+        // Docs: https://developer.apple.com/documentation/network/nwconnection/start(queue:)
+        connection.start(queue: queue)
+    }
+
+    func setReadHandler(_ handler: @escaping ([Data]?, Error?) -> Void, maxDatagrams: Int) {
+        _ = maxDatagrams
+        readHandler = handler
+        receiveNext()
+    }
+
+    func writeDatagram(_ datagram: Data, completionHandler: @escaping (Error?) -> Void) {
+        connection.send(content: datagram, completion: .contentProcessed { error in
+            completionHandler(error)
+        })
+    }
+
+    func cancel() {
+        isCancelled = true
+        connection.cancel()
+    }
+
+    private func handleState(_ state: NWConnection.State) {
+        switch state {
+        case .waiting(let error):
+            Task {
+                await logger.log(
+                    level: .warning,
+                    phase: .relay,
+                    category: .relayUDP,
+                    component: "NWConnectionUDPSessionAdapter",
+                    event: "waiting",
+                    errorCode: error.localizedDescription,
+                    message: "Outbound UDP waiting",
+                    metadata: ["path": pathSummary(connection.currentPath)]
+                )
+            }
+        case .failed(let error):
+            Task {
+                await logger.log(
+                    level: .error,
+                    phase: .relay,
+                    category: .relayUDP,
+                    component: "NWConnectionUDPSessionAdapter",
+                    event: "failed",
+                    errorCode: error.localizedDescription,
+                    message: "Outbound UDP failed",
+                    metadata: ["path": pathSummary(connection.currentPath)]
+                )
+            }
+        default:
+            break
+        }
+    }
+
+    private func receiveNext() {
+        guard !isCancelled else { return }
+        connection.receiveMessage { [weak self] data, _, _, error in
+            guard let self else { return }
+            if let error {
+                self.readHandler?(nil, error)
+                return
+            }
+            if let data {
+                self.readHandler?([data], nil)
+            }
+            self.receiveNext()
+        }
+    }
+}
+
+final class NWUDPSessionAdapter: Socks5UDPSession {
+    private let session: NWUDPSession
+
+    /// - Parameter session: Tunnel-provider UDP session object.
+    init(_ session: NWUDPSession) {
+        self.session = session
+    }
+
+    func setReadHandler(_ handler: @escaping ([Data]?, Error?) -> Void, maxDatagrams: Int) {
+        session.setReadHandler(handler, maxDatagrams: maxDatagrams)
+    }
+
+    func writeDatagram(_ datagram: Data, completionHandler: @escaping (Error?) -> Void) {
+        session.writeDatagram(datagram, completionHandler: completionHandler)
+    }
+
+    func cancel() {
+        session.cancel()
+    }
+}
+
+/// Provider adapter that prefers Network.framework egress and falls back to provider tunnel APIs.
+final class PacketTunnelProviderAdapter: Socks5FullConnectionProvider {
+    private let provider: NEPacketTunnelProvider
+    private let queue: DispatchQueue
+    private let logger: StructuredLogger
+
+    /// - Parameters:
+    ///   - provider: Active packet tunnel provider.
+    ///   - queue: Queue for outbound Network.framework connection callbacks.
+    ///   - logger: Structured logger for outbound path events.
+    init(provider: NEPacketTunnelProvider, queue: DispatchQueue, logger: StructuredLogger) {
+        self.provider = provider
+        self.queue = queue
+        self.logger = logger
+    }
+
+    func makeTCPConnection(
+        to endpoint: NWHostEndpoint,
+        enableTLS: Bool,
+        tlsParameters: NWTLSParameters?,
+        delegate: NWTCPConnectionAuthenticationDelegate?
+    ) -> Socks5TCPOutbound {
+        if let outbound = makeNWConnection(to: endpoint, enableTLS: enableTLS) {
+            return outbound
+        }
+
+        // Docs: https://developer.apple.com/documentation/networkextension/nepackettunnelprovider/createtcpconnectionthroughtunnel(to:enabletls:tlsparameters:delegate:)
+        let connection = provider.createTCPConnectionThroughTunnel(
+            to: endpoint,
+            enableTLS: enableTLS,
+            tlsParameters: tlsParameters,
+            delegate: delegate
+        )
+        return NWTCPConnectionAdapter(connection, queue: queue, logger: logger)
+    }
+
+    func makeUDPSession(to endpoint: NWHostEndpoint) -> Socks5UDPSession {
+        if let outbound = makeNWUDPSession(to: endpoint) {
+            return outbound
+        }
+
+        // Docs: https://developer.apple.com/documentation/networkextension/nepackettunnelprovider/createudpsessionthroughtunnel(to:from:)
+        let session = provider.createUDPSessionThroughTunnel(to: endpoint, from: nil)
+        return NWUDPSessionAdapter(session)
+    }
+
+    private func makeNWConnection(to endpoint: NWHostEndpoint, enableTLS: Bool) -> Socks5TCPOutbound? {
+        guard let portValue = UInt16(endpoint.port),
+              let port = NWEndpoint.Port(rawValue: portValue)
+        else {
+            return nil
+        }
+
+        let parameters = enableTLS ? NWParameters.tls : NWParameters.tcp
+        if #available(iOS 18.0, macOS 15.0, *) {
+            // Docs: https://developer.apple.com/documentation/networkextension/nepackettunnelprovider
+            if let virtualInterface = provider.virtualInterface {
+                parameters.prohibitedInterfaces = [virtualInterface]
+            }
+        }
+
+        let host = NWEndpoint.Host(endpoint.hostname)
+        let connection = NWConnection(host: host, port: port, using: parameters)
+        return NWConnectionTCPAdapter(connection, queue: queue, logger: logger)
+    }
+
+    private func makeNWUDPSession(to endpoint: NWHostEndpoint) -> Socks5UDPSession? {
+        guard let portValue = UInt16(endpoint.port),
+              let port = NWEndpoint.Port(rawValue: portValue)
+        else {
+            return nil
+        }
+
+        let parameters = NWParameters.udp
+        if #available(iOS 18.0, macOS 15.0, *) {
+            // Docs: https://developer.apple.com/documentation/networkextension/nepackettunnelprovider
+            if let virtualInterface = provider.virtualInterface {
+                parameters.prohibitedInterfaces = [virtualInterface]
+            }
+        }
+
+        let host = NWEndpoint.Host(endpoint.hostname)
+        let connection = NWConnection(host: host, port: port, using: parameters)
+        return NWConnectionUDPSessionAdapter(connection, queue: queue, logger: logger)
+    }
+}
+
+public enum Socks5ServerError: Error {
+    case invalidPort
+}
+
+/// Local SOCKS5 server that handles CONNECT and UDP ASSOCIATE from the dataplane.
+/// Queue ownership: listener state and `connections` map are mutated on `queue`.
+public final class Socks5Server {
+    private let logger: StructuredLogger
+    private let provider: Socks5FullConnectionProvider
+    private let queue: DispatchQueue
+    private let mtu: Int
+
+    private var listener: NWListener?
+    private var connections: [ObjectIdentifier: Socks5Connection] = [:]
+
+    /// - Parameters:
+    ///   - provider: Outbound connection provider implementation.
+    ///   - queue: Serial queue used for listener + connection events.
+    ///   - mtu: MTU hint forwarded to UDP relay handlers.
+    ///   - logger: Structured logger for server lifecycle and failures.
+    init(provider: Socks5FullConnectionProvider, queue: DispatchQueue, mtu: Int, logger: StructuredLogger) {
+        self.provider = provider
+        self.queue = queue
+        self.mtu = mtu
+        self.logger = logger
+    }
+
+    /// Convenience initializer that binds server egress to `NEPacketTunnelProvider`.
+    /// - Parameters:
+    ///   - provider: Active packet tunnel provider.
+    ///   - queue: Serial queue for listener + connection events.
+    ///   - mtu: MTU hint used by UDP relay.
+    ///   - logger: Structured logger.
+    public convenience init(provider: NEPacketTunnelProvider, queue: DispatchQueue, mtu: Int, logger: StructuredLogger) {
+        self.init(provider: PacketTunnelProviderAdapter(provider: provider, queue: queue, logger: logger), queue: queue, mtu: mtu, logger: logger)
+    }
+
+    /// Starts SOCKS5 listening on loopback.
+    /// - Parameters:
+    ///   - port: Requested local port (`0` chooses random ephemeral).
+    ///   - completion: Called once with actual bound port or startup error.
+    public func start(port: UInt16, completion: @escaping (Result<UInt16, Error>) -> Void) {
+        let initialPort = port == 0 ? pickEphemeralPort() : port
+        startListener(port: initialPort, remainingAttempts: 3, completion: completion)
+    }
+
+    /// Stops listener and all active SOCKS sessions.
+    public func stop() {
+        listener?.cancel()
+        listener = nil
+        connections.values.forEach { $0.stop() }
+        connections.removeAll()
+    }
+
+    private func startListener(port: UInt16, remainingAttempts: Int, completion: @escaping (Result<UInt16, Error>) -> Void) {
+        guard let listenPort = NWEndpoint.Port(rawValue: port) else {
+            completion(.failure(Socks5ServerError.invalidPort))
+            return
+        }
+
+        let parameters = NWParameters.tcp
+        parameters.allowLocalEndpointReuse = true
+        if let loopback = IPv4Address("127.0.0.1") {
+            parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(loopback), port: listenPort)
+        }
+
+        let listener: NWListener
+        do {
+            // Docs: https://developer.apple.com/documentation/network/nwlistener/init(using:on:)
+            listener = try NWListener(using: parameters, on: .any)
+        } catch {
+            completion(.failure(error))
+            return
+        }
+
+        self.listener = listener
+
+        var didComplete = false
+        listener.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .ready:
+                if !didComplete {
+                    didComplete = true
+                    completion(.success(listener.port?.rawValue ?? port))
+                }
+                Task {
+                    await self.logger.log(
+                        level: .info,
+                        phase: .relay,
+                        category: .relayTCP,
+                        component: "Socks5Server",
+                        event: "listener-ready",
+                        message: "SOCKS5 listener ready",
+                        metadata: ["port": String(listener.port?.rawValue ?? port)]
+                    )
+                }
+            case .failed(let error):
+                if self.isAddressInUse(error), remainingAttempts > 0 {
+                    didComplete = true
+                    listener.cancel()
+                    self.listener = nil
+                    let nextPort = self.pickEphemeralPort()
+                    self.startListener(port: nextPort, remainingAttempts: remainingAttempts - 1, completion: completion)
+                    return
+                }
+                if !didComplete {
+                    didComplete = true
+                    completion(.failure(error))
+                }
+                Task {
+                    await self.logger.log(
+                        level: .error,
+                        phase: .relay,
+                        category: .relayTCP,
+                        component: "Socks5Server",
+                        event: "listener-failed",
+                        errorCode: error.localizedDescription,
+                        message: "SOCKS5 listener failed"
+                    )
+                }
+            case .waiting(let error):
+                Task {
+                    await self.logger.log(
+                        level: .warning,
+                        phase: .relay,
+                        category: .relayTCP,
+                        component: "Socks5Server",
+                        event: "listener-waiting",
+                        errorCode: error.localizedDescription,
+                        message: "SOCKS5 listener waiting"
+                    )
+                }
+            default:
+                break
+            }
+        }
+
+        listener.newConnectionHandler = { [weak self] connection in
+            guard let self else { return }
+            let session = Socks5Connection(
+                connection: SocksInboundNWConnectionAdapter(connection),
+                provider: self.provider,
+                queue: self.queue,
+                mtu: self.mtu,
+                logger: self.logger
+            )
+            session.onClose = { [weak self] in
+                self?.connections.removeValue(forKey: ObjectIdentifier(connection))
+            }
+            self.connections[ObjectIdentifier(connection)] = session
+            session.start()
+        }
+
+        // Docs: https://developer.apple.com/documentation/network/nwlistener/start(queue:)
+        listener.start(queue: queue)
+    }
+
+    private func pickEphemeralPort() -> UInt16 {
+        UInt16.random(in: 49_152 ... 65_535)
+    }
+
+    private func isAddressInUse(_ error: NWError) -> Bool {
+        switch error {
+        case .posix(let code):
+            return code == .EADDRINUSE
+        default:
+            return false
+        }
+    }
+}
+
+/// Per-client SOCKS connection state machine.
+/// Invariant: transitions are serialized by callbacks running on `queue`.
+final class Socks5Connection {
+    private enum State {
+        case greeting
+        case request
+        case connectingTCP(Socks5TCPOutbound)
+        case tcpProxy(Socks5TCPOutbound)
+        case udpProxy(Socks5UDPRelayProtocol)
+    }
+
+    private let logger: StructuredLogger
+    private let connection: Socks5InboundConnection
+    private let provider: Socks5FullConnectionProvider
+    private let queue: DispatchQueue
+    private let mtu: Int
+    private let udpRelayFactory: (Socks5ConnectionProvider, DispatchQueue, Int, StructuredLogger) throws -> Socks5UDPRelayProtocol
+
+    private var buffer = Data()
+    private var state: State = .greeting
+    private var isClosed = false
+
+    var onClose: (() -> Void)?
+
+    /// - Parameters:
+    ///   - connection: Accepted inbound SOCKS connection.
+    ///   - provider: Outbound connection provider.
+    ///   - queue: Queue for callback-driven state transitions.
+    ///   - mtu: MTU hint passed into UDP relay.
+    ///   - logger: Structured logger for connection lifecycle.
+    ///   - udpRelayFactory: Factory override used by tests.
+    init(
+        connection: Socks5InboundConnection,
+        provider: Socks5FullConnectionProvider,
+        queue: DispatchQueue,
+        mtu: Int,
+        logger: StructuredLogger,
+        udpRelayFactory: @escaping (Socks5ConnectionProvider, DispatchQueue, Int, StructuredLogger) throws -> Socks5UDPRelayProtocol = {
+            try Socks5UDPRelay(provider: $0, queue: $1, mtu: $2, logger: $3)
+        }
+    ) {
+        self.connection = connection
+        self.provider = provider
+        self.queue = queue
+        self.mtu = mtu
+        self.logger = logger
+        self.udpRelayFactory = udpRelayFactory
+    }
+
+    /// Starts handshake processing for inbound SOCKS connection.
+    func start() {
+        connection.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .failed(let error):
+                Task {
+                    await self.logger.log(
+                        level: .error,
+                        phase: .relay,
+                        category: .relayTCP,
+                        component: "Socks5Connection",
+                        event: "connection-failed",
+                        errorCode: error.localizedDescription,
+                        message: "SOCKS5 inbound connection failed"
+                    )
+                }
+                self.stop()
+            case .cancelled:
+                self.stop()
+            default:
+                break
+            }
+        }
+        connection.start(queue: queue)
+        receive()
+    }
+
+    /// Idempotently closes this connection and any outbound resources.
+    func stop() {
+        guard !isClosed else { return }
+        isClosed = true
+        switch state {
+        case .tcpProxy(let outbound):
+            outbound.cancel()
+        case .udpProxy(let relay):
+            relay.stop()
+        default:
+            break
+        }
+        connection.cancel()
+        onClose?()
+    }
+
+    private func receive() {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: max(65_535, mtu + 256)) { [weak self] data, _, isComplete, error in
+            guard let self else { return }
+            if let data, !data.isEmpty {
+                self.buffer.append(data)
+                self.processBuffer()
+            }
+            if isComplete || error != nil {
+                self.stop()
+                return
+            }
+            self.receive()
+        }
+    }
+
+    private func processBuffer() {
+        switch state {
+        case .greeting:
+            guard let methods = Socks5Codec.parseGreeting(&buffer) else { return }
+            let method: UInt8 = methods.contains(0x00) ? 0x00 : 0xFF
+            connection.send(content: Socks5Codec.buildMethodSelection(method: method), completion: .contentProcessed { _ in })
+            if method == 0x00 {
+                state = .request
+                processBuffer()
+            } else {
+                stop()
+            }
+        case .request:
+            guard let request = Socks5Codec.parseRequest(&buffer) else { return }
+            handleRequest(request)
+        case .connectingTCP:
+            // RFC 1928 requires the server reply before payload forwarding.
+            // Any pipelined client bytes are buffered until the outbound channel is ready.
+            return
+        case .tcpProxy(let outbound):
+            if !buffer.isEmpty {
+                forwardToOutbound(buffer, outbound: outbound)
+                buffer.removeAll()
+            }
+        case .udpProxy:
+            buffer.removeAll()
+        }
+    }
+
+    private func handleRequest(_ request: Socks5Request) {
+        switch request.command {
+        case .connect:
+            startTCPProxy(request)
+        case .udpAssociate:
+            startUDPRelay()
+        case .bind:
+            sendFailure()
+        }
+    }
+
+    private func startTCPProxy(_ request: Socks5Request) {
+        let host: String
+        switch request.address {
+        case .ipv4(let value), .ipv6(let value), .domain(let value):
+            host = value
+        }
+
+        let endpoint = NWHostEndpoint(hostname: host, port: String(request.port))
+        let outbound = provider.makeTCPConnection(to: endpoint, enableTLS: false, tlsParameters: nil, delegate: nil)
+
+        state = .connectingTCP(outbound)
+        outbound.waitUntilReady { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success:
+                guard case .connectingTCP(let activeOutbound) = self.state,
+                      activeOutbound === outbound,
+                      !self.isClosed else {
+                    outbound.cancel()
+                    return
+                }
+                self.state = .tcpProxy(outbound)
+                self.connection.send(
+                    content: Socks5Codec.buildReply(code: 0x00, bindAddress: .ipv4("0.0.0.0"), bindPort: 0),
+                    completion: .contentProcessed { _ in }
+                )
+                self.readOutbound(outbound)
+                self.processBuffer()
+            case .failure(let error):
+                Task {
+                    await self.logger.log(
+                        level: .error,
+                        phase: .relay,
+                        category: .relayTCP,
+                        component: "Socks5Connection",
+                        event: "outbound-connect-failed",
+                        errorCode: error.localizedDescription,
+                        message: "SOCKS5 outbound connect failed"
+                    )
+                }
+                self.sendFailure(replyCode: 0x05)
+            }
+        }
+    }
+
+    private func readOutbound(_ outbound: Socks5TCPOutbound) {
+        outbound.readMinimumLength(1, maximumLength: 65_535) { [weak self] data, error in
+            guard let self else { return }
+            if let data, !data.isEmpty {
+                self.connection.send(content: data, completion: .contentProcessed { _ in })
+            } else if data == nil {
+                self.stop()
+                return
+            }
+            if error != nil {
+                self.stop()
+                return
+            }
+            self.readOutbound(outbound)
+        }
+    }
+
+    private func forwardToOutbound(_ data: Data, outbound: Socks5TCPOutbound) {
+        outbound.write(data) { [weak self] error in
+            guard let self, let error else { return }
+            Task {
+                await self.logger.log(
+                    level: .error,
+                    phase: .relay,
+                    category: .relayTCP,
+                    component: "Socks5Connection",
+                    event: "outbound-write-failed",
+                    errorCode: error.localizedDescription,
+                    message: "SOCKS5 outbound write failed"
+                )
+            }
+            self.stop()
+        }
+    }
+
+    private func startUDPRelay() {
+        do {
+            let relay = try udpRelayFactory(provider, queue, mtu, logger)
+            relay.start()
+            state = .udpProxy(relay)
+            connection.send(
+                content: Socks5Codec.buildReply(code: 0x00, bindAddress: .ipv4("127.0.0.1"), bindPort: relay.port),
+                completion: .contentProcessed { _ in }
+            )
+        } catch {
+            Task {
+                await logger.log(
+                    level: .error,
+                    phase: .relay,
+                    category: .relayUDP,
+                    component: "Socks5Connection",
+                    event: "udp-relay-failed",
+                    errorCode: String(describing: error),
+                    message: "SOCKS5 UDP relay failed"
+                )
+            }
+            sendFailure()
+        }
+    }
+
+    private func sendFailure(replyCode: UInt8 = 0x01) {
+        connection.send(
+            content: Socks5Codec.buildReply(code: replyCode, bindAddress: .ipv4("0.0.0.0"), bindPort: 0),
+            completion: .contentProcessed { _ in }
+        )
+        stop()
+    }
+}

@@ -1,31 +1,56 @@
 // swift-tools-version: 5.9
 import PackageDescription
 
+let strictSwiftSettings: [SwiftSetting] = [
+    .unsafeFlags(["-warnings-as-errors"], .when(platforms: [.macOS]))
+]
+
+let strictCSettings: [CSetting] = [
+    .unsafeFlags(["-Wall", "-Wextra", "-Werror", "-Wpedantic"])
+]
+
 let package = Package(
-    name: "relative-protocol",
+    name: "VPNBridgeTunnel",
     platforms: [
-        .iOS(.v15),
+        .iOS(.v16),
         .macOS(.v14)
     ],
     products: [
-        .library(name: "RelativeProtocolCore", targets: ["RelativeProtocolCore"]),
-        .library(name: "RelativeProtocolHost", targets: ["RelativeProtocolHost"]),
-        .library(name: "RelativeProtocolTunnel", targets: ["RelativeProtocolTunnel"]),
-        .executable(name: "Standalone", targets: ["Standalone"])
+        .library(name: "DataplaneFFI", targets: ["DataplaneFFI"]),
+        .library(name: "TunnelRuntime", targets: ["TunnelRuntime"]),
+        .library(name: "PacketRelay", targets: ["PacketRelay"]),
+        .library(name: "Analytics", targets: ["Analytics"]),
+        .library(name: "Observability", targets: ["Observability"]),
+        .library(name: "TunnelControl", targets: ["TunnelControl"]),
+        .library(name: "HostClient", targets: ["HostClient"]),
+        .executable(name: "HarnessLocal", targets: ["HarnessLocal"])
     ],
     targets: [
         .target(
             name: "HevSocks5Tunnel",
-            path: "RelativeProtocol/ThirdParty/hev-socks5-tunnel",
+            path: "ThirdParty/hev-socks5-tunnel",
             exclude: [
                 ".clang-format",
+                ".dockerignore",
+                ".github",
+                ".git",
+                ".gitignore",
+                ".gitmodules",
+                "Android.mk",
+                "Application.mk",
+                "Dockerfile",
+                "Makefile",
+                "README.md",
+                "build-apple.sh",
+                "build.mk",
                 "conf",
+                "docker",
+                "module.modulemap",
                 "third-part/hev-task-system/configs.mk",
                 "third-part/hev-task-system/apps",
                 "third-part/hev-task-system/tests",
                 "third-part/hev-task-system/src/kern/io/hev-task-io-reactor-epoll.c",
                 "third-part/hev-task-system/src/kern/io/hev-task-io-reactor-iocp.c",
-                "third-part/hev-task-system/src/kern/task/hev-task-execute.S",
                 "third-part/hev-task-system/src/lib/list/hev-list.c",
                 "third-part/hev-task-system/src/lib/rbtree/hev-rbtree.c",
                 "third-part/hev-task-system/src/arch/arc",
@@ -41,6 +66,7 @@ let package = Package(
                 "third-part/hev-task-system/src/arch/sw64",
                 "third-part/hev-task-system/src/arch/x86",
                 "third-part/hev-task-system/src/arch/arm/hev-task-execute-arm.s",
+                "third-part/hev-task-system/src/arch/arm/hev-task-execute-aarch64.s",
                 "third-part/lwip/.git",
                 "third-part/lwip/src/netif",
                 "third-part/lwip/src/ports/unix",
@@ -48,6 +74,7 @@ let package = Package(
                 "third-part/yaml/.git",
                 "third-part/yaml/.gitlab-ci.yml",
                 "third-part/yaml/configs.mk",
+                "src/hev-jni.c",
                 "src/hev-tunnel-linux.c",
                 "src/hev-tunnel-freebsd.c",
                 "src/hev-tunnel-netbsd.c",
@@ -82,33 +109,107 @@ let package = Package(
             ]
         ),
         .target(
-            name: "RelativeProtocolCore",
-            path: "RelativeProtocol/Sources/RelativeProtocolCore"
+            name: "DataplaneFFICBridge",
+            dependencies: ["HevSocks5Tunnel"],
+            path: "Sources/DataplaneFFI/Bridge",
+            publicHeadersPath: "include",
+            cSettings: strictCSettings
         ),
         .target(
-            name: "RelativeProtocolHost",
-            dependencies: ["RelativeProtocolCore"],
-            path: "RelativeProtocol/Sources/RelativeProtocolHost"
+            name: "Observability",
+            path: "Sources/Observability",
+            swiftSettings: strictSwiftSettings
         ),
         .target(
-            name: "RelativeProtocolTunnel",
-            dependencies: ["RelativeProtocolCore", "HevSocks5Tunnel"],
-            path: "RelativeProtocol/Sources/RelativeProtocolTunnel"
+            name: "DataplaneFFI",
+            dependencies: ["DataplaneFFICBridge", "Observability"],
+            path: "Sources/DataplaneFFI",
+            exclude: ["Bridge"],
+            swiftSettings: strictSwiftSettings
+        ),
+        .target(
+            name: "TunnelRuntime",
+            dependencies: ["DataplaneFFI", "Observability"],
+            path: "Sources/TunnelRuntime",
+            swiftSettings: strictSwiftSettings
+        ),
+        .target(
+            name: "PacketRelay",
+            dependencies: ["Observability", "TunnelRuntime"],
+            path: "Sources/PacketRelay",
+            swiftSettings: strictSwiftSettings
+        ),
+        .target(
+            name: "Analytics",
+            dependencies: ["Observability", "TunnelRuntime"],
+            path: "Sources/Analytics",
+            swiftSettings: strictSwiftSettings
+        ),
+        .target(
+            name: "HostClient",
+            dependencies: ["Analytics", "TunnelRuntime"],
+            path: "Sources/HostClient",
+            swiftSettings: strictSwiftSettings
+        ),
+        .target(
+            name: "TunnelControl",
+            dependencies: ["Analytics", "Observability", "PacketRelay", "TunnelRuntime"],
+            path: "Sources/TunnelControl",
+            swiftSettings: strictSwiftSettings
         ),
         .executableTarget(
-            name: "Standalone",
-            dependencies: ["RelativeProtocolCore", "RelativeProtocolTunnel"],
-            path: "RelativeProtocol/Sources/Standalone"
+            name: "HarnessLocal",
+            dependencies: ["Analytics", "HostClient", "Observability", "PacketRelay", "TunnelRuntime"],
+            path: "Sources/HarnessLocal",
+            swiftSettings: strictSwiftSettings
         ),
         .testTarget(
-            name: "RelativeProtocolCoreTests",
-            dependencies: ["RelativeProtocolCore", "RelativeProtocolHost"],
-            path: "RelativeProtocol/Tests/RelativeProtocolCoreTests"
+            name: "DataplaneFFITests",
+            dependencies: ["DataplaneFFI"],
+            path: "Tests/DataplaneFFITests",
+            swiftSettings: strictSwiftSettings
         ),
         .testTarget(
-            name: "RelativeProtocolTunnelTests",
-            dependencies: ["RelativeProtocolTunnel"],
-            path: "RelativeProtocol/Tests/RelativeProtocolTunnelTests"
+            name: "HostClientTests",
+            dependencies: ["HostClient"],
+            path: "Tests/HostClientTests",
+            swiftSettings: strictSwiftSettings
+        ),
+        .testTarget(
+            name: "TunnelRuntimeTests",
+            dependencies: ["TunnelRuntime", "Analytics", "Observability"],
+            path: "Tests/TunnelRuntimeTests",
+            swiftSettings: strictSwiftSettings
+        ),
+        .testTarget(
+            name: "AnalyticsTests",
+            dependencies: ["Analytics", "Observability", "TunnelRuntime"],
+            path: "Tests/AnalyticsTests",
+            resources: [
+                .copy("Fixtures/PerfBaseline.json")
+            ],
+            swiftSettings: strictSwiftSettings
+        ),
+        .testTarget(
+            name: "ObservabilityTests",
+            dependencies: ["Observability"],
+            path: "Tests/ObservabilityTests",
+            swiftSettings: strictSwiftSettings
+        ),
+        .testTarget(
+            name: "PacketRelayTests",
+            dependencies: ["PacketRelay", "Observability"],
+            path: "Tests/PacketRelayTests",
+            swiftSettings: strictSwiftSettings
+        ),
+        .testTarget(
+            name: "HarnessLocalTests",
+            dependencies: ["HarnessLocal", "Analytics", "TunnelRuntime"],
+            path: "Tests/HarnessLocalTests",
+            resources: [
+                .copy("Fixtures/ReplayScenario.json")
+            ],
+            swiftSettings: strictSwiftSettings
         )
     ]
 )
