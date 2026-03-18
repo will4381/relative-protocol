@@ -157,6 +157,35 @@ Add the package to your app and tunnel extension targets through Swift Package M
 - `TunnelControl`
 - `TunnelRuntime`
 
+### Typical target wiring
+
+Most apps should link products like this:
+
+- containing app target
+  - `HostClient`
+  - `TunnelControl`
+- packet tunnel extension target
+  - `Analytics`
+  - `TunnelControl`
+  - `PacketRelay`
+  - `TunnelRuntime`
+  - `Observability`
+  - `DataplaneFFI`
+
+The app mainly:
+
+- installs and updates the VPN profile
+- starts and stops the tunnel
+- reads foreground snapshots
+- reads persisted detections and stop records
+
+The extension mainly:
+
+- runs the tunnel
+- runs detectors
+- persists durable detector outputs
+- exposes the live tap through provider messages
+
 ## Tunnel Integration
 
 ### 1. Define a tunnel provider subclass
@@ -170,6 +199,8 @@ final class PacketTunnelProvider: PacketTunnelProviderShell {}
 ```
 
 That is enough for the default runtime.
+
+If you want custom detectors, override `makeDetectors(...)` in this subclass.
 
 ### 2. Build and persist a `TunnelProfile`
 
@@ -204,7 +235,20 @@ Important fields in `TunnelProfile`:
 
 `liveTapEnabled` only has effect when `telemetryEnabled` is also `true`.
 
-### 3. Start the tunnel normally
+### 3. Configure `NETunnelProviderManager` in the containing app
+
+The package does not install the VPN profile for you automatically.
+Your app still owns:
+
+- creating a `NETunnelProviderManager`
+- assigning a `NETunnelProviderProtocol`
+- writing `TunnelProfile` into `providerConfiguration`
+- saving/loading preferences
+- starting and stopping the connection
+
+`TunnelProfileManager.configure(...)` exists to keep that profile encoding consistent.
+
+### 4. Start the tunnel normally
 
 Use `NETunnelProviderManager` / `NEVPNManager` from the containing app.
 `PacketTunnelProviderShell` handles:
@@ -272,6 +316,102 @@ final class AdBurstDetector: TrafficDetector {
 }
 ```
 
+### Detector implementation options
+
+`TrafficDetector` is intentionally generic.
+The package does not force one detector style.
+
+Common patterns:
+
+1. heuristic detector
+   - plain Swift logic over `DetectorRecord`
+   - best default choice
+   - easiest to test and reason about
+
+2. rules-engine detector
+   - same as a heuristic detector, but with externally supplied thresholds or signatures
+   - useful when non-code tuning matters
+
+3. tiny ML detector
+   - small in-process model fed by sparse feature vectors
+   - good for scoring sequences or confidence
+   - should run on detector features, not raw packets
+
+4. native scorer detector
+   - Swift detector calls into C, C++, Rust, or another embedded native library
+   - useful when you already have an optimized scoring engine
+
+The package contract is the same in all four cases:
+
+- ingest sparse `DetectorRecord` batches
+- keep bounded in-memory state
+- emit `DetectionEvent`
+- persist only compact outputs
+
+### What belongs inside a detector
+
+Good detector responsibilities:
+
+- feature extraction from sparse records
+- short rolling state keyed by flow, host, or target bucket
+- sequence scoring
+- confidence assignment
+- emitting compact `DetectionEvent` values
+
+Bad detector responsibilities:
+
+- raw packet capture
+- blocking file I/O
+- network requests
+- cross-process RPC
+- unbounded caches
+- large per-packet model inference
+
+### Using a tiny ML model
+
+If you want ML-backed detection, the recommended shape is:
+
+1. use `PacketAnalyticsPipeline` output as features, not raw packets
+2. build a compact feature vector inside your detector
+3. load the model once
+4. score synchronously and cheaply
+5. emit a normal `DetectionEvent`
+
+This usually means:
+
+- `CoreML` model loaded in the tunnel extension target
+- or a tiny custom scorer linked into the extension
+
+Keep the bar high:
+
+- small model
+- low latency
+- no dynamic downloads
+- no per-record heavy allocation
+
+### Using a native binary or embedded scorer
+
+If you already have a small native detector/scorer:
+
+- link it into the tunnel extension target
+- wrap it behind a Swift `TrafficDetector`
+- pass only compact features across the boundary
+
+Do not design this as an external process.
+The detector must run in-process inside the extension.
+
+### Detector design checklist
+
+Before shipping a custom detector, make sure it:
+
+1. processes `DetectorRecordCollection` in linear time
+2. keeps bounded memory
+3. does not block the telemetry worker
+4. degrades gracefully when some records are skipped or shed
+5. uses stable `signal`, `target`, and `trigger` strings
+6. persists only the detector output, not raw evidence
+7. can recover correctly after long app background gaps
+
 ### Register detectors
 
 Override `PacketTunnelProviderShell.makeDetectors(profile:analyticsRootURL:logger:)` in your provider subclass.
@@ -300,6 +440,20 @@ final class PacketTunnelProvider: PacketTunnelProviderShell {
 
 This is the main extension point for detector customization.
 
+### Integrating detectors in a different app
+
+For a host app, the typical setup is:
+
+1. add the package to both your app target and packet tunnel extension target
+2. create your own `PacketTunnelProvider: PacketTunnelProviderShell`
+3. override `makeDetectors(...)`
+4. return your custom detector list
+5. use `TunnelTelemetryClient` in the app for foreground snapshots
+6. use `TunnelDetectionStore` and `TunnelStopStore` for background recovery
+
+That is the supported package integration path.
+You do not need to patch package internals to add detectors.
+
 ## Detector Contract
 
 `TrafficDetector` implementations receive `DetectorRecord` batches.
@@ -319,10 +473,24 @@ Those records contain stable fields such as:
 - `registrableDomain`
 - `dnsQueryName`
 - `dnsCname`
+- `dnsAnswerAddresses`
+- `ipVersion`
+- `transportProtocolNumber`
 - `tlsServerName`
+- `quicVersion`
+- `quicPacketType`
+- `quicDestinationConnectionId`
+- `quicSourceConnectionId`
 - `classification`
 - `burstDurationMs`
 - `burstPacketCount`
+
+`DetectorRecordCollection` is a lightweight batch wrapper.
+Use it when you want to:
+
+- iterate the batch once
+- short-circuit on the first strong match
+- avoid materializing extra arrays inside your detector
 
 Hot-path rule:
 
@@ -343,6 +511,23 @@ String-field contract:
 - `trigger` is a stable detector-defined cause label
 - downstream code should treat unknown values as forward-compatible and scope parsing by `detectorIdentifier`
 
+Recommended naming pattern:
+
+- `detectorIdentifier`
+  - stable namespace for one detector implementation
+  - example: `ad-burst`
+- `signal`
+  - stable event kind within that detector
+  - example: `video-transition`
+- `target`
+  - stable subject bucket if you need one
+  - example: `pre-roll-ad`
+- `trigger`
+  - stable cause or evidence label
+  - example: `burst`
+
+That gives downstream code a forward-compatible parsing model.
+
 ## Detector Persistence Model
 
 `DetectionSnapshot` is the durable aggregate returned to the app.
@@ -359,6 +544,15 @@ If you need richer detector-specific state, you can either:
 
 - expose it in live foreground reads through `DetectionEvent.metadata`
 - or maintain your own auxiliary store in the App Group container for durable state
+
+Recommended persistence split:
+
+- live tap
+  - short-lived evidence/debug context
+- `DetectionSnapshot`
+  - durable product state
+- your own auxiliary detector store
+  - only if your product truly needs detector-specific durable state
 
 ## Signatures
 
@@ -455,6 +649,21 @@ That split matters:
 - live tap explains the last few seconds
 - persisted detections explain long background spans
 
+Useful detector debugging questions:
+
+1. did the tunnel see the expected sparse records?
+2. did the detector emit at the right boundary?
+3. did confidence match the evidence strength?
+4. did the detection persist across app suspension?
+5. did shed mode materially affect the detector?
+
+If you are debugging model-backed detectors, also record:
+
+- model load success
+- model version
+- feature-vector shape
+- scoring latency bucket
+
 ## Profiling Guidance
 
 Use Instruments in separate passes.
@@ -509,6 +718,7 @@ For rollout, track at minimum:
 - detection persistence correctness on resume
 - network transition recovery
 - thermal state during real usage
+- telemetry accepted / skipped / shed rates
 
 Do not use raw packet persistence as your operational metric source.
 Use detector outputs and lifecycle signals.
@@ -524,11 +734,6 @@ The package is intentionally shaped to minimize data retention:
 
 If you add custom detectors, keep that same discipline.
 Only persist what the product truly needs.
-
-## Repository Shape
-
-The Example app is a local integration and demo surface.
-It is useful for validating tunnel setup and custom detectors, but it is not part of the package contract.
 
 ## Apple API References
 
