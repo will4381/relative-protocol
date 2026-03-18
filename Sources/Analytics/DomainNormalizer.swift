@@ -8,6 +8,7 @@ public enum DomainNormalizer {
         "com.au", "net.au", "org.au", "com.br", "com.mx", "com.ar", "com.cn", "com.hk",
         "com.tw", "com.my", "com.sg", "com.tr", "com.sa"
     ]
+    private static let cache = BoundedCache<String, String>(countLimit: 4_096)
 
     public static func registrableDomain(from name: String?) -> String? {
         guard var name else { return nil }
@@ -15,14 +16,25 @@ public enum DomainNormalizer {
         guard !name.isEmpty else { return nil }
         guard !isIPAddress(name) else { return nil }
 
+        if let cached = cache.value(for: name) {
+            return cached
+        }
+
         let labels = name.split(separator: ".").map(String.init)
-        guard labels.count >= 2 else { return name }
+        guard labels.count >= 2 else {
+            cache.insert(name, for: name)
+            return name
+        }
 
         let suffix = labels.suffix(2).joined(separator: ".")
         if twoPartTLDs.contains(suffix), labels.count >= 3 {
-            return labels.suffix(3).joined(separator: ".")
+            let result = labels.suffix(3).joined(separator: ".")
+            cache.insert(result, for: name)
+            return result
         }
-        return labels.suffix(2).joined(separator: ".")
+        let result = labels.suffix(2).joined(separator: ".")
+        cache.insert(result, for: name)
+        return result
     }
 
     private static func isIPAddress(_ value: String) -> Bool {

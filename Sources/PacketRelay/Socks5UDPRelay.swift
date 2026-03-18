@@ -13,8 +13,8 @@ protocol Socks5UDPRelayProtocol: AnyObject {
 
 /// UDP session abstraction used by SOCKS relay to support Network/NetworkExtension backends.
 protocol Socks5UDPSession: AnyObject {
-    func setReadHandler(_ handler: @escaping ([Data]?, Error?) -> Void, maxDatagrams: Int)
-    func writeDatagram(_ datagram: Data, completionHandler: @escaping (Error?) -> Void)
+    func setReadHandler(_ handler: @escaping @Sendable ([Data]?, Error?) -> Void, maxDatagrams: Int)
+    func writeDatagram(_ datagram: Data, completionHandler: @escaping @Sendable (Error?) -> Void)
     func cancel()
 }
 
@@ -26,24 +26,42 @@ protocol Socks5ConnectionProvider: AnyObject {
 
 /// SOCKS5 UDP ASSOCIATE relay bound to localhost.
 /// Queue ownership: all socket I/O and session mutation happen on `queue`.
-final class Socks5UDPRelay: Socks5UDPRelayProtocol {
-    private struct SessionKey: Hashable {
+final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
+    private enum SessionPolicy {
+        static let maxSessions = 256
+        static let idleTimeoutSeconds: TimeInterval = 60
+        static let usageQueueCompactionThreshold = 128
+    }
+
+    private struct SessionKey: Hashable, Sendable {
         let address: Socks5Address
         let port: UInt16
     }
 
     private struct SessionEntry {
         let session: Socks5UDPSession
+        var lastUsedAt: Date
+        var lastUsedSequence: UInt64
+    }
+
+    private struct SessionUsageStamp {
+        let key: SessionKey
+        let sequence: UInt64
     }
 
     private let logger: StructuredLogger
     private let provider: Socks5ConnectionProvider
     private let queue: DispatchQueue
     private let mtu: Int
+    private let nowProvider: @Sendable () -> Date
+    private let queueSpecificKey = DispatchSpecificKey<UUID>()
+    private let queueSpecificValue = UUID()
 
     private var socketFD: Int32 = -1
     private var readSource: DispatchSourceRead?
     private var sessions: [SessionKey: SessionEntry] = [:]
+    private var sessionUsageQueue: ArraySlice<SessionUsageStamp> = []
+    private var nextUsageSequence: UInt64 = 0
     private var clientAddress = sockaddr_storage()
     private var clientAddressLen: socklen_t = 0
 
@@ -54,34 +72,77 @@ final class Socks5UDPRelay: Socks5UDPRelayProtocol {
     ///   - queue: Serial queue for socket I/O and state.
     ///   - mtu: Max expected datagram size.
     ///   - logger: Structured logger for relay events.
-    init(provider: Socks5ConnectionProvider, queue: DispatchQueue, mtu: Int, logger: StructuredLogger) throws {
+    ///   - nowProvider: Time source used for bounded UDP session eviction.
+    init(
+        provider: Socks5ConnectionProvider,
+        queue: DispatchQueue,
+        mtu: Int,
+        logger: StructuredLogger,
+        nowProvider: @escaping @Sendable () -> Date = { Date() }
+    ) throws {
         self.provider = provider
         self.queue = queue
         self.mtu = max(256, mtu)
         self.logger = logger
+        self.nowProvider = nowProvider
+        queue.setSpecific(key: queueSpecificKey, value: queueSpecificValue)
         try openSocket()
+    }
+
+    deinit {
+        stop()
+    }
+
+    var activeSessionCount: Int {
+        sessions.count
     }
 
     /// Starts local UDP socket read loop for SOCKS5 UDP ASSOCIATE traffic.
     func start() {
-        guard socketFD >= 0 else { return }
-        let source = DispatchSource.makeReadSource(fileDescriptor: socketFD, queue: queue)
-        source.setEventHandler { [weak self] in
-            self?.drainReadable()
+        performOnQueue {
+            guard readSource == nil else { return }
+            if socketFD < 0 {
+                do {
+                    try openSocket()
+                } catch {
+                    let logger = self.logger
+                    Task {
+                        await logger.log(
+                            level: .error,
+                            phase: .relay,
+                            category: .relayUDP,
+                            component: "Socks5UDPRelay",
+                            event: "socket-open-failed",
+                            errorCode: String(describing: error),
+                            message: "UDP relay socket open failed"
+                        )
+                    }
+                    return
+                }
+            }
+
+            let source = DispatchSource.makeReadSource(fileDescriptor: socketFD, queue: queue)
+            source.setEventHandler { [weak self] in
+                self?.drainReadable()
+            }
+            source.resume()
+            readSource = source
         }
-        source.setCancelHandler { [socketFD] in
-            close(socketFD)
-        }
-        source.resume()
-        readSource = source
     }
 
     /// Stops socket read loop and cancels all outbound UDP sessions.
     func stop() {
-        readSource?.cancel()
-        readSource = nil
-        sessions.values.forEach { $0.session.cancel() }
-        sessions.removeAll()
+        performOnQueue {
+            readSource?.cancel()
+            readSource = nil
+            sessions.values.forEach { $0.session.cancel() }
+            sessions.removeAll()
+            sessionUsageQueue.removeAll(keepingCapacity: false)
+            nextUsageSequence = 0
+            clientAddress = sockaddr_storage()
+            clientAddressLen = 0
+            closeSocketIfNeeded()
+        }
     }
 
     private func drainReadable() {
@@ -98,6 +159,7 @@ final class Socks5UDPRelay: Socks5UDPRelayProtocol {
                 if errno == EAGAIN || errno == EWOULDBLOCK {
                     break
                 }
+                let logger = self.logger
                 Task {
                     await logger.log(
                         level: .error,
@@ -122,12 +184,15 @@ final class Socks5UDPRelay: Socks5UDPRelayProtocol {
             clientAddress = addr
             clientAddressLen = addrLen
 
+            let now = nowProvider()
+            reapIdleSessions(now: now)
             let key = SessionKey(address: packet.address, port: packet.port)
-            let entry = sessions[key] ?? createSession(for: key)
+            let entry = sessionEntry(for: key, now: now)
             entry.session.writeDatagram(packet.payload) { [weak self] error in
                 guard let self, let error else { return }
+                let logger = self.logger
                 Task {
-                    await self.logger.log(
+                    await logger.log(
                         level: .error,
                         phase: .relay,
                         category: .relayUDP,
@@ -141,7 +206,28 @@ final class Socks5UDPRelay: Socks5UDPRelayProtocol {
         }
     }
 
-    private func createSession(for key: SessionKey) -> SessionEntry {
+    func reapIdleSessions(now: Date) {
+        dispatchPrecondition(condition: .onQueue(queue))
+
+        let expiredKeys = sessions.compactMap { key, entry in
+            now.timeIntervalSince(entry.lastUsedAt) > SessionPolicy.idleTimeoutSeconds ? key : nil
+        }
+
+        for key in expiredKeys {
+            removeSession(for: key)
+        }
+    }
+
+    private func sessionEntry(for key: SessionKey, now: Date) -> SessionEntry {
+        if sessions[key] != nil {
+            return markSessionUsed(for: key, at: now)
+        }
+
+        evictOldestSessionIfNeeded()
+        return createSession(for: key, now: now)
+    }
+
+    private func createSession(for key: SessionKey, now: Date) -> SessionEntry {
         let hostString: String
         switch key.address {
         case .ipv4(let value), .ipv6(let value), .domain(let value):
@@ -153,8 +239,10 @@ final class Socks5UDPRelay: Socks5UDPRelayProtocol {
         session.setReadHandler({ [weak self] datagrams, error in
             guard let self else { return }
             if let error {
+                self.removeSession(for: key)
+                let logger = self.logger
                 Task {
-                    await self.logger.log(
+                    await logger.log(
                         level: .error,
                         phase: .relay,
                         category: .relayUDP,
@@ -167,15 +255,92 @@ final class Socks5UDPRelay: Socks5UDPRelayProtocol {
                 return
             }
             guard let datagrams, !datagrams.isEmpty else { return }
+            _ = self.markSessionUsed(for: key, at: self.nowProvider())
             for datagram in datagrams {
                 let response = Socks5Codec.buildUDPPacket(address: key.address, port: key.port, payload: datagram)
                 self.sendToClient(response)
             }
         }, maxDatagrams: 32)
 
-        let entry = SessionEntry(session: session)
+        let entry = SessionEntry(
+            session: session,
+            lastUsedAt: now,
+            lastUsedSequence: nextSessionUsageSequence()
+        )
         sessions[key] = entry
+        sessionUsageQueue.append(SessionUsageStamp(key: key, sequence: entry.lastUsedSequence))
+        pruneUsageQueueIfNeeded()
         return entry
+    }
+
+    private func evictOldestSessionIfNeeded() {
+        guard sessions.count >= SessionPolicy.maxSessions else {
+            return
+        }
+
+        pruneUsageQueueIfNeeded(force: true)
+        while sessions.count >= SessionPolicy.maxSessions {
+            if let stamp = sessionUsageQueue.popFirst() {
+                guard let entry = sessions[stamp.key], entry.lastUsedSequence == stamp.sequence else {
+                    continue
+                }
+                removeSession(for: stamp.key)
+                pruneUsageQueueIfNeeded()
+                return
+            }
+
+            guard let fallback = sessions.keys.first else {
+                return
+            }
+            // Decision: this should stay cold because the usage queue is the primary eviction path.
+            // If the queue is unexpectedly empty, removing any active session is cheaper than re-scanning the whole map.
+            removeSession(for: fallback)
+        }
+    }
+
+    private func markSessionUsed(for key: SessionKey, at now: Date) -> SessionEntry {
+        guard var entry = sessions[key] else {
+            preconditionFailure("Attempted to mark a missing UDP session as used")
+        }
+        entry.lastUsedAt = now
+        entry.lastUsedSequence = nextSessionUsageSequence()
+        sessions[key] = entry
+        sessionUsageQueue.append(SessionUsageStamp(key: key, sequence: entry.lastUsedSequence))
+        pruneUsageQueueIfNeeded()
+        return entry
+    }
+
+    private func removeSession(for key: SessionKey) {
+        guard let entry = sessions.removeValue(forKey: key) else {
+            return
+        }
+        entry.session.cancel()
+    }
+
+    private func nextSessionUsageSequence() -> UInt64 {
+        nextUsageSequence &+= 1
+        return nextUsageSequence
+    }
+
+    private func pruneUsageQueueIfNeeded(force: Bool = false) {
+        let queueLimit = max(SessionPolicy.maxSessions * 4, 256)
+        guard force ||
+                sessionUsageQueue.startIndex > SessionPolicy.usageQueueCompactionThreshold ||
+                sessionUsageQueue.count > queueLimit else {
+            return
+        }
+
+        var activeQueue: [SessionUsageStamp] = []
+        activeQueue.reserveCapacity(min(sessions.count, SessionPolicy.maxSessions))
+
+        for stamp in sessionUsageQueue {
+            guard let entry = sessions[stamp.key], entry.lastUsedSequence == stamp.sequence else {
+                continue
+            }
+            activeQueue.append(stamp)
+        }
+
+        sessionUsageQueue = ArraySlice(activeQueue)
     }
 
     private func sendToClient(_ data: Data) {
@@ -186,6 +351,7 @@ final class Socks5UDPRelay: Socks5UDPRelayProtocol {
                 sendto(socketFD, base, data.count, 0, UnsafeRawPointer($0).assumingMemoryBound(to: sockaddr.self), clientAddressLen)
             }
             if sent < 0, errno != EAGAIN, errno != EWOULDBLOCK {
+                let logger = self.logger
                 Task {
                     await logger.log(
                         level: .error,
@@ -202,6 +368,8 @@ final class Socks5UDPRelay: Socks5UDPRelayProtocol {
     }
 
     private func openSocket() throws {
+        guard socketFD < 0 else { return }
+
         let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         guard fd >= 0 else {
             throw POSIXError(.init(rawValue: errno) ?? .EINVAL)
@@ -236,5 +404,20 @@ final class Socks5UDPRelay: Socks5UDPRelayProtocol {
         }
 
         socketFD = fd
+    }
+
+    private func closeSocketIfNeeded() {
+        guard socketFD >= 0 else { return }
+        close(socketFD)
+        socketFD = -1
+        port = 0
+    }
+
+    private func performOnQueue(_ work: () -> Void) {
+        if DispatchQueue.getSpecific(key: queueSpecificKey) == queueSpecificValue {
+            work()
+        } else {
+            queue.sync(execute: work)
+        }
     }
 }

@@ -38,6 +38,6 @@ final class HarnessLocalTests: XCTestCase {
 
         XCTAssertEqual(first.scenarioID, second.scenarioID)
         XCTAssertEqual(first.packetCount, second.packetCount)
-        XCTAssertEqual(first.metricsCount, second.metricsCount)
+        XCTAssertEqual(first.runtimeState, second.runtimeState)
     }
 }

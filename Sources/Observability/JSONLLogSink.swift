@@ -49,6 +49,25 @@ public struct JSONLDropCounters: Sendable, Equatable {
 
 /// JSONL sink with single-writer semantics and deterministic rotation behavior.
 public actor JSONLLogSink: LogSink {
+    private static var protectionAttributes: [FileAttributeKey: Any] {
+#if os(iOS) || os(tvOS) || os(watchOS) || os(visionOS)
+        [.protectionKey: FileProtectionType.complete]
+#else
+        [:]
+#endif
+    }
+
+    private static func excludeFromBackupIfNeeded(_ url: URL) throws {
+#if os(iOS) || os(tvOS) || os(watchOS) || os(visionOS)
+        // Docs: https://developer.apple.com/documentation/foundation/urlresourcevalues
+        // Docs: https://developer.apple.com/documentation/foundation/nsurl/setresourcevalues(_:)
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        var mutableURL = url
+        try mutableURL.setResourceValues(values)
+#endif
+    }
+
     private let encoder: JSONEncoder
     private let policy: JSONLRotationPolicy
     private let rootProvider: any LogRootPathProvider
@@ -60,7 +79,7 @@ public actor JSONLLogSink: LogSink {
     private var handle: FileHandle?
     private var activeSize = 0
     private var rotationSequence = 0
-    private var pending: [Data] = []
+    private var pending: ArraySlice<Data> = []
     private var isDraining = false
     private var drops = JSONLDropCounters()
 
@@ -141,6 +160,7 @@ public actor JSONLLogSink: LogSink {
                 drops.droppedIOError += 1
             }
         }
+        pending = []
         isDraining = false
         await emitDropSummaryIfNeeded(trigger: "drain")
     }
@@ -152,10 +172,22 @@ public actor JSONLLogSink: LogSink {
 
         rootURL = try rootProvider.resolveRootPath()
         activeURL = rootURL.appendingPathComponent("events.current.jsonl", isDirectory: false)
-        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            atPath: rootURL.path,
+            withIntermediateDirectories: true,
+            attributes: Self.protectionAttributes
+        )
+        try Self.excludeFromBackupIfNeeded(rootURL)
         if !FileManager.default.fileExists(atPath: activeURL.path) {
-            FileManager.default.createFile(atPath: activeURL.path, contents: nil)
+            FileManager.default.createFile(
+                atPath: activeURL.path,
+                contents: nil,
+                attributes: Self.protectionAttributes
+            )
+        } else if !Self.protectionAttributes.isEmpty {
+            try FileManager.default.setAttributes(Self.protectionAttributes, ofItemAtPath: activeURL.path)
         }
+        try Self.excludeFromBackupIfNeeded(activeURL)
         handle = try FileHandle(forWritingTo: activeURL)
         try handle?.seekToEnd()
         let attrs = try FileManager.default.attributesOfItem(atPath: activeURL.path)
@@ -179,7 +211,16 @@ public actor JSONLLogSink: LogSink {
         rotationSequence += 1
         let rotatedURL = rootURL.appendingPathComponent(rotatedName, isDirectory: false)
         try FileManager.default.moveItem(at: activeURL, to: rotatedURL)
-        FileManager.default.createFile(atPath: activeURL.path, contents: nil)
+        if !Self.protectionAttributes.isEmpty {
+            try FileManager.default.setAttributes(Self.protectionAttributes, ofItemAtPath: rotatedURL.path)
+        }
+        try Self.excludeFromBackupIfNeeded(rotatedURL)
+        FileManager.default.createFile(
+            atPath: activeURL.path,
+            contents: nil,
+            attributes: Self.protectionAttributes
+        )
+        try Self.excludeFromBackupIfNeeded(activeURL)
         self.handle = try FileHandle(forWritingTo: activeURL)
         activeSize = 0
 
@@ -208,9 +249,9 @@ public actor JSONLLogSink: LogSink {
             for entry in files.prefix(files.count - policy.maxFiles) {
                 try FileManager.default.removeItem(at: entry.url)
             }
+            files.removeFirst(files.count - policy.maxFiles)
         }
 
-        files = try fileMetadata()
         var totalBytes = files.reduce(0) { $0 + $1.size }
         var index = 0
         while totalBytes > policy.maxTotalBytes && index < files.count {
@@ -251,7 +292,6 @@ public actor JSONLLogSink: LogSink {
         guard let handle else {
             throw CocoaError(.fileNoSuchFile)
         }
-        try handle.seekToEnd()
         try handle.write(contentsOf: data)
         activeSize += data.count
     }

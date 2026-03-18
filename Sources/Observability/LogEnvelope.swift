@@ -33,10 +33,8 @@ public enum LogCategory: String, Codable, Sendable, CaseIterable {
     case relayTCP = "relay.tcp"
     case relayUDP = "relay.udp"
     case dataplane
-    case analyticsMetrics = "analytics.metrics"
+    case liveTap = "live.tap"
     case analyticsClassifier = "analytics.classifier"
-    case analyticsFlow = "analytics.flow"
-    case samplerPath = "sampler.path"
 }
 
 /// Structured event contract shared by OSLog and JSONL sinks.
@@ -107,13 +105,42 @@ public struct LogEnvelope: Codable, Sendable, Equatable {
 
 /// Redacts endpoint metadata before serialization to satisfy privacy constraints.
 public struct EndpointMetadataRedactor: Sendable {
+    private static let explicitHostKeys: Set<String> = [
+        "host",
+        "hostname",
+        "domain",
+        "address",
+        "remotehost",
+        "localhost",
+        "sourcehost",
+        "destinationhost",
+        "remoteaddress",
+        "localaddress",
+        "sourceaddress",
+        "destinationaddress",
+        "servername",
+        "server",
+        "tlsservername",
+        "registrabledomain",
+        "dnsqueryname",
+        "dnscname"
+    ]
+
+    private static let explicitPortKeys: Set<String> = [
+        "port",
+        "remoteport",
+        "localport",
+        "sourceport",
+        "destinationport"
+    ]
+
     public var redactHost: Bool
     public var redactPort: Bool
 
-    /// Creates a metadata redactor with configurable host/port redaction.
+    /// Creates a metadata redactor with configurable endpoint redaction.
     /// - Parameters:
-    ///   - redactHost: Whether `host` key should be replaced by `<redacted>`.
-    ///   - redactPort: Whether `port` key should be replaced by `<redacted>`.
+    ///   - redactHost: Whether common host/domain/address keys should be replaced by `<redacted>`.
+    ///   - redactPort: Whether common port keys should be replaced by `<redacted>`.
     public init(redactHost: Bool = true, redactPort: Bool = false) {
         self.redactHost = redactHost
         self.redactPort = redactPort
@@ -124,12 +151,43 @@ public struct EndpointMetadataRedactor: Sendable {
     /// - Returns: Redacted metadata dictionary.
     public func redact(_ metadata: [String: String]) -> [String: String] {
         var redacted = metadata
-        if redactHost, redacted.keys.contains("host") {
-            redacted["host"] = "<redacted>"
-        }
-        if redactPort, redacted.keys.contains("port") {
-            redacted["port"] = "<redacted>"
+        for key in redacted.keys {
+            if redactHost, Self.isHostKey(key) {
+                redacted[key] = "<redacted>"
+                continue
+            }
+            if redactPort, Self.isPortKey(key) {
+                redacted[key] = "<redacted>"
+            }
         }
         return redacted
+    }
+
+    private static func isHostKey(_ key: String) -> Bool {
+        let normalized = normalize(key)
+        if explicitHostKeys.contains(normalized) {
+            return true
+        }
+        return normalized.hasSuffix("host") ||
+            normalized.hasSuffix("hostname") ||
+            normalized.hasSuffix("domain") ||
+            normalized.hasSuffix("address") ||
+            normalized.hasSuffix("servername") ||
+            normalized.hasSuffix("queryname") ||
+            normalized.hasSuffix("cname")
+    }
+
+    private static func isPortKey(_ key: String) -> Bool {
+        let normalized = normalize(key)
+        if explicitPortKeys.contains(normalized) {
+            return true
+        }
+        return normalized.hasSuffix("port")
+    }
+
+    private static func normalize(_ key: String) -> String {
+        String(
+            key.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }
+        ).lowercased()
     }
 }

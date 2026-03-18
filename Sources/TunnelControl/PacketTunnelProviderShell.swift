@@ -9,8 +9,17 @@ import TunnelRuntime
 // Docs: https://developer.apple.com/documentation/networkextension/nepackettunnelprovider
 /// Queue ownership:
 /// - `ioQueue` serializes packet ingress/egress and bridge backpressure transitions.
-/// - actor/Task boundaries are used for async runtime, analytics, and logging calls.
+/// - `relayQueue` isolates SOCKS listener + Network.framework connection callbacks from packet I/O.
+/// - actor/Task boundaries are used for async runtime, packet intelligence, and logging calls.
 open class PacketTunnelProviderShell: NEPacketTunnelProvider {
+    private enum HealthSamplePolicy {
+        static let minimumIntervalSeconds: TimeInterval = 60
+    }
+
+    private enum AppMessagePolicy {
+        static let maxPacketLimit = 96
+    }
+
     /// Provider-owned backlog retained when the bridge is saturated but not failed.
     fileprivate struct PendingOutboundBatch {
         let packets: [Data]
@@ -34,8 +43,12 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
         var runtime: TunnelRuntime?
         var tunBridge: TunSocketBridge?
         var socksServer: Socks5Server?
-        var analyticsPipeline: PacketAnalyticsPipeline?
-        var livenessMonitor: ProviderLivenessMonitor?
+        var telemetryWorker: PacketTelemetryWorker?
+        var cumulativeOutboundPackets = 0
+        var cumulativeOutboundBytes = 0
+        var cumulativeInboundPackets = 0
+        var cumulativeInboundBytes = 0
+        var lastHealthSampleAt: Date?
         var waitingForBackpressureRelief = false
         var isStopping = false
         var pendingOutbound: [PendingOutboundBatch] = []
@@ -47,10 +60,31 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
         let runtime: TunnelRuntime?
         let tunBridge: TunSocketBridge?
         let socksServer: Socks5Server?
-        let livenessMonitor: ProviderLivenessMonitor?
+        let telemetryWorker: PacketTelemetryWorker?
+    }
+
+    /// One-shot callback wrapper used when framework completion handlers need to cross into `Task`.
+    /// Safety invariant: the callback is consumed under `lock`, so callers can safely invoke it from concurrent tasks
+    /// without racing a second invocation.
+    private final class CallbackBox<Payload>: @unchecked Sendable {
+        private let lock = NSLock()
+        private var callback: ((Payload) -> Void)?
+
+        init(_ callback: @escaping (Payload) -> Void) {
+            self.callback = callback
+        }
+
+        func call(_ payload: Payload) {
+            lock.lock()
+            let callback = self.callback
+            self.callback = nil
+            lock.unlock()
+            callback?(payload)
+        }
     }
 
     private let ioQueue = DispatchQueue(label: "com.vpnbridge.tunnel.io", qos: .userInitiated)
+    private let relayQueue = DispatchQueue(label: "com.vpnbridge.tunnel.relay", qos: .userInitiated)
     private let stateLock = NSLock()
 
     private var state: ProviderState
@@ -61,7 +95,10 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
         let bootstrapLogger = StructuredLogger(
             sink: FanoutLogSink(
                 sinks: [
-                    OSLogSink(subsystem: "com.vpnbridge.tunnel", category: LogCategory.control.rawValue),
+                    MinimumLevelLogSink(
+                        minimumLevel: .warning,
+                        sink: OSLogSink(subsystem: "com.vpnbridge.tunnel", category: LogCategory.control.rawValue)
+                    ),
                     InMemoryLogSink()
                 ]
             )
@@ -78,6 +115,7 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
     open override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         _ = options
         let startupInterval = signposts.begin(.startup, message: "packet-tunnel-start")
+        let completion = CallbackBox<Error?>(completionHandler)
 
         // Docs: https://developer.apple.com/documentation/networkextension/netunnelproviderprotocol/providerconfiguration
         let providerConfig = (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration ?? [:]
@@ -86,6 +124,9 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
 
         Task {
             let logger = self.makeLogger(profile: profile)
+            var startupTelemetryWorker: PacketTelemetryWorker?
+            var startupSocksServer: Socks5Server?
+            var startupBridge: TunSocketBridge?
             do {
                 let runtime = TunnelRuntime(
                     clock: SystemClock(),
@@ -93,14 +134,17 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                     randomSource: SystemRandomSource(),
                     logger: logger
                 )
-                let analyticsPipeline = try await self.makeAnalyticsPipeline(profile: profile, clock: SystemClock(), logger: logger)
+                let telemetryWorker = try await self.makeTelemetryWorker(profile: profile, clock: SystemClock(), logger: logger)
+                startupTelemetryWorker = telemetryWorker
 
                 let settingsInterval = signposts.begin(.settingsApply, message: "setTunnelNetworkSettings")
                 try await apply(settings)
                 signposts.end(.settingsApply, state: settingsInterval, message: "ok")
 
                 let (socksServer, socksPort) = try await startSocksServer(profile: profile, logger: logger)
+                startupSocksServer = socksServer
                 let bridge = try TunSocketBridge(mtu: profile.mtu, queue: ioQueue, logger: logger)
+                startupBridge = bridge
                 bridge.onBackpressureRelieved = { [weak self] in
                     self?.resumePacketReadLoopIfNeeded()
                 }
@@ -113,19 +157,14 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                     runtime: runtime,
                     tunBridge: bridge,
                     socksServer: socksServer,
-                    analyticsPipeline: analyticsPipeline
+                    telemetryWorker: telemetryWorker
                 )
+                startupTelemetryWorker = nil
+                startupSocksServer = nil
+                startupBridge = nil
 
                 let dataplaneConfig = makeDataplaneConfig(profile: profile, socksPort: socksPort)
                 try await runtime.start(configJSON: dataplaneConfig, tunFD: bridge.engineFD)
-                let runtimeSnapshot = await runtime.currentSnapshot()
-                let livenessMonitor = makeLivenessMonitor(
-                    logger: logger,
-                    runId: runtimeSnapshot.runId,
-                    sessionId: runtimeSnapshot.sessionId
-                )
-                installLivenessMonitor(livenessMonitor)
-                livenessMonitor.start()
 
                 let relayLoopInterval = signposts.begin(.relayLoop, message: "packet-flow-loop")
                 ioQueue.async { [weak self] in
@@ -134,7 +173,7 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                 signposts.end(.relayLoop, state: relayLoopInterval, message: "started")
 
                 await logger.log(
-                    level: .info,
+                    level: .notice,
                     phase: .lifecycle,
                     category: .control,
                     component: "PacketTunnelProviderShell",
@@ -146,9 +185,13 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                     ]
                 )
                 signposts.end(.startup, state: startupInterval, message: "ok")
-                completionHandler(nil)
+                completion.call(nil)
             } catch {
-                await cleanupAfterFailedStart()
+                await cleanupAfterFailedStart(
+                    startupTelemetryWorker: startupTelemetryWorker,
+                    startupSocksServer: startupSocksServer,
+                    startupBridge: startupBridge
+                )
                 await logger.log(
                     level: .error,
                     phase: .lifecycle,
@@ -159,7 +202,7 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                     message: "Tunnel failed to start"
                 )
                 signposts.end(.startup, state: startupInterval, message: "failed")
-                completionHandler(error)
+                completion.call(error)
             }
         }
     }
@@ -170,8 +213,12 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
     ///   - reason: System stop reason for observability.
     ///   - completionHandler: Must be called when cleanup is complete.
     open override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
+        let completion = CallbackBox<Void> { _ in completionHandler() }
         Task {
             let snapshot = takeCleanupSnapshot(markStopping: true)
+            if let telemetryWorker = snapshot.telemetryWorker {
+                await telemetryWorker.stopAndWait()
+            }
             do {
                 try persistLastStopRecord(for: reason)
             } catch {
@@ -186,7 +233,6 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                 )
             }
 
-            snapshot.livenessMonitor?.stop()
             snapshot.tunBridge?.stop()
             snapshot.socksServer?.stop()
             if let runtime = snapshot.runtime {
@@ -194,7 +240,7 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
             }
 
             await snapshot.logger.log(
-                level: .info,
+                level: .notice,
                 phase: .lifecycle,
                 category: .control,
                 component: "PacketTunnelProviderShell",
@@ -206,7 +252,22 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                     "stop_reason_code": String(reason.rawValue)
                 ]
             )
-            completionHandler()
+            completion.call(())
+        }
+    }
+
+    // Docs: https://developer.apple.com/documentation/networkextension/netunnelprovider/handleappmessage(_:completionhandler:)
+    /// Handles bounded foreground snapshot requests from the containing app.
+    /// Decision: the app asks for a recent rolling window on demand instead of tailing persisted packet history while
+    /// the tunnel is running.
+    open override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)? = nil) {
+        let completion = completionHandler.map(CallbackBox<Data?>.init)
+        Task { [weak self] in
+            guard let self else {
+                completion?.call(nil)
+                return
+            }
+            completion?.call(await self.handleTunnelAppMessage(messageData))
         }
     }
 
@@ -246,7 +307,7 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
             (
                 logger: state.logger,
                 bridge: state.tunBridge,
-                analyticsPipeline: state.analyticsPipeline,
+                telemetryWorker: state.telemetryWorker,
                 isStopping: state.isStopping
             )
         }
@@ -262,6 +323,13 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
             families.append(family)
         }
 
+        let packetCount = packets.count
+        let byteCount = packets.reduce(0) { $0 + $1.count }
+        withState { state in
+            state.cumulativeOutboundPackets += packetCount
+            state.cumulativeOutboundBytes += byteCount
+        }
+
         let batch = PendingOutboundBatch(packets: packets, families: families, nextIndex: 0)
         switch writePendingBatch(batch, bridge: bridge) {
         case .complete:
@@ -275,8 +343,9 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                 state.pendingOutbound.append(pendingBatch)
                 state.waitingForBackpressureRelief = true
             }
+            let logger = snapshot.logger
             Task {
-                await snapshot.logger.log(
+                await logger.log(
                     level: .notice,
                     phase: .relay,
                     category: .control,
@@ -294,12 +363,18 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
             failTunnelForBridgeWrite(errorCode: errorCode, logger: snapshot.logger)
         }
 
-        guard let analyticsPipeline = snapshot.analyticsPipeline else {
+        emitHealthSampleIfNeeded(trigger: "outbound", logger: snapshot.logger)
+
+        guard let telemetryWorker = snapshot.telemetryWorker else {
             return
         }
-        Task {
-            await analyticsPipeline.ingest(packets: packets, families: families, direction: .outbound)
-        }
+        schedulePacketTelemetryIngest(
+            telemetryWorker,
+            packets: packets,
+            families: families,
+            direction: .outbound,
+            logger: snapshot.logger
+        )
     }
 
     /// Handles inbound packets flowing dataplane -> device.
@@ -312,7 +387,7 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
         let snapshot = withState { state in
             (
                 logger: state.logger,
-                analyticsPipeline: state.analyticsPipeline,
+                telemetryWorker: state.telemetryWorker,
                 isStopping: state.isStopping
             )
         }
@@ -334,11 +409,19 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
             }
         }
 
+        let packetCount = packets.count
+        let byteCount = packets.reduce(0) { $0 + $1.count }
+        withState { state in
+            state.cumulativeInboundPackets += packetCount
+            state.cumulativeInboundBytes += byteCount
+        }
+
         // Docs: https://developer.apple.com/documentation/networkextension/nepackettunnelflow/writepackets(_:withprotocols:)
         let success = packetFlow.writePackets(packets, withProtocols: protocols)
         if !success {
+            let logger = snapshot.logger
             Task {
-                await snapshot.logger.log(
+                await logger.log(
                     level: .error,
                     phase: .packetOut,
                     category: .control,
@@ -349,12 +432,18 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
             }
         }
 
-        guard let analyticsPipeline = snapshot.analyticsPipeline else {
+        emitHealthSampleIfNeeded(trigger: "inbound", logger: snapshot.logger)
+
+        guard let telemetryWorker = snapshot.telemetryWorker else {
             return
         }
-        Task {
-            await analyticsPipeline.ingest(packets: packets, families: families, direction: .inbound)
-        }
+        schedulePacketTelemetryIngest(
+            telemetryWorker,
+            packets: packets,
+            families: families,
+            direction: .inbound,
+            logger: snapshot.logger
+        )
     }
 
     /// Resumes packet read loop after backpressure drops below threshold.
@@ -388,7 +477,7 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
     /// - Parameter profile: Active tunnel profile.
     /// - Returns: Bound SOCKS listen port.
     private func startSocksServer(profile: TunnelProfile, logger: StructuredLogger) async throws -> (server: Socks5Server, port: UInt16) {
-        let server = Socks5Server(provider: self, queue: ioQueue, mtu: profile.mtu, logger: logger)
+        let server = Socks5Server(provider: self, queue: relayQueue, mtu: profile.mtu, logger: logger)
         return try await withCheckedThrowingContinuation { continuation in
             server.start(port: profile.engineSocksPort) { result in
                 switch result {
@@ -402,50 +491,144 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
         }
     }
 
-    /// Creates analytics components with deterministic bounds for memory and file growth.
+    /// Creates the detector-focused telemetry worker used by the provider hot path.
     /// - Parameter profile: Active tunnel profile.
-    /// - Returns: Configured analytics pipeline for packet parsing/classification.
-    private func makeAnalyticsPipeline(profile: TunnelProfile, clock: any Clock, logger: StructuredLogger) async throws -> PacketAnalyticsPipeline {
+    /// - Returns: Configured telemetry worker, or `nil` when telemetry is disabled entirely.
+    private func makeTelemetryWorker(profile: TunnelProfile, clock: any Clock, logger: StructuredLogger) async throws -> PacketTelemetryWorker? {
+        guard profile.telemetryEnabled else {
+            return nil
+        }
+
         let root = analyticsRootURL(appGroupID: profile.appGroupID)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
 
-        let metricsStore = MetricsStore(
-            capacity: 1024,
-            maxBytes: 1_500_000,
-            outputURL: root.appendingPathComponent("metrics.json", isDirectory: false),
-            clock: clock,
-            logger: logger
-        )
-
-        let packetStream: PacketSampleStream?
-        if profile.packetStreamEnabled {
-            packetStream = PacketSampleStream(
-                maxBytes: max(1, profile.packetStreamMaxBytes),
-                url: root.appendingPathComponent("packet-stream.ndjson", isDirectory: false),
+        let packetStream: PacketSampleStream? = if profile.liveTapEnabled {
+            PacketSampleStream(
+                maxBytes: max(1, profile.liveTapMaxBytes),
+                retentionWindowSeconds: 10,
+                clock: clock,
                 logger: logger
             )
         } else {
-            packetStream = nil
+            nil
         }
 
         let classifier = SignatureClassifier(logger: logger)
-        let signatureURL = root
-            .appendingPathComponent("AppSignatures", isDirectory: true)
-            .appendingPathComponent(profile.signatureFileName, isDirectory: false)
+        let signatureURL: URL
+        if !profile.appGroupID.isEmpty {
+            signatureURL = try AnalyticsStoragePaths.signatureURL(
+                appGroupID: profile.appGroupID,
+                fileName: profile.signatureFileName
+            )
+        } else {
+            signatureURL = root
+                .appendingPathComponent("AppSignatures", isDirectory: true)
+                .appendingPathComponent(profile.signatureFileName, isDirectory: false)
+        }
         if FileManager.default.fileExists(atPath: signatureURL.path) {
             try? await classifier.load(from: signatureURL)
         }
 
-        return PacketAnalyticsPipeline(
+        let detectionStoreURL: URL
+        if !profile.appGroupID.isEmpty {
+            detectionStoreURL = try AnalyticsStoragePaths.detectionsURL(appGroupID: profile.appGroupID)
+        } else {
+            detectionStoreURL = root
+                .appendingPathComponent("Detections", isDirectory: true)
+                .appendingPathComponent("detections.json", isDirectory: false)
+        }
+        let detectionStore = DetectionStore(fileURL: detectionStoreURL)
+        let initialDetectionSnapshot = (try? detectionStore.load()) ?? .empty
+        let detectors = try await makeDetectors(profile: profile, analyticsRootURL: root, logger: logger)
+        if packetStream == nil && detectors.isEmpty {
+            return nil
+        }
+
+        let pipeline = PacketAnalyticsPipeline(
             clock: clock,
-            flowTracker: FlowTracker(maxTrackedFlows: 4096, flowTTLSeconds: 300),
-            burstTracker: BurstTracker(thresholdMs: 350),
-            signatureClassifier: classifier,
-            packetStream: packetStream,
-            metricsStore: metricsStore,
-            logger: logger,
-            insightCapacity: 2048
+            burstTracker: BurstTracker(
+                thresholdMs: 350,
+                maxTrackedFlows: 1_024,
+                flowTTLSeconds: 60
+            ),
+            signatureClassifier: classifier
         )
+
+        return PacketTelemetryWorker(
+            pipeline: pipeline,
+            packetStream: packetStream,
+            detectors: detectors,
+            initialDetectionSnapshot: initialDetectionSnapshot,
+            detectionStore: detectionStore,
+            logger: logger
+        )
+    }
+
+    /// Returns the detector set used by the provider's telemetry worker.
+    /// Override this in a subclass to supply custom detectors. The default implementation installs no detectors so
+    /// package users opt into product-specific logic explicitly.
+    open func makeDetectors(
+        profile: TunnelProfile,
+        analyticsRootURL: URL,
+        logger: StructuredLogger
+    ) async throws -> [any TrafficDetector] {
+        _ = profile
+        _ = analyticsRootURL
+        _ = logger
+        return []
+    }
+
+    private func handleTunnelAppMessage(_ messageData: Data) async -> Data? {
+        let snapshot = withState { state in
+            (logger: state.logger, telemetryWorker: state.telemetryWorker)
+        }
+
+        let response: TunnelTelemetryResponse
+        do {
+            let request = try TunnelTelemetryMessageCodec.decodeRequest(messageData)
+            switch request.command {
+            case .snapshot:
+                let limit = normalizedPacketLimit(request.packetLimit)
+                let telemetrySnapshot: TunnelTelemetrySnapshot
+                if let telemetryWorker = snapshot.telemetryWorker {
+                    telemetrySnapshot = await telemetryWorker.recentSnapshot(limit: limit)
+                } else {
+                    telemetrySnapshot = .empty
+                }
+                response = .snapshot(telemetrySnapshot)
+
+            case .clearRecentEvents:
+                if let telemetryWorker = snapshot.telemetryWorker {
+                    await telemetryWorker.clearRecentEventsAndWait()
+                }
+                response = .cleared
+
+            case .clearDetections:
+                if let telemetryWorker = snapshot.telemetryWorker {
+                    await telemetryWorker.clearDetectionsAndWait()
+                }
+                response = .cleared
+            }
+        } catch {
+            await snapshot.logger.log(
+                level: .warning,
+                phase: .lifecycle,
+                category: .control,
+                component: "PacketTunnelProviderShell",
+                event: "handle-app-message-failed",
+                errorCode: String(describing: error),
+                message: "Ignored invalid app message sent to the tunnel provider"
+            )
+            response = .failure("invalid-request")
+        }
+
+        return try? TunnelTelemetryMessageCodec.encodeResponse(response)
+    }
+
+    private func normalizedPacketLimit(_ value: Int?) -> Int? {
+        guard let value else {
+            return AppMessagePolicy.maxPacketLimit
+        }
+        return max(0, min(value, AppMessagePolicy.maxPacketLimit))
     }
 
     /// Resolves dataplane runtime config text.
@@ -508,9 +691,8 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
     /// - Parameter appGroupID: Optional App Group identifier.
     private func analyticsRootURL(appGroupID: String) -> URL {
         if !appGroupID.isEmpty,
-           let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupID)
-        {
-            return container.appendingPathComponent("Analytics", isDirectory: true)
+           let root = try? AnalyticsStoragePaths.analyticsRoot(appGroupID: appGroupID) {
+            return root
         }
         return FileManager.default.temporaryDirectory
             .appendingPathComponent("VPNBridge-Analytics", isDirectory: true)
@@ -520,7 +702,10 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
     /// - Parameter profile: Active tunnel profile.
     private func makeLogger(profile: TunnelProfile) -> StructuredLogger {
         var sinks: [any LogSink] = [
-            OSLogSink(subsystem: "com.vpnbridge.tunnel", category: LogCategory.control.rawValue)
+            MinimumLevelLogSink(
+                minimumLevel: .warning,
+                sink: OSLogSink(subsystem: "com.vpnbridge.tunnel", category: LogCategory.control.rawValue)
+            )
         ]
 
         let rootProvider: any LogRootPathProvider
@@ -538,26 +723,9 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
             policy: JSONLRotationPolicy(maxBytesPerFile: 1_048_576, maxFiles: 8, maxTotalBytes: 8_388_608),
             eventQueueLabel: "tunnel"
         )
-        sinks.append(jsonSink)
+        sinks.append(MinimumLevelLogSink(minimumLevel: .notice, sink: jsonSink))
 
         return StructuredLogger(sink: FanoutLogSink(sinks: sinks))
-    }
-
-    /// Creates the extension-wide liveness monitor that observes provider path changes and emits heartbeats.
-    /// Decision: keep this outside the dataplane worker queue so liveness breadcrumbs still disappear when the provider itself wedges.
-    private func makeLivenessMonitor(
-        logger: StructuredLogger,
-        runId: String?,
-        sessionId: String?
-    ) -> ProviderLivenessMonitor {
-        ProviderLivenessMonitor(
-            logger: logger,
-            runId: runId,
-            sessionId: sessionId,
-            snapshotProvider: { [weak self] in
-                self?.livenessSnapshot() ?? .empty
-            }
-        )
     }
 
     /// Persists the most recent provider stop reason where host diagnostics can read it after disconnect.
@@ -568,15 +736,20 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
         // Docs: https://developer.apple.com/documentation/networkextension/nepackettunnelprovider/stoptunnel(with:completionhandler:)
         let providerConfig = (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration ?? [:]
         let profile = TunnelProfile.from(providerConfiguration: providerConfig)
-        let root = analyticsRootURL(appGroupID: profile.appGroupID)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
 
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.sortedKeys]
 
         let payload = try encoder.encode(makeStopRecord(for: reason))
-        try payload.write(to: root.appendingPathComponent("last-stop.json", isDirectory: false), options: .atomic)
+        let url: URL
+        if !profile.appGroupID.isEmpty {
+            url = try AnalyticsStoragePaths.lastStopURL(appGroupID: profile.appGroupID)
+        } else {
+            url = analyticsRootURL(appGroupID: profile.appGroupID)
+                .appendingPathComponent("last-stop.json", isDirectory: false)
+        }
+        try ProtectedAnalyticsFileIO.writeProtectedData(payload, to: url)
     }
 
     /// Converts the framework stop enum into a portable record shared with the host app.
@@ -649,26 +822,22 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
         runtime: TunnelRuntime,
         tunBridge: TunSocketBridge,
         socksServer: Socks5Server,
-        analyticsPipeline: PacketAnalyticsPipeline
+        telemetryWorker: PacketTelemetryWorker?
     ) {
         withState { state in
             state.logger = logger
             state.runtime = runtime
             state.tunBridge = tunBridge
             state.socksServer = socksServer
-            state.analyticsPipeline = analyticsPipeline
-            state.livenessMonitor = nil
+            state.telemetryWorker = telemetryWorker
+            state.cumulativeOutboundPackets = 0
+            state.cumulativeOutboundBytes = 0
+            state.cumulativeInboundPackets = 0
+            state.cumulativeInboundBytes = 0
+            state.lastHealthSampleAt = nil
             state.waitingForBackpressureRelief = false
             state.isStopping = false
             state.pendingOutbound.removeAll(keepingCapacity: false)
-        }
-    }
-
-    /// Installs the provider liveness monitor after runtime identifiers become available.
-    /// Preconditions: runtime/dataplane startup succeeded and the monitor has not started logging yet.
-    private func installLivenessMonitor(_ livenessMonitor: ProviderLivenessMonitor) {
-        withState { state in
-            state.livenessMonitor = livenessMonitor
         }
     }
 
@@ -687,29 +856,113 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                 runtime: state.runtime,
                 tunBridge: state.tunBridge,
                 socksServer: state.socksServer,
-                livenessMonitor: state.livenessMonitor
+                telemetryWorker: state.telemetryWorker
             )
             state.runtime = nil
             state.tunBridge = nil
             state.socksServer = nil
-            state.analyticsPipeline = nil
-            state.livenessMonitor = nil
+            state.telemetryWorker = nil
             return snapshot
         }
     }
 
-    /// Synchronously captures provider-owned liveness state for the heartbeat timer.
-    /// The snapshot intentionally avoids touching dataplane worker state so it remains safe under failure.
-    private func livenessSnapshot() -> ProviderLivenessMonitor.Snapshot {
-        withState { state in
-            ProviderLivenessMonitor.Snapshot(
-                isStopping: state.isStopping,
-                waitingForBackpressureRelief: state.waitingForBackpressureRelief,
-                pendingBatches: state.pendingOutbound.count,
-                pendingPackets: state.pendingOutbound.reduce(0) { $0 + $1.remainingPackets },
-                runtimeInstalled: state.runtime != nil,
-                socksServerInstalled: state.socksServer != nil,
-                bridgeInstalled: state.tunBridge != nil
+    /// Submits packet batches into the long-lived telemetry worker.
+    /// Decision: the provider stays synchronous on `ioQueue`, while one worker task handles parsing, throttling, and stream flushes.
+    private func schedulePacketTelemetryIngest(
+        _ telemetryWorker: PacketTelemetryWorker,
+        packets: [Data],
+        families: [Int32],
+        direction: PacketDirection,
+        logger: StructuredLogger
+    ) {
+        dispatchPrecondition(condition: .onQueue(ioQueue))
+
+        let admission = telemetryWorker.submit(packets: packets, families: families, direction: direction)
+        guard !admission.skipped else {
+            return
+        }
+        guard admission.accepted else {
+            if admission.shouldLogSheddingStart {
+                let batchBytes = packets.reduce(0) { $0 + $1.count }
+                Task {
+                    await logger.log(
+                        level: .warning,
+                        phase: .performance,
+                        category: .control,
+                        component: "PacketTunnelProviderShell",
+                        event: "packet-telemetry-shedding-started",
+                        result: "shed",
+                        message: "Packet intelligence entered bounded shed mode; see health samples for cumulative drop counts",
+                        metadata: [
+                            "direction": direction.rawValue,
+                            "batch_bytes": String(batchBytes),
+                            "dropped_batches": String(admission.droppedBatches),
+                            "inflight_batches": String(admission.queuedBatches),
+                            "inflight_bytes": String(admission.queuedBytes)
+                        ]
+                    )
+                }
+            }
+            return
+        }
+    }
+
+    /// Emits one low-rate health sample into the event log.
+    /// Decision: fleet telemetry should be periodic and cheap, not a separate persisted metrics subsystem.
+    private func emitHealthSampleIfNeeded(trigger: String, logger: StructuredLogger) {
+        dispatchPrecondition(condition: .onQueue(ioQueue))
+
+        let snapshot = withState { state -> (shouldEmit: Bool, metadata: [String: String]) in
+            let now = Date()
+            if let lastHealthSampleAt = state.lastHealthSampleAt,
+               now.timeIntervalSince(lastHealthSampleAt) < HealthSamplePolicy.minimumIntervalSeconds {
+                return (false, [:])
+            }
+
+            state.lastHealthSampleAt = now
+            let pendingPackets = state.pendingOutbound.reduce(0) { $0 + $1.remainingPackets }
+            let pendingBytes = state.pendingOutbound.reduce(0) { $0 + $1.remainingBytes }
+            let bridgeBackpressured = state.tunBridge?.isBackpressured() ?? false
+            let telemetrySnapshot = state.telemetryWorker?.snapshot()
+
+            return (
+                true,
+                [
+                    "trigger": trigger,
+                    "outbound_packets_total": String(state.cumulativeOutboundPackets),
+                    "outbound_bytes_total": String(state.cumulativeOutboundBytes),
+                    "inbound_packets_total": String(state.cumulativeInboundPackets),
+                    "inbound_bytes_total": String(state.cumulativeInboundBytes),
+                    "pending_outbound_packets": String(pendingPackets),
+                    "pending_outbound_bytes": String(pendingBytes),
+                    "bridge_backpressured": String(bridgeBackpressured),
+                    "waiting_for_backpressure_relief": String(state.waitingForBackpressureRelief),
+                    "packet_batches_accepted": String(telemetrySnapshot?.acceptedBatches ?? 0),
+                    "packet_batches_inflight": String(telemetrySnapshot?.queuedBatches ?? 0),
+                    "packet_bytes_inflight": String(telemetrySnapshot?.queuedBytes ?? 0),
+                    "packet_batches_dropped": String(telemetrySnapshot?.droppedBatches ?? 0),
+                    "packet_batches_skipped": String(telemetrySnapshot?.skippedBatches ?? 0),
+                    "packet_records_buffered": String(telemetrySnapshot?.bufferedRecords ?? 0),
+                    "thermal_state": TunnelThermalState(thermalState: telemetrySnapshot?.thermalState).rawValue,
+                    "low_power_mode_enabled": String(telemetrySnapshot?.lowPowerModeEnabled ?? false)
+                ]
+            )
+        }
+
+        guard snapshot.shouldEmit else {
+            return
+        }
+
+        Task {
+            await logger.log(
+                level: .notice,
+                phase: .performance,
+                category: .control,
+                component: "PacketTunnelProviderShell",
+                event: "health-sample",
+                result: "sampled",
+                message: "Periodic tunnel health sample",
+                metadata: snapshot.metadata
             )
         }
     }
@@ -862,10 +1115,24 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
     }
 
     /// Best-effort cleanup path used when startup fails after partial initialization.
-    private func cleanupAfterFailedStart() async {
-        let snapshot = takeCleanupSnapshot(markStopping: true)
+    /// Decision: startup can fail before freshly created components are published into shared provider state, so this
+    /// cleanup path must tear down both staged local resources and anything already installed.
+    private func cleanupAfterFailedStart(
+        startupTelemetryWorker: PacketTelemetryWorker? = nil,
+        startupSocksServer: Socks5Server? = nil,
+        startupBridge: TunSocketBridge? = nil
+    ) async {
+        if let startupTelemetryWorker {
+            await startupTelemetryWorker.stopAndWait()
+        }
+        startupBridge?.stop()
+        startupSocksServer?.stop()
 
-        snapshot.livenessMonitor?.stop()
+        let snapshot = takeCleanupSnapshot(markStopping: true)
+        if let telemetryWorker = snapshot.telemetryWorker {
+            await telemetryWorker.stopAndWait()
+        }
+
         snapshot.tunBridge?.stop()
         snapshot.socksServer?.stop()
         if let runtime = snapshot.runtime {

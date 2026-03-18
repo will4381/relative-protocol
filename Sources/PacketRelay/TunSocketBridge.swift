@@ -18,6 +18,9 @@ public final class TunSocketBridge: @unchecked Sendable {
     private let logger: StructuredLogger
     private let mtu: Int
     private let queue: DispatchQueue
+    private let lifecycleLock = NSLock()
+    private let queueSpecificKey = DispatchSpecificKey<UUID>()
+    private let queueSpecificValue = UUID()
     private let appFD: Int32
     public let engineFD: Int32
 
@@ -30,6 +33,7 @@ public final class TunSocketBridge: @unchecked Sendable {
     private let maxPendingBytes: Int
     private let backpressureThreshold: Int
     private var readBuffer: [UInt8]
+    private var isStopped = false
 
     public var onBackpressureRelieved: (@Sendable () -> Void)?
 
@@ -41,6 +45,7 @@ public final class TunSocketBridge: @unchecked Sendable {
         self.logger = logger
         self.mtu = max(256, mtu)
         self.queue = queue
+        queue.setSpecific(key: queueSpecificKey, value: queueSpecificValue)
         self.maxPendingBytes = max(4_194_304, self.mtu * 1024)
         self.backpressureThreshold = maxPendingBytes * 3 / 4
         self.readBuffer = [UInt8](repeating: 0, count: self.mtu + MemoryLayout<UInt32>.size)
@@ -131,26 +136,42 @@ public final class TunSocketBridge: @unchecked Sendable {
 
     /// Stops read/write sources and closes owned descriptors.
     public func stop() {
-        let source = readSource
+        let source: DispatchSourceRead?
+        let writeSource: DispatchSourceWrite?
+        let shouldResumeWriteSource: Bool
+
+        lifecycleLock.lock()
+        guard !isStopped else {
+            lifecycleLock.unlock()
+            return
+        }
+        isStopped = true
+        source = readSource
         readSource = nil
-        if let source {
-            source.cancel()
-        } else {
-            close(appFD)
-        }
+        writeSource = self.writeSource
+        self.writeSource = nil
+        shouldResumeWriteSource = writeSource != nil && !writeSourceActive
+        writeSourceActive = false
+        lifecycleLock.unlock()
 
-        if let writeSource {
-            if !writeSourceActive {
-                writeSource.resume()
-                writeSourceActive = true
+        performOnQueue {
+            if let source {
+                source.cancel()
+            } else {
+                close(appFD)
             }
-            writeSource.cancel()
-            self.writeSource = nil
-        }
 
-        pendingWrites.removeAll(keepingCapacity: false)
-        pendingBytes = 0
-        onBackpressureRelieved = nil
+            if let writeSource {
+                if shouldResumeWriteSource {
+                    writeSource.resume()
+                }
+                writeSource.cancel()
+            }
+
+            pendingWrites.removeAll(keepingCapacity: false)
+            pendingBytes = 0
+            onBackpressureRelieved = nil
+        }
         close(engineFD)
     }
 
@@ -370,6 +391,14 @@ public final class TunSocketBridge: @unchecked Sendable {
                 ]
                 return writev(appFD, &iov, Int32(iov.count))
             }
+        }
+    }
+
+    private func performOnQueue(_ work: () -> Void) {
+        if DispatchQueue.getSpecific(key: queueSpecificKey) == queueSpecificValue {
+            work()
+        } else {
+            queue.sync(execute: work)
         }
     }
 }

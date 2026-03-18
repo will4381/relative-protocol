@@ -1,217 +1,504 @@
 import Foundation
-import Observability
 import TunnelRuntime
 
-/// Runtime analytics pipeline that parses packets, tracks flows/bursts, and emits bounded packet samples.
-/// Actor ownership: all parsing side effects and rolling insight buffers are serialized here.
+/// Runtime packet pipeline that favors detector-friendly flow and burst events over rich per-packet logging.
+/// Actor ownership: packet parsing, flow state, burst tracking, and metadata caches are serialized here.
 public actor PacketAnalyticsPipeline {
+    private enum FlowCachePolicy {
+        static let maxTrackedFlows = 2_048
+        static let flowTTLSeconds: TimeInterval = 120
+        static let evictionSweepIntervalSeconds: TimeInterval = 15
+        static let arrivalQueueCompactionThreshold = 128
+    }
+
+    /// Emission policy applied by the long-lived telemetry worker.
+    /// Decision: always-on capture stays cheap, while richer metadata and activity samples are reduced as thermal pressure rises.
+    public struct EmissionPolicy: Sendable {
+        public let allowDeepMetadata: Bool
+        public let maxMetadataProbesPerBatch: Int
+        public let activitySampleMinimumPackets: Int
+        public let activitySampleMinimumBytes: Int
+        public let activitySampleMinimumInterval: TimeInterval
+        public let emitBurstEvents: Bool
+        public let emitActivitySamples: Bool
+
+        public init(
+            allowDeepMetadata: Bool,
+            maxMetadataProbesPerBatch: Int,
+            activitySampleMinimumPackets: Int,
+            activitySampleMinimumBytes: Int,
+            activitySampleMinimumInterval: TimeInterval,
+            emitBurstEvents: Bool,
+            emitActivitySamples: Bool
+        ) {
+            self.allowDeepMetadata = allowDeepMetadata
+            self.maxMetadataProbesPerBatch = max(0, maxMetadataProbesPerBatch)
+            self.activitySampleMinimumPackets = max(1, activitySampleMinimumPackets)
+            self.activitySampleMinimumBytes = max(1, activitySampleMinimumBytes)
+            self.activitySampleMinimumInterval = max(0, activitySampleMinimumInterval)
+            self.emitBurstEvents = emitBurstEvents
+            self.emitActivitySamples = emitActivitySamples
+        }
+    }
+
+    private struct FlowContext: Sendable {
+        var registrableDomain: String?
+        var dnsQueryName: String?
+        var dnsCname: String?
+        var dnsAnswerAddresses: [String]?
+        var tlsServerName: String?
+        var quicVersion: UInt32?
+        var quicPacketType: String?
+        var quicDestinationConnectionId: String?
+        var quicSourceConnectionId: String?
+        var classification: String?
+        var lastSeen: Date
+        var hasEmittedFlowOpen = false
+        var lastMetadataFingerprint: UInt64?
+        var lastActivityEmissionAt: Date?
+        var totalPacketCount = 0
+        var totalByteCount = 0
+        var windowPacketCount = 0
+        var windowByteCount = 0
+        var currentBurstPacketCount = 0
+        var currentBurstByteCount = 0
+    }
+
     private let clock: any Clock
-    private let flowTracker: FlowTracker
     private let burstTracker: BurstTracker
     private let signatureClassifier: SignatureClassifier
-    private let packetStream: PacketSampleStream?
-    private let metricsStore: MetricsStore?
-    private let logger: StructuredLogger
 
-    private var recentInsights: MetricsRingBuffer<PacketInsight>
+    private var flowContexts: [FlowKey: FlowContext] = [:]
+    private var flowContextArrivalQueue: ArraySlice<FlowKey> = []
+    private var lastFlowContextSweepAt: Date?
 
     /// - Parameters:
     ///   - clock: Time source used for deterministic timestamps.
-    ///   - flowTracker: Bounded flow tracker for per-flow aggregation.
-    ///   - burstTracker: Burst detector keyed by flow.
+    ///   - burstTracker: Burst detector keyed by stable flow identity.
     ///   - signatureClassifier: Domain classifier for packet-level labeling.
-    ///   - packetStream: Optional NDJSON packet sample stream sink.
-    ///   - metricsStore: Optional metrics sink for aggregated counters.
-    ///   - logger: Structured logger for analytics and storage errors.
-    ///   - insightCapacity: Max in-memory retained packet insights.
     public init(
         clock: any Clock,
-        flowTracker: FlowTracker,
         burstTracker: BurstTracker,
-        signatureClassifier: SignatureClassifier,
-        packetStream: PacketSampleStream?,
-        metricsStore: MetricsStore?,
-        logger: StructuredLogger,
-        insightCapacity: Int = 1024
+        signatureClassifier: SignatureClassifier
     ) {
         self.clock = clock
-        self.flowTracker = flowTracker
         self.burstTracker = burstTracker
         self.signatureClassifier = signatureClassifier
-        self.packetStream = packetStream
-        self.metricsStore = metricsStore
-        self.logger = logger
-        self.recentInsights = MetricsRingBuffer(capacity: insightCapacity)
     }
 
-    /// Ingests a packet batch and updates flow/burst/classification artifacts.
+    /// Ingests a packet batch and returns compact detector-facing records.
+    /// Decision: the tunnel emits a sparse event stream (`flowOpen`, `metadata`, `burst`, `activitySample`)
+    /// instead of serializing a rich `PacketSample` for every admitted packet.
     /// - Parameters:
     ///   - packets: Raw packet payloads.
     ///   - families: Optional family hints aligned by packet index.
-    ///   - direction: Packet direction relative to tunnel interface.
-    public func ingest(packets: [Data], families: [Int32], direction: PacketDirection) async {
+    ///   - summaries: Optional precomputed fast-path summaries aligned by packet index.
+    ///   - direction: Packet direction relative to the tunnel interface.
+    ///   - policy: Thermal-aware emission policy chosen by the worker.
+    /// - Returns: Compact live-tap records ready for the rolling in-memory tap.
+    func ingest(
+        packets: [Data],
+        families: [Int32],
+        summaries: [FastPacketSummary]? = nil,
+        direction: PacketDirection,
+        policy: EmissionPolicy
+    ) async -> [PacketSampleStream.PacketStreamRecord] {
         guard !packets.isEmpty else {
-            return
+            return []
         }
 
         let now = await clock.now()
-        var batchBytes = 0
-        var parsedCount = 0
+        maybeEvictExpiredFlowContexts(now: now)
+
+        var records: [PacketSampleStream.PacketStreamRecord] = []
+        records.reserveCapacity(min(packets.count, 64))
+
+        var metadataProbesRemaining = policy.maxMetadataProbesPerBatch
 
         for (index, packet) in packets.enumerated() {
             let familyHint: Int32? = families.indices.contains(index) ? families[index] : nil
-            guard let metadata = PacketParser.parse(packet, ipVersionHint: familyHint) else {
+            let summary: FastPacketSummary
+            if let summaries, summaries.indices.contains(index) {
+                summary = summaries[index]
+            } else {
+                guard let parsed = FastPacketSummary(data: packet, ipVersionHint: familyHint) else {
+                    continue
+                }
+                summary = parsed
+            }
+
+            let shouldTrackForTelemetry = shouldTrackForTelemetry(summary: summary)
+            guard shouldTrackForTelemetry else {
                 continue
             }
 
-            parsedCount += 1
-            batchBytes += metadata.length
+            let allowMetadataProbe = policy.allowDeepMetadata &&
+                metadataProbesRemaining > 0
 
-            let flow = FlowKey(
-                src: flowAddress(address: metadata.srcAddress, port: metadata.srcPort),
-                dst: flowAddress(address: metadata.dstAddress, port: metadata.dstPort),
-                proto: String(metadata.transport.rawValue)
-            )
-            await flowTracker.record(flow: flow, bytes: metadata.length, now: now)
-            let burst = await burstTracker.recordPacket(flow: flow, now: now)
+            let flow = summary.flowKey
+            let isNewFlow = flowContexts[flow] == nil
+            var context = flowContexts[flow] ?? makeFlowContext(for: summary, now: now)
+            context.lastSeen = now
 
-            let hostCandidate = metadata.tlsServerName
-                ?? metadata.dnsCname
-                ?? metadata.dnsQueryName
-                ?? metadata.registrableDomain
-            let classification = await signatureClassifier.classify(host: hostCandidate ?? "")
-
-            let insight = PacketInsight(
-                timestamp: now,
-                direction: direction,
-                metadata: metadata,
-                classification: classification,
-                burst: burst
-            )
-            recentInsights.append(insight)
-
-            if let packetStream {
-                do {
-                    try await packetStream.append(
-                        PacketSample(
+            if let burst = burstTracker.recordPacket(flow: flow, now: now) {
+                if policy.emitBurstEvents, context.currentBurstPacketCount > 0 {
+                    records.append(
+                        makeRecord(
+                            kind: .burst,
                             timestamp: now,
-                            direction: direction.rawValue,
-                            flowId: flowId(flow),
-                            bytes: metadata.length,
-                            protocolHint: protocolHint(metadata)
+                            direction: direction,
+                            summary: summary,
+                            flowContext: context,
+                            bytes: context.currentBurstByteCount,
+                            packetCount: burst.packetCount,
+                            burstDurationMs: burst.burstDurationMs,
+                            burstPacketCount: burst.packetCount
                         )
                     )
-                } catch {
-                    await logger.log(
-                        level: .warning,
-                        phase: .storage,
-                        category: .analyticsMetrics,
-                        component: "PacketAnalyticsPipeline",
-                        event: "packet-stream-write-failed",
-                        errorCode: String(describing: error),
-                        message: "Failed to append packet sample"
+                }
+                context.currentBurstPacketCount = 0
+                context.currentBurstByteCount = 0
+            }
+
+            context.totalPacketCount += 1
+            context.totalByteCount += summary.packetLength
+            context.windowPacketCount += 1
+            context.windowByteCount += summary.packetLength
+            context.currentBurstPacketCount += 1
+            context.currentBurstByteCount += summary.packetLength
+
+            mergeCheapMetadata(into: &context, summary: summary)
+
+            if !context.hasEmittedFlowOpen {
+                records.append(
+                    makeRecord(
+                        kind: .flowOpen,
+                        timestamp: now,
+                        direction: direction,
+                        summary: summary,
+                        flowContext: context,
+                        bytes: summary.packetLength,
+                        packetCount: 1
                     )
+                )
+                context.hasEmittedFlowOpen = true
+            }
+
+            if allowMetadataProbe,
+               shouldProbeDeepMetadata(summary: summary, flowContext: context) {
+                if let deepMetadata = PacketParser.parse(packet, ipVersionHint: familyHint) {
+                    metadataProbesRemaining -= 1
+                    let previousFingerprint = context.lastMetadataFingerprint
+                    await mergeDeepMetadata(into: &context, metadata: deepMetadata)
+                    let nextFingerprint = metadataFingerprint(for: context)
+                    if nextFingerprint != previousFingerprint {
+                        context.lastMetadataFingerprint = nextFingerprint
+                        records.append(
+                            makeRecord(
+                                kind: .metadata,
+                                timestamp: now,
+                                direction: direction,
+                                summary: summary,
+                                flowContext: context,
+                                bytes: summary.packetLength,
+                                packetCount: 1
+                            )
+                        )
+                    }
                 }
             }
 
-            if metadata.dnsQueryName != nil || metadata.dnsCname != nil || metadata.tlsServerName != nil {
-                await logger.log(
-                    level: .debug,
-                    phase: metadata.dnsQueryName == nil && metadata.dnsCname == nil ? .analytics : .dns,
-                    category: .analyticsClassifier,
-                    component: "PacketAnalyticsPipeline",
-                    event: "packet-insight",
-                    flowId: flowId(flow),
-                    message: "Parsed packet metadata",
-                    metadata: insightMetadata(insight)
+            if shouldEmitActivitySample(context: context, now: now, policy: policy) {
+                records.append(
+                    makeRecord(
+                        kind: .activitySample,
+                        timestamp: now,
+                        direction: direction,
+                        summary: summary,
+                        flowContext: context,
+                        bytes: context.windowByteCount,
+                        packetCount: context.windowPacketCount
+                    )
                 )
+                context.windowPacketCount = 0
+                context.windowByteCount = 0
+                context.lastActivityEmissionAt = now
+            }
+
+            flowContexts[flow] = context
+            if isNewFlow {
+                flowContextArrivalQueue.append(flow)
             }
         }
 
-        if let metricsStore {
-            await metricsStore.append(
-                MetricRecord(
-                    name: direction == .outbound ? "packet.outbound.count" : "packet.inbound.count",
-                    value: Double(parsedCount),
-                    timestamp: now
-                )
-            )
-            await metricsStore.append(
-                MetricRecord(
-                    name: direction == .outbound ? "packet.outbound.bytes" : "packet.inbound.bytes",
-                    value: Double(batchBytes),
-                    timestamp: now
-                )
-            )
+        trimOverflowFlowContextsIfNeeded()
+        return records
+    }
+
+    /// Returns `true` when a packet is worth tracking for burst/activity detection.
+    /// Decision: pure TCP ACK traffic is ignored because it adds a lot of heat without improving detector signal.
+    private func shouldTrackForTelemetry(summary: FastPacketSummary) -> Bool {
+        switch summary.transport {
+        case .tcp:
+            return summary.hasTransportPayload || summary.isTCPControlSignal
+        case .udp:
+            return summary.hasTransportPayload
+        case .icmp, .icmpv6:
+            return true
+        default:
+            return summary.packetLength > 0
         }
     }
 
-    /// Returns current in-memory packet insight snapshot.
-    public func latestInsights() -> [PacketInsight] {
-        recentInsights.snapshot()
+    private func makeFlowContext(for summary: FastPacketSummary, now: Date) -> FlowContext {
+        FlowContext(
+            registrableDomain: nil,
+            dnsQueryName: nil,
+            dnsCname: nil,
+            dnsAnswerAddresses: nil,
+            tlsServerName: nil,
+            quicVersion: summary.quicVersion,
+            quicPacketType: summary.quicPacketType?.rawValue,
+            quicDestinationConnectionId: Self.hexString(summary.quicDestinationConnectionID),
+            quicSourceConnectionId: Self.hexString(summary.quicSourceConnectionID),
+            classification: nil,
+            lastSeen: now
+        )
     }
 
-    private func flowAddress(address: IPAddress, port: UInt16?) -> String {
-        if let port {
-            return "\(address.stringValue):\(port)"
+    private func mergeCheapMetadata(into flowContext: inout FlowContext, summary: FastPacketSummary) {
+        if flowContext.quicVersion == nil {
+            flowContext.quicVersion = summary.quicVersion
         }
-        return address.stringValue
+        if flowContext.quicPacketType == nil {
+            flowContext.quicPacketType = summary.quicPacketType?.rawValue
+        }
+        if flowContext.quicDestinationConnectionId == nil {
+            flowContext.quicDestinationConnectionId = Self.hexString(summary.quicDestinationConnectionID)
+        }
+        if flowContext.quicSourceConnectionId == nil {
+            flowContext.quicSourceConnectionId = Self.hexString(summary.quicSourceConnectionID)
+        }
     }
 
-    private func flowId(_ flow: FlowKey) -> String {
-        let input = "\(flow.src)|\(flow.dst)|\(flow.proto)"
+    private func shouldProbeDeepMetadata(summary: FastPacketSummary, flowContext: FlowContext) -> Bool {
+        if summary.isDNSCandidate {
+            return true
+        }
+        if summary.isTLSClientHelloCandidate && flowContext.tlsServerName == nil {
+            return true
+        }
+        if summary.isQUICInitialCandidate && flowContext.tlsServerName == nil {
+            return true
+        }
+        return false
+    }
+
+    private func mergeDeepMetadata(into flowContext: inout FlowContext, metadata: PacketMetadata) async {
+        if let registrableDomain = metadata.registrableDomain, !registrableDomain.isEmpty {
+            flowContext.registrableDomain = registrableDomain
+        }
+        if let dnsQueryName = metadata.dnsQueryName, !dnsQueryName.isEmpty {
+            flowContext.dnsQueryName = dnsQueryName
+        }
+        if let dnsCname = metadata.dnsCname, !dnsCname.isEmpty {
+            flowContext.dnsCname = dnsCname
+        }
+        if let dnsAnswerAddresses = metadata.dnsAnswerAddresses, !dnsAnswerAddresses.isEmpty {
+            flowContext.dnsAnswerAddresses = dnsAnswerAddresses.map(\.stringValue)
+        }
+        if let tlsServerName = metadata.tlsServerName, !tlsServerName.isEmpty {
+            flowContext.tlsServerName = tlsServerName
+        }
+        if let quicVersion = metadata.quicVersion {
+            flowContext.quicVersion = quicVersion
+        }
+        if let quicPacketType = metadata.quicPacketType?.rawValue {
+            flowContext.quicPacketType = quicPacketType
+        }
+        if let quicDestinationConnectionId = metadata.quicDestinationConnectionId, !quicDestinationConnectionId.isEmpty {
+            flowContext.quicDestinationConnectionId = quicDestinationConnectionId
+        }
+        if let quicSourceConnectionId = metadata.quicSourceConnectionId, !quicSourceConnectionId.isEmpty {
+            flowContext.quicSourceConnectionId = quicSourceConnectionId
+        }
+
+        let hostCandidate = metadata.tlsServerName
+            ?? metadata.dnsCname
+            ?? metadata.dnsQueryName
+            ?? metadata.registrableDomain
+        if let hostCandidate, !hostCandidate.isEmpty {
+            flowContext.classification = await signatureClassifier.classify(host: hostCandidate)
+        }
+    }
+
+    private func shouldEmitActivitySample(context: FlowContext, now: Date, policy: EmissionPolicy) -> Bool {
+        guard policy.emitActivitySamples else {
+            return false
+        }
+
+        if context.windowPacketCount >= policy.activitySampleMinimumPackets {
+            return true
+        }
+        if context.windowByteCount >= policy.activitySampleMinimumBytes {
+            return true
+        }
+        if let lastActivityEmissionAt = context.lastActivityEmissionAt {
+            return now.timeIntervalSince(lastActivityEmissionAt) >= policy.activitySampleMinimumInterval
+        }
+        return context.windowPacketCount > 0 && policy.activitySampleMinimumInterval == 0
+    }
+
+    private func metadataFingerprint(for flowContext: FlowContext) -> UInt64 {
         var hash: UInt64 = 14_695_981_039_346_656_037
-        for byte in input.utf8 {
-            hash ^= UInt64(byte)
+        func mix(_ value: String?) {
+            guard let value else { return }
+            for byte in value.utf8 {
+                hash ^= UInt64(byte)
+                hash &*= 1_099_511_628_211
+            }
+        }
+        func mix(_ values: [String]?) {
+            guard let values else { return }
+            for value in values {
+                mix(value)
+            }
+        }
+
+        mix(flowContext.registrableDomain)
+        mix(flowContext.dnsQueryName)
+        mix(flowContext.dnsCname)
+        mix(flowContext.dnsAnswerAddresses)
+        mix(flowContext.tlsServerName)
+        mix(flowContext.quicPacketType)
+        mix(flowContext.quicDestinationConnectionId)
+        mix(flowContext.quicSourceConnectionId)
+        mix(flowContext.classification)
+        if let quicVersion = flowContext.quicVersion {
+            hash ^= UInt64(quicVersion)
             hash &*= 1_099_511_628_211
         }
-
-        let hex = String(hash, radix: 16, uppercase: false)
-        if hex.count >= 16 {
-            return hex
-        }
-        return String(repeating: "0", count: 16 - hex.count) + hex
+        return hash
     }
 
-    private func protocolHint(_ metadata: PacketMetadata) -> String {
-        switch metadata.transport {
-        case .tcp:
-            return "tcp"
-        case .udp:
-            return "udp"
-        default:
-            return "ip"
-        }
+    private func makeRecord(
+        kind: PacketSampleKind,
+        timestamp: Date,
+        direction: PacketDirection,
+        summary: FastPacketSummary,
+        flowContext: FlowContext,
+        bytes: Int,
+        packetCount: Int,
+        burstDurationMs: Int? = nil,
+        burstPacketCount: Int? = nil
+    ) -> PacketSampleStream.PacketStreamRecord {
+        PacketSampleStream.PacketStreamRecord(
+            kind: kind,
+            timestamp: timestamp,
+            direction: direction.rawValue,
+            bytes: bytes,
+            packetCount: packetCount,
+            flowPacketCount: flowContext.totalPacketCount,
+            flowByteCount: flowContext.totalByteCount,
+            protocolHint: summary.protocolHint,
+            ipVersion: summary.ipVersion,
+            transportProtocolNumber: summary.transportProtocolNumber,
+            sourcePort: summary.hasPorts ? summary.sourcePort : nil,
+            destinationPort: summary.hasPorts ? summary.destinationPort : nil,
+            flowHash: summary.flowHash,
+            textFlowId: nil,
+            sourceAddressLength: summary.sourceAddressLength,
+            sourceAddressHigh: summary.sourceAddressHigh,
+            sourceAddressLow: summary.sourceAddressLow,
+            destinationAddressLength: summary.destinationAddressLength,
+            destinationAddressHigh: summary.destinationAddressHigh,
+            destinationAddressLow: summary.destinationAddressLow,
+            textSourceAddress: nil,
+            textDestinationAddress: nil,
+            registrableDomain: flowContext.registrableDomain,
+            dnsQueryName: flowContext.dnsQueryName,
+            dnsCname: flowContext.dnsCname,
+            dnsAnswerAddresses: flowContext.dnsAnswerAddresses,
+            tlsServerName: flowContext.tlsServerName,
+            quicVersion: flowContext.quicVersion,
+            quicPacketType: flowContext.quicPacketType,
+            quicDestinationConnectionId: flowContext.quicDestinationConnectionId,
+            quicSourceConnectionId: flowContext.quicSourceConnectionId,
+            classification: flowContext.classification,
+            burstDurationMs: burstDurationMs,
+            burstPacketCount: burstPacketCount
+        )
     }
 
-    private func insightMetadata(_ insight: PacketInsight) -> [String: String] {
-        var metadata: [String: String] = [
-            "ip_version": String(insight.metadata.ipVersion.rawValue),
-            "transport": String(insight.metadata.transport.rawValue),
-            "length": String(insight.metadata.length)
-        ]
-        if let dns = insight.metadata.dnsQueryName {
-            metadata["dns_query"] = dns
+    /// Decision: flow-context cleanup is amortized because sweeping a large dictionary on every batch adds heat
+    /// without improving detector quality.
+    private func maybeEvictExpiredFlowContexts(now: Date) {
+        if let lastFlowContextSweepAt,
+           now.timeIntervalSince(lastFlowContextSweepAt) < FlowCachePolicy.evictionSweepIntervalSeconds,
+           flowContexts.count < FlowCachePolicy.maxTrackedFlows {
+            return
         }
-        if let cname = insight.metadata.dnsCname {
-            metadata["dns_cname"] = cname
+
+        lastFlowContextSweepAt = now
+        let expiredFlows = flowContexts.compactMap { flow, context in
+            now.timeIntervalSince(context.lastSeen) > FlowCachePolicy.flowTTLSeconds ? flow : nil
         }
-        if let sni = insight.metadata.tlsServerName {
-            metadata["tls_sni"] = sni
+        for flow in expiredFlows {
+            flowContexts.removeValue(forKey: flow)
         }
-        if let quicVersion = insight.metadata.quicVersion {
-            metadata["quic_version"] = String(quicVersion)
+        pruneFlowContextArrivalQueueIfNeeded(force: !expiredFlows.isEmpty)
+    }
+
+    private func trimOverflowFlowContextsIfNeeded() {
+        guard flowContexts.count > FlowCachePolicy.maxTrackedFlows else {
+            return
         }
-        if let quicType = insight.metadata.quicPacketType {
-            metadata["quic_packet_type"] = quicType.rawValue
+
+        pruneFlowContextArrivalQueueIfNeeded(force: true)
+
+        while flowContexts.count > FlowCachePolicy.maxTrackedFlows {
+            if let candidate = flowContextArrivalQueue.popFirst() {
+                guard flowContexts.removeValue(forKey: candidate) != nil else {
+                    continue
+                }
+            } else if let fallback = flowContexts.keys.first {
+                // Decision: this should stay cold because the arrival queue is the primary eviction path.
+                // If the queue is unexpectedly empty, removing any active flow is cheaper than re-sorting the actor state.
+                flowContexts.removeValue(forKey: fallback)
+            } else {
+                break
+            }
         }
-        if let classification = insight.classification {
-            metadata["classification"] = classification
+
+        pruneFlowContextArrivalQueueIfNeeded()
+    }
+
+    private func pruneFlowContextArrivalQueueIfNeeded(force: Bool = false) {
+        let queueLimit = max(FlowCachePolicy.maxTrackedFlows * 4, 256)
+        guard force ||
+                flowContextArrivalQueue.startIndex > FlowCachePolicy.arrivalQueueCompactionThreshold ||
+                flowContextArrivalQueue.count > queueLimit else {
+            return
         }
-        if let burst = insight.burst {
-            metadata["burst_duration_ms"] = String(burst.burstDurationMs)
-            metadata["burst_packet_count"] = String(burst.packetCount)
+
+        var seen: Set<FlowKey> = []
+        var activeQueue: [FlowKey] = []
+        activeQueue.reserveCapacity(min(flowContexts.count, FlowCachePolicy.maxTrackedFlows))
+
+        for flow in flowContextArrivalQueue {
+            guard flowContexts[flow] != nil, seen.insert(flow).inserted else {
+                continue
+            }
+            activeQueue.append(flow)
         }
-        return metadata
+
+        flowContextArrivalQueue = ArraySlice(activeQueue)
+    }
+
+    private static func hexString(_ data: Data?) -> String? {
+        guard let data, !data.isEmpty else {
+            return nil
+        }
+        return data.map { String(format: "%02x", $0) }.joined()
     }
 }

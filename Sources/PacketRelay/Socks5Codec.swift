@@ -2,21 +2,21 @@ import Darwin
 import Foundation
 
 /// SOCKS5 command byte values from RFC 1928.
-public enum Socks5Command: UInt8 {
+public enum Socks5Command: UInt8, Sendable {
     case connect = 0x01
     case bind = 0x02
     case udpAssociate = 0x03
 }
 
 /// SOCKS5 target address representation.
-public enum Socks5Address: Hashable {
+public enum Socks5Address: Hashable, Sendable {
     case ipv4(String)
     case ipv6(String)
     case domain(String)
 }
 
 /// Parsed SOCKS5 request message.
-public struct Socks5Request: Hashable {
+public struct Socks5Request: Hashable, Sendable {
     public let command: Socks5Command
     public let address: Socks5Address
     public let port: UInt16
@@ -33,7 +33,7 @@ public struct Socks5Request: Hashable {
 }
 
 /// Parsed SOCKS5 UDP ASSOCIATE datagram.
-public struct Socks5UDPPacket: Hashable {
+public struct Socks5UDPPacket: Hashable, Sendable {
     public let address: Socks5Address
     public let port: UInt16
     public let payload: Data

@@ -34,11 +34,19 @@ public struct SignatureDocument: Codable, Sendable, Equatable {
 
 /// Signature classifier with on-demand reload and in-memory cache.
 public actor SignatureClassifier {
+    private struct CompiledSignature: Sendable, Equatable {
+        let label: String
+        let domains: [String]
+    }
+
     private let logger: StructuredLogger
     private let decoder: JSONDecoder
+    private let maxCachedLookups = 4_096
 
     private var cache: SignatureDocument?
     private var cacheURL: URL?
+    private var compiledSignatures: [CompiledSignature] = []
+    private var classificationCache: [String: String?] = [:]
 
     /// Creates a classifier with an empty in-memory cache.
     /// - Parameter logger: Structured logger used for reload events and errors.
@@ -56,6 +64,13 @@ public actor SignatureClassifier {
         let document = try decoder.decode(SignatureDocument.self, from: payload)
         cache = document
         cacheURL = url
+        compiledSignatures = document.signatures.map { signature in
+            CompiledSignature(
+                label: signature.label,
+                domains: signature.domains.map { $0.lowercased() }
+            )
+        }
+        classificationCache.removeAll(keepingCapacity: false)
         await logger.log(
             level: .info,
             phase: .config,
@@ -74,25 +89,22 @@ public actor SignatureClassifier {
     /// - Parameter host: Hostname to classify.
     /// - Returns: Matching label, or `nil` when no signature matches.
     public func classify(host: String) -> String? {
-        guard let cache else {
+        guard cache != nil else {
             return nil
         }
         let normalized = host.lowercased()
-        for signature in cache.signatures {
-            if signature.domains.contains(where: { normalized.hasSuffix($0.lowercased()) }) {
-                return signature.label
-            }
+        if let cached = classificationCache[normalized] {
+            return cached
         }
-        return nil
-    }
 
-    /// Returns the currently cached signature document, if loaded.
-    public func cachedDocument() -> SignatureDocument? {
-        cache
-    }
+        let classification = compiledSignatures.first { signature in
+            signature.domains.contains(where: normalized.hasSuffix)
+        }?.label
 
-    /// Returns the filesystem path of the currently loaded signature document.
-    public func cachedSourcePath() -> String? {
-        cacheURL?.path
+        if classificationCache.count >= maxCachedLookups {
+            classificationCache.removeAll(keepingCapacity: true)
+        }
+        classificationCache[normalized] = classification
+        return classification
     }
 }

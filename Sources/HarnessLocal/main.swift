@@ -26,7 +26,6 @@ private func runHarness() async -> Int32 {
         let output = [
             "scenario": result.scenarioID,
             "state": result.runtimeState.rawValue,
-            "metrics": String(result.metricsCount),
             "packets": String(result.packetCount)
         ]
         print(output)

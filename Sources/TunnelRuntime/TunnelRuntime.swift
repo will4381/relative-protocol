@@ -167,7 +167,7 @@ public actor TunnelRuntime {
         state
     }
 
-    /// Returns a runtime snapshot suitable for diagnostics and metrics sinks.
+    /// Returns a runtime snapshot suitable for diagnostics and lightweight health sampling.
     public func currentSnapshot() async -> RuntimeSnapshot {
         let setupLatency = await setupLatencyMs()
         return RuntimeSnapshot(

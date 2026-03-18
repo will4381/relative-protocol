@@ -4,7 +4,7 @@ import PacketRelay
 /// Decoded provider configuration used by extension startup.
 /// Invariant: values are pre-normalized with safe defaults for missing keys.
 public struct TunnelProfile: Sendable, Equatable {
-    /// App Group identifier used for shared storage (logs, metrics, signatures).
+    /// App Group identifier used for shared storage (logs, signatures, detections, stop records).
     public let appGroupID: String
     /// Remote address required by `NEPacketTunnelNetworkSettings`.
     public let tunnelRemoteAddress: String
@@ -20,8 +20,9 @@ public struct TunnelProfile: Sendable, Equatable {
     public let dnsServers: [String]
     public let engineSocksPort: UInt16
     public let engineLogLevel: String
-    public let packetStreamEnabled: Bool
-    public let packetStreamMaxBytes: Int
+    public let telemetryEnabled: Bool
+    public let liveTapEnabled: Bool
+    public let liveTapMaxBytes: Int
     public let signatureFileName: String
     public let relayEndpoint: RelayEndpoint
     public let dataplaneConfigJSON: String
@@ -40,8 +41,9 @@ public struct TunnelProfile: Sendable, Equatable {
     ///   - dnsServers: DNS servers pushed to the tunnel interface.
     ///   - engineSocksPort: Local SOCKS server listen port.
     ///   - engineLogLevel: Dataplane log level hint.
-    ///   - packetStreamEnabled: Enables packet sample stream persistence.
-    ///   - packetStreamMaxBytes: Max packet stream size before truncation.
+    ///   - telemetryEnabled: Enables sparse analytics and detector execution inside the tunnel extension.
+    ///   - liveTapEnabled: Enables the live rolling packet tap used for foreground snapshots.
+    ///   - liveTapMaxBytes: Approximate memory budget for the live rolling packet tap.
     ///   - signatureFileName: Signature filename loaded by classifier.
     ///   - relayEndpoint: Upstream relay endpoint metadata.
     ///   - dataplaneConfigJSON: Dataplane config template or raw config.
@@ -58,8 +60,9 @@ public struct TunnelProfile: Sendable, Equatable {
         dnsServers: [String],
         engineSocksPort: UInt16,
         engineLogLevel: String,
-        packetStreamEnabled: Bool,
-        packetStreamMaxBytes: Int,
+        telemetryEnabled: Bool,
+        liveTapEnabled: Bool,
+        liveTapMaxBytes: Int,
         signatureFileName: String,
         relayEndpoint: RelayEndpoint,
         dataplaneConfigJSON: String
@@ -76,8 +79,9 @@ public struct TunnelProfile: Sendable, Equatable {
         self.dnsServers = dnsServers
         self.engineSocksPort = engineSocksPort
         self.engineLogLevel = engineLogLevel
-        self.packetStreamEnabled = packetStreamEnabled
-        self.packetStreamMaxBytes = packetStreamMaxBytes
+        self.telemetryEnabled = telemetryEnabled
+        self.liveTapEnabled = liveTapEnabled
+        self.liveTapMaxBytes = liveTapMaxBytes
         self.signatureFileName = signatureFileName
         self.relayEndpoint = relayEndpoint
         self.dataplaneConfigJSON = dataplaneConfigJSON
@@ -103,8 +107,9 @@ public struct TunnelProfile: Sendable, Equatable {
             dnsServers: providerConfiguration["dnsServers"] as? [String] ?? ["1.1.1.1"],
             engineSocksPort: uint16(providerConfiguration["engineSocksPort"], default: 1080),
             engineLogLevel: providerConfiguration["engineLogLevel"] as? String ?? "warn",
-            packetStreamEnabled: bool(providerConfiguration["packetStreamEnabled"], default: false),
-            packetStreamMaxBytes: int(providerConfiguration["packetStreamMaxBytes"], default: 5_000_000),
+            telemetryEnabled: bool(providerConfiguration["telemetryEnabled"], default: true),
+            liveTapEnabled: bool(providerConfiguration["liveTapEnabled"], default: false),
+            liveTapMaxBytes: int(providerConfiguration["liveTapMaxBytes"], default: 5_000_000),
             signatureFileName: providerConfiguration["signatureFileName"] as? String ?? "app_signatures.json",
             relayEndpoint: RelayEndpoint(host: relayHost, port: relayPort, useUDP: useUDP),
             dataplaneConfigJSON: providerConfiguration["dataplaneConfigJSON"] as? String ?? "{}"

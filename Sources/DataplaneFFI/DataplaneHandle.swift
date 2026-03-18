@@ -10,6 +10,21 @@ private final class CallbackBox {
     }
 }
 
+private final class ManagedHandle: @unchecked Sendable {
+    let rawHandle: OpaquePointer
+    private let callbackToken: Unmanaged<CallbackBox>
+
+    init(rawHandle: OpaquePointer, callbackToken: Unmanaged<CallbackBox>) {
+        self.rawHandle = rawHandle
+        self.callbackToken = callbackToken
+    }
+
+    deinit {
+        rp_dp_destroy(rawHandle)
+        callbackToken.release()
+    }
+}
+
 private func bridgeLogCallback(message: UnsafePointer<CChar>?, userCtx: UnsafeMutableRawPointer?) {
     guard let userCtx else {
         return
@@ -29,8 +44,7 @@ private func bridgeStateCallback(state: UInt32, userCtx: UnsafeMutableRawPointer
 
 /// Actor wrapper around the C dataplane handle lifecycle and version guard.
 public actor DataplaneHandle {
-    private var rawHandle: OpaquePointer?
-    private let callbackToken: Unmanaged<CallbackBox>
+    private var managedHandle: ManagedHandle?
     private let logger: StructuredLogger
 
     /// Validates runtime dataplane API/ABI compatibility before creating a handle.
@@ -61,41 +75,33 @@ public actor DataplaneHandle {
 
         self.logger = logger
         let callbackBox = CallbackBox(callbacks: callbacks)
-        self.callbackToken = Unmanaged.passRetained(callbackBox)
+        let callbackToken = Unmanaged.passRetained(callbackBox)
 
         var bridgeCallbacks = rp_dp_callbacks_t(
             on_log: bridgeLogCallback,
             on_state: bridgeStateCallback
         )
-        let callbackToken = self.callbackToken
 
         let handle = configJSON.withCString { rawCString in
             rp_dp_create(rawCString, &bridgeCallbacks, callbackToken.toOpaque())
         }
 
         guard let handle else {
-            self.callbackToken.release()
+            callbackToken.release()
             throw DataplaneError.createFailed
         }
 
-        self.rawHandle = handle
-    }
-
-    deinit {
-        if let rawHandle {
-            rp_dp_destroy(rawHandle)
-        }
-        callbackToken.release()
+        self.managedHandle = ManagedHandle(rawHandle: handle, callbackToken: callbackToken)
     }
 
     /// Starts dataplane processing against the provided tunnel file descriptor.
     /// - Parameter tunFD: Tunnel descriptor passed to the native dataplane bridge.
     /// - Throws: `DataplaneError.destroyed` or `DataplaneError.startFailed`.
     public func start(tunFD: Int32) async throws {
-        guard let rawHandle else {
+        guard let managedHandle else {
             throw DataplaneError.destroyed
         }
-        let result = rp_dp_start(rawHandle, tunFD)
+        let result = rp_dp_start(managedHandle.rawHandle, tunFD)
         guard result == 0 else {
             await logger.log(
                 level: .error,
@@ -113,10 +119,10 @@ public actor DataplaneHandle {
     /// Stops dataplane processing.
     /// - Throws: `DataplaneError.destroyed` or `DataplaneError.stopFailed`.
     public func stop() async throws {
-        guard let rawHandle else {
+        guard let managedHandle else {
             throw DataplaneError.destroyed
         }
-        let result = rp_dp_stop(rawHandle)
+        let result = rp_dp_stop(managedHandle.rawHandle)
         guard result == 0 else {
             throw DataplaneError.stopFailed(code: result)
         }
@@ -126,11 +132,11 @@ public actor DataplaneHandle {
     /// - Returns: Current dataplane statistics snapshot.
     /// - Throws: `DataplaneError.destroyed` or `DataplaneError.statsFailed`.
     public func stats() throws -> DataplaneStats {
-        guard let rawHandle else {
+        guard let managedHandle else {
             throw DataplaneError.destroyed
         }
         var native = rp_dp_stats_t()
-        let result = rp_dp_get_stats(rawHandle, &native)
+        let result = rp_dp_get_stats(managedHandle.rawHandle, &native)
         guard result == 0 else {
             throw DataplaneError.statsFailed(code: result)
         }
@@ -144,10 +150,9 @@ public actor DataplaneHandle {
 
     /// Idempotently destroys the underlying native dataplane handle.
     public func destroy() {
-        guard let rawHandle else {
+        guard managedHandle != nil else {
             return
         }
-        rp_dp_destroy(rawHandle)
-        self.rawHandle = nil
+        managedHandle = nil
     }
 }

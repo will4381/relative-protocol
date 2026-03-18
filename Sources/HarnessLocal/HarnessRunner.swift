@@ -1,6 +1,5 @@
 import Analytics
 import Foundation
-import HostClient
 import Observability
 import PacketRelay
 import TunnelRuntime
@@ -9,18 +8,15 @@ import TunnelRuntime
 public struct HarnessRunResult: Sendable, Equatable {
     public let scenarioID: String
     public let runtimeState: RuntimeState
-    public let metricsCount: Int
     public let packetCount: Int
 
     /// - Parameters:
     ///   - scenarioID: Scenario identifier used for this run.
     ///   - runtimeState: Final runtime state after scenario completion.
-    ///   - metricsCount: Number of persisted metric entries.
-    ///   - packetCount: Number of persisted packet samples.
-    public init(scenarioID: String, runtimeState: RuntimeState, metricsCount: Int, packetCount: Int) {
+    ///   - packetCount: Number of retained packet samples in the rolling tap.
+    public init(scenarioID: String, runtimeState: RuntimeState, packetCount: Int) {
         self.scenarioID = scenarioID
         self.runtimeState = runtimeState
-        self.metricsCount = metricsCount
         self.packetCount = packetCount
     }
 }
@@ -39,7 +35,7 @@ public actor HarnessRunner {
     /// - Parameters:
     ///   - scenario: Deterministic scenario definition.
     ///   - adapter: Local packet producer adapter.
-    ///   - rootPath: Output directory for metrics and packet stream artifacts.
+    ///   - rootPath: Reserved diagnostics root for harness callers.
     /// - Returns: High-level scenario result summary.
     public func run(
         scenario: HarnessScenario,
@@ -52,17 +48,14 @@ public actor HarnessRunner {
         let runIds = DeterministicRunIdGenerator(prefix: scenario.id, start: 0)
         let random = SeededRandomSource(seed: scenario.seed)
 
-        let metricsURL = rootPath.appendingPathComponent("metrics.json", isDirectory: false)
-        let streamURL = rootPath.appendingPathComponent("packet-stream.ndjson", isDirectory: false)
+        _ = rootPath
 
-        let metricsStore = MetricsStore(capacity: 128, maxBytes: 256_000, outputURL: metricsURL, logger: logger)
-        let packetStream = PacketSampleStream(maxBytes: 256_000, url: streamURL, logger: logger)
+        let packetStream = PacketSampleStream(maxBytes: 256_000, clock: clock, logger: logger)
         let runtime = TunnelRuntime(
             clock: clock,
             runIdGenerator: runIds,
             randomSource: random,
-            logger: logger,
-            snapshotSink: metricsStore
+            logger: logger
         )
 
         try await runtime.start(configJSON: "{\"mode\":\"deterministic-local\"}", tunFD: 0)
@@ -72,16 +65,15 @@ public actor HarnessRunner {
             await runtime.updatePressure(queueDepth: sample.bytes, relayLatencyMs: sample.bytes / 4)
         }
 
-        let diagnostics = DiagnosticsClient(runtime: runtime, metricsStore: metricsStore, packetStream: packetStream)
-        let snapshot = try await diagnostics.snapshot()
+        let runtimeSnapshot = await runtime.currentSnapshot()
+        let packetCount = await packetStream.readAll().count
 
         try await runtime.stop()
 
         return HarnessRunResult(
             scenarioID: scenario.id,
-            runtimeState: snapshot.runtime.state,
-            metricsCount: snapshot.metricsCount,
-            packetCount: snapshot.packetSamplesCount
+            runtimeState: runtimeSnapshot.state,
+            packetCount: packetCount
         )
     }
 }

@@ -10,10 +10,6 @@ public protocol LogRootPathProvider: Sendable {
 
 /// Production root provider that resolves an app group container path.
 public struct AppGroupLogRootPathProvider: LogRootPathProvider {
-    public enum Error: Swift.Error {
-        case unavailableContainer(String)
-    }
-
     public let appGroupID: String
 
     /// Creates an app-group-backed log root provider.
@@ -22,16 +18,11 @@ public struct AppGroupLogRootPathProvider: LogRootPathProvider {
         self.appGroupID = appGroupID
     }
 
-    // Docs: https://developer.apple.com/documentation/foundation/filemanager/containerurl(forsecurityapplicationgroupidentifier:)
     /// Resolves shared App Group logs root.
     /// - Returns: `<app-group-container>/Logs`.
-    /// - Throws: `Error.unavailableContainer` when group container cannot be resolved.
+    /// - Throws: `SharedContainerRootResolver.Error.unavailableContainer` when group container cannot be resolved.
     public func resolveRootPath() throws -> URL {
-        guard let container = FileManager.default.containerURL(
-            forSecurityApplicationGroupIdentifier: appGroupID
-        ) else {
-            throw Error.unavailableContainer(appGroupID)
-        }
+        let container = try SharedContainerRootResolver.resolve(appGroupID: appGroupID)
         return container.appendingPathComponent("Logs", isDirectory: true)
     }
 }

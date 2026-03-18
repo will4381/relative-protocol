@@ -7,6 +7,27 @@ public protocol LogSink: Sendable {
     func write(_ envelope: LogEnvelope) async
 }
 
+private extension LogLevel {
+    var severityRank: Int {
+        switch self {
+        case .trace:
+            return 0
+        case .debug:
+            return 1
+        case .info:
+            return 2
+        case .notice:
+            return 3
+        case .warning:
+            return 4
+        case .error:
+            return 5
+        case .fault:
+            return 6
+        }
+    }
+}
+
 /// Fanout sink that forwards each event to every configured destination.
 public actor FanoutLogSink: LogSink {
     private let sinks: [any LogSink]
@@ -23,6 +44,27 @@ public actor FanoutLogSink: LogSink {
         for sink in sinks {
             await sink.write(envelope)
         }
+    }
+}
+
+/// Sink wrapper that drops events below the configured minimum log level.
+public actor MinimumLevelLogSink: LogSink {
+    private let minimumLevel: LogLevel
+    private let sink: any LogSink
+
+    /// - Parameters:
+    ///   - minimumLevel: Lowest severity that should be forwarded.
+    ///   - sink: Wrapped sink implementation.
+    public init(minimumLevel: LogLevel, sink: any LogSink) {
+        self.minimumLevel = minimumLevel
+        self.sink = sink
+    }
+
+    public func write(_ envelope: LogEnvelope) async {
+        guard envelope.level.severityRank >= minimumLevel.severityRank else {
+            return
+        }
+        await sink.write(envelope)
     }
 }
 

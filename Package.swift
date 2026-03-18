@@ -2,6 +2,7 @@
 import PackageDescription
 
 let strictSwiftSettings: [SwiftSetting] = [
+    .unsafeFlags(["-strict-concurrency=complete"]),
     .unsafeFlags(["-warnings-as-errors"], .when(platforms: [.macOS]))
 ]
 
@@ -12,7 +13,7 @@ let strictCSettings: [CSetting] = [
 let package = Package(
     name: "VPNBridgeTunnel",
     platforms: [
-        .iOS(.v16),
+        .iOS("18.0"),
         .macOS(.v14)
     ],
     products: [
@@ -116,6 +117,12 @@ let package = Package(
             cSettings: strictCSettings
         ),
         .target(
+            name: "PacketIntelligenceCore",
+            path: "Sources/PacketIntelligenceCore",
+            publicHeadersPath: "include",
+            cSettings: strictCSettings
+        ),
+        .target(
             name: "Observability",
             path: "Sources/Observability",
             swiftSettings: strictSwiftSettings
@@ -141,13 +148,13 @@ let package = Package(
         ),
         .target(
             name: "Analytics",
-            dependencies: ["Observability", "TunnelRuntime"],
+            dependencies: ["Observability", "PacketIntelligenceCore", "TunnelRuntime"],
             path: "Sources/Analytics",
             swiftSettings: strictSwiftSettings
         ),
         .target(
             name: "HostClient",
-            dependencies: ["Analytics", "TunnelRuntime"],
+            dependencies: ["Analytics"],
             path: "Sources/HostClient",
             swiftSettings: strictSwiftSettings
         ),
@@ -159,7 +166,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "HarnessLocal",
-            dependencies: ["Analytics", "HostClient", "Observability", "PacketRelay", "TunnelRuntime"],
+            dependencies: ["Analytics", "Observability", "PacketRelay", "TunnelRuntime"],
             path: "Sources/HarnessLocal",
             swiftSettings: strictSwiftSettings
         ),
@@ -167,12 +174,6 @@ let package = Package(
             name: "DataplaneFFITests",
             dependencies: ["DataplaneFFI"],
             path: "Tests/DataplaneFFITests",
-            swiftSettings: strictSwiftSettings
-        ),
-        .testTarget(
-            name: "HostClientTests",
-            dependencies: ["HostClient"],
-            path: "Tests/HostClientTests",
             swiftSettings: strictSwiftSettings
         ),
         .testTarget(
@@ -185,9 +186,6 @@ let package = Package(
             name: "AnalyticsTests",
             dependencies: ["Analytics", "Observability", "TunnelRuntime"],
             path: "Tests/AnalyticsTests",
-            resources: [
-                .copy("Fixtures/PerfBaseline.json")
-            ],
             swiftSettings: strictSwiftSettings
         ),
         .testTarget(

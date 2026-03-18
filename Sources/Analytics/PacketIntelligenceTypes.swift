@@ -41,11 +41,7 @@ public struct IPAddress: Hashable, Codable, Sendable {
     /// Network-order bytes (`4` for IPv4, `16` for IPv6).
     public let bytes: Data
 
-    private static let stringCache: NSCache<NSData, NSString> = {
-        let cache = NSCache<NSData, NSString>()
-        cache.countLimit = 4096
-        return cache
-    }()
+    private static let stringCache = BoundedCache<Data, String>(countLimit: 4_096)
 
     /// - Parameter bytes: Raw address bytes.
     public init?(bytes: Data) {
@@ -60,9 +56,8 @@ public struct IPAddress: Hashable, Codable, Sendable {
 
     /// Cached text form for logging and analytics keys.
     public var stringValue: String {
-        let key = bytes as NSData
-        if let cached = Self.stringCache.object(forKey: key) {
-            return cached as String
+        if let cached = Self.stringCache.value(for: bytes) {
+            return cached
         }
 
         let value = bytes.withUnsafeBytes { rawBuffer in
@@ -86,7 +81,7 @@ public struct IPAddress: Hashable, Codable, Sendable {
         }
 
         if !value.isEmpty {
-            Self.stringCache.setObject(value as NSString, forKey: key)
+            Self.stringCache.insert(value, for: bytes)
         }
         return value
     }
@@ -163,34 +158,5 @@ public struct PacketMetadata: Sendable {
         self.quicPacketType = quicPacketType
         self.quicDestinationConnectionId = quicDestinationConnectionId
         self.quicSourceConnectionId = quicSourceConnectionId
-    }
-}
-
-/// Combined analytics artifact produced per parsed packet.
-public struct PacketInsight: Sendable {
-    public let timestamp: Date
-    public let direction: PacketDirection
-    public let metadata: PacketMetadata
-    public let classification: String?
-    public let burst: BurstSample?
-
-    /// - Parameters:
-    ///   - timestamp: Packet processing timestamp.
-    ///   - direction: Inbound/outbound direction.
-    ///   - metadata: Deep packet metadata.
-    ///   - classification: Optional signature/classification label.
-    ///   - burst: Optional burst observation for the flow.
-    public init(
-        timestamp: Date,
-        direction: PacketDirection,
-        metadata: PacketMetadata,
-        classification: String?,
-        burst: BurstSample?
-    ) {
-        self.timestamp = timestamp
-        self.direction = direction
-        self.metadata = metadata
-        self.classification = classification
-        self.burst = burst
     }
 }
