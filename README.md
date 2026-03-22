@@ -1,6 +1,6 @@
-# VPNBridgeTunnel
+# relative-protocol
 
-`VPNBridgeTunnel` is a Swift package for packet-tunnel VPN products that need three things at once:
+`relative-protocol` is a Swift package for packet-tunnel VPN products that need three things at once:
 
 1. a real packet tunnel dataplane
 2. a bounded, app-readable live telemetry tap

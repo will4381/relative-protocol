@@ -11,7 +11,7 @@ let strictCSettings: [CSetting] = [
 ]
 
 let package = Package(
-    name: "VPNBridgeTunnel",
+    name: "relative-protocol",
     platforms: [
         .iOS("18.0"),
         .macOS(.v14)
