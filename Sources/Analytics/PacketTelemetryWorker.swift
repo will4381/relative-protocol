@@ -11,8 +11,24 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
     }
 
     private enum DetailPolicy {
-        static let maxBufferedRecords = 96
+        static let maxBufferedRecords = 128
         static let maxSnapshotPacketLimit = 96
+    }
+
+    private struct LiveTapPolicy: Sendable {
+        let includeActivitySamples: Bool
+        let includeFlowSlices: Bool
+        let includeFlowCloseEvents: Bool
+
+        /// Decision: the default app-facing live tap stays leaner than the detector-facing sparse stream.
+        /// `flowSlice` remains detector-only by default because pushing every cadence record into the
+        /// foreground snapshot would raise snapshot volume and debugging overhead without improving
+        /// durable detector correctness.
+        static let `default` = LiveTapPolicy(
+            includeActivitySamples: true,
+            includeFlowSlices: false,
+            includeFlowCloseEvents: true
+        )
     }
 
     private enum DetectionPolicy {
@@ -144,6 +160,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         case batch(Batch)
         case reset(CommandSignal?)
         case clearDetections(CommandSignal?)
+        case barrier(CommandSignal?)
         case stop(CommandSignal?)
     }
 
@@ -174,6 +191,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
     private let logger: StructuredLogger
     private let processInfo: ProcessInfo
     private let state: SharedState
+    private let emissionPolicyOverride: PacketAnalyticsPipeline.EmissionPolicy?
 
     private var workerTask: Task<Void, Never>?
 
@@ -182,7 +200,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
     /// Docs: https://developer.apple.com/documentation/foundation/processinfo/islowpowermodeenabled
     /// The worker evaluates thermal and power state at batch boundaries so the tunnel can reduce telemetry cost
     /// without paying for per-packet notification handling.
-    public init(
+    public convenience init(
         pipeline: PacketAnalyticsPipeline,
         packetStream: PacketSampleStream? = nil,
         detectors: [any TrafficDetector] = [],
@@ -190,6 +208,28 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         detectionStore: DetectionStore? = nil,
         logger: StructuredLogger,
         processInfo: ProcessInfo = .processInfo
+    ) {
+        self.init(
+            pipeline: pipeline,
+            packetStream: packetStream,
+            detectors: detectors,
+            initialDetectionSnapshot: initialDetectionSnapshot,
+            detectionStore: detectionStore,
+            logger: logger,
+            processInfo: processInfo,
+            emissionPolicyOverride: nil
+        )
+    }
+
+    init(
+        pipeline: PacketAnalyticsPipeline,
+        packetStream: PacketSampleStream? = nil,
+        detectors: [any TrafficDetector] = [],
+        initialDetectionSnapshot: DetectionSnapshot = .empty,
+        detectionStore: DetectionStore? = nil,
+        logger: StructuredLogger,
+        processInfo: ProcessInfo = .processInfo,
+        emissionPolicyOverride: PacketAnalyticsPipeline.EmissionPolicy?
     ) {
         self.pipeline = pipeline
         self.packetStream = packetStream
@@ -202,6 +242,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         self.logger = logger
         self.processInfo = processInfo
         self.state = SharedState(initialDetectionSnapshot: initialDetectionSnapshot)
+        self.emissionPolicyOverride = emissionPolicyOverride
 
         var streamContinuation: AsyncStream<Command>.Continuation?
         let stream = AsyncStream<Command> { continuation in
@@ -218,8 +259,9 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         let logger = self.logger
         let processInfo = self.processInfo
         let state = self.state
+        let emissionPolicyOverride = self.emissionPolicyOverride
 
-        self.workerTask = Task { [state, pipeline, packetStream, detectors, detectionPersistence, logger, processInfo] in
+        self.workerTask = Task { [state, pipeline, packetStream, detectors, detectionPersistence, logger, processInfo, emissionPolicyOverride] in
             await Self.runLoop(
                 stream: stream,
                 state: state,
@@ -228,7 +270,8 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 detectors: detectors,
                 detectionPersistence: detectionPersistence,
                 logger: logger,
-                processInfo: processInfo
+                processInfo: processInfo,
+                emissionPolicyOverride: emissionPolicyOverride
             )
         }
     }
@@ -419,6 +462,11 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         await enqueueAndWait { .clearDetections($0) }
     }
 
+    /// Waits until all previously enqueued telemetry work has been processed.
+    func flushAndWait() async {
+        await enqueueAndWait { .barrier($0) }
+    }
+
     /// Stops the worker without waiting for queued work or final persistence flushes.
     /// Use `stopAndWait()` when shutdown correctness matters.
     public func stop() {
@@ -521,7 +569,8 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         detectors: [any TrafficDetector],
         detectionPersistence: DetectionPersistenceCoordinator?,
         logger: StructuredLogger,
-        processInfo: ProcessInfo
+        processInfo: ProcessInfo,
+        emissionPolicyOverride: PacketAnalyticsPipeline.EmissionPolicy?
     ) async {
         var detailRecords: [PacketSampleStream.PacketStreamRecord] = []
 
@@ -529,7 +578,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
             switch command {
             case .batch(let batch):
                 Self.didStartBatch(state: state, byteCount: batch.byteCount)
-                let policy = Self.currentEmissionPolicy(processInfo: processInfo)
+                let policy = emissionPolicyOverride ?? Self.currentEmissionPolicy(processInfo: processInfo)
                 let records = await pipeline.ingest(
                     packets: batch.packets,
                     families: batch.families,
@@ -554,7 +603,12 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                     }
                 }
 
-                let snapshotRecords = Self.buffer(packetStream: packetStream, records, detailRecords: &detailRecords)
+                let snapshotRecords = Self.buffer(
+                    packetStream: packetStream,
+                    records,
+                    detailRecords: &detailRecords,
+                    liveTapPolicy: .default
+                )
                 Self.setBufferedRecordCount(state: state, detailRecords.count)
                 if !snapshotRecords.isEmpty {
                     await Self.publish(packetStream: packetStream, logger: logger, snapshotRecords)
@@ -577,6 +631,9 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 await detectionPersistence?.persistNow(cleared)
                 signal?.resume()
 
+            case .barrier(let signal):
+                signal?.resume()
+
             case .stop(let signal):
                 detailRecords.removeAll(keepingCapacity: false)
                 Self.setBufferedRecordCount(state: state, 0)
@@ -593,12 +650,14 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
     }
 
     /// Routes sparse detector records either into the rolling app-facing tap or into the recent detail buffer.
-    /// Decision: `activitySample` stays memory-only until a matching `metadata` or `burst` event makes a short
-    /// detector window worth exposing to the app.
+    /// Decision: the default app-facing tap is intentionally not a mirror of the full detector stream.
+    /// `flowSlice` stays detector-only by default, while `activitySample` stays memory-only until a matching
+    /// `metadata`, `burst`, or `flowClose` event makes a short detector window worth exposing to the app.
     private static func buffer(
         packetStream: PacketSampleStream?,
         _ records: [PacketSampleStream.PacketStreamRecord],
-        detailRecords: inout [PacketSampleStream.PacketStreamRecord]
+        detailRecords: inout [PacketSampleStream.PacketStreamRecord],
+        liveTapPolicy: LiveTapPolicy
     ) -> [PacketSampleStream.PacketStreamRecord] {
         guard packetStream != nil else {
             detailRecords.removeAll(keepingCapacity: false)
@@ -611,6 +670,18 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         for record in records {
             switch record.kind {
             case .activitySample:
+                guard liveTapPolicy.includeActivitySamples else {
+                    continue
+                }
+                detailRecords.append(record)
+                if detailRecords.count > DetailPolicy.maxBufferedRecords {
+                    detailRecords.removeFirst(detailRecords.count - DetailPolicy.maxBufferedRecords)
+                }
+
+            case .flowSlice:
+                guard liveTapPolicy.includeFlowSlices else {
+                    continue
+                }
                 detailRecords.append(record)
                 if detailRecords.count > DetailPolicy.maxBufferedRecords {
                     detailRecords.removeFirst(detailRecords.count - DetailPolicy.maxBufferedRecords)
@@ -619,6 +690,12 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
             case .metadata, .burst:
                 snapshotRecords.append(contentsOf: Self.drainDetailWindow(for: record, detailRecords: &detailRecords))
                 snapshotRecords.append(record)
+
+            case .flowClose:
+                snapshotRecords.append(contentsOf: Self.drainDetailWindow(for: record, detailRecords: &detailRecords))
+                if liveTapPolicy.includeFlowCloseEvents {
+                    snapshotRecords.append(record)
+                }
 
             case .flowOpen:
                 snapshotRecords.append(record)
@@ -697,6 +774,10 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
             return PacketAnalyticsPipeline.EmissionPolicy(
                 allowDeepMetadata: false,
                 maxMetadataProbesPerBatch: 0,
+                emitFlowSlices: false,
+                flowSliceIntervalMs: 250,
+                emitFlowCloseEvents: true,
+                emitBurstShapeCounters: true,
                 activitySampleMinimumPackets: 2_048,
                 activitySampleMinimumBytes: 4_194_304,
                 activitySampleMinimumInterval: 30,
@@ -710,6 +791,10 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
             return PacketAnalyticsPipeline.EmissionPolicy(
                 allowDeepMetadata: true,
                 maxMetadataProbesPerBatch: 1,
+                emitFlowSlices: true,
+                flowSliceIntervalMs: 250,
+                emitFlowCloseEvents: true,
+                emitBurstShapeCounters: true,
                 activitySampleMinimumPackets: 256,
                 activitySampleMinimumBytes: 524_288,
                 activitySampleMinimumInterval: 6,
@@ -720,6 +805,10 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
             return PacketAnalyticsPipeline.EmissionPolicy(
                 allowDeepMetadata: false,
                 maxMetadataProbesPerBatch: 0,
+                emitFlowSlices: thermalState == .fair,
+                flowSliceIntervalMs: 250,
+                emitFlowCloseEvents: true,
+                emitBurstShapeCounters: true,
                 activitySampleMinimumPackets: 2_048,
                 activitySampleMinimumBytes: 4_194_304,
                 activitySampleMinimumInterval: 30,
@@ -730,6 +819,10 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
             return PacketAnalyticsPipeline.EmissionPolicy(
                 allowDeepMetadata: false,
                 maxMetadataProbesPerBatch: 0,
+                emitFlowSlices: false,
+                flowSliceIntervalMs: 250,
+                emitFlowCloseEvents: true,
+                emitBurstShapeCounters: true,
                 activitySampleMinimumPackets: 2_048,
                 activitySampleMinimumBytes: 4_194_304,
                 activitySampleMinimumInterval: 30,

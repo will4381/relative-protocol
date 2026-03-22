@@ -16,6 +16,10 @@ public actor PacketAnalyticsPipeline {
     public struct EmissionPolicy: Sendable {
         public let allowDeepMetadata: Bool
         public let maxMetadataProbesPerBatch: Int
+        public let emitFlowSlices: Bool
+        public let flowSliceIntervalMs: Int
+        public let emitFlowCloseEvents: Bool
+        public let emitBurstShapeCounters: Bool
         public let activitySampleMinimumPackets: Int
         public let activitySampleMinimumBytes: Int
         public let activitySampleMinimumInterval: TimeInterval
@@ -25,6 +29,10 @@ public actor PacketAnalyticsPipeline {
         public init(
             allowDeepMetadata: Bool,
             maxMetadataProbesPerBatch: Int,
+            emitFlowSlices: Bool,
+            flowSliceIntervalMs: Int,
+            emitFlowCloseEvents: Bool,
+            emitBurstShapeCounters: Bool,
             activitySampleMinimumPackets: Int,
             activitySampleMinimumBytes: Int,
             activitySampleMinimumInterval: TimeInterval,
@@ -33,6 +41,10 @@ public actor PacketAnalyticsPipeline {
         ) {
             self.allowDeepMetadata = allowDeepMetadata
             self.maxMetadataProbesPerBatch = max(0, maxMetadataProbesPerBatch)
+            self.emitFlowSlices = emitFlowSlices
+            self.flowSliceIntervalMs = max(50, flowSliceIntervalMs)
+            self.emitFlowCloseEvents = emitFlowCloseEvents
+            self.emitBurstShapeCounters = emitBurstShapeCounters
             self.activitySampleMinimumPackets = max(1, activitySampleMinimumPackets)
             self.activitySampleMinimumBytes = max(1, activitySampleMinimumBytes)
             self.activitySampleMinimumInterval = max(0, activitySampleMinimumInterval)
@@ -41,7 +53,146 @@ public actor PacketAnalyticsPipeline {
         }
     }
 
+    private struct FlowRecordTemplate: Sendable {
+        let protocolHint: String
+        let ipVersion: UInt8
+        let transportProtocolNumber: UInt8
+        let sourcePort: UInt16?
+        let destinationPort: UInt16?
+        let flowHash: UInt64
+        let sourceAddressLength: UInt8
+        let sourceAddressHigh: UInt64
+        let sourceAddressLow: UInt64
+        let destinationAddressLength: UInt8
+        let destinationAddressHigh: UInt64
+        let destinationAddressLow: UInt64
+    }
+
+    private struct CounterSet: Sendable {
+        var bytes = 0
+        var packetCount = 0
+        var largePacketCount = 0
+        var smallPacketCount = 0
+        var udpPacketCount = 0
+        var tcpPacketCount = 0
+        var quicInitialCount = 0
+        var tcpSynCount = 0
+        var tcpFinCount = 0
+        var tcpRstCount = 0
+
+        var isEmpty: Bool {
+            packetCount == 0
+        }
+
+        mutating func record(summary: FastPacketSummary) {
+            bytes += summary.packetLength
+            packetCount += 1
+            if summary.isLargePacketForDetectorStats {
+                largePacketCount += 1
+            }
+            if summary.isSmallPacketForDetectorStats {
+                smallPacketCount += 1
+            }
+            switch summary.transport {
+            case .udp:
+                udpPacketCount += 1
+            case .tcp:
+                tcpPacketCount += 1
+            default:
+                break
+            }
+            if summary.isQUICInitialCandidate {
+                quicInitialCount += 1
+            }
+            if summary.hasTCPSYN {
+                tcpSynCount += 1
+            }
+            if summary.hasTCPFIN {
+                tcpFinCount += 1
+            }
+            if summary.hasTCPRST {
+                tcpRstCount += 1
+            }
+        }
+
+        mutating func reset() {
+            self = CounterSet()
+        }
+
+        init() {}
+
+        init(summary: FastPacketSummary) {
+            self.init()
+            record(summary: summary)
+        }
+    }
+
+    private struct FlowSliceAccumulator: Sendable {
+        var startedAt: Date?
+        var counters = CounterSet()
+
+        var isEmpty: Bool {
+            counters.isEmpty
+        }
+
+        mutating func record(summary: FastPacketSummary, now: Date) {
+            if startedAt == nil {
+                startedAt = now
+            }
+            counters.record(summary: summary)
+        }
+
+        mutating func reset() {
+            startedAt = nil
+            counters.reset()
+        }
+    }
+
+    private struct BurstAccumulator: Sendable {
+        var startedAt: Date?
+        var counters = CounterSet()
+        var leadingBytes200ms = 0
+        var leadingPackets200ms = 0
+        var leadingBytes600ms = 0
+        var leadingPackets600ms = 0
+
+        var isEmpty: Bool {
+            counters.isEmpty
+        }
+
+        mutating func record(summary: FastPacketSummary, now: Date) {
+            if startedAt == nil {
+                startedAt = now
+            }
+            counters.record(summary: summary)
+
+            guard let startedAt else {
+                return
+            }
+
+            let elapsed = now.timeIntervalSince(startedAt)
+            if elapsed <= 0.2 {
+                leadingBytes200ms += summary.packetLength
+                leadingPackets200ms += 1
+            }
+            if elapsed <= 0.6 {
+                leadingBytes600ms += summary.packetLength
+                leadingPackets600ms += 1
+            }
+        }
+
+        mutating func reset() {
+            startedAt = nil
+            counters.reset()
+            leadingBytes200ms = 0
+            leadingPackets200ms = 0
+            leadingBytes600ms = 0
+            leadingPackets600ms = 0
+        }
+    }
+
     private struct FlowContext: Sendable {
+        let recordTemplate: FlowRecordTemplate
         var registrableDomain: String?
         var dnsQueryName: String?
         var dnsCname: String?
@@ -53,15 +204,15 @@ public actor PacketAnalyticsPipeline {
         var quicSourceConnectionId: String?
         var classification: String?
         var lastSeen: Date
+        var lastDirection: PacketDirection
         var hasEmittedFlowOpen = false
         var lastMetadataFingerprint: UInt64?
         var lastActivityEmissionAt: Date?
         var totalPacketCount = 0
         var totalByteCount = 0
-        var windowPacketCount = 0
-        var windowByteCount = 0
-        var currentBurstPacketCount = 0
-        var currentBurstByteCount = 0
+        var activityCounters = CounterSet()
+        var slice = FlowSliceAccumulator()
+        var currentBurst = BurstAccumulator()
     }
 
     private let clock: any Clock
@@ -87,7 +238,8 @@ public actor PacketAnalyticsPipeline {
     }
 
     /// Ingests a packet batch and returns compact detector-facing records.
-    /// Decision: the tunnel emits a sparse event stream (`flowOpen`, `metadata`, `burst`, `activitySample`)
+    /// Decision: the tunnel emits a sparse event stream (`flowOpen`, `flowSlice`, `flowClose`, `metadata`,
+    /// `burst`, `activitySample`)
     /// instead of serializing a rich `PacketSample` for every admitted packet.
     /// - Parameters:
     ///   - packets: Raw packet payloads.
@@ -108,10 +260,9 @@ public actor PacketAnalyticsPipeline {
         }
 
         let now = await clock.now()
-        maybeEvictExpiredFlowContexts(now: now)
-
         var records: [PacketSampleStream.PacketStreamRecord] = []
-        records.reserveCapacity(min(packets.count, 64))
+        records.reserveCapacity(min(packets.count * 2, 128))
+        records.append(contentsOf: maybeEvictExpiredFlowContexts(now: now, policy: policy))
 
         var metadataProbesRemaining = policy.maxMetadataProbesPerBatch
 
@@ -137,35 +288,22 @@ public actor PacketAnalyticsPipeline {
 
             let flow = summary.flowKey
             let isNewFlow = flowContexts[flow] == nil
-            var context = flowContexts[flow] ?? makeFlowContext(for: summary, now: now)
+            var context = flowContexts[flow] ?? makeFlowContext(for: summary, now: now, direction: direction)
             context.lastSeen = now
+            context.lastDirection = direction
 
             if let burst = burstTracker.recordPacket(flow: flow, now: now) {
-                if policy.emitBurstEvents, context.currentBurstPacketCount > 0 {
-                    records.append(
-                        makeRecord(
-                            kind: .burst,
-                            timestamp: now,
-                            direction: direction,
-                            summary: summary,
-                            flowContext: context,
-                            bytes: context.currentBurstByteCount,
-                            packetCount: burst.packetCount,
-                            burstDurationMs: burst.burstDurationMs,
-                            burstPacketCount: burst.packetCount
-                        )
-                    )
+                if policy.emitBurstEvents, !context.currentBurst.isEmpty {
+                    records.append(makeBurstRecord(timestamp: now, direction: direction, flowContext: context, burst: burst, policy: policy))
                 }
-                context.currentBurstPacketCount = 0
-                context.currentBurstByteCount = 0
+                context.currentBurst.reset()
             }
 
             context.totalPacketCount += 1
             context.totalByteCount += summary.packetLength
-            context.windowPacketCount += 1
-            context.windowByteCount += summary.packetLength
-            context.currentBurstPacketCount += 1
-            context.currentBurstByteCount += summary.packetLength
+            context.activityCounters.record(summary: summary)
+            context.slice.record(summary: summary, now: now)
+            context.currentBurst.record(summary: summary, now: now)
 
             mergeCheapMetadata(into: &context, summary: summary)
 
@@ -175,10 +313,8 @@ public actor PacketAnalyticsPipeline {
                         kind: .flowOpen,
                         timestamp: now,
                         direction: direction,
-                        summary: summary,
                         flowContext: context,
-                        bytes: summary.packetLength,
-                        packetCount: 1
+                        counters: CounterSet(summary: summary)
                     )
                 )
                 context.hasEmittedFlowOpen = true
@@ -198,14 +334,25 @@ public actor PacketAnalyticsPipeline {
                                 kind: .metadata,
                                 timestamp: now,
                                 direction: direction,
-                                summary: summary,
                                 flowContext: context,
-                                bytes: summary.packetLength,
-                                packetCount: 1
+                                counters: CounterSet(summary: summary)
                             )
                         )
                     }
                 }
+            }
+
+            if shouldEmitFlowSlice(context: context, now: now, policy: policy) {
+                records.append(
+                    makeRecord(
+                        kind: .flowSlice,
+                        timestamp: now,
+                        direction: direction,
+                        flowContext: context,
+                        counters: context.slice.counters
+                    )
+                )
+                context.slice.reset()
             }
 
             if shouldEmitActivitySample(context: context, now: now, policy: policy) {
@@ -214,15 +361,27 @@ public actor PacketAnalyticsPipeline {
                         kind: .activitySample,
                         timestamp: now,
                         direction: direction,
-                        summary: summary,
                         flowContext: context,
-                        bytes: context.windowByteCount,
-                        packetCount: context.windowPacketCount
+                        counters: context.activityCounters
                     )
                 )
-                context.windowPacketCount = 0
-                context.windowByteCount = 0
+                context.activityCounters.reset()
                 context.lastActivityEmissionAt = now
+            }
+
+            if let closeReason = closeReason(for: summary) {
+                records.append(
+                    contentsOf: closeFlow(
+                        flow: flow,
+                        context: context,
+                        timestamp: now,
+                        direction: direction,
+                        reason: closeReason,
+                        policy: policy,
+                        closingSummary: summary
+                    )
+                )
+                continue
             }
 
             flowContexts[flow] = context
@@ -231,7 +390,7 @@ public actor PacketAnalyticsPipeline {
             }
         }
 
-        trimOverflowFlowContextsIfNeeded()
+        records.append(contentsOf: trimOverflowFlowContextsIfNeeded(policy: policy, now: now))
         return records
     }
 
@@ -250,8 +409,22 @@ public actor PacketAnalyticsPipeline {
         }
     }
 
-    private func makeFlowContext(for summary: FastPacketSummary, now: Date) -> FlowContext {
+    private func makeFlowContext(for summary: FastPacketSummary, now: Date, direction: PacketDirection) -> FlowContext {
         FlowContext(
+            recordTemplate: FlowRecordTemplate(
+                protocolHint: summary.protocolHint,
+                ipVersion: summary.ipVersion,
+                transportProtocolNumber: summary.transportProtocolNumber,
+                sourcePort: summary.hasPorts ? summary.sourcePort : nil,
+                destinationPort: summary.hasPorts ? summary.destinationPort : nil,
+                flowHash: summary.flowHash,
+                sourceAddressLength: summary.sourceAddressLength,
+                sourceAddressHigh: summary.sourceAddressHigh,
+                sourceAddressLow: summary.sourceAddressLow,
+                destinationAddressLength: summary.destinationAddressLength,
+                destinationAddressHigh: summary.destinationAddressHigh,
+                destinationAddressLow: summary.destinationAddressLow
+            ),
             registrableDomain: nil,
             dnsQueryName: nil,
             dnsCname: nil,
@@ -262,7 +435,8 @@ public actor PacketAnalyticsPipeline {
             quicDestinationConnectionId: Self.hexString(summary.quicDestinationConnectionID),
             quicSourceConnectionId: Self.hexString(summary.quicSourceConnectionID),
             classification: nil,
-            lastSeen: now
+            lastSeen: now,
+            lastDirection: direction
         )
     }
 
@@ -337,16 +511,33 @@ public actor PacketAnalyticsPipeline {
             return false
         }
 
-        if context.windowPacketCount >= policy.activitySampleMinimumPackets {
+        if context.activityCounters.packetCount >= policy.activitySampleMinimumPackets {
             return true
         }
-        if context.windowByteCount >= policy.activitySampleMinimumBytes {
+        if context.activityCounters.bytes >= policy.activitySampleMinimumBytes {
             return true
         }
         if let lastActivityEmissionAt = context.lastActivityEmissionAt {
             return now.timeIntervalSince(lastActivityEmissionAt) >= policy.activitySampleMinimumInterval
         }
-        return context.windowPacketCount > 0 && policy.activitySampleMinimumInterval == 0
+        return context.activityCounters.packetCount > 0 && policy.activitySampleMinimumInterval == 0
+    }
+
+    private func shouldEmitFlowSlice(context: FlowContext, now: Date, policy: EmissionPolicy) -> Bool {
+        guard policy.emitFlowSlices, let startedAt = context.slice.startedAt else {
+            return false
+        }
+        return now.timeIntervalSince(startedAt) * 1000 >= Double(policy.flowSliceIntervalMs)
+    }
+
+    private func closeReason(for summary: FastPacketSummary) -> FlowCloseReason? {
+        if summary.hasTCPRST {
+            return .tcpRst
+        }
+        if summary.hasTCPFIN {
+            return .tcpFin
+        }
+        return nil
     }
 
     private func metadataFingerprint(for flowContext: FlowContext) -> UInt64 {
@@ -381,38 +572,73 @@ public actor PacketAnalyticsPipeline {
         return hash
     }
 
+    private func makeBurstRecord(
+        timestamp: Date,
+        direction: PacketDirection,
+        flowContext: FlowContext,
+        burst: BurstSample,
+        policy: EmissionPolicy
+    ) -> PacketSampleStream.PacketStreamRecord {
+        makeRecord(
+            kind: .burst,
+            timestamp: timestamp,
+            direction: direction,
+            flowContext: flowContext,
+            counters: flowContext.currentBurst.counters,
+            burstDurationMs: burst.burstDurationMs,
+            burstPacketCount: burst.packetCount,
+            leadingBytes200ms: policy.emitBurstShapeCounters ? flowContext.currentBurst.leadingBytes200ms : nil,
+            leadingPackets200ms: policy.emitBurstShapeCounters ? flowContext.currentBurst.leadingPackets200ms : nil,
+            leadingBytes600ms: policy.emitBurstShapeCounters ? flowContext.currentBurst.leadingBytes600ms : nil,
+            leadingPackets600ms: policy.emitBurstShapeCounters ? flowContext.currentBurst.leadingPackets600ms : nil,
+            burstLargePacketCount: policy.emitBurstShapeCounters ? flowContext.currentBurst.counters.largePacketCount : nil,
+            burstUdpPacketCount: policy.emitBurstShapeCounters ? flowContext.currentBurst.counters.udpPacketCount : nil,
+            burstTcpPacketCount: policy.emitBurstShapeCounters ? flowContext.currentBurst.counters.tcpPacketCount : nil,
+            burstQuicInitialCount: policy.emitBurstShapeCounters ? flowContext.currentBurst.counters.quicInitialCount : nil
+        )
+    }
+
     private func makeRecord(
         kind: PacketSampleKind,
         timestamp: Date,
         direction: PacketDirection,
-        summary: FastPacketSummary,
         flowContext: FlowContext,
-        bytes: Int,
-        packetCount: Int,
+        counters: CounterSet? = nil,
+        closeReason: FlowCloseReason? = nil,
         burstDurationMs: Int? = nil,
-        burstPacketCount: Int? = nil
+        burstPacketCount: Int? = nil,
+        leadingBytes200ms: Int? = nil,
+        leadingPackets200ms: Int? = nil,
+        leadingBytes600ms: Int? = nil,
+        leadingPackets600ms: Int? = nil,
+        burstLargePacketCount: Int? = nil,
+        burstUdpPacketCount: Int? = nil,
+        burstTcpPacketCount: Int? = nil,
+        burstQuicInitialCount: Int? = nil
     ) -> PacketSampleStream.PacketStreamRecord {
-        PacketSampleStream.PacketStreamRecord(
+        let counters = counters ?? CounterSet()
+        let template = flowContext.recordTemplate
+        return PacketSampleStream.PacketStreamRecord(
             kind: kind,
             timestamp: timestamp,
             direction: direction.rawValue,
-            bytes: bytes,
-            packetCount: packetCount,
+            bytes: counters.bytes,
+            packetCount: counters.isEmpty ? nil : counters.packetCount,
             flowPacketCount: flowContext.totalPacketCount,
             flowByteCount: flowContext.totalByteCount,
-            protocolHint: summary.protocolHint,
-            ipVersion: summary.ipVersion,
-            transportProtocolNumber: summary.transportProtocolNumber,
-            sourcePort: summary.hasPorts ? summary.sourcePort : nil,
-            destinationPort: summary.hasPorts ? summary.destinationPort : nil,
-            flowHash: summary.flowHash,
+            protocolHint: template.protocolHint,
+            ipVersion: template.ipVersion,
+            transportProtocolNumber: template.transportProtocolNumber,
+            sourcePort: template.sourcePort,
+            destinationPort: template.destinationPort,
+            flowHash: template.flowHash,
             textFlowId: nil,
-            sourceAddressLength: summary.sourceAddressLength,
-            sourceAddressHigh: summary.sourceAddressHigh,
-            sourceAddressLow: summary.sourceAddressLow,
-            destinationAddressLength: summary.destinationAddressLength,
-            destinationAddressHigh: summary.destinationAddressHigh,
-            destinationAddressLow: summary.destinationAddressLow,
+            sourceAddressLength: template.sourceAddressLength,
+            sourceAddressHigh: template.sourceAddressHigh,
+            sourceAddressLow: template.sourceAddressLow,
+            destinationAddressLength: template.destinationAddressLength,
+            destinationAddressHigh: template.destinationAddressHigh,
+            destinationAddressLow: template.destinationAddressLow,
             textSourceAddress: nil,
             textDestinationAddress: nil,
             registrableDomain: flowContext.registrableDomain,
@@ -425,52 +651,119 @@ public actor PacketAnalyticsPipeline {
             quicDestinationConnectionId: flowContext.quicDestinationConnectionId,
             quicSourceConnectionId: flowContext.quicSourceConnectionId,
             classification: flowContext.classification,
+            closeReason: closeReason,
+            largePacketCount: counters.isEmpty ? nil : counters.largePacketCount,
+            smallPacketCount: counters.isEmpty ? nil : counters.smallPacketCount,
+            udpPacketCount: counters.isEmpty ? nil : counters.udpPacketCount,
+            tcpPacketCount: counters.isEmpty ? nil : counters.tcpPacketCount,
+            quicInitialCount: counters.isEmpty ? nil : counters.quicInitialCount,
+            tcpSynCount: counters.isEmpty ? nil : counters.tcpSynCount,
+            tcpFinCount: counters.isEmpty ? nil : counters.tcpFinCount,
+            tcpRstCount: counters.isEmpty ? nil : counters.tcpRstCount,
             burstDurationMs: burstDurationMs,
-            burstPacketCount: burstPacketCount
+            burstPacketCount: burstPacketCount,
+            leadingBytes200ms: leadingBytes200ms,
+            leadingPackets200ms: leadingPackets200ms,
+            leadingBytes600ms: leadingBytes600ms,
+            leadingPackets600ms: leadingPackets600ms,
+            burstLargePacketCount: burstLargePacketCount,
+            burstUdpPacketCount: burstUdpPacketCount,
+            burstTcpPacketCount: burstTcpPacketCount,
+            burstQuicInitialCount: burstQuicInitialCount
         )
     }
 
     /// Decision: flow-context cleanup is amortized because sweeping a large dictionary on every batch adds heat
     /// without improving detector quality.
-    private func maybeEvictExpiredFlowContexts(now: Date) {
+    private func maybeEvictExpiredFlowContexts(now: Date, policy: EmissionPolicy) -> [PacketSampleStream.PacketStreamRecord] {
         if let lastFlowContextSweepAt,
            now.timeIntervalSince(lastFlowContextSweepAt) < FlowCachePolicy.evictionSweepIntervalSeconds,
            flowContexts.count < FlowCachePolicy.maxTrackedFlows {
-            return
+            return []
         }
 
         lastFlowContextSweepAt = now
         let expiredFlows = flowContexts.compactMap { flow, context in
             now.timeIntervalSince(context.lastSeen) > FlowCachePolicy.flowTTLSeconds ? flow : nil
         }
+        var records: [PacketSampleStream.PacketStreamRecord] = []
         for flow in expiredFlows {
-            flowContexts.removeValue(forKey: flow)
+            guard let context = flowContexts[flow] else {
+                continue
+            }
+            records.append(contentsOf: closeFlow(flow: flow, context: context, timestamp: now, direction: context.lastDirection, reason: .idleEviction, policy: policy))
         }
         pruneFlowContextArrivalQueueIfNeeded(force: !expiredFlows.isEmpty)
+        return records
     }
 
-    private func trimOverflowFlowContextsIfNeeded() {
+    private func trimOverflowFlowContextsIfNeeded(policy: EmissionPolicy, now: Date) -> [PacketSampleStream.PacketStreamRecord] {
         guard flowContexts.count > FlowCachePolicy.maxTrackedFlows else {
-            return
+            return []
         }
 
         pruneFlowContextArrivalQueueIfNeeded(force: true)
+        var records: [PacketSampleStream.PacketStreamRecord] = []
 
         while flowContexts.count > FlowCachePolicy.maxTrackedFlows {
             if let candidate = flowContextArrivalQueue.popFirst() {
-                guard flowContexts.removeValue(forKey: candidate) != nil else {
+                guard let context = flowContexts[candidate] else {
                     continue
                 }
+                records.append(contentsOf: closeFlow(flow: candidate, context: context, timestamp: now, direction: context.lastDirection, reason: .overflowEviction, policy: policy))
             } else if let fallback = flowContexts.keys.first {
                 // Decision: this should stay cold because the arrival queue is the primary eviction path.
                 // If the queue is unexpectedly empty, removing any active flow is cheaper than re-sorting the actor state.
-                flowContexts.removeValue(forKey: fallback)
+                guard let context = flowContexts[fallback] else {
+                    continue
+                }
+                records.append(contentsOf: closeFlow(flow: fallback, context: context, timestamp: now, direction: context.lastDirection, reason: .overflowEviction, policy: policy))
             } else {
                 break
             }
         }
 
         pruneFlowContextArrivalQueueIfNeeded()
+        return records
+    }
+
+    private func closeFlow(
+        flow: FlowKey,
+        context: FlowContext,
+        timestamp: Date,
+        direction: PacketDirection,
+        reason: FlowCloseReason,
+        policy: EmissionPolicy,
+        closingSummary: FastPacketSummary? = nil
+    ) -> [PacketSampleStream.PacketStreamRecord] {
+        var records: [PacketSampleStream.PacketStreamRecord] = []
+        if policy.emitFlowSlices, !context.slice.isEmpty {
+            records.append(
+                makeRecord(
+                    kind: .flowSlice,
+                    timestamp: timestamp,
+                    direction: direction,
+                    flowContext: context,
+                    counters: context.slice.counters
+                )
+            )
+        }
+        if policy.emitFlowCloseEvents {
+            let closingCounters = closingSummary.map(CounterSet.init(summary:)) ?? CounterSet()
+            records.append(
+                makeRecord(
+                    kind: .flowClose,
+                    timestamp: timestamp,
+                    direction: direction,
+                    flowContext: context,
+                    counters: closingSummary == nil ? nil : closingCounters,
+                    closeReason: reason
+                )
+            )
+        }
+        flowContexts.removeValue(forKey: flow)
+        burstTracker.removeFlow(flow: flow)
+        return records
     }
 
     private func pruneFlowContextArrivalQueueIfNeeded(force: Bool = false) {

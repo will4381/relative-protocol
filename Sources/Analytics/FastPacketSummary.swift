@@ -4,6 +4,13 @@ import PacketIntelligenceCore
 /// Zero-copy packet header summary produced by the C fast path.
 /// Decision: the fast path owns cheap packet/header extraction, while Swift layers cache any expensive enrichment.
 struct FastPacketSummary: Sendable {
+    private enum DetectorThresholds {
+        // Decision: these bucket edges separate control/telemetry-sized packets from media-sized packets
+        // without introducing app-specific logic into the fast path.
+        static let smallPacketBytes = 200
+        static let largePacketBytes = 1200
+    }
+
     let ipVersion: UInt8
     let transportProtocolNumber: UInt8
     let flags: UInt8
@@ -115,6 +122,26 @@ struct FastPacketSummary: Sendable {
     /// Returns `true` when the TCP packet carries control flags that are useful for flow lifecycle detection.
     var isTCPControlSignal: Bool {
         transport == .tcp && (tcpFlags & 0x07) != 0
+    }
+
+    var isLargePacketForDetectorStats: Bool {
+        packetLength >= DetectorThresholds.largePacketBytes
+    }
+
+    var isSmallPacketForDetectorStats: Bool {
+        packetLength <= DetectorThresholds.smallPacketBytes
+    }
+
+    var hasTCPSYN: Bool {
+        transport == .tcp && (tcpFlags & 0x02) != 0
+    }
+
+    var hasTCPFIN: Bool {
+        transport == .tcp && (tcpFlags & 0x01) != 0
+    }
+
+    var hasTCPRST: Bool {
+        transport == .tcp && (tcpFlags & 0x04) != 0
     }
 
     var flowKey: FlowKey {

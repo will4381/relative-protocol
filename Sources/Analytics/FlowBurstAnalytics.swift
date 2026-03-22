@@ -314,6 +314,16 @@ public final class BurstTracker: @unchecked Sendable {
         return lastPacketAt.count
     }
 
+    /// Explicitly removes one tracked flow.
+    /// Decision: the analytics pipeline clears burst state on flow-close and synthetic lifecycle eviction so a
+    /// recycled 5-tuple does not inherit stale burst history.
+    func removeFlow(flow: FlowKey) {
+        lock.lock()
+        defer { lock.unlock() }
+        remove(flow: flow)
+        pruneArrivalQueueIfNeeded(force: true)
+    }
+
     private func maybeEvictExpired(now: Date) {
         if let lastSweepAt,
            now.timeIntervalSince(lastSweepAt) < EvictionPolicy.minimumSweepIntervalSeconds,

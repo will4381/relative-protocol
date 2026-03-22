@@ -84,6 +84,59 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertEqual(all, [sample])
     }
 
+    /// Verifies compact lifecycle and burst-shape counters survive conversion into the app-facing live tap.
+    func testPacketStreamConvertsCompactLifecycleAndBurstCounters() async throws {
+        let clock = DeterministicClock(startTime: Date(timeIntervalSince1970: 0))
+        let stream = PacketSampleStream(maxBytes: 4_096, clock: clock, logger: StructuredLogger(sink: InMemoryLogSink()))
+
+        try await stream.append(
+            records: [
+                makePacketStreamRecord(
+                    kind: .flowClose,
+                    timestamp: Date(timeIntervalSince1970: 42),
+                    flowHash: 0xfeed_beef,
+                    registrableDomain: "example.com",
+                    tlsServerName: "api.example.com",
+                    bytes: 1_536,
+                    packetCount: 3,
+                    closeReason: .tcpFin,
+                    largePacketCount: 1,
+                    smallPacketCount: 1,
+                    udpPacketCount: 0,
+                    tcpPacketCount: 3,
+                    quicInitialCount: 0,
+                    tcpSynCount: 1,
+                    tcpFinCount: 1,
+                    tcpRstCount: 0,
+                    burstDurationMs: 180,
+                    burstPacketCount: 3,
+                    leadingBytes200ms: 1_400,
+                    leadingPackets200ms: 2,
+                    leadingBytes600ms: 1_536,
+                    leadingPackets600ms: 3,
+                    burstLargePacketCount: 1,
+                    burstUdpPacketCount: 0,
+                    burstTcpPacketCount: 3,
+                    burstQuicInitialCount: 0
+                )
+            ]
+        )
+
+        let samples = await stream.readAll()
+        let sample = try XCTUnwrap(samples.first)
+        XCTAssertEqual(sample.kind, .flowClose)
+        XCTAssertEqual(sample.closeReason, .tcpFin)
+        XCTAssertEqual(sample.largePacketCount, 1)
+        XCTAssertEqual(sample.smallPacketCount, 1)
+        XCTAssertEqual(sample.tcpPacketCount, 3)
+        XCTAssertEqual(sample.tcpSynCount, 1)
+        XCTAssertEqual(sample.tcpFinCount, 1)
+        XCTAssertEqual(sample.leadingBytes200ms, 1_400)
+        XCTAssertEqual(sample.leadingPackets600ms, 3)
+        XCTAssertEqual(sample.burstLargePacketCount, 1)
+        XCTAssertEqual(sample.burstTcpPacketCount, 3)
+    }
+
     /// Verifies the detector-first pipeline emits sparse flow and activity records without deep metadata work.
     func testPacketAnalyticsPipelineEmitsSparseFlowAndActivityRecords() async throws {
         let clock = DeterministicClock(startTime: Date(timeIntervalSince1970: 0))
@@ -117,6 +170,10 @@ final class AnalyticsTests: XCTestCase {
         let policy = PacketAnalyticsPipeline.EmissionPolicy(
             allowDeepMetadata: false,
             maxMetadataProbesPerBatch: 0,
+            emitFlowSlices: true,
+            flowSliceIntervalMs: 250,
+            emitFlowCloseEvents: true,
+            emitBurstShapeCounters: true,
             activitySampleMinimumPackets: 2,
             activitySampleMinimumBytes: 1_024,
             activitySampleMinimumInterval: 60,
@@ -136,6 +193,283 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertEqual(records.last?.packetCount, 2)
         XCTAssertEqual(records.last?.flowPacketCount, 2)
         XCTAssertEqual(records.last?.flowByteCount, packet1.count + packet2.count)
+    }
+
+    /// Verifies detector-grade flow slices emit on cadence with typed protocol and control counters.
+    func testPacketAnalyticsPipelineEmitsFlowSliceCountersOnCadence() async throws {
+        let clock = DeterministicClock(startTime: Date(timeIntervalSince1970: 0))
+        let pipeline = PacketAnalyticsPipeline(
+            clock: clock,
+            burstTracker: BurstTracker(thresholdMs: 350),
+            signatureClassifier: SignatureClassifier(logger: StructuredLogger(sink: InMemoryLogSink()))
+        )
+
+        let syn = Data(
+            makeIPv4TCPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [1, 1, 1, 1],
+                sourcePort: 50_000,
+                destinationPort: 443,
+                tcpFlags: 0x02,
+                payload: []
+            )
+        )
+        let large = Data(
+            makeIPv4TCPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [1, 1, 1, 1],
+                sourcePort: 50_000,
+                destinationPort: 443,
+                tcpFlags: 0x18,
+                payload: Array(repeating: 0x17, count: 1_400)
+            )
+        )
+        let small = Data(
+            makeIPv4TCPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [1, 1, 1, 1],
+                sourcePort: 50_000,
+                destinationPort: 443,
+                tcpFlags: 0x18,
+                payload: Array(repeating: 0x17, count: 32)
+            )
+        )
+
+        let policy = PacketAnalyticsPipeline.EmissionPolicy(
+            allowDeepMetadata: false,
+            maxMetadataProbesPerBatch: 0,
+            emitFlowSlices: true,
+            flowSliceIntervalMs: 250,
+            emitFlowCloseEvents: false,
+            emitBurstShapeCounters: true,
+            activitySampleMinimumPackets: 1_024,
+            activitySampleMinimumBytes: 16 * 1_024 * 1_024,
+            activitySampleMinimumInterval: 60,
+            emitBurstEvents: false,
+            emitActivitySamples: false
+        )
+
+        let first = await pipeline.ingest(packets: [syn], families: [], direction: .outbound, policy: policy)
+        XCTAssertEqual(first.map(\.kind), [.flowOpen])
+
+        await clock.advance(by: 0.1)
+        let second = await pipeline.ingest(packets: [large], families: [], direction: .outbound, policy: policy)
+        XCTAssertTrue(second.isEmpty)
+
+        await clock.advance(by: 0.2)
+        let third = await pipeline.ingest(packets: [small], families: [], direction: .outbound, policy: policy)
+        XCTAssertEqual(third.map(\.kind), [.flowSlice])
+
+        let slice = try XCTUnwrap(third.first)
+        XCTAssertEqual(slice.packetCount, 3)
+        XCTAssertEqual(slice.bytes, syn.count + large.count + small.count)
+        XCTAssertEqual(slice.flowPacketCount, 3)
+        XCTAssertEqual(slice.tcpPacketCount, 3)
+        XCTAssertEqual(slice.udpPacketCount, 0)
+        XCTAssertEqual(slice.largePacketCount, 1)
+        XCTAssertEqual(slice.smallPacketCount, 2)
+        XCTAssertEqual(slice.tcpSynCount, 1)
+        XCTAssertEqual(slice.tcpFinCount, 0)
+        XCTAssertEqual(slice.tcpRstCount, 0)
+        XCTAssertEqual(slice.quicInitialCount, 0)
+    }
+
+    /// Verifies explicit TCP close signals produce typed `flowClose` records.
+    func testPacketAnalyticsPipelineEmitsFlowCloseOnTCPFIN() async throws {
+        let clock = DeterministicClock(startTime: Date(timeIntervalSince1970: 0))
+        let pipeline = PacketAnalyticsPipeline(
+            clock: clock,
+            burstTracker: BurstTracker(thresholdMs: 350),
+            signatureClassifier: SignatureClassifier(logger: StructuredLogger(sink: InMemoryLogSink()))
+        )
+
+        let dataPacket = Data(
+            makeIPv4TCPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [1, 1, 1, 1],
+                sourcePort: 50_000,
+                destinationPort: 443,
+                tcpFlags: 0x18,
+                payload: Array(repeating: 0x17, count: 128)
+            )
+        )
+        let finPacket = Data(
+            makeIPv4TCPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [1, 1, 1, 1],
+                sourcePort: 50_000,
+                destinationPort: 443,
+                tcpFlags: 0x11,
+                payload: []
+            )
+        )
+
+        let policy = PacketAnalyticsPipeline.EmissionPolicy(
+            allowDeepMetadata: false,
+            maxMetadataProbesPerBatch: 0,
+            emitFlowSlices: false,
+            flowSliceIntervalMs: 250,
+            emitFlowCloseEvents: true,
+            emitBurstShapeCounters: true,
+            activitySampleMinimumPackets: 1_024,
+            activitySampleMinimumBytes: 16 * 1_024 * 1_024,
+            activitySampleMinimumInterval: 60,
+            emitBurstEvents: false,
+            emitActivitySamples: false
+        )
+
+        let opened = await pipeline.ingest(packets: [dataPacket], families: [], direction: .outbound, policy: policy)
+        XCTAssertEqual(opened.map(\.kind), [.flowOpen])
+
+        await clock.advance(by: 0.05)
+        let closed = await pipeline.ingest(packets: [finPacket], families: [], direction: .outbound, policy: policy)
+        XCTAssertEqual(closed.map(\.kind), [.flowClose])
+
+        let close = try XCTUnwrap(closed.first)
+        XCTAssertEqual(close.closeReason, .tcpFin)
+        XCTAssertEqual(close.packetCount, 1)
+        XCTAssertEqual(close.tcpPacketCount, 1)
+        XCTAssertEqual(close.tcpFinCount, 1)
+        XCTAssertEqual(close.tcpSynCount, 0)
+        XCTAssertEqual(close.flowPacketCount, 2)
+        XCTAssertEqual(close.flowByteCount, dataPacket.count + finPacket.count)
+    }
+
+    /// Verifies idle flow eviction emits a synthetic `flowClose` record before new traffic is processed.
+    func testPacketAnalyticsPipelineEmitsIdleFlowCloseOnEviction() async throws {
+        let clock = DeterministicClock(startTime: Date(timeIntervalSince1970: 0))
+        let pipeline = PacketAnalyticsPipeline(
+            clock: clock,
+            burstTracker: BurstTracker(thresholdMs: 350),
+            signatureClassifier: SignatureClassifier(logger: StructuredLogger(sink: InMemoryLogSink()))
+        )
+
+        let firstFlowPacket = Data(
+            makeIPv4UDPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [1, 1, 1, 1],
+                sourcePort: 50_000,
+                destinationPort: 443,
+                payload: Array(repeating: 0x42, count: 160)
+            )
+        )
+        let secondFlowPacket = Data(
+            makeIPv4UDPPacket(
+                sourceAddress: [10, 0, 0, 3],
+                destinationAddress: [8, 8, 8, 8],
+                sourcePort: 50_001,
+                destinationPort: 443,
+                payload: Array(repeating: 0x24, count: 160)
+            )
+        )
+
+        let policy = PacketAnalyticsPipeline.EmissionPolicy(
+            allowDeepMetadata: false,
+            maxMetadataProbesPerBatch: 0,
+            emitFlowSlices: false,
+            flowSliceIntervalMs: 250,
+            emitFlowCloseEvents: true,
+            emitBurstShapeCounters: true,
+            activitySampleMinimumPackets: 1_024,
+            activitySampleMinimumBytes: 16 * 1_024 * 1_024,
+            activitySampleMinimumInterval: 60,
+            emitBurstEvents: false,
+            emitActivitySamples: false
+        )
+
+        let first = await pipeline.ingest(packets: [firstFlowPacket], families: [], direction: .outbound, policy: policy)
+        XCTAssertEqual(first.map(\.kind), [.flowOpen])
+
+        await clock.advance(by: 121)
+        let second = await pipeline.ingest(packets: [secondFlowPacket], families: [], direction: .outbound, policy: policy)
+        XCTAssertEqual(second.map(\.kind), [.flowClose, .flowOpen])
+
+        let close = try XCTUnwrap(second.first)
+        XCTAssertEqual(close.closeReason, .idleEviction)
+        XCTAssertEqual(close.bytes, 0)
+        XCTAssertNil(close.packetCount)
+        XCTAssertEqual(close.flowPacketCount, 1)
+        XCTAssertEqual(close.flowByteCount, firstFlowPacket.count)
+    }
+
+    /// Verifies completed bursts carry onset and protocol-shape counters without replaying raw packets.
+    func testPacketAnalyticsPipelineEmitsBurstShapeCounters() async throws {
+        let clock = DeterministicClock(startTime: Date(timeIntervalSince1970: 0))
+        let pipeline = PacketAnalyticsPipeline(
+            clock: clock,
+            burstTracker: BurstTracker(thresholdMs: 50),
+            signatureClassifier: SignatureClassifier(logger: StructuredLogger(sink: InMemoryLogSink()))
+        )
+
+        let small = Data(
+            makeIPv4UDPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [1, 1, 1, 1],
+                sourcePort: 50_000,
+                destinationPort: 443,
+                payload: Array(repeating: 0x11, count: 96)
+            )
+        )
+        let large = Data(
+            makeIPv4UDPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [1, 1, 1, 1],
+                sourcePort: 50_000,
+                destinationPort: 443,
+                payload: Array(repeating: 0x22, count: 1_400)
+            )
+        )
+        let nextBurst = Data(
+            makeIPv4UDPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [1, 1, 1, 1],
+                sourcePort: 50_000,
+                destinationPort: 443,
+                payload: Array(repeating: 0x33, count: 128)
+            )
+        )
+
+        let policy = PacketAnalyticsPipeline.EmissionPolicy(
+            allowDeepMetadata: false,
+            maxMetadataProbesPerBatch: 0,
+            emitFlowSlices: false,
+            flowSliceIntervalMs: 250,
+            emitFlowCloseEvents: false,
+            emitBurstShapeCounters: true,
+            activitySampleMinimumPackets: 1_024,
+            activitySampleMinimumBytes: 16 * 1_024 * 1_024,
+            activitySampleMinimumInterval: 60,
+            emitBurstEvents: true,
+            emitActivitySamples: false
+        )
+
+        let first = await pipeline.ingest(packets: [small], families: [], direction: .inbound, policy: policy)
+        XCTAssertEqual(first.map(\.kind), [.flowOpen])
+
+        await clock.advance(by: 0.05)
+        let second = await pipeline.ingest(packets: [large], families: [], direction: .inbound, policy: policy)
+        XCTAssertTrue(second.isEmpty)
+
+        await clock.advance(by: 0.15)
+        let third = await pipeline.ingest(packets: [nextBurst], families: [], direction: .inbound, policy: policy)
+        XCTAssertEqual(third.map(\.kind), [.burst])
+
+        let burst = try XCTUnwrap(third.first)
+        XCTAssertEqual(burst.bytes, small.count + large.count)
+        XCTAssertEqual(burst.packetCount, 2)
+        XCTAssertEqual(burst.burstPacketCount, 2)
+        XCTAssertEqual(burst.udpPacketCount, 2)
+        XCTAssertEqual(burst.tcpPacketCount, 0)
+        XCTAssertEqual(burst.largePacketCount, 1)
+        XCTAssertEqual(burst.smallPacketCount, 1)
+        XCTAssertEqual(burst.leadingBytes200ms, small.count + large.count)
+        XCTAssertEqual(burst.leadingPackets200ms, 2)
+        XCTAssertEqual(burst.leadingBytes600ms, small.count + large.count)
+        XCTAssertEqual(burst.leadingPackets600ms, 2)
+        XCTAssertEqual(burst.burstLargePacketCount, 1)
+        XCTAssertEqual(burst.burstUdpPacketCount, 2)
+        XCTAssertEqual(burst.burstTcpPacketCount, 0)
+        XCTAssertEqual(burst.burstQuicInitialCount, 0)
     }
 
     /// Verifies the telemetry worker skips pure ACK-only batches before they enter the async worker queue.
@@ -317,6 +651,85 @@ final class AnalyticsTests: XCTestCase {
         await worker.stopAndWait()
     }
 
+    /// Verifies detectors can consume richer sparse records than the foreground live tap publishes by default.
+    func testPacketTelemetryWorkerDetectorsSeeFlowSlicesWhileLiveTapStaysLean() async throws {
+        let clock = DeterministicClock(startTime: Date(timeIntervalSince1970: 0))
+        let pipeline = PacketAnalyticsPipeline(
+            clock: clock,
+            burstTracker: BurstTracker(thresholdMs: 350),
+            signatureClassifier: SignatureClassifier(logger: StructuredLogger(sink: InMemoryLogSink()))
+        )
+        let packetStream = PacketSampleStream(maxBytes: 4_096, clock: clock, logger: StructuredLogger(sink: InMemoryLogSink()))
+        let detector = RecordingDetector()
+        let policy = PacketAnalyticsPipeline.EmissionPolicy(
+            allowDeepMetadata: false,
+            maxMetadataProbesPerBatch: 0,
+            emitFlowSlices: true,
+            flowSliceIntervalMs: 250,
+            emitFlowCloseEvents: false,
+            emitBurstShapeCounters: true,
+            activitySampleMinimumPackets: 1_024,
+            activitySampleMinimumBytes: 16 * 1_024 * 1_024,
+            activitySampleMinimumInterval: 60,
+            emitBurstEvents: false,
+            emitActivitySamples: false
+        )
+        let worker = PacketTelemetryWorker(
+            pipeline: pipeline,
+            packetStream: packetStream,
+            detectors: [detector],
+            logger: StructuredLogger(sink: InMemoryLogSink()),
+            processInfo: .processInfo,
+            emissionPolicyOverride: policy
+        )
+
+        let syn = Data(
+            makeIPv4TCPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [1, 1, 1, 1],
+                sourcePort: 50_000,
+                destinationPort: 443,
+                tcpFlags: 0x02,
+                payload: []
+            )
+        )
+        let payloadA = Data(
+            makeIPv4TCPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [1, 1, 1, 1],
+                sourcePort: 50_000,
+                destinationPort: 443,
+                tcpFlags: 0x18,
+                payload: Array(repeating: 0x17, count: 256)
+            )
+        )
+        let payloadB = Data(
+            makeIPv4TCPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [1, 1, 1, 1],
+                sourcePort: 50_000,
+                destinationPort: 443,
+                tcpFlags: 0x18,
+                payload: Array(repeating: 0x17, count: 256)
+            )
+        )
+
+        XCTAssertTrue(worker.submit(packets: [syn], families: [], direction: .outbound).accepted)
+        await worker.flushAndWait()
+        await clock.advance(by: 0.1)
+        XCTAssertTrue(worker.submit(packets: [payloadA], families: [], direction: .outbound).accepted)
+        await worker.flushAndWait()
+        await clock.advance(by: 0.2)
+        XCTAssertTrue(worker.submit(packets: [payloadB], families: [], direction: .outbound).accepted)
+        await worker.flushAndWait()
+
+        await worker.stopAndWait()
+
+        let snapshot = await worker.recentSnapshot(limit: 10)
+        XCTAssertEqual(snapshot.samples.map(\.kind), [.flowOpen])
+        XCTAssertEqual(detector.recordedKinds(), [.flowOpen, .flowSlice])
+    }
+
     /// Verifies the persisted detector store round-trips durable detector summaries.
     func testDetectionStoreRoundTrip() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -443,6 +856,31 @@ final class AnalyticsTests: XCTestCase {
         }
     }
 
+    private final class RecordingDetector: TrafficDetector {
+        let identifier = "recording-detector"
+        private let lock = NSLock()
+        private var kinds: [PacketSampleKind] = []
+
+        func ingest(_ records: DetectorRecordCollection) -> [DetectionEvent] {
+            lock.lock()
+            kinds.append(contentsOf: records.map(\.kind))
+            lock.unlock()
+            return []
+        }
+
+        func reset() {
+            lock.lock()
+            kinds.removeAll(keepingCapacity: false)
+            lock.unlock()
+        }
+
+        func recordedKinds() -> [PacketSampleKind] {
+            lock.lock()
+            defer { lock.unlock() }
+            return kinds
+        }
+    }
+
     /// Verifies persisted provider stop records map to stable user-facing summaries.
     func testTunnelStopRecordSummaryMapping() {
         let userStop = TunnelStopRecord(timestamp: Date(timeIntervalSince1970: 0), reasonCode: 1, reasonName: "userInitiated")
@@ -475,8 +913,25 @@ final class AnalyticsTests: XCTestCase {
         tlsServerName: String?,
         bytes: Int,
         packetCount: Int,
+        closeReason: FlowCloseReason? = nil,
+        largePacketCount: Int? = nil,
+        smallPacketCount: Int? = nil,
+        udpPacketCount: Int? = nil,
+        tcpPacketCount: Int? = nil,
+        quicInitialCount: Int? = nil,
+        tcpSynCount: Int? = nil,
+        tcpFinCount: Int? = nil,
+        tcpRstCount: Int? = nil,
         burstDurationMs: Int? = nil,
-        burstPacketCount: Int? = nil
+        burstPacketCount: Int? = nil,
+        leadingBytes200ms: Int? = nil,
+        leadingPackets200ms: Int? = nil,
+        leadingBytes600ms: Int? = nil,
+        leadingPackets600ms: Int? = nil,
+        burstLargePacketCount: Int? = nil,
+        burstUdpPacketCount: Int? = nil,
+        burstTcpPacketCount: Int? = nil,
+        burstQuicInitialCount: Int? = nil
     ) -> PacketSampleStream.PacketStreamRecord {
         PacketSampleStream.PacketStreamRecord(
             kind: kind,
@@ -511,8 +966,25 @@ final class AnalyticsTests: XCTestCase {
             quicDestinationConnectionId: nil,
             quicSourceConnectionId: nil,
             classification: nil,
+            closeReason: closeReason,
+            largePacketCount: largePacketCount,
+            smallPacketCount: smallPacketCount,
+            udpPacketCount: udpPacketCount,
+            tcpPacketCount: tcpPacketCount,
+            quicInitialCount: quicInitialCount,
+            tcpSynCount: tcpSynCount,
+            tcpFinCount: tcpFinCount,
+            tcpRstCount: tcpRstCount,
             burstDurationMs: burstDurationMs,
-            burstPacketCount: burstPacketCount
+            burstPacketCount: burstPacketCount,
+            leadingBytes200ms: leadingBytes200ms,
+            leadingPackets200ms: leadingPackets200ms,
+            leadingBytes600ms: leadingBytes600ms,
+            leadingPackets600ms: leadingPackets600ms,
+            burstLargePacketCount: burstLargePacketCount,
+            burstUdpPacketCount: burstUdpPacketCount,
+            burstTcpPacketCount: burstTcpPacketCount,
+            burstQuicInitialCount: burstQuicInitialCount
         )
     }
 
@@ -540,7 +1012,39 @@ final class AnalyticsTests: XCTestCase {
         packet[tcpOffset + 3] = UInt8(destinationPort & 0xff)
         packet[tcpOffset + 12] = 0x50
         packet[tcpOffset + 13] = tcpFlags
-        packet[(tcpOffset + 20)...] = payload[0...]
+        if !payload.isEmpty {
+            packet[(tcpOffset + 20)...] = payload[0...]
+        }
+        return packet
+    }
+
+    private func makeIPv4UDPPacket(
+        sourceAddress: [UInt8],
+        destinationAddress: [UInt8],
+        sourcePort: UInt16,
+        destinationPort: UInt16,
+        payload: [UInt8]
+    ) -> [UInt8] {
+        var packet = [UInt8](repeating: 0, count: 20 + 8 + payload.count)
+        packet[0] = 0x45
+        packet[2] = UInt8(packet.count >> 8)
+        packet[3] = UInt8(packet.count & 0xff)
+        packet[8] = 64
+        packet[9] = 17
+        packet[12..<16] = sourceAddress[0..<4]
+        packet[16..<20] = destinationAddress[0..<4]
+
+        let udpOffset = 20
+        let udpLength = 8 + payload.count
+        packet[udpOffset] = UInt8(sourcePort >> 8)
+        packet[udpOffset + 1] = UInt8(sourcePort & 0xff)
+        packet[udpOffset + 2] = UInt8(destinationPort >> 8)
+        packet[udpOffset + 3] = UInt8(destinationPort & 0xff)
+        packet[udpOffset + 4] = UInt8(udpLength >> 8)
+        packet[udpOffset + 5] = UInt8(udpLength & 0xff)
+        if !payload.isEmpty {
+            packet[(udpOffset + 8)...] = payload[0...]
+        }
         return packet
     }
 }

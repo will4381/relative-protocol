@@ -36,8 +36,25 @@ public struct DetectorRecord: Sendable, Equatable {
     public let quicDestinationConnectionId: String?
     public let quicSourceConnectionId: String?
     public let classification: String?
+    public let closeReason: FlowCloseReason?
+    public let largePacketCount: Int?
+    public let smallPacketCount: Int?
+    public let udpPacketCount: Int?
+    public let tcpPacketCount: Int?
+    public let quicInitialCount: Int?
+    public let tcpSynCount: Int?
+    public let tcpFinCount: Int?
+    public let tcpRstCount: Int?
     public let burstDurationMs: Int?
     public let burstPacketCount: Int?
+    public let leadingBytes200ms: Int?
+    public let leadingPackets200ms: Int?
+    public let leadingBytes600ms: Int?
+    public let leadingPackets600ms: Int?
+    public let burstLargePacketCount: Int?
+    public let burstUdpPacketCount: Int?
+    public let burstTcpPacketCount: Int?
+    public let burstQuicInitialCount: Int?
 
     public var sourceAddress: String? {
         if let sourceAddressStorage {
@@ -90,8 +107,25 @@ public struct DetectorRecord: Sendable, Equatable {
         quicDestinationConnectionId: String?,
         quicSourceConnectionId: String?,
         classification: String?,
+        closeReason: FlowCloseReason?,
+        largePacketCount: Int?,
+        smallPacketCount: Int?,
+        udpPacketCount: Int?,
+        tcpPacketCount: Int?,
+        quicInitialCount: Int?,
+        tcpSynCount: Int?,
+        tcpFinCount: Int?,
+        tcpRstCount: Int?,
         burstDurationMs: Int?,
-        burstPacketCount: Int?
+        burstPacketCount: Int?,
+        leadingBytes200ms: Int?,
+        leadingPackets200ms: Int?,
+        leadingBytes600ms: Int?,
+        leadingPackets600ms: Int?,
+        burstLargePacketCount: Int?,
+        burstUdpPacketCount: Int?,
+        burstTcpPacketCount: Int?,
+        burstQuicInitialCount: Int?
     ) {
         self.kind = kind
         self.timestamp = timestamp
@@ -125,8 +159,25 @@ public struct DetectorRecord: Sendable, Equatable {
         self.quicDestinationConnectionId = quicDestinationConnectionId
         self.quicSourceConnectionId = quicSourceConnectionId
         self.classification = classification
+        self.closeReason = closeReason
+        self.largePacketCount = largePacketCount
+        self.smallPacketCount = smallPacketCount
+        self.udpPacketCount = udpPacketCount
+        self.tcpPacketCount = tcpPacketCount
+        self.quicInitialCount = quicInitialCount
+        self.tcpSynCount = tcpSynCount
+        self.tcpFinCount = tcpFinCount
+        self.tcpRstCount = tcpRstCount
         self.burstDurationMs = burstDurationMs
         self.burstPacketCount = burstPacketCount
+        self.leadingBytes200ms = leadingBytes200ms
+        self.leadingPackets200ms = leadingPackets200ms
+        self.leadingBytes600ms = leadingBytes600ms
+        self.leadingPackets600ms = leadingPackets600ms
+        self.burstLargePacketCount = burstLargePacketCount
+        self.burstUdpPacketCount = burstUdpPacketCount
+        self.burstTcpPacketCount = burstTcpPacketCount
+        self.burstQuicInitialCount = burstQuicInitialCount
     }
 
     init(compactRecord record: PacketSampleStream.PacketStreamRecord) {
@@ -162,8 +213,25 @@ public struct DetectorRecord: Sendable, Equatable {
         self.quicDestinationConnectionId = record.quicDestinationConnectionId
         self.quicSourceConnectionId = record.quicSourceConnectionId
         self.classification = record.classification
+        self.closeReason = record.closeReason
+        self.largePacketCount = record.largePacketCount
+        self.smallPacketCount = record.smallPacketCount
+        self.udpPacketCount = record.udpPacketCount
+        self.tcpPacketCount = record.tcpPacketCount
+        self.quicInitialCount = record.quicInitialCount
+        self.tcpSynCount = record.tcpSynCount
+        self.tcpFinCount = record.tcpFinCount
+        self.tcpRstCount = record.tcpRstCount
         self.burstDurationMs = record.burstDurationMs
         self.burstPacketCount = record.burstPacketCount
+        self.leadingBytes200ms = record.leadingBytes200ms
+        self.leadingPackets200ms = record.leadingPackets200ms
+        self.leadingBytes600ms = record.leadingBytes600ms
+        self.leadingPackets600ms = record.leadingPackets600ms
+        self.burstLargePacketCount = record.burstLargePacketCount
+        self.burstUdpPacketCount = record.burstUdpPacketCount
+        self.burstTcpPacketCount = record.burstTcpPacketCount
+        self.burstQuicInitialCount = record.burstQuicInitialCount
     }
 }
 

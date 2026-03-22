@@ -4,13 +4,24 @@ import Observability
 import TunnelRuntime
 
 /// Event kind used by the app-facing rolling packet tap.
-/// Decision: the tunnel writes fewer, more meaningful events (`flowOpen`, `metadata`, `burst`, `activitySample`)
+/// Decision: the tunnel writes fewer, more meaningful events (`flowOpen`, `flowSlice`, `flowClose`, `metadata`,
+/// `burst`, `activitySample`)
 /// instead of one rich sample for every admitted packet.
 public enum PacketSampleKind: String, Codable, Sendable, Equatable {
     case flowOpen
+    case flowSlice
+    case flowClose
     case metadata
     case burst
     case activitySample
+}
+
+/// Lifecycle reason attached to `flowClose` records.
+public enum FlowCloseReason: String, Codable, Sendable, Equatable {
+    case tcpFin
+    case tcpRst
+    case idleEviction
+    case overflowEviction
 }
 
 /// One app-facing packet intelligence event.
@@ -40,8 +51,25 @@ public struct PacketSample: Codable, Sendable, Equatable {
     public let quicDestinationConnectionId: String?
     public let quicSourceConnectionId: String?
     public let classification: String?
+    public let closeReason: FlowCloseReason?
+    public let largePacketCount: Int?
+    public let smallPacketCount: Int?
+    public let udpPacketCount: Int?
+    public let tcpPacketCount: Int?
+    public let quicInitialCount: Int?
+    public let tcpSynCount: Int?
+    public let tcpFinCount: Int?
+    public let tcpRstCount: Int?
     public let burstDurationMs: Int?
     public let burstPacketCount: Int?
+    public let leadingBytes200ms: Int?
+    public let leadingPackets200ms: Int?
+    public let leadingBytes600ms: Int?
+    public let leadingPackets600ms: Int?
+    public let burstLargePacketCount: Int?
+    public let burstUdpPacketCount: Int?
+    public let burstTcpPacketCount: Int?
+    public let burstQuicInitialCount: Int?
 
     public init(
         kind: PacketSampleKind = .activitySample,
@@ -69,8 +97,25 @@ public struct PacketSample: Codable, Sendable, Equatable {
         quicDestinationConnectionId: String? = nil,
         quicSourceConnectionId: String? = nil,
         classification: String? = nil,
+        closeReason: FlowCloseReason? = nil,
+        largePacketCount: Int? = nil,
+        smallPacketCount: Int? = nil,
+        udpPacketCount: Int? = nil,
+        tcpPacketCount: Int? = nil,
+        quicInitialCount: Int? = nil,
+        tcpSynCount: Int? = nil,
+        tcpFinCount: Int? = nil,
+        tcpRstCount: Int? = nil,
         burstDurationMs: Int? = nil,
-        burstPacketCount: Int? = nil
+        burstPacketCount: Int? = nil,
+        leadingBytes200ms: Int? = nil,
+        leadingPackets200ms: Int? = nil,
+        leadingBytes600ms: Int? = nil,
+        leadingPackets600ms: Int? = nil,
+        burstLargePacketCount: Int? = nil,
+        burstUdpPacketCount: Int? = nil,
+        burstTcpPacketCount: Int? = nil,
+        burstQuicInitialCount: Int? = nil
     ) {
         self.kind = kind
         self.timestamp = timestamp
@@ -97,8 +142,25 @@ public struct PacketSample: Codable, Sendable, Equatable {
         self.quicDestinationConnectionId = quicDestinationConnectionId
         self.quicSourceConnectionId = quicSourceConnectionId
         self.classification = classification
+        self.closeReason = closeReason
+        self.largePacketCount = largePacketCount
+        self.smallPacketCount = smallPacketCount
+        self.udpPacketCount = udpPacketCount
+        self.tcpPacketCount = tcpPacketCount
+        self.quicInitialCount = quicInitialCount
+        self.tcpSynCount = tcpSynCount
+        self.tcpFinCount = tcpFinCount
+        self.tcpRstCount = tcpRstCount
         self.burstDurationMs = burstDurationMs
         self.burstPacketCount = burstPacketCount
+        self.leadingBytes200ms = leadingBytes200ms
+        self.leadingPackets200ms = leadingPackets200ms
+        self.leadingBytes600ms = leadingBytes600ms
+        self.leadingPackets600ms = leadingPackets600ms
+        self.burstLargePacketCount = burstLargePacketCount
+        self.burstUdpPacketCount = burstUdpPacketCount
+        self.burstTcpPacketCount = burstTcpPacketCount
+        self.burstQuicInitialCount = burstQuicInitialCount
     }
 }
 
@@ -162,8 +224,25 @@ public actor PacketSampleStream {
         let quicDestinationConnectionId: String?
         let quicSourceConnectionId: String?
         let classification: String?
+        let closeReason: FlowCloseReason?
+        let largePacketCount: Int?
+        let smallPacketCount: Int?
+        let udpPacketCount: Int?
+        let tcpPacketCount: Int?
+        let quicInitialCount: Int?
+        let tcpSynCount: Int?
+        let tcpFinCount: Int?
+        let tcpRstCount: Int?
         let burstDurationMs: Int?
         let burstPacketCount: Int?
+        let leadingBytes200ms: Int?
+        let leadingPackets200ms: Int?
+        let leadingBytes600ms: Int?
+        let leadingPackets600ms: Int?
+        let burstLargePacketCount: Int?
+        let burstUdpPacketCount: Int?
+        let burstTcpPacketCount: Int?
+        let burstQuicInitialCount: Int?
     }
 
     private enum StoredPayload: Sendable {
@@ -287,7 +366,7 @@ public actor PacketSampleStream {
 
     /// Approximate memory cost used for eviction policy tests and capacity sizing.
     public static func estimatedRecordSize(for sample: PacketSample) -> Int {
-        var size = 160
+        var size = 224
 
         func add(_ value: String?) {
             guard let value else { return }
@@ -320,7 +399,7 @@ public actor PacketSampleStream {
     }
 
     static func estimatedRecordSize(for record: PacketStreamRecord) -> Int {
-        var size = 160
+        var size = 224
 
         func add(_ value: String?) {
             guard let value else { return }
@@ -494,8 +573,25 @@ public actor PacketSampleStream {
             quicDestinationConnectionId: record.quicDestinationConnectionId,
             quicSourceConnectionId: record.quicSourceConnectionId,
             classification: record.classification,
+            closeReason: record.closeReason,
+            largePacketCount: record.largePacketCount,
+            smallPacketCount: record.smallPacketCount,
+            udpPacketCount: record.udpPacketCount,
+            tcpPacketCount: record.tcpPacketCount,
+            quicInitialCount: record.quicInitialCount,
+            tcpSynCount: record.tcpSynCount,
+            tcpFinCount: record.tcpFinCount,
+            tcpRstCount: record.tcpRstCount,
             burstDurationMs: record.burstDurationMs,
-            burstPacketCount: record.burstPacketCount
+            burstPacketCount: record.burstPacketCount,
+            leadingBytes200ms: record.leadingBytes200ms,
+            leadingPackets200ms: record.leadingPackets200ms,
+            leadingBytes600ms: record.leadingBytes600ms,
+            leadingPackets600ms: record.leadingPackets600ms,
+            burstLargePacketCount: record.burstLargePacketCount,
+            burstUdpPacketCount: record.burstUdpPacketCount,
+            burstTcpPacketCount: record.burstTcpPacketCount,
+            burstQuicInitialCount: record.burstQuicInitialCount
         )
     }
 

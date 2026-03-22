@@ -32,6 +32,7 @@ There are two telemetry surfaces:
    - rolling in-memory packet/event window
    - roughly `10s` by default
    - foreground app reads it on demand
+   - intentionally leaner than the full detector-facing sparse stream
 
 2. `durable detections`
    - compact detector outputs persisted in the App Group container
@@ -103,12 +104,25 @@ It exists so a foreground app can inspect recent evidence without forcing the tu
 `PacketAnalyticsPipeline` turns raw packets into sparse detector-friendly events:
 
 - `flowOpen`
+- `flowSlice`
+- `flowClose`
 - `metadata`
 - `burst`
 - `activitySample`
 
 These are not full packet logs.
 They are lower-cost runtime signals designed for detectors.
+
+The detector path can be richer than the app-facing live tap.
+By default, the tunnel may emit detector-grade `flowSlice` records for in-extension detectors while keeping the foreground live tap leaner.
+That means:
+
+- detectors can receive `flowSlice`
+- the default app-facing live tap does not surface `flowSlice`
+- a host app can therefore legitimately see `0` `flowSlice` rows even while detectors are using them
+
+This is intentional.
+`flowSlice` is a high-value detector primitive, but publishing every slice into the foreground live tap would inflate snapshot volume, memory pressure, and UI/debug overhead without improving durable correctness.
 
 ### Durable Detections
 
@@ -234,6 +248,17 @@ Important fields in `TunnelProfile`:
 - foreground packet/event snapshots
 
 `liveTapEnabled` only has effect when `telemetryEnabled` is also `true`.
+The default live tap stays lean even when detector telemetry is richer.
+It does not mean every sparse detector record kind is surfaced to the app.
+
+Current default split:
+
+- detector path
+  - can see `flowOpen`, `flowSlice`, `flowClose`, `metadata`, `burst`, `activitySample`
+- default app-facing live tap
+  - surfaces `flowOpen`, `metadata`, `burst`, `flowClose`
+  - keeps `flowSlice` detector-only by default
+  - buffers `activitySample` and only surfaces it when a nearby `metadata`, `burst`, or `flowClose` event makes that context useful
 
 ### 3. Configure `NETunnelProviderManager` in the containing app
 
@@ -454,6 +479,215 @@ For a host app, the typical setup is:
 That is the supported package integration path.
 You do not need to patch package internals to add detectors.
 
+## Detector Surfaces
+
+There are several detector-related surfaces in the package.
+They are not interchangeable.
+
+Use them like this:
+
+### 1. Detector registration surface
+
+This is where detectors are installed into the tunnel runtime:
+
+- `PacketTunnelProviderShell.makeDetectors(profile:analyticsRootURL:logger:)`
+
+Use this when you want to:
+
+- add one or more custom detectors
+- load detector-local resources from the App Group analytics root
+- choose detectors based on product config
+
+This is an extension-runtime hook, not an app-facing read path.
+
+### 2. Detector runtime input surface
+
+This is what detectors actually consume:
+
+- `TrafficDetector`
+- `DetectorRecordCollection`
+- `DetectorRecord`
+
+Use this when you want to:
+
+- inspect sparse traffic features
+- build rolling detector state
+- score rules or ML features
+- emit durable `DetectionEvent` values
+
+This is the main detector-facing API surface.
+
+### 3. Sparse record-kind surface
+
+These are the record kinds the pipeline can emit for detectors:
+
+- `flowOpen`
+- `flowSlice`
+- `flowClose`
+- `metadata`
+- `burst`
+- `activitySample`
+
+Use them like this:
+
+- `flowOpen`
+  - first lifecycle marker for a tracked flow
+- `flowSlice`
+  - fixed-cadence aggregate for short-window features
+  - best source for throughput, concentration, packet-shape, and control-mix features
+- `flowClose`
+  - lifecycle end marker with typed close reason
+- `metadata`
+  - host/DNS/TLS/QUIC enrichment boundary
+- `burst`
+  - completed burst with onset and burst-shape counters
+- `activitySample`
+  - coarse low-frequency activity rollup
+
+If you are building detectors, this is usually the most important surface to reason about.
+
+### 4. Typed feature surface
+
+These detector-facing typed fields are available on `DetectorRecord`:
+
+- flow/lifecycle
+  - `kind`
+  - `timestamp`
+  - `direction`
+  - `flowHash`
+  - `flowPacketCount`
+  - `flowByteCount`
+  - `closeReason`
+- volume and packet shape
+  - `bytes`
+  - `packetCount`
+  - `largePacketCount`
+  - `smallPacketCount`
+- protocol/control mix
+  - `protocolHint`
+  - `ipVersion`
+  - `transportProtocolNumber`
+  - `udpPacketCount`
+  - `tcpPacketCount`
+  - `quicInitialCount`
+  - `tcpSynCount`
+  - `tcpFinCount`
+  - `tcpRstCount`
+- endpoint and host enrichment
+  - `sourcePort`
+  - `destinationPort`
+  - `registrableDomain`
+  - `dnsQueryName`
+  - `dnsCname`
+  - `dnsAnswerAddresses`
+  - `tlsServerName`
+  - `classification`
+- QUIC enrichment
+  - `quicVersion`
+  - `quicPacketType`
+  - `quicDestinationConnectionId`
+  - `quicSourceConnectionId`
+- burst-shape fields
+  - `burstDurationMs`
+  - `burstPacketCount`
+  - `leadingBytes200ms`
+  - `leadingPackets200ms`
+  - `leadingBytes600ms`
+  - `leadingPackets600ms`
+  - `burstLargePacketCount`
+  - `burstUdpPacketCount`
+  - `burstTcpPacketCount`
+  - `burstQuicInitialCount`
+
+These are the typed detector surfaces you should prefer over string metadata.
+
+### 5. Durable detector output surface
+
+This is what detectors emit and what the package persists:
+
+- `DetectionEvent`
+- `DetectionSnapshot`
+- `DetectionStore`
+- `TunnelDetectionStore`
+
+Use this when you want to:
+
+- build product state
+- recover after app suspension
+- show detector results in the app
+- persist compact detector outputs safely
+
+This is the detector system of record for app-visible product behavior.
+
+### 6. Foreground debug/read surface
+
+This is what the app can ask the tunnel for while it is active:
+
+- `TunnelTelemetryClient`
+- `TunnelTelemetrySnapshot`
+- `PacketSample`
+
+Use this when you want to:
+
+- inspect recent foreground tunnel activity
+- debug detector timing
+- correlate a just-fired detection with nearby sparse records
+
+Important:
+
+- this is a debug/read surface
+- it is intentionally leaner than the full detector-facing sparse stream
+- it is not the source of truth for background correctness
+
+### 7. Optional low-cost classification surface
+
+The package can enrich sparse records with a classifier label from signatures:
+
+- `SignatureClassifier`
+- `<AppGroup>/Analytics/AppSignatures/<signatureFileName>`
+
+Use this when you want to:
+
+- add cheap app/domain classification hints
+- gate detectors on a coarse label
+- reduce host-token heuristics in your detector code
+
+This is an input hint, not an authoritative detector output.
+
+### 8. Detector control/config surface
+
+These `TunnelProfile` knobs control whether the detector pipeline and app-facing reads exist:
+
+- `telemetryEnabled`
+- `liveTapEnabled`
+- `liveTapMaxBytes`
+
+Use them like this:
+
+- `telemetryEnabled`
+  - turns on sparse analytics, detector execution, and durable detector persistence
+- `liveTapEnabled`
+  - turns on the app-facing rolling live tap
+  - does not imply every detector-grade record kind is exposed to the app
+- `liveTapMaxBytes`
+  - bounds the in-memory live tap footprint
+
+### 9. What is not a detector surface
+
+Do not treat these as your primary detector integration surface:
+
+- raw packet persistence
+- the containing app polling loop
+- UI-only state
+- string metadata for core typed traffic features
+
+The intended detector model is:
+
+- tunnel extension owns detection
+- detectors read sparse typed records
+- detectors emit compact `DetectionEvent` values
+- the app reads durable outputs and optional recent debug context
+
 ## Detector Contract
 
 `TrafficDetector` implementations receive `DetectorRecord` batches.
@@ -482,8 +716,66 @@ Those records contain stable fields such as:
 - `quicDestinationConnectionId`
 - `quicSourceConnectionId`
 - `classification`
+- `closeReason`
+- `largePacketCount`
+- `smallPacketCount`
+- `udpPacketCount`
+- `tcpPacketCount`
+- `quicInitialCount`
+- `tcpSynCount`
+- `tcpFinCount`
+- `tcpRstCount`
 - `burstDurationMs`
 - `burstPacketCount`
+- `leadingBytes200ms`
+- `leadingPackets200ms`
+- `leadingBytes600ms`
+- `leadingPackets600ms`
+- `burstLargePacketCount`
+- `burstUdpPacketCount`
+- `burstTcpPacketCount`
+- `burstQuicInitialCount`
+
+Record-kind guidance:
+
+- `flowOpen`
+  - first admitted sparse record for a tracked flow
+  - good for detector-side flow lifecycle start markers
+- `flowSlice`
+  - fixed-cadence per-flow aggregate, `250 ms` by default
+  - good for short-window throughput, packet mix, control-signal, and concentration features
+  - detector-grade by default and not normally shown in the foreground live tap
+- `flowClose`
+  - explicit or synthetic lifecycle end marker
+  - `closeReason` is one of:
+    - `tcpFin`
+    - `tcpRst`
+    - `idleEviction`
+    - `overflowEviction`
+- `metadata`
+  - sparse host/DNS/TLS/QUIC enrichment boundary
+- `burst`
+  - completed burst boundary with onset and protocol-shape counters
+- `activitySample`
+  - coarse low-frequency activity rollup kept mainly for recent foreground context
+  - not every emitted activity sample is guaranteed to appear in the live tap snapshot
+
+Typed counter guidance:
+
+- `largePacketCount` / `smallPacketCount`
+  - packet-size bucket counts for the current record window
+- `udpPacketCount` / `tcpPacketCount`
+  - protocol mix for the current record window
+- `quicInitialCount`
+  - number of QUIC Initial candidates in the current record window
+- `tcpSynCount` / `tcpFinCount` / `tcpRstCount`
+  - cheap TCP control-signal counts surfaced directly from the fast parser
+- `leadingBytes200ms` / `leadingPackets200ms`
+  - first `200 ms` onset shape for a completed burst
+- `leadingBytes600ms` / `leadingPackets600ms`
+  - first `600 ms` onset shape for a completed burst
+- `burstLargePacketCount` / `burstUdpPacketCount` / `burstTcpPacketCount` / `burstQuicInitialCount`
+  - burst-local packet-shape counters emitted alongside `burst`
 
 `DetectorRecordCollection` is a lightweight batch wrapper.
 Use it when you want to:
@@ -549,6 +841,8 @@ Recommended persistence split:
 
 - live tap
   - short-lived evidence/debug context
+  - intentionally leaner than the full detector-facing sparse stream
+  - should be treated as a debug surface, not the detector system of record
 - `DetectionSnapshot`
   - durable product state
 - your own auxiliary detector store
@@ -586,6 +880,9 @@ Current package defaults:
 - live tap retention window: `10s`
 - foreground packet snapshot cap: `96`
 - telemetry queue cap: `2` batches / `256 KB`
+- detector `flowSlice` cadence: `250 ms`
+- default live tap publishes `flowOpen`, `metadata`, `burst`, and `flowClose`
+- default live tap does not publish `flowSlice`
 - health sample interval: `60s`
 - more aggressive telemetry backoff at elevated thermal states
 
@@ -601,14 +898,17 @@ The worker reads:
 Policy shape:
 
 - `nominal`
+  - detector-side `flowSlice` enabled
   - sparse activity samples enabled
   - limited deep metadata allowed
 - `fair`
+  - detector-side `flowSlice` still enabled
   - deep metadata off
   - activity samples off
-  - burst-only sparse persistence remains
 - `serious` / `critical` / low power mode
-  - same or harsher reduced mode
+  - detector-side `flowSlice` off
+  - deep metadata off
+  - activity samples off
 
 This is intentional.
 The package is designed to degrade telemetry cost before the tunnel becomes thermally unsafe.
@@ -656,6 +956,9 @@ Useful detector debugging questions:
 3. did confidence match the evidence strength?
 4. did the detection persist across app suspension?
 5. did shed mode materially affect the detector?
+
+If a foreground app snapshot shows `0` `flowSlice` rows, that is expected with the default package policy.
+`flowSlice` is currently detector-facing by default, not app-facing.
 
 If you are debugging model-backed detectors, also record:
 

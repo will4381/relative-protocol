@@ -42,7 +42,9 @@ public struct TunnelProfile: Sendable, Equatable {
     ///   - engineSocksPort: Local SOCKS server listen port.
     ///   - engineLogLevel: Dataplane log level hint.
     ///   - telemetryEnabled: Enables sparse analytics and detector execution inside the tunnel extension.
-    ///   - liveTapEnabled: Enables the live rolling packet tap used for foreground snapshots.
+    ///   - liveTapEnabled: Enables the live rolling packet tap used for foreground snapshots. This is a
+    ///     lean app-facing debug/read surface, not a guarantee that every detector-grade sparse record kind
+    ///     will be published to the containing app.
     ///   - liveTapMaxBytes: Approximate memory budget for the live rolling packet tap.
     ///   - signatureFileName: Signature filename loaded by classifier.
     ///   - relayEndpoint: Upstream relay endpoint metadata.
