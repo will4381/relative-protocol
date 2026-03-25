@@ -258,6 +258,7 @@ Important fields in `TunnelProfile`:
 - `engineLogLevel`
 - `telemetryEnabled`
 - `liveTapEnabled`
+- `liveTapIncludeFlowSlices`
 - `liveTapMaxBytes`
 - `signatureFileName`
 - `relayEndpoint`
@@ -273,6 +274,9 @@ Important fields in `TunnelProfile`:
 
 - the rolling live tap
 - foreground packet/event snapshots
+
+`liveTapIncludeFlowSlices = true` opts the app-facing live tap into detector-grade `flowSlice` records.
+Keep this off for normal product reads and enable it only when you intentionally want a richer debug surface.
 
 `liveTapEnabled` only has effect when `telemetryEnabled` is also `true`.
 The default live tap stays lean even when detector telemetry is richer.
@@ -434,6 +438,10 @@ Use `DetectorRequirements` to request:
   - `lineage`
   - `pathRegime`
   - `serviceAttribution`
+- preferred cadence
+  - `preferredFlowSliceIntervalMs`
+  - only applies when the detector requests `flowSlice`
+  - bounded to `200...1000 ms`
 
 The worker computes the union once across installed detectors.
 That means:
@@ -772,6 +780,7 @@ These `TunnelProfile` knobs control whether the detector pipeline and app-facing
 
 - `telemetryEnabled`
 - `liveTapEnabled`
+- `liveTapIncludeFlowSlices`
 - `liveTapMaxBytes`
 
 Use them like this:
@@ -781,6 +790,9 @@ Use them like this:
 - `liveTapEnabled`
   - turns on the app-facing rolling live tap
   - does not imply every detector-grade record kind is exposed to the app
+- `liveTapIncludeFlowSlices`
+  - opts the app-facing live tap into publishing detector-grade `flowSlice` records
+  - intended for richer inspection/debug scenarios, not default product reads
 - `liveTapMaxBytes`
   - bounds the in-memory live tap footprint
 
@@ -1024,6 +1036,7 @@ Current package defaults:
 - detector `flowSlice` cadence: `250 ms`
 - default live tap publishes `flowOpen`, `metadata`, `burst`, and `flowClose`
 - default live tap does not publish `flowSlice`
+- default `liveTapIncludeFlowSlices`: `false`
 - health sample interval: `60s`
 - more aggressive telemetry backoff at elevated thermal states
 
