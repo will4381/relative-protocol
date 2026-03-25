@@ -559,7 +559,8 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
             detectors: detectors,
             initialDetectionSnapshot: initialDetectionSnapshot,
             detectionStore: detectionStore,
-            logger: logger
+            logger: logger,
+            includeFlowSlicesInLiveTap: profile.liveTapIncludeFlowSlices
         )
     }
 

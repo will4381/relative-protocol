@@ -29,6 +29,14 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
             includeFlowSlices: false,
             includeFlowCloseEvents: true
         )
+
+        static func configured(includeFlowSlices: Bool) -> LiveTapPolicy {
+            LiveTapPolicy(
+                includeActivitySamples: true,
+                includeFlowSlices: includeFlowSlices,
+                includeFlowCloseEvents: true
+            )
+        }
     }
 
     private enum DetectionPolicy {
@@ -192,6 +200,9 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
     private let processInfo: ProcessInfo
     private let state: SharedState
     private let emissionPolicyOverride: PacketAnalyticsPipeline.EmissionPolicy?
+    private let runtimePlan: DetectorRuntimePlan
+    private let pathRegimeProvider: (any PathRegimeProvider)?
+    private let liveTapPolicy: LiveTapPolicy
 
     private var workerTask: Task<Void, Never>?
 
@@ -207,7 +218,8 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         initialDetectionSnapshot: DetectionSnapshot = .empty,
         detectionStore: DetectionStore? = nil,
         logger: StructuredLogger,
-        processInfo: ProcessInfo = .processInfo
+        processInfo: ProcessInfo = .processInfo,
+        includeFlowSlicesInLiveTap: Bool = false
     ) {
         self.init(
             pipeline: pipeline,
@@ -217,7 +229,9 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
             detectionStore: detectionStore,
             logger: logger,
             processInfo: processInfo,
-            emissionPolicyOverride: nil
+            emissionPolicyOverride: nil,
+            pathRegimeProvider: nil,
+            includeFlowSlicesInLiveTap: includeFlowSlicesInLiveTap
         )
     }
 
@@ -229,11 +243,14 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         detectionStore: DetectionStore? = nil,
         logger: StructuredLogger,
         processInfo: ProcessInfo = .processInfo,
-        emissionPolicyOverride: PacketAnalyticsPipeline.EmissionPolicy?
+        emissionPolicyOverride: PacketAnalyticsPipeline.EmissionPolicy?,
+        pathRegimeProvider: (any PathRegimeProvider)? = nil,
+        includeFlowSlicesInLiveTap: Bool = false
     ) {
         self.pipeline = pipeline
         self.packetStream = packetStream
         self.detectors = detectors
+        self.runtimePlan = DetectorRuntimePlan(detectors: detectors, liveTapEnabled: packetStream != nil)
         if let detectionStore {
             self.detectionPersistence = DetectionPersistenceCoordinator(store: detectionStore, logger: logger)
         } else {
@@ -243,6 +260,12 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         self.processInfo = processInfo
         self.state = SharedState(initialDetectionSnapshot: initialDetectionSnapshot)
         self.emissionPolicyOverride = emissionPolicyOverride
+        self.liveTapPolicy = .configured(includeFlowSlices: includeFlowSlicesInLiveTap)
+        if self.runtimePlan.needsPathRegime {
+            self.pathRegimeProvider = pathRegimeProvider ?? NWPathRegimeMonitor()
+        } else {
+            self.pathRegimeProvider = nil
+        }
 
         var streamContinuation: AsyncStream<Command>.Continuation?
         let stream = AsyncStream<Command> { continuation in
@@ -260,8 +283,11 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         let processInfo = self.processInfo
         let state = self.state
         let emissionPolicyOverride = self.emissionPolicyOverride
+        let runtimePlan = self.runtimePlan
+        let pathRegimeProvider = self.pathRegimeProvider
+        let liveTapPolicy = self.liveTapPolicy
 
-        self.workerTask = Task { [state, pipeline, packetStream, detectors, detectionPersistence, logger, processInfo, emissionPolicyOverride] in
+        self.workerTask = Task { [state, pipeline, packetStream, detectors, detectionPersistence, logger, processInfo, emissionPolicyOverride, runtimePlan, pathRegimeProvider, liveTapPolicy] in
             await Self.runLoop(
                 stream: stream,
                 state: state,
@@ -271,12 +297,16 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 detectionPersistence: detectionPersistence,
                 logger: logger,
                 processInfo: processInfo,
-                emissionPolicyOverride: emissionPolicyOverride
+                emissionPolicyOverride: emissionPolicyOverride,
+                runtimePlan: runtimePlan,
+                pathRegimeProvider: pathRegimeProvider,
+                liveTapPolicy: liveTapPolicy
             )
         }
     }
 
     deinit {
+        pathRegimeProvider?.stop()
         let continuation: AsyncStream<Command>.Continuation? = state.withLock { state in
             state.isStopped = true
             let continuation = state.continuation
@@ -570,7 +600,10 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         detectionPersistence: DetectionPersistenceCoordinator?,
         logger: StructuredLogger,
         processInfo: ProcessInfo,
-        emissionPolicyOverride: PacketAnalyticsPipeline.EmissionPolicy?
+        emissionPolicyOverride: PacketAnalyticsPipeline.EmissionPolicy?,
+        runtimePlan: DetectorRuntimePlan,
+        pathRegimeProvider: (any PathRegimeProvider)?,
+        liveTapPolicy: LiveTapPolicy
     ) async {
         var detailRecords: [PacketSampleStream.PacketStreamRecord] = []
 
@@ -578,23 +611,28 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
             switch command {
             case .batch(let batch):
                 Self.didStartBatch(state: state, byteCount: batch.byteCount)
-                let policy = emissionPolicyOverride ?? Self.currentEmissionPolicy(processInfo: processInfo)
+                let policy = emissionPolicyOverride ?? Self.currentEmissionPolicy(processInfo: processInfo, runtimePlan: runtimePlan)
+                let runtimeContext = PacketAnalyticsPipeline.RuntimeContext(
+                    pathRegime: policy.emitPathRegimeFields ? pathRegimeProvider?.currentSnapshot : nil
+                )
                 let records = await pipeline.ingest(
                     packets: batch.packets,
                     families: batch.families,
                     summaries: batch.summaries,
                     direction: batch.direction,
-                    policy: policy
+                    policy: policy,
+                    runtimeContext: runtimeContext
                 )
                 guard !records.isEmpty else {
                     continue
                 }
 
                 if !detectors.isEmpty {
-                    let detectorRecords = DetectorRecordCollection(records)
                     var emittedDetections: [DetectionEvent] = []
                     emittedDetections.reserveCapacity(4)
                     for detector in detectors {
+                        let projection = runtimePlan.projection(for: detector)
+                        let detectorRecords = DetectorRecordCollection(records, projection: projection)
                         emittedDetections.append(contentsOf: detector.ingest(detectorRecords))
                     }
                     if !emittedDetections.isEmpty {
@@ -607,7 +645,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                     packetStream: packetStream,
                     records,
                     detailRecords: &detailRecords,
-                    liveTapPolicy: .default
+                    liveTapPolicy: liveTapPolicy
                 )
                 Self.setBufferedRecordCount(state: state, detailRecords.count)
                 if !snapshotRecords.isEmpty {
@@ -647,6 +685,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         detailRecords.removeAll(keepingCapacity: false)
         Self.setBufferedRecordCount(state: state, 0)
         await detectionPersistence?.flush()
+        pathRegimeProvider?.stop()
     }
 
     /// Routes sparse detector records either into the rolling app-facing tap or into the recent detail buffer.
@@ -766,7 +805,10 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         }
     }
 
-    private static func currentEmissionPolicy(processInfo: ProcessInfo) -> PacketAnalyticsPipeline.EmissionPolicy {
+    private static func currentEmissionPolicy(
+        processInfo: ProcessInfo,
+        runtimePlan: DetectorRuntimePlan
+    ) -> PacketAnalyticsPipeline.EmissionPolicy {
         let thermalState = processInfo.thermalState
         let lowPowerModeEnabled = processInfo.isLowPowerModeEnabled
 
@@ -775,9 +817,16 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 allowDeepMetadata: false,
                 maxMetadataProbesPerBatch: 0,
                 emitFlowSlices: false,
-                flowSliceIntervalMs: 250,
+                flowSliceIntervalMs: runtimePlan.flowSliceIntervalMs,
                 emitFlowCloseEvents: true,
-                emitBurstShapeCounters: true,
+                emitBurstShapeCounters: runtimePlan.needsBurstShapeCounters || runtimePlan.liveTapFeatureFamilies.contains(.burstShape),
+                emitDNSAssociationFields: false,
+                emitLineageFields: false,
+                emitPathRegimeFields: runtimePlan.needsPathRegime,
+                emitServiceAttributionFields: false,
+                includeHostHints: runtimePlan.liveTapFeatureFamilies.contains(.hostHints),
+                includeDNSAnswerAddresses: runtimePlan.unionFeatureFamilies.contains(.dnsAnswerAddresses),
+                includeQUICIdentity: runtimePlan.needsQUICIdentity || runtimePlan.liveTapFeatureFamilies.contains(.quicIdentity),
                 activitySampleMinimumPackets: 2_048,
                 activitySampleMinimumBytes: 4_194_304,
                 activitySampleMinimumInterval: 30,
@@ -789,26 +838,63 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         switch thermalState {
         case .nominal:
             return PacketAnalyticsPipeline.EmissionPolicy(
-                allowDeepMetadata: true,
-                maxMetadataProbesPerBatch: 1,
-                emitFlowSlices: true,
-                flowSliceIntervalMs: 250,
+                allowDeepMetadata: runtimePlan.needsDeepMetadata ||
+                    runtimePlan.liveTapFeatureFamilies.contains(.hostHints) ||
+                    runtimePlan.liveTapFeatureFamilies.contains(.dnsAnswerAddresses),
+                maxMetadataProbesPerBatch: runtimePlan.needsDeepMetadata ? 2 : 1,
+                emitFlowSlices: runtimePlan.needsFlowSlices,
+                flowSliceIntervalMs: runtimePlan.flowSliceIntervalMs,
                 emitFlowCloseEvents: true,
-                emitBurstShapeCounters: true,
+                emitBurstShapeCounters: runtimePlan.needsBurstShapeCounters || runtimePlan.liveTapFeatureFamilies.contains(.burstShape),
+                emitDNSAssociationFields: runtimePlan.needsDNSAssociation,
+                emitLineageFields: runtimePlan.needsLineage,
+                emitPathRegimeFields: runtimePlan.needsPathRegime,
+                emitServiceAttributionFields: runtimePlan.needsServiceAttribution,
+                includeHostHints: runtimePlan.needsHostHints || runtimePlan.liveTapFeatureFamilies.contains(.hostHints),
+                includeDNSAnswerAddresses: runtimePlan.unionFeatureFamilies.contains(.dnsAnswerAddresses),
+                includeQUICIdentity: runtimePlan.needsQUICIdentity || runtimePlan.liveTapFeatureFamilies.contains(.quicIdentity),
                 activitySampleMinimumPackets: 256,
                 activitySampleMinimumBytes: 524_288,
                 activitySampleMinimumInterval: 6,
                 emitBurstEvents: true,
                 emitActivitySamples: true
             )
-        case .fair, .serious, .critical:
+        case .fair:
+            return PacketAnalyticsPipeline.EmissionPolicy(
+                allowDeepMetadata: runtimePlan.needsDeepMetadata,
+                maxMetadataProbesPerBatch: runtimePlan.needsDeepMetadata ? 1 : 0,
+                emitFlowSlices: runtimePlan.needsFlowSlices,
+                flowSliceIntervalMs: runtimePlan.flowSliceIntervalMs,
+                emitFlowCloseEvents: true,
+                emitBurstShapeCounters: runtimePlan.needsBurstShapeCounters || runtimePlan.liveTapFeatureFamilies.contains(.burstShape),
+                emitDNSAssociationFields: runtimePlan.needsDNSAssociation,
+                emitLineageFields: runtimePlan.needsLineage,
+                emitPathRegimeFields: runtimePlan.needsPathRegime,
+                emitServiceAttributionFields: runtimePlan.needsServiceAttribution,
+                includeHostHints: runtimePlan.needsHostHints || runtimePlan.liveTapFeatureFamilies.contains(.hostHints),
+                includeDNSAnswerAddresses: runtimePlan.unionFeatureFamilies.contains(.dnsAnswerAddresses),
+                includeQUICIdentity: runtimePlan.needsQUICIdentity || runtimePlan.liveTapFeatureFamilies.contains(.quicIdentity),
+                activitySampleMinimumPackets: 2_048,
+                activitySampleMinimumBytes: 4_194_304,
+                activitySampleMinimumInterval: 30,
+                emitBurstEvents: true,
+                emitActivitySamples: false
+            )
+        case .serious, .critical:
             return PacketAnalyticsPipeline.EmissionPolicy(
                 allowDeepMetadata: false,
                 maxMetadataProbesPerBatch: 0,
-                emitFlowSlices: thermalState == .fair,
-                flowSliceIntervalMs: 250,
+                emitFlowSlices: false,
+                flowSliceIntervalMs: runtimePlan.flowSliceIntervalMs,
                 emitFlowCloseEvents: true,
-                emitBurstShapeCounters: true,
+                emitBurstShapeCounters: runtimePlan.needsBurstShapeCounters || runtimePlan.liveTapFeatureFamilies.contains(.burstShape),
+                emitDNSAssociationFields: false,
+                emitLineageFields: false,
+                emitPathRegimeFields: runtimePlan.needsPathRegime,
+                emitServiceAttributionFields: false,
+                includeHostHints: runtimePlan.liveTapFeatureFamilies.contains(.hostHints),
+                includeDNSAnswerAddresses: runtimePlan.unionFeatureFamilies.contains(.dnsAnswerAddresses),
+                includeQUICIdentity: runtimePlan.needsQUICIdentity || runtimePlan.liveTapFeatureFamilies.contains(.quicIdentity),
                 activitySampleMinimumPackets: 2_048,
                 activitySampleMinimumBytes: 4_194_304,
                 activitySampleMinimumInterval: 30,
@@ -820,9 +906,16 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 allowDeepMetadata: false,
                 maxMetadataProbesPerBatch: 0,
                 emitFlowSlices: false,
-                flowSliceIntervalMs: 250,
+                flowSliceIntervalMs: runtimePlan.flowSliceIntervalMs,
                 emitFlowCloseEvents: true,
-                emitBurstShapeCounters: true,
+                emitBurstShapeCounters: runtimePlan.needsBurstShapeCounters || runtimePlan.liveTapFeatureFamilies.contains(.burstShape),
+                emitDNSAssociationFields: false,
+                emitLineageFields: false,
+                emitPathRegimeFields: runtimePlan.needsPathRegime,
+                emitServiceAttributionFields: false,
+                includeHostHints: runtimePlan.liveTapFeatureFamilies.contains(.hostHints),
+                includeDNSAnswerAddresses: runtimePlan.unionFeatureFamilies.contains(.dnsAnswerAddresses),
+                includeQUICIdentity: runtimePlan.needsQUICIdentity || runtimePlan.liveTapFeatureFamilies.contains(.quicIdentity),
                 activitySampleMinimumPackets: 2_048,
                 activitySampleMinimumBytes: 4_194_304,
                 activitySampleMinimumInterval: 30,

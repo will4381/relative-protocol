@@ -9,6 +9,30 @@
 The package is detector-first, not packet-log-first.
 It is designed so the tunnel can stay alive and keep detecting while the containing app is suspended, while the app can still read a recent live window on demand when it is foregrounded.
 
+## Recent Changes
+
+- detector-grade sparse record expansion
+  - added `flowSlice` records on a bounded cadence
+  - added explicit `flowClose` records
+  - enriched burst records with typed onset and burst-shape counters
+- richer typed detector surfaces
+  - packet shape, control-signal, lifecycle, burst-shape, DNS association, lineage, path-regime, and service-attribution fields are now first-class typed record fields
+  - no string-metadata escape hatch is required for these surfaces
+- detector-declared requirements
+  - detectors now declare required record kinds and feature families through `DetectorRequirements`
+  - the worker computes one runtime union plan and only activates requested enrichments
+- bounded enrichment subsystems
+  - added DNS association caching
+  - added flow lineage and reuse tracking
+  - added path-regime stamping
+  - added generic service-family attribution
+  - added a shared detector arming/suppression state helper
+- cleaner detector-vs-app split
+  - detector-facing sparse records can now be richer than the foreground live tap
+  - `flowSlice` remains detector-only by default unless a host opts into exposing it in the live tap
+- expanded verification
+  - added package tests for flow slices, flow close, burst-shape counters, detector projection, DNS association, lineage, path regime, and live-tap publication of DNS answers/association
+
 ## What This Package Does
 
 - runs a packet tunnel using `NEPacketTunnelProvider`
@@ -71,6 +95,9 @@ Most host apps interact with these types:
 - `TunnelDetectionStore`
 - `TunnelStopStore`
 - `TrafficDetector`
+- `DetectorRequirements`
+- `DetectorFeatureFamily`
+- `DetectorArmingStateMachine`
 - `DetectionEvent`
 - `DetectionSnapshot`
 
@@ -331,6 +358,10 @@ import Analytics
 
 final class AdBurstDetector: TrafficDetector {
     let identifier = "ad-burst"
+    let requirements = DetectorRequirements(
+        recordKinds: [.flowOpen, .burst, .flowClose],
+        featureFamilies: [.packetShape, .controlSignals, .hostHints]
+    )
 
     func ingest(_ records: DetectorRecordCollection) -> [DetectionEvent] {
         // Inspect sparse records and emit durable detections when your conditions match.
@@ -368,10 +399,50 @@ Common patterns:
 
 The package contract is the same in all four cases:
 
+- declare `DetectorRequirements`
 - ingest sparse `DetectorRecord` batches
 - keep bounded in-memory state
 - emit `DetectionEvent`
 - persist only compact outputs
+
+### Detector requirements
+
+Every detector can declare the exact record kinds and feature families it needs.
+The package keeps this inside the normal iOS packet-tunnel model:
+
+- packet ingress still comes from `NEPacketTunnelProvider`
+- path-regime updates come from `NWPathMonitor`
+
+Use `DetectorRequirements` to request:
+
+- record kinds
+  - `flowOpen`
+  - `flowSlice`
+  - `flowClose`
+  - `metadata`
+  - `burst`
+  - `activitySample`
+- feature families
+  - `packetShape`
+  - `controlSignals`
+  - `burstShape`
+  - `hostHints`
+  - `quicIdentity`
+  - `stringAddresses`
+  - `dnsAnswerAddresses`
+  - `dnsAssociation`
+  - `lineage`
+  - `pathRegime`
+  - `serviceAttribution`
+
+The worker computes the union once across installed detectors.
+That means:
+
+- expensive enrichment is only activated when some detector asks for it
+- each detector receives a projected lazy view, not the full raw batch
+- the app-facing live tap still stays lean by default
+
+If a detector does not declare requirements explicitly, the package uses a compatibility default that matches the pre-requirements detector surface.
 
 ### What belongs inside a detector
 
@@ -505,6 +576,8 @@ This is an extension-runtime hook, not an app-facing read path.
 This is what detectors actually consume:
 
 - `TrafficDetector`
+- `DetectorRequirements`
+- `DetectorFeatureFamily`
 - `DetectorRecordCollection`
 - `DetectorRecord`
 
@@ -539,6 +612,7 @@ Use them like this:
   - lifecycle end marker with typed close reason
 - `metadata`
   - host/DNS/TLS/QUIC enrichment boundary
+  - also where DNS association caches are refreshed when enabled
 - `burst`
   - completed burst with onset and burst-shape counters
 - `activitySample`
@@ -582,11 +656,34 @@ These detector-facing typed fields are available on `DetectorRecord`:
   - `dnsAnswerAddresses`
   - `tlsServerName`
   - `classification`
+- DNS association
+  - `associatedDomain`
+  - `associationSource`
+  - `associationAgeMs`
+  - `associationConfidence`
 - QUIC enrichment
   - `quicVersion`
   - `quicPacketType`
   - `quicDestinationConnectionId`
   - `quicSourceConnectionId`
+- flow lineage
+  - `lineageID`
+  - `lineageGeneration`
+  - `lineageAgeMs`
+  - `lineageReuseGapMs`
+  - `lineageReopenCount`
+  - `lineageSiblingCount`
+- path regime
+  - `pathEpoch`
+  - `pathInterfaceClass`
+  - `pathIsExpensive`
+  - `pathIsConstrained`
+  - `pathSupportsDNS`
+  - `pathChangedRecently`
+- service attribution
+  - `serviceFamily`
+  - `serviceFamilyConfidence`
+  - `serviceAttributionSourceMask`
 - burst-shape fields
   - `burstDurationMs`
   - `burstPacketCount`
@@ -654,7 +751,22 @@ Use this when you want to:
 
 This is an input hint, not an authoritative detector output.
 
-### 8. Detector control/config surface
+### 8. Shared detector state helpers
+
+The package also exposes one generic state helper:
+
+- `DetectorArmingStateMachine`
+
+Use it when you want a lightweight shared implementation for:
+
+- cold-start settling
+- post-count cooldown
+- temporary suppression after path/regime changes
+
+It is optional.
+Product-specific event semantics still belong in your detector.
+
+### 9. Detector control/config surface
 
 These `TunnelProfile` knobs control whether the detector pipeline and app-facing reads exist:
 
@@ -672,7 +784,7 @@ Use them like this:
 - `liveTapMaxBytes`
   - bounds the in-memory live tap footprint
 
-### 9. What is not a detector surface
+### 10. What is not a detector surface
 
 Do not treat these as your primary detector integration surface:
 
@@ -691,6 +803,7 @@ The intended detector model is:
 ## Detector Contract
 
 `TrafficDetector` implementations receive `DetectorRecord` batches.
+They should also declare `requirements` so the telemetry worker can avoid computing unused enrichment.
 Those records contain stable fields such as:
 
 - `kind`
@@ -716,6 +829,10 @@ Those records contain stable fields such as:
 - `quicDestinationConnectionId`
 - `quicSourceConnectionId`
 - `classification`
+- `associatedDomain`
+- `associationSource`
+- `associationAgeMs`
+- `associationConfidence`
 - `closeReason`
 - `largePacketCount`
 - `smallPacketCount`
@@ -735,6 +852,29 @@ Those records contain stable fields such as:
 - `burstUdpPacketCount`
 - `burstTcpPacketCount`
 - `burstQuicInitialCount`
+- `lineageID`
+- `lineageGeneration`
+- `lineageAgeMs`
+- `lineageReuseGapMs`
+- `lineageReopenCount`
+- `lineageSiblingCount`
+- `pathEpoch`
+- `pathInterfaceClass`
+- `pathIsExpensive`
+- `pathIsConstrained`
+- `pathSupportsDNS`
+- `pathChangedRecently`
+- `serviceFamily`
+- `serviceFamilyConfidence`
+- `serviceAttributionSourceMask`
+
+Requirements guidance:
+
+- only request the record kinds your detector actually uses
+- only request feature families your detector will read
+- prefer `flowOpen` / `metadata` / `burst` / `flowClose` over `flowSlice` unless you need short-window cadence features
+- request `stringAddresses` and `dnsAnswerAddresses` only when you truly need them
+- treat `lineage`, `dnsAssociation`, `pathRegime`, and `serviceAttribution` as optional higher-cost signal
 
 Record-kind guidance:
 
@@ -783,6 +923,7 @@ Use it when you want to:
 - iterate the batch once
 - short-circuit on the first strong match
 - avoid materializing extra arrays inside your detector
+- receive only the projected record kinds and typed fields your detector requested
 
 Hot-path rule:
 

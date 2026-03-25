@@ -20,6 +20,13 @@ public actor PacketAnalyticsPipeline {
         public let flowSliceIntervalMs: Int
         public let emitFlowCloseEvents: Bool
         public let emitBurstShapeCounters: Bool
+        public let emitDNSAssociationFields: Bool
+        public let emitLineageFields: Bool
+        public let emitPathRegimeFields: Bool
+        public let emitServiceAttributionFields: Bool
+        public let includeHostHints: Bool
+        public let includeDNSAnswerAddresses: Bool
+        public let includeQUICIdentity: Bool
         public let activitySampleMinimumPackets: Int
         public let activitySampleMinimumBytes: Int
         public let activitySampleMinimumInterval: TimeInterval
@@ -33,6 +40,13 @@ public actor PacketAnalyticsPipeline {
             flowSliceIntervalMs: Int,
             emitFlowCloseEvents: Bool,
             emitBurstShapeCounters: Bool,
+            emitDNSAssociationFields: Bool = false,
+            emitLineageFields: Bool = false,
+            emitPathRegimeFields: Bool = false,
+            emitServiceAttributionFields: Bool = false,
+            includeHostHints: Bool = true,
+            includeDNSAnswerAddresses: Bool = true,
+            includeQUICIdentity: Bool = true,
             activitySampleMinimumPackets: Int,
             activitySampleMinimumBytes: Int,
             activitySampleMinimumInterval: TimeInterval,
@@ -45,12 +59,25 @@ public actor PacketAnalyticsPipeline {
             self.flowSliceIntervalMs = max(50, flowSliceIntervalMs)
             self.emitFlowCloseEvents = emitFlowCloseEvents
             self.emitBurstShapeCounters = emitBurstShapeCounters
+            self.emitDNSAssociationFields = emitDNSAssociationFields
+            self.emitLineageFields = emitLineageFields
+            self.emitPathRegimeFields = emitPathRegimeFields
+            self.emitServiceAttributionFields = emitServiceAttributionFields
+            self.includeHostHints = includeHostHints
+            self.includeDNSAnswerAddresses = includeDNSAnswerAddresses
+            self.includeQUICIdentity = includeQUICIdentity
             self.activitySampleMinimumPackets = max(1, activitySampleMinimumPackets)
             self.activitySampleMinimumBytes = max(1, activitySampleMinimumBytes)
             self.activitySampleMinimumInterval = max(0, activitySampleMinimumInterval)
             self.emitBurstEvents = emitBurstEvents
             self.emitActivitySamples = emitActivitySamples
         }
+    }
+
+    struct RuntimeContext: Sendable {
+        let pathRegime: PathRegimeSnapshot?
+
+        static let empty = RuntimeContext(pathRegime: nil)
     }
 
     private struct FlowRecordTemplate: Sendable {
@@ -203,6 +230,10 @@ public actor PacketAnalyticsPipeline {
         var quicDestinationConnectionId: String?
         var quicSourceConnectionId: String?
         var classification: String?
+        var association: DNSAssociationSnapshot?
+        var lineage: FlowLineageSnapshot?
+        var pathRegime: PathRegimeSnapshot?
+        var serviceAttribution: ServiceAttribution?
         var lastSeen: Date
         var lastDirection: PacketDirection
         var hasEmittedFlowOpen = false
@@ -215,6 +246,15 @@ public actor PacketAnalyticsPipeline {
         var currentBurst = BurstAccumulator()
     }
 
+    struct FlowContextView: Sendable {
+        let registrableDomain: String?
+        let dnsQueryName: String?
+        let dnsCname: String?
+        let tlsServerName: String?
+        let classification: String?
+        let associatedDomain: String?
+    }
+
     private let clock: any Clock
     private let burstTracker: BurstTracker
     private let signatureClassifier: SignatureClassifier
@@ -222,6 +262,8 @@ public actor PacketAnalyticsPipeline {
     private var flowContexts: [FlowKey: FlowContext] = [:]
     private var flowContextArrivalQueue: ArraySlice<FlowKey> = []
     private var lastFlowContextSweepAt: Date?
+    private var dnsAssociationCache = DNSAssociationCache()
+    private var lineageTracker = FlowLineageTracker()
 
     /// - Parameters:
     ///   - clock: Time source used for deterministic timestamps.
@@ -253,7 +295,8 @@ public actor PacketAnalyticsPipeline {
         families: [Int32],
         summaries: [FastPacketSummary]? = nil,
         direction: PacketDirection,
-        policy: EmissionPolicy
+        policy: EmissionPolicy,
+        runtimeContext: RuntimeContext = .empty
     ) async -> [PacketSampleStream.PacketStreamRecord] {
         guard !packets.isEmpty else {
             return []
@@ -288,9 +331,18 @@ public actor PacketAnalyticsPipeline {
 
             let flow = summary.flowKey
             let isNewFlow = flowContexts[flow] == nil
-            var context = flowContexts[flow] ?? makeFlowContext(for: summary, now: now, direction: direction)
+            var context = flowContexts[flow] ?? makeFlowContext(for: summary, now: now, direction: direction, policy: policy)
             context.lastSeen = now
             context.lastDirection = direction
+            if policy.emitPathRegimeFields {
+                context.pathRegime = runtimeContext.pathRegime
+            }
+            if policy.emitLineageFields {
+                context.lineage = lineageTracker.snapshot(for: flow, summary: summary, direction: direction, now: now)
+            }
+            if policy.emitDNSAssociationFields || policy.emitServiceAttributionFields {
+                context.association = dnsAssociationCache.associate(summary: summary, direction: direction, now: now)
+            }
 
             if let burst = burstTracker.recordPacket(flow: flow, now: now) {
                 if policy.emitBurstEvents, !context.currentBurst.isEmpty {
@@ -305,7 +357,10 @@ public actor PacketAnalyticsPipeline {
             context.slice.record(summary: summary, now: now)
             context.currentBurst.record(summary: summary, now: now)
 
-            mergeCheapMetadata(into: &context, summary: summary)
+            mergeCheapMetadata(into: &context, summary: summary, policy: policy)
+            if policy.emitServiceAttributionFields {
+                context.serviceAttribution = ServiceAttributionBuilder.make(flowContext: flowContextView(context))
+            }
 
             if !context.hasEmittedFlowOpen {
                 records.append(
@@ -325,7 +380,14 @@ public actor PacketAnalyticsPipeline {
                 if let deepMetadata = PacketParser.parse(packet, ipVersionHint: familyHint) {
                     metadataProbesRemaining -= 1
                     let previousFingerprint = context.lastMetadataFingerprint
-                    await mergeDeepMetadata(into: &context, metadata: deepMetadata)
+                    await mergeDeepMetadata(into: &context, metadata: deepMetadata, policy: policy)
+                    if policy.emitDNSAssociationFields || policy.emitServiceAttributionFields {
+                        dnsAssociationCache.record(metadata: deepMetadata, classification: context.classification, now: now)
+                        context.association = dnsAssociationCache.associate(summary: summary, direction: direction, now: now)
+                    }
+                    if policy.emitServiceAttributionFields {
+                        context.serviceAttribution = ServiceAttributionBuilder.make(flowContext: flowContextView(context))
+                    }
                     let nextFingerprint = metadataFingerprint(for: context)
                     if nextFingerprint != previousFingerprint {
                         context.lastMetadataFingerprint = nextFingerprint
@@ -409,7 +471,7 @@ public actor PacketAnalyticsPipeline {
         }
     }
 
-    private func makeFlowContext(for summary: FastPacketSummary, now: Date, direction: PacketDirection) -> FlowContext {
+    private func makeFlowContext(for summary: FastPacketSummary, now: Date, direction: PacketDirection, policy: EmissionPolicy) -> FlowContext {
         FlowContext(
             recordTemplate: FlowRecordTemplate(
                 protocolHint: summary.protocolHint,
@@ -430,17 +492,24 @@ public actor PacketAnalyticsPipeline {
             dnsCname: nil,
             dnsAnswerAddresses: nil,
             tlsServerName: nil,
-            quicVersion: summary.quicVersion,
-            quicPacketType: summary.quicPacketType?.rawValue,
-            quicDestinationConnectionId: Self.hexString(summary.quicDestinationConnectionID),
-            quicSourceConnectionId: Self.hexString(summary.quicSourceConnectionID),
+            quicVersion: policy.includeQUICIdentity ? summary.quicVersion : nil,
+            quicPacketType: policy.includeQUICIdentity ? summary.quicPacketType?.rawValue : nil,
+            quicDestinationConnectionId: policy.includeQUICIdentity ? Self.hexString(summary.quicDestinationConnectionID) : nil,
+            quicSourceConnectionId: policy.includeQUICIdentity ? Self.hexString(summary.quicSourceConnectionID) : nil,
             classification: nil,
+            association: nil,
+            lineage: nil,
+            pathRegime: nil,
+            serviceAttribution: nil,
             lastSeen: now,
             lastDirection: direction
         )
     }
 
-    private func mergeCheapMetadata(into flowContext: inout FlowContext, summary: FastPacketSummary) {
+    private func mergeCheapMetadata(into flowContext: inout FlowContext, summary: FastPacketSummary, policy: EmissionPolicy) {
+        guard policy.includeQUICIdentity else {
+            return
+        }
         if flowContext.quicVersion == nil {
             flowContext.quicVersion = summary.quicVersion
         }
@@ -468,32 +537,34 @@ public actor PacketAnalyticsPipeline {
         return false
     }
 
-    private func mergeDeepMetadata(into flowContext: inout FlowContext, metadata: PacketMetadata) async {
-        if let registrableDomain = metadata.registrableDomain, !registrableDomain.isEmpty {
+    private func mergeDeepMetadata(into flowContext: inout FlowContext, metadata: PacketMetadata, policy: EmissionPolicy) async {
+        if policy.includeHostHints, let registrableDomain = metadata.registrableDomain, !registrableDomain.isEmpty {
             flowContext.registrableDomain = registrableDomain
         }
-        if let dnsQueryName = metadata.dnsQueryName, !dnsQueryName.isEmpty {
+        if policy.includeHostHints, let dnsQueryName = metadata.dnsQueryName, !dnsQueryName.isEmpty {
             flowContext.dnsQueryName = dnsQueryName
         }
-        if let dnsCname = metadata.dnsCname, !dnsCname.isEmpty {
+        if policy.includeHostHints, let dnsCname = metadata.dnsCname, !dnsCname.isEmpty {
             flowContext.dnsCname = dnsCname
         }
-        if let dnsAnswerAddresses = metadata.dnsAnswerAddresses, !dnsAnswerAddresses.isEmpty {
+        if policy.includeHostHints || policy.includeDNSAnswerAddresses,
+           let dnsAnswerAddresses = metadata.dnsAnswerAddresses,
+           !dnsAnswerAddresses.isEmpty {
             flowContext.dnsAnswerAddresses = dnsAnswerAddresses.map(\.stringValue)
         }
-        if let tlsServerName = metadata.tlsServerName, !tlsServerName.isEmpty {
+        if policy.includeHostHints, let tlsServerName = metadata.tlsServerName, !tlsServerName.isEmpty {
             flowContext.tlsServerName = tlsServerName
         }
-        if let quicVersion = metadata.quicVersion {
+        if policy.includeQUICIdentity, let quicVersion = metadata.quicVersion {
             flowContext.quicVersion = quicVersion
         }
-        if let quicPacketType = metadata.quicPacketType?.rawValue {
+        if policy.includeQUICIdentity, let quicPacketType = metadata.quicPacketType?.rawValue {
             flowContext.quicPacketType = quicPacketType
         }
-        if let quicDestinationConnectionId = metadata.quicDestinationConnectionId, !quicDestinationConnectionId.isEmpty {
+        if policy.includeQUICIdentity, let quicDestinationConnectionId = metadata.quicDestinationConnectionId, !quicDestinationConnectionId.isEmpty {
             flowContext.quicDestinationConnectionId = quicDestinationConnectionId
         }
-        if let quicSourceConnectionId = metadata.quicSourceConnectionId, !quicSourceConnectionId.isEmpty {
+        if policy.includeQUICIdentity, let quicSourceConnectionId = metadata.quicSourceConnectionId, !quicSourceConnectionId.isEmpty {
             flowContext.quicSourceConnectionId = quicSourceConnectionId
         }
 
@@ -501,7 +572,9 @@ public actor PacketAnalyticsPipeline {
             ?? metadata.dnsCname
             ?? metadata.dnsQueryName
             ?? metadata.registrableDomain
-        if let hostCandidate, !hostCandidate.isEmpty {
+        if (policy.includeHostHints || policy.emitServiceAttributionFields || policy.emitDNSAssociationFields),
+           let hostCandidate,
+           !hostCandidate.isEmpty {
             flowContext.classification = await signatureClassifier.classify(host: hostCandidate)
         }
     }
@@ -669,7 +742,26 @@ public actor PacketAnalyticsPipeline {
             burstLargePacketCount: burstLargePacketCount,
             burstUdpPacketCount: burstUdpPacketCount,
             burstTcpPacketCount: burstTcpPacketCount,
-            burstQuicInitialCount: burstQuicInitialCount
+            burstQuicInitialCount: burstQuicInitialCount,
+            associatedDomain: flowContext.association?.associatedDomain,
+            associationSource: flowContext.association?.source,
+            associationAgeMs: flowContext.association?.ageMs,
+            associationConfidence: flowContext.association?.confidence,
+            lineageID: flowContext.lineage?.lineageID,
+            lineageGeneration: flowContext.lineage?.generation,
+            lineageAgeMs: flowContext.lineage?.ageMs,
+            lineageReuseGapMs: flowContext.lineage?.reuseGapMs,
+            lineageReopenCount: flowContext.lineage?.reopenCount,
+            lineageSiblingCount: flowContext.lineage?.siblingCount,
+            pathEpoch: flowContext.pathRegime?.epoch,
+            pathInterfaceClass: flowContext.pathRegime?.interfaceClass,
+            pathIsExpensive: flowContext.pathRegime?.isExpensive,
+            pathIsConstrained: flowContext.pathRegime?.isConstrained,
+            pathSupportsDNS: flowContext.pathRegime?.supportsDNS,
+            pathChangedRecently: flowContext.pathRegime.map { $0.changedRecently(at: timestamp) },
+            serviceFamily: flowContext.serviceAttribution?.family,
+            serviceFamilyConfidence: flowContext.serviceAttribution?.confidence,
+            serviceAttributionSourceMask: flowContext.serviceAttribution?.sourceMask
         )
     }
 
@@ -763,7 +855,19 @@ public actor PacketAnalyticsPipeline {
         }
         flowContexts.removeValue(forKey: flow)
         burstTracker.removeFlow(flow: flow)
+        lineageTracker.close(flow: flow, now: timestamp)
         return records
+    }
+
+    private func flowContextView(_ flowContext: FlowContext) -> FlowContextView {
+        FlowContextView(
+            registrableDomain: flowContext.registrableDomain,
+            dnsQueryName: flowContext.dnsQueryName,
+            dnsCname: flowContext.dnsCname,
+            tlsServerName: flowContext.tlsServerName,
+            classification: flowContext.classification,
+            associatedDomain: flowContext.association?.associatedDomain
+        )
     }
 
     private func pruneFlowContextArrivalQueueIfNeeded(force: Bool = false) {

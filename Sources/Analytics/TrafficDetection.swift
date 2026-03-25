@@ -55,6 +55,25 @@ public struct DetectorRecord: Sendable, Equatable {
     public let burstUdpPacketCount: Int?
     public let burstTcpPacketCount: Int?
     public let burstQuicInitialCount: Int?
+    public let associatedDomain: String?
+    public let associationSource: DetectorAssociationSource?
+    public let associationAgeMs: Int?
+    public let associationConfidence: Double?
+    public let lineageID: UInt64?
+    public let lineageGeneration: Int?
+    public let lineageAgeMs: Int?
+    public let lineageReuseGapMs: Int?
+    public let lineageReopenCount: Int?
+    public let lineageSiblingCount: Int?
+    public let pathEpoch: UInt32?
+    public let pathInterfaceClass: PathInterfaceClass?
+    public let pathIsExpensive: Bool?
+    public let pathIsConstrained: Bool?
+    public let pathSupportsDNS: Bool?
+    public let pathChangedRecently: Bool?
+    public let serviceFamily: String?
+    public let serviceFamilyConfidence: Double?
+    public let serviceAttributionSourceMask: UInt16?
 
     public var sourceAddress: String? {
         if let sourceAddressStorage {
@@ -125,7 +144,26 @@ public struct DetectorRecord: Sendable, Equatable {
         burstLargePacketCount: Int?,
         burstUdpPacketCount: Int?,
         burstTcpPacketCount: Int?,
-        burstQuicInitialCount: Int?
+        burstQuicInitialCount: Int?,
+        associatedDomain: String? = nil,
+        associationSource: DetectorAssociationSource? = nil,
+        associationAgeMs: Int? = nil,
+        associationConfidence: Double? = nil,
+        lineageID: UInt64? = nil,
+        lineageGeneration: Int? = nil,
+        lineageAgeMs: Int? = nil,
+        lineageReuseGapMs: Int? = nil,
+        lineageReopenCount: Int? = nil,
+        lineageSiblingCount: Int? = nil,
+        pathEpoch: UInt32? = nil,
+        pathInterfaceClass: PathInterfaceClass? = nil,
+        pathIsExpensive: Bool? = nil,
+        pathIsConstrained: Bool? = nil,
+        pathSupportsDNS: Bool? = nil,
+        pathChangedRecently: Bool? = nil,
+        serviceFamily: String? = nil,
+        serviceFamilyConfidence: Double? = nil,
+        serviceAttributionSourceMask: UInt16? = nil
     ) {
         self.kind = kind
         self.timestamp = timestamp
@@ -178,9 +216,40 @@ public struct DetectorRecord: Sendable, Equatable {
         self.burstUdpPacketCount = burstUdpPacketCount
         self.burstTcpPacketCount = burstTcpPacketCount
         self.burstQuicInitialCount = burstQuicInitialCount
+        self.associatedDomain = associatedDomain
+        self.associationSource = associationSource
+        self.associationAgeMs = associationAgeMs
+        self.associationConfidence = associationConfidence
+        self.lineageID = lineageID
+        self.lineageGeneration = lineageGeneration
+        self.lineageAgeMs = lineageAgeMs
+        self.lineageReuseGapMs = lineageReuseGapMs
+        self.lineageReopenCount = lineageReopenCount
+        self.lineageSiblingCount = lineageSiblingCount
+        self.pathEpoch = pathEpoch
+        self.pathInterfaceClass = pathInterfaceClass
+        self.pathIsExpensive = pathIsExpensive
+        self.pathIsConstrained = pathIsConstrained
+        self.pathSupportsDNS = pathSupportsDNS
+        self.pathChangedRecently = pathChangedRecently
+        self.serviceFamily = serviceFamily
+        self.serviceFamilyConfidence = serviceFamilyConfidence
+        self.serviceAttributionSourceMask = serviceAttributionSourceMask
     }
 
-    init(compactRecord record: PacketSampleStream.PacketStreamRecord) {
+    init(compactRecord record: PacketSampleStream.PacketStreamRecord, projection: DetectorRecordProjection) {
+        let includePacketShape = projection.includes(.packetShape)
+        let includeControlSignals = projection.includes(.controlSignals)
+        let includeBurstShape = projection.includes(.burstShape)
+        let includeHostHints = projection.includes(.hostHints)
+        let includeQUICIdentity = projection.includes(.quicIdentity)
+        let includeStringAddresses = projection.includes(.stringAddresses)
+        let includeDNSAnswerAddresses = projection.includes(.dnsAnswerAddresses)
+        let includeDNSAssociation = projection.includes(.dnsAssociation)
+        let includeLineage = projection.includes(.lineage)
+        let includePathRegime = projection.includes(.pathRegime)
+        let includeServiceAttribution = projection.includes(.serviceAttribution)
+
         self.kind = record.kind
         self.timestamp = record.timestamp
         self.direction = record.direction
@@ -195,43 +264,62 @@ public struct DetectorRecord: Sendable, Equatable {
         self.destinationPort = record.destinationPort
         self.flowHash = record.flowHash
         self.textFlowId = record.textFlowId
-        self.sourceAddressStorage = record.textSourceAddress
-        self.destinationAddressStorage = record.textDestinationAddress
-        self.sourceAddressLength = record.sourceAddressLength
-        self.sourceAddressHigh = record.sourceAddressHigh
-        self.sourceAddressLow = record.sourceAddressLow
-        self.destinationAddressLength = record.destinationAddressLength
-        self.destinationAddressHigh = record.destinationAddressHigh
-        self.destinationAddressLow = record.destinationAddressLow
-        self.registrableDomain = record.registrableDomain
-        self.dnsQueryName = record.dnsQueryName
-        self.dnsCname = record.dnsCname
-        self.dnsAnswerAddresses = record.dnsAnswerAddresses
-        self.tlsServerName = record.tlsServerName
-        self.quicVersion = record.quicVersion
-        self.quicPacketType = record.quicPacketType
-        self.quicDestinationConnectionId = record.quicDestinationConnectionId
-        self.quicSourceConnectionId = record.quicSourceConnectionId
-        self.classification = record.classification
+        self.sourceAddressStorage = includeStringAddresses ? record.textSourceAddress : nil
+        self.destinationAddressStorage = includeStringAddresses ? record.textDestinationAddress : nil
+        self.sourceAddressLength = includeStringAddresses ? record.sourceAddressLength : nil
+        self.sourceAddressHigh = includeStringAddresses ? record.sourceAddressHigh : nil
+        self.sourceAddressLow = includeStringAddresses ? record.sourceAddressLow : nil
+        self.destinationAddressLength = includeStringAddresses ? record.destinationAddressLength : nil
+        self.destinationAddressHigh = includeStringAddresses ? record.destinationAddressHigh : nil
+        self.destinationAddressLow = includeStringAddresses ? record.destinationAddressLow : nil
+        self.registrableDomain = includeHostHints ? record.registrableDomain : nil
+        self.dnsQueryName = includeHostHints ? record.dnsQueryName : nil
+        self.dnsCname = includeHostHints ? record.dnsCname : nil
+        self.dnsAnswerAddresses = includeDNSAnswerAddresses ? record.dnsAnswerAddresses : nil
+        self.tlsServerName = includeHostHints ? record.tlsServerName : nil
+        self.quicVersion = includeQUICIdentity ? record.quicVersion : nil
+        self.quicPacketType = includeQUICIdentity ? record.quicPacketType : nil
+        self.quicDestinationConnectionId = includeQUICIdentity ? record.quicDestinationConnectionId : nil
+        self.quicSourceConnectionId = includeQUICIdentity ? record.quicSourceConnectionId : nil
+        self.classification = includeHostHints ? record.classification : nil
         self.closeReason = record.closeReason
-        self.largePacketCount = record.largePacketCount
-        self.smallPacketCount = record.smallPacketCount
-        self.udpPacketCount = record.udpPacketCount
-        self.tcpPacketCount = record.tcpPacketCount
-        self.quicInitialCount = record.quicInitialCount
-        self.tcpSynCount = record.tcpSynCount
-        self.tcpFinCount = record.tcpFinCount
-        self.tcpRstCount = record.tcpRstCount
+        self.largePacketCount = includePacketShape || includeBurstShape ? record.largePacketCount : nil
+        self.smallPacketCount = includePacketShape || includeBurstShape ? record.smallPacketCount : nil
+        self.udpPacketCount = includePacketShape || includeBurstShape ? record.udpPacketCount : nil
+        self.tcpPacketCount = includePacketShape || includeBurstShape ? record.tcpPacketCount : nil
+        self.quicInitialCount = includeControlSignals ? record.quicInitialCount : nil
+        self.tcpSynCount = includeControlSignals ? record.tcpSynCount : nil
+        self.tcpFinCount = includeControlSignals ? record.tcpFinCount : nil
+        self.tcpRstCount = includeControlSignals ? record.tcpRstCount : nil
         self.burstDurationMs = record.burstDurationMs
         self.burstPacketCount = record.burstPacketCount
-        self.leadingBytes200ms = record.leadingBytes200ms
-        self.leadingPackets200ms = record.leadingPackets200ms
-        self.leadingBytes600ms = record.leadingBytes600ms
-        self.leadingPackets600ms = record.leadingPackets600ms
-        self.burstLargePacketCount = record.burstLargePacketCount
-        self.burstUdpPacketCount = record.burstUdpPacketCount
-        self.burstTcpPacketCount = record.burstTcpPacketCount
-        self.burstQuicInitialCount = record.burstQuicInitialCount
+        self.leadingBytes200ms = includeBurstShape ? record.leadingBytes200ms : nil
+        self.leadingPackets200ms = includeBurstShape ? record.leadingPackets200ms : nil
+        self.leadingBytes600ms = includeBurstShape ? record.leadingBytes600ms : nil
+        self.leadingPackets600ms = includeBurstShape ? record.leadingPackets600ms : nil
+        self.burstLargePacketCount = includeBurstShape ? record.burstLargePacketCount : nil
+        self.burstUdpPacketCount = includeBurstShape ? record.burstUdpPacketCount : nil
+        self.burstTcpPacketCount = includeBurstShape ? record.burstTcpPacketCount : nil
+        self.burstQuicInitialCount = includeBurstShape ? record.burstQuicInitialCount : nil
+        self.associatedDomain = includeDNSAssociation ? record.associatedDomain : nil
+        self.associationSource = includeDNSAssociation ? record.associationSource : nil
+        self.associationAgeMs = includeDNSAssociation ? record.associationAgeMs : nil
+        self.associationConfidence = includeDNSAssociation ? record.associationConfidence : nil
+        self.lineageID = includeLineage ? record.lineageID : nil
+        self.lineageGeneration = includeLineage ? record.lineageGeneration : nil
+        self.lineageAgeMs = includeLineage ? record.lineageAgeMs : nil
+        self.lineageReuseGapMs = includeLineage ? record.lineageReuseGapMs : nil
+        self.lineageReopenCount = includeLineage ? record.lineageReopenCount : nil
+        self.lineageSiblingCount = includeLineage ? record.lineageSiblingCount : nil
+        self.pathEpoch = includePathRegime ? record.pathEpoch : nil
+        self.pathInterfaceClass = includePathRegime ? record.pathInterfaceClass : nil
+        self.pathIsExpensive = includePathRegime ? record.pathIsExpensive : nil
+        self.pathIsConstrained = includePathRegime ? record.pathIsConstrained : nil
+        self.pathSupportsDNS = includePathRegime ? record.pathSupportsDNS : nil
+        self.pathChangedRecently = includePathRegime ? record.pathChangedRecently : nil
+        self.serviceFamily = includeServiceAttribution ? record.serviceFamily : nil
+        self.serviceFamilyConfidence = includeServiceAttribution ? record.serviceFamilyConfidence : nil
+        self.serviceAttributionSourceMask = includeServiceAttribution ? record.serviceAttributionSourceMask : nil
     }
 }
 
@@ -372,8 +460,15 @@ public struct DetectionSnapshot: Codable, Sendable, Equatable {
 /// sleeps, long CPU work, cross-process calls, or unbounded allocations.
 public protocol TrafficDetector: AnyObject {
     var identifier: String { get }
+    var requirements: DetectorRequirements { get }
     func ingest(_ records: DetectorRecordCollection) -> [DetectionEvent]
     func reset()
+}
+
+public extension TrafficDetector {
+    var requirements: DetectorRequirements {
+        .legacyDefault
+    }
 }
 
 /// Stable semantics for detector-owned string fields.
@@ -390,7 +485,7 @@ public enum DetectionFieldSemantics {
 
 extension DetectorRecord {
     init(_ record: PacketSampleStream.PacketStreamRecord) {
-        self.init(compactRecord: record)
+        self.init(compactRecord: record, projection: .legacyDefault)
     }
 }
 
@@ -402,17 +497,31 @@ public struct DetectorRecordCollection: RandomAccessCollection, Sendable {
     public typealias Index = Int
 
     private let records: [PacketSampleStream.PacketStreamRecord]
+    private let projection: DetectorRecordProjection
+    private let includedIndices: [Int]?
 
-    init(_ records: [PacketSampleStream.PacketStreamRecord]) {
+    init(_ records: [PacketSampleStream.PacketStreamRecord], projection: DetectorRecordProjection = .legacyDefault) {
         self.records = records
+        self.projection = projection
+        if projection.recordKinds == Set(PacketSampleKind.allCases) {
+            self.includedIndices = nil
+        } else {
+            var includedIndices: [Int] = []
+            includedIndices.reserveCapacity(records.count)
+            for (index, record) in records.enumerated() where projection.includes(record.kind) {
+                includedIndices.append(index)
+            }
+            self.includedIndices = includedIndices
+        }
     }
 
-    public var startIndex: Int { records.startIndex }
-    public var endIndex: Int { records.endIndex }
-    public var count: Int { records.count }
-    public var isEmpty: Bool { records.isEmpty }
+    public var startIndex: Int { 0 }
+    public var endIndex: Int { includedIndices?.count ?? records.count }
+    public var count: Int { endIndex }
+    public var isEmpty: Bool { count == 0 }
 
     public subscript(position: Int) -> DetectorRecord {
-        DetectorRecord(compactRecord: records[position])
+        let recordIndex = includedIndices?[position] ?? position
+        return DetectorRecord(compactRecord: records[recordIndex], projection: projection)
     }
 }

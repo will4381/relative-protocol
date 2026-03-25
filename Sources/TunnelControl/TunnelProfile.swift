@@ -22,6 +22,7 @@ public struct TunnelProfile: Sendable, Equatable {
     public let engineLogLevel: String
     public let telemetryEnabled: Bool
     public let liveTapEnabled: Bool
+    public let liveTapIncludeFlowSlices: Bool
     public let liveTapMaxBytes: Int
     public let signatureFileName: String
     public let relayEndpoint: RelayEndpoint
@@ -45,6 +46,8 @@ public struct TunnelProfile: Sendable, Equatable {
     ///   - liveTapEnabled: Enables the live rolling packet tap used for foreground snapshots. This is a
     ///     lean app-facing debug/read surface, not a guarantee that every detector-grade sparse record kind
     ///     will be published to the containing app.
+    ///   - liveTapIncludeFlowSlices: Opts the live rolling packet tap into detector-grade `flowSlice` records.
+    ///     Keep this `false` for normal foreground reads and enable it only for richer inspection/debug builds.
     ///   - liveTapMaxBytes: Approximate memory budget for the live rolling packet tap.
     ///   - signatureFileName: Signature filename loaded by classifier.
     ///   - relayEndpoint: Upstream relay endpoint metadata.
@@ -64,6 +67,7 @@ public struct TunnelProfile: Sendable, Equatable {
         engineLogLevel: String,
         telemetryEnabled: Bool,
         liveTapEnabled: Bool,
+        liveTapIncludeFlowSlices: Bool,
         liveTapMaxBytes: Int,
         signatureFileName: String,
         relayEndpoint: RelayEndpoint,
@@ -83,6 +87,7 @@ public struct TunnelProfile: Sendable, Equatable {
         self.engineLogLevel = engineLogLevel
         self.telemetryEnabled = telemetryEnabled
         self.liveTapEnabled = liveTapEnabled
+        self.liveTapIncludeFlowSlices = liveTapIncludeFlowSlices
         self.liveTapMaxBytes = liveTapMaxBytes
         self.signatureFileName = signatureFileName
         self.relayEndpoint = relayEndpoint
@@ -111,6 +116,7 @@ public struct TunnelProfile: Sendable, Equatable {
             engineLogLevel: providerConfiguration["engineLogLevel"] as? String ?? "warn",
             telemetryEnabled: bool(providerConfiguration["telemetryEnabled"], default: true),
             liveTapEnabled: bool(providerConfiguration["liveTapEnabled"], default: false),
+            liveTapIncludeFlowSlices: bool(providerConfiguration["liveTapIncludeFlowSlices"], default: false),
             liveTapMaxBytes: int(providerConfiguration["liveTapMaxBytes"], default: 5_000_000),
             signatureFileName: providerConfiguration["signatureFileName"] as? String ?? "app_signatures.json",
             relayEndpoint: RelayEndpoint(host: relayHost, port: relayPort, useUDP: useUDP),

@@ -7,7 +7,7 @@ import TunnelRuntime
 /// Decision: the tunnel writes fewer, more meaningful events (`flowOpen`, `flowSlice`, `flowClose`, `metadata`,
 /// `burst`, `activitySample`)
 /// instead of one rich sample for every admitted packet.
-public enum PacketSampleKind: String, Codable, Sendable, Equatable {
+public enum PacketSampleKind: String, Codable, Sendable, Equatable, CaseIterable {
     case flowOpen
     case flowSlice
     case flowClose
@@ -70,6 +70,25 @@ public struct PacketSample: Codable, Sendable, Equatable {
     public let burstUdpPacketCount: Int?
     public let burstTcpPacketCount: Int?
     public let burstQuicInitialCount: Int?
+    public let associatedDomain: String?
+    public let associationSource: DetectorAssociationSource?
+    public let associationAgeMs: Int?
+    public let associationConfidence: Double?
+    public let lineageID: UInt64?
+    public let lineageGeneration: Int?
+    public let lineageAgeMs: Int?
+    public let lineageReuseGapMs: Int?
+    public let lineageReopenCount: Int?
+    public let lineageSiblingCount: Int?
+    public let pathEpoch: UInt32?
+    public let pathInterfaceClass: PathInterfaceClass?
+    public let pathIsExpensive: Bool?
+    public let pathIsConstrained: Bool?
+    public let pathSupportsDNS: Bool?
+    public let pathChangedRecently: Bool?
+    public let serviceFamily: String?
+    public let serviceFamilyConfidence: Double?
+    public let serviceAttributionSourceMask: UInt16?
 
     public init(
         kind: PacketSampleKind = .activitySample,
@@ -115,7 +134,26 @@ public struct PacketSample: Codable, Sendable, Equatable {
         burstLargePacketCount: Int? = nil,
         burstUdpPacketCount: Int? = nil,
         burstTcpPacketCount: Int? = nil,
-        burstQuicInitialCount: Int? = nil
+        burstQuicInitialCount: Int? = nil,
+        associatedDomain: String? = nil,
+        associationSource: DetectorAssociationSource? = nil,
+        associationAgeMs: Int? = nil,
+        associationConfidence: Double? = nil,
+        lineageID: UInt64? = nil,
+        lineageGeneration: Int? = nil,
+        lineageAgeMs: Int? = nil,
+        lineageReuseGapMs: Int? = nil,
+        lineageReopenCount: Int? = nil,
+        lineageSiblingCount: Int? = nil,
+        pathEpoch: UInt32? = nil,
+        pathInterfaceClass: PathInterfaceClass? = nil,
+        pathIsExpensive: Bool? = nil,
+        pathIsConstrained: Bool? = nil,
+        pathSupportsDNS: Bool? = nil,
+        pathChangedRecently: Bool? = nil,
+        serviceFamily: String? = nil,
+        serviceFamilyConfidence: Double? = nil,
+        serviceAttributionSourceMask: UInt16? = nil
     ) {
         self.kind = kind
         self.timestamp = timestamp
@@ -161,6 +199,25 @@ public struct PacketSample: Codable, Sendable, Equatable {
         self.burstUdpPacketCount = burstUdpPacketCount
         self.burstTcpPacketCount = burstTcpPacketCount
         self.burstQuicInitialCount = burstQuicInitialCount
+        self.associatedDomain = associatedDomain
+        self.associationSource = associationSource
+        self.associationAgeMs = associationAgeMs
+        self.associationConfidence = associationConfidence
+        self.lineageID = lineageID
+        self.lineageGeneration = lineageGeneration
+        self.lineageAgeMs = lineageAgeMs
+        self.lineageReuseGapMs = lineageReuseGapMs
+        self.lineageReopenCount = lineageReopenCount
+        self.lineageSiblingCount = lineageSiblingCount
+        self.pathEpoch = pathEpoch
+        self.pathInterfaceClass = pathInterfaceClass
+        self.pathIsExpensive = pathIsExpensive
+        self.pathIsConstrained = pathIsConstrained
+        self.pathSupportsDNS = pathSupportsDNS
+        self.pathChangedRecently = pathChangedRecently
+        self.serviceFamily = serviceFamily
+        self.serviceFamilyConfidence = serviceFamilyConfidence
+        self.serviceAttributionSourceMask = serviceAttributionSourceMask
     }
 }
 
@@ -243,6 +300,25 @@ public actor PacketSampleStream {
         let burstUdpPacketCount: Int?
         let burstTcpPacketCount: Int?
         let burstQuicInitialCount: Int?
+        let associatedDomain: String?
+        let associationSource: DetectorAssociationSource?
+        let associationAgeMs: Int?
+        let associationConfidence: Double?
+        let lineageID: UInt64?
+        let lineageGeneration: Int?
+        let lineageAgeMs: Int?
+        let lineageReuseGapMs: Int?
+        let lineageReopenCount: Int?
+        let lineageSiblingCount: Int?
+        let pathEpoch: UInt32?
+        let pathInterfaceClass: PathInterfaceClass?
+        let pathIsExpensive: Bool?
+        let pathIsConstrained: Bool?
+        let pathSupportsDNS: Bool?
+        let pathChangedRecently: Bool?
+        let serviceFamily: String?
+        let serviceFamilyConfidence: Double?
+        let serviceAttributionSourceMask: UInt16?
     }
 
     private enum StoredPayload: Sendable {
@@ -395,6 +471,8 @@ public actor PacketSampleStream {
         add(sample.quicDestinationConnectionId)
         add(sample.quicSourceConnectionId)
         add(sample.classification)
+        add(sample.associatedDomain)
+        add(sample.serviceFamily)
         return size
     }
 
@@ -432,6 +510,8 @@ public actor PacketSampleStream {
         add(record.quicDestinationConnectionId)
         add(record.quicSourceConnectionId)
         add(record.classification)
+        add(record.associatedDomain)
+        add(record.serviceFamily)
         return size
     }
 
@@ -591,7 +671,26 @@ public actor PacketSampleStream {
             burstLargePacketCount: record.burstLargePacketCount,
             burstUdpPacketCount: record.burstUdpPacketCount,
             burstTcpPacketCount: record.burstTcpPacketCount,
-            burstQuicInitialCount: record.burstQuicInitialCount
+            burstQuicInitialCount: record.burstQuicInitialCount,
+            associatedDomain: record.associatedDomain,
+            associationSource: record.associationSource,
+            associationAgeMs: record.associationAgeMs,
+            associationConfidence: record.associationConfidence,
+            lineageID: record.lineageID,
+            lineageGeneration: record.lineageGeneration,
+            lineageAgeMs: record.lineageAgeMs,
+            lineageReuseGapMs: record.lineageReuseGapMs,
+            lineageReopenCount: record.lineageReopenCount,
+            lineageSiblingCount: record.lineageSiblingCount,
+            pathEpoch: record.pathEpoch,
+            pathInterfaceClass: record.pathInterfaceClass,
+            pathIsExpensive: record.pathIsExpensive,
+            pathIsConstrained: record.pathIsConstrained,
+            pathSupportsDNS: record.pathSupportsDNS,
+            pathChangedRecently: record.pathChangedRecently,
+            serviceFamily: record.serviceFamily,
+            serviceFamilyConfidence: record.serviceFamilyConfidence,
+            serviceAttributionSourceMask: record.serviceAttributionSourceMask
         )
     }
 
@@ -616,16 +715,18 @@ public actor PacketSampleStream {
         }
 
         var bytes = [UInt8](repeating: 0, count: 16)
-        for index in 0..<8 {
-            bytes[index] = UInt8((high >> UInt64(index * 8)) & 0xff)
-            bytes[index + 8] = UInt8((low >> UInt64(index * 8)) & 0xff)
-        }
+        var highBE = high.bigEndian
+        var lowBE = low.bigEndian
+        let highBytes = withUnsafeBytes(of: &highBE) { Array($0) }
+        let lowBytes = withUnsafeBytes(of: &lowBE) { Array($0) }
+        bytes.replaceSubrange(0..<8, with: highBytes)
+        bytes.replaceSubrange(8..<16, with: lowBytes)
 
         switch length {
         case 4:
             var address = in_addr()
             _ = bytes.withUnsafeBytes { rawBuffer in
-                memcpy(&address, rawBuffer.baseAddress, 4)
+                memcpy(&address, rawBuffer.baseAddress!.advanced(by: 12), 4)
             }
             var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
             guard inet_ntop(AF_INET, &address, &buffer, socklen_t(INET_ADDRSTRLEN)) != nil else {

@@ -137,6 +137,94 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertEqual(sample.burstTcpPacketCount, 3)
     }
 
+    /// Verifies compact numeric IPv4 addresses decode correctly for detector and live-tap reads.
+    func testPacketStreamDecodesNumericIPv4Addresses() async throws {
+        let clock = DeterministicClock(startTime: Date(timeIntervalSince1970: 0))
+        let stream = PacketSampleStream(maxBytes: 4_096, clock: clock, logger: StructuredLogger(sink: InMemoryLogSink()))
+
+        try await stream.append(
+            records: [
+                PacketSampleStream.PacketStreamRecord(
+                    kind: .flowOpen,
+                    timestamp: Date(timeIntervalSince1970: 5),
+                    direction: PacketDirection.outbound.rawValue,
+                    bytes: 128,
+                    packetCount: 1,
+                    flowPacketCount: 1,
+                    flowByteCount: 128,
+                    protocolHint: "tcp",
+                    ipVersion: 4,
+                    transportProtocolNumber: 6,
+                    sourcePort: 50_000,
+                    destinationPort: 443,
+                    flowHash: 0xfeed_beef,
+                    textFlowId: nil,
+                    sourceAddressLength: 4,
+                    sourceAddressHigh: 0,
+                    sourceAddressLow: 0x0000_0000_0a00_0002,
+                    destinationAddressLength: 4,
+                    destinationAddressHigh: 0,
+                    destinationAddressLow: 0x0000_0000_0101_0101,
+                    textSourceAddress: nil,
+                    textDestinationAddress: nil,
+                    registrableDomain: nil,
+                    dnsQueryName: nil,
+                    dnsCname: nil,
+                    dnsAnswerAddresses: nil,
+                    tlsServerName: nil,
+                    quicVersion: nil,
+                    quicPacketType: nil,
+                    quicDestinationConnectionId: nil,
+                    quicSourceConnectionId: nil,
+                    classification: nil,
+                    closeReason: nil,
+                    largePacketCount: nil,
+                    smallPacketCount: nil,
+                    udpPacketCount: nil,
+                    tcpPacketCount: nil,
+                    quicInitialCount: nil,
+                    tcpSynCount: nil,
+                    tcpFinCount: nil,
+                    tcpRstCount: nil,
+                    burstDurationMs: nil,
+                    burstPacketCount: nil,
+                    leadingBytes200ms: nil,
+                    leadingPackets200ms: nil,
+                    leadingBytes600ms: nil,
+                    leadingPackets600ms: nil,
+                    burstLargePacketCount: nil,
+                    burstUdpPacketCount: nil,
+                    burstTcpPacketCount: nil,
+                    burstQuicInitialCount: nil,
+                    associatedDomain: nil,
+                    associationSource: nil,
+                    associationAgeMs: nil,
+                    associationConfidence: nil,
+                    lineageID: nil,
+                    lineageGeneration: nil,
+                    lineageAgeMs: nil,
+                    lineageReuseGapMs: nil,
+                    lineageReopenCount: nil,
+                    lineageSiblingCount: nil,
+                    pathEpoch: nil,
+                    pathInterfaceClass: nil,
+                    pathIsExpensive: nil,
+                    pathIsConstrained: nil,
+                    pathSupportsDNS: nil,
+                    pathChangedRecently: nil,
+                    serviceFamily: nil,
+                    serviceFamilyConfidence: nil,
+                    serviceAttributionSourceMask: nil
+                )
+            ]
+        )
+
+        let samples = await stream.readAll()
+        let sample = try XCTUnwrap(samples.first)
+        XCTAssertEqual(sample.sourceAddress, "10.0.0.2")
+        XCTAssertEqual(sample.destinationAddress, "1.1.1.1")
+    }
+
     /// Verifies the detector-first pipeline emits sparse flow and activity records without deep metadata work.
     func testPacketAnalyticsPipelineEmitsSparseFlowAndActivityRecords() async throws {
         let clock = DeterministicClock(startTime: Date(timeIntervalSince1970: 0))
@@ -730,6 +818,485 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertEqual(detector.recordedKinds(), [.flowOpen, .flowSlice])
     }
 
+    /// Verifies detector projections filter record kinds and omit unrequested enrichment families.
+    func testDetectorRecordCollectionProjectsKindsAndFieldsByRequirements() {
+        let records = [
+            makePacketStreamRecord(
+                kind: .flowOpen,
+                timestamp: Date(timeIntervalSince1970: 1),
+                flowHash: 0xfeed_beef,
+                registrableDomain: "example.com",
+                tlsServerName: "api.example.com",
+                bytes: 512,
+                packetCount: 2,
+                associatedDomain: "example.com",
+                serviceFamily: "example.com",
+                serviceFamilyConfidence: 0.76,
+                serviceAttributionSourceMask: 0b11
+            ),
+            makePacketStreamRecord(
+                kind: .flowSlice,
+                timestamp: Date(timeIntervalSince1970: 2),
+                flowHash: 0xfeed_beef,
+                registrableDomain: "example.com",
+                tlsServerName: "api.example.com",
+                bytes: 1_024,
+                packetCount: 4,
+                lineageID: 42,
+                lineageGeneration: 1
+            )
+        ]
+
+        let requirements = DetectorRequirements(
+            recordKinds: [.flowOpen],
+            featureFamilies: [.serviceAttribution]
+        )
+        let collection = DetectorRecordCollection(records, projection: DetectorRecordProjection(requirements: requirements))
+
+        XCTAssertEqual(collection.count, 1)
+        guard let record = collection.first else {
+            XCTFail("Expected one projected record")
+            return
+        }
+        XCTAssertEqual(record.kind, .flowOpen)
+        XCTAssertNil(record.registrableDomain)
+        XCTAssertNil(record.tlsServerName)
+        XCTAssertNil(record.lineageID)
+        XCTAssertEqual(record.serviceFamily, "example.com")
+        XCTAssertEqual(record.serviceAttributionSourceMask, 0b11)
+    }
+
+    /// Verifies DNS answers can be reused to attribute later hostless UDP/443 traffic and derive service-family hints.
+    func testPacketAnalyticsPipelineEmitsDNSAssociationAndServiceAttributionWhenRequested() async throws {
+        let clock = DeterministicClock(startTime: Date(timeIntervalSince1970: 0))
+        let pipeline = PacketAnalyticsPipeline(
+            clock: clock,
+            burstTracker: BurstTracker(thresholdMs: 350),
+            signatureClassifier: SignatureClassifier(logger: StructuredLogger(sink: InMemoryLogSink()))
+        )
+
+        let dnsResponse = Data(
+            makeIPv4UDPPacket(
+                sourceAddress: [8, 8, 8, 8],
+                destinationAddress: [10, 0, 0, 2],
+                sourcePort: 53,
+                destinationPort: 53_000,
+                payload: makeDNSResponsePayload(
+                    queryName: "video.example.com",
+                    answerIPv4: [1, 1, 1, 1]
+                )
+            )
+        )
+
+        let policy = PacketAnalyticsPipeline.EmissionPolicy(
+            allowDeepMetadata: true,
+            maxMetadataProbesPerBatch: 2,
+            emitFlowSlices: false,
+            flowSliceIntervalMs: 250,
+            emitFlowCloseEvents: false,
+            emitBurstShapeCounters: false,
+            emitDNSAssociationFields: true,
+            emitLineageFields: false,
+            emitPathRegimeFields: false,
+            emitServiceAttributionFields: true,
+            includeHostHints: false,
+            includeQUICIdentity: false,
+            activitySampleMinimumPackets: 1_024,
+            activitySampleMinimumBytes: 16 * 1_024 * 1_024,
+            activitySampleMinimumInterval: 60,
+            emitBurstEvents: false,
+            emitActivitySamples: false
+        )
+
+        _ = await pipeline.ingest(
+            packets: [dnsResponse],
+            families: [],
+            direction: .inbound,
+            policy: policy
+        )
+
+        await clock.advance(by: 0.1)
+        let mediaPacket = Data(
+            makeIPv4UDPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [1, 1, 1, 1],
+                sourcePort: 53_001,
+                destinationPort: 443,
+                payload: Array(repeating: 0xc0, count: 64)
+            )
+        )
+
+        let records = await pipeline.ingest(
+            packets: [mediaPacket],
+            families: [],
+            direction: .outbound,
+            policy: policy
+        )
+
+        let flowOpen = try XCTUnwrap(records.first(where: { $0.kind == .flowOpen }))
+        XCTAssertEqual(flowOpen.associatedDomain, "example.com")
+        XCTAssertEqual(flowOpen.associationSource, .dnsAnswer)
+        XCTAssertEqual(flowOpen.serviceFamily, "example.com")
+        XCTAssertNotNil(flowOpen.serviceFamilyConfidence)
+    }
+
+    /// Verifies DNS answers and DNS association survive all the way into the app-facing live tap snapshot.
+    func testPacketTelemetryWorkerPublishesDNSAnswersAndAssociationIntoLiveTap() async throws {
+        let clock = DeterministicClock(startTime: Date(timeIntervalSince1970: 0))
+        let pipeline = PacketAnalyticsPipeline(
+            clock: clock,
+            burstTracker: BurstTracker(thresholdMs: 350),
+            signatureClassifier: SignatureClassifier(logger: StructuredLogger(sink: InMemoryLogSink()))
+        )
+        let packetStream = PacketSampleStream(maxBytes: 64 * 1_024, clock: clock, logger: StructuredLogger(sink: InMemoryLogSink()))
+        let detector = ProjectionRecordingDetector(
+            identifier: "dns-association-detector",
+            requirements: DetectorRequirements(
+                recordKinds: [.flowOpen, .metadata],
+                featureFamilies: [.dnsAssociation]
+            )
+        )
+        let policy = PacketAnalyticsPipeline.EmissionPolicy(
+            allowDeepMetadata: true,
+            maxMetadataProbesPerBatch: 2,
+            emitFlowSlices: false,
+            flowSliceIntervalMs: 250,
+            emitFlowCloseEvents: false,
+            emitBurstShapeCounters: false,
+            emitDNSAssociationFields: true,
+            emitLineageFields: false,
+            emitPathRegimeFields: false,
+            emitServiceAttributionFields: false,
+            includeHostHints: false,
+            includeDNSAnswerAddresses: true,
+            includeQUICIdentity: false,
+            activitySampleMinimumPackets: 1_024,
+            activitySampleMinimumBytes: 16 * 1_024 * 1_024,
+            activitySampleMinimumInterval: 60,
+            emitBurstEvents: false,
+            emitActivitySamples: false
+        )
+        let worker = PacketTelemetryWorker(
+            pipeline: pipeline,
+            packetStream: packetStream,
+            detectors: [detector],
+            logger: StructuredLogger(sink: InMemoryLogSink()),
+            processInfo: .processInfo,
+            emissionPolicyOverride: policy,
+            pathRegimeProvider: nil,
+            includeFlowSlicesInLiveTap: false
+        )
+
+        let dnsResponse = Data(
+            makeIPv4UDPPacket(
+                sourceAddress: [8, 8, 8, 8],
+                destinationAddress: [10, 0, 0, 2],
+                sourcePort: 53,
+                destinationPort: 53_000,
+                payload: makeDNSResponsePayload(
+                    queryName: "video.example.com",
+                    answerIPv4: [1, 1, 1, 1]
+                )
+            )
+        )
+
+        XCTAssertTrue(worker.submit(packets: [dnsResponse], families: [], direction: .inbound).accepted)
+        await worker.flushAndWait()
+
+        await clock.advance(by: 0.1)
+        let mediaPacket = Data(
+            makeIPv4UDPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [1, 1, 1, 1],
+                sourcePort: 53_001,
+                destinationPort: 443,
+                payload: Array(repeating: 0xc0, count: 64)
+            )
+        )
+
+        XCTAssertTrue(worker.submit(packets: [mediaPacket], families: [], direction: .outbound).accepted)
+        await worker.flushAndWait()
+
+        let snapshot = await worker.recentSnapshot(limit: 10)
+        _ = try XCTUnwrap(snapshot.samples.first(where: { sample in
+            sample.kind == .metadata && sample.dnsAnswerAddresses == ["1.1.1.1"]
+        }))
+
+        let associatedFlow = try XCTUnwrap(snapshot.samples.first(where: { $0.associatedDomain == "example.com" }))
+        XCTAssertEqual(associatedFlow.associationSource, .dnsAnswer)
+        XCTAssertNotNil(associatedFlow.associationConfidence)
+
+        await worker.stopAndWait()
+    }
+
+    /// Verifies the lineage tracker stitches related flows together across close/reopen boundaries.
+    func testPacketAnalyticsPipelineEmitsLineageAcrossRelatedFlows() async throws {
+        let clock = DeterministicClock(startTime: Date(timeIntervalSince1970: 0))
+        let pipeline = PacketAnalyticsPipeline(
+            clock: clock,
+            burstTracker: BurstTracker(thresholdMs: 350),
+            signatureClassifier: SignatureClassifier(logger: StructuredLogger(sink: InMemoryLogSink()))
+        )
+
+        let policy = PacketAnalyticsPipeline.EmissionPolicy(
+            allowDeepMetadata: false,
+            maxMetadataProbesPerBatch: 0,
+            emitFlowSlices: false,
+            flowSliceIntervalMs: 250,
+            emitFlowCloseEvents: true,
+            emitBurstShapeCounters: false,
+            emitDNSAssociationFields: false,
+            emitLineageFields: true,
+            emitPathRegimeFields: false,
+            emitServiceAttributionFields: false,
+            includeHostHints: false,
+            includeQUICIdentity: false,
+            activitySampleMinimumPackets: 1_024,
+            activitySampleMinimumBytes: 16 * 1_024 * 1_024,
+            activitySampleMinimumInterval: 60,
+            emitBurstEvents: false,
+            emitActivitySamples: false
+        )
+
+        let firstOpen = Data(
+            makeIPv4TCPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [1, 1, 1, 1],
+                sourcePort: 50_000,
+                destinationPort: 443,
+                tcpFlags: 0x02,
+                payload: []
+            )
+        )
+        let firstRecords = await pipeline.ingest(packets: [firstOpen], families: [], direction: .outbound, policy: policy)
+        let firstFlowOpen = try XCTUnwrap(firstRecords.first(where: { $0.kind == .flowOpen }))
+        let firstLineageID = try XCTUnwrap(firstFlowOpen.lineageID)
+        XCTAssertEqual(firstFlowOpen.lineageGeneration, 0)
+
+        await clock.advance(by: 0.1)
+        let firstClose = Data(
+            makeIPv4TCPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [1, 1, 1, 1],
+                sourcePort: 50_000,
+                destinationPort: 443,
+                tcpFlags: 0x01,
+                payload: []
+            )
+        )
+        _ = await pipeline.ingest(packets: [firstClose], families: [], direction: .outbound, policy: policy)
+
+        await clock.advance(by: 0.5)
+        let secondOpen = Data(
+            makeIPv4TCPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [1, 1, 1, 1],
+                sourcePort: 50_001,
+                destinationPort: 443,
+                tcpFlags: 0x02,
+                payload: []
+            )
+        )
+        let secondRecords = await pipeline.ingest(packets: [secondOpen], families: [], direction: .outbound, policy: policy)
+        let secondFlowOpen = try XCTUnwrap(secondRecords.first(where: { $0.kind == .flowOpen }))
+        XCTAssertEqual(secondFlowOpen.lineageID, firstLineageID)
+        XCTAssertEqual(secondFlowOpen.lineageGeneration, 1)
+        XCTAssertEqual(secondFlowOpen.lineageReopenCount, 1)
+        XCTAssertNotNil(secondFlowOpen.lineageReuseGapMs)
+    }
+
+    /// Verifies path-regime snapshots are stamped onto sparse detector records when requested.
+    func testPacketAnalyticsPipelineStampsPathRegimeFieldsWhenRequested() async throws {
+        let clock = DeterministicClock(startTime: Date(timeIntervalSince1970: 0))
+        let pipeline = PacketAnalyticsPipeline(
+            clock: clock,
+            burstTracker: BurstTracker(thresholdMs: 350),
+            signatureClassifier: SignatureClassifier(logger: StructuredLogger(sink: InMemoryLogSink()))
+        )
+
+        let packet = Data(
+            makeIPv4TCPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [1, 1, 1, 1],
+                sourcePort: 50_000,
+                destinationPort: 443,
+                tcpFlags: 0x18,
+                payload: [0x17, 0x03, 0x03, 0x00, 0x01]
+            )
+        )
+
+        let policy = PacketAnalyticsPipeline.EmissionPolicy(
+            allowDeepMetadata: false,
+            maxMetadataProbesPerBatch: 0,
+            emitFlowSlices: false,
+            flowSliceIntervalMs: 250,
+            emitFlowCloseEvents: false,
+            emitBurstShapeCounters: false,
+            emitDNSAssociationFields: false,
+            emitLineageFields: false,
+            emitPathRegimeFields: true,
+            emitServiceAttributionFields: false,
+            includeHostHints: false,
+            includeQUICIdentity: false,
+            activitySampleMinimumPackets: 1_024,
+            activitySampleMinimumBytes: 16 * 1_024 * 1_024,
+            activitySampleMinimumInterval: 60,
+            emitBurstEvents: false,
+            emitActivitySamples: false
+        )
+
+        let runtimeContext = PacketAnalyticsPipeline.RuntimeContext(
+            pathRegime: PathRegimeSnapshot(
+                epoch: 7,
+                interfaceClass: .cellular,
+                isExpensive: true,
+                isConstrained: true,
+                supportsDNS: true,
+                changedAt: Date(timeIntervalSince1970: 0)
+            )
+        )
+
+        let records = await pipeline.ingest(
+            packets: [packet],
+            families: [],
+            direction: .outbound,
+            policy: policy,
+            runtimeContext: runtimeContext
+        )
+
+        let flowOpen = try XCTUnwrap(records.first(where: { $0.kind == .flowOpen }))
+        XCTAssertEqual(flowOpen.pathEpoch, 7)
+        XCTAssertEqual(flowOpen.pathInterfaceClass, .cellular)
+        XCTAssertEqual(flowOpen.pathIsExpensive, true)
+        XCTAssertEqual(flowOpen.pathIsConstrained, true)
+        XCTAssertEqual(flowOpen.pathSupportsDNS, true)
+        XCTAssertEqual(flowOpen.pathChangedRecently, true)
+    }
+
+    /// Verifies the generic arm/suppress/count helper stays lightweight and deterministic.
+    func testDetectorArmingStateMachineTransitionsThroughSettleSuppressAndCooldown() {
+        var machine = DetectorArmingStateMachine(
+            policy: DetectorArmingPolicy(
+                settlingWindow: 1,
+                cooldownWindow: 0.5,
+                suppressionWindow: 1
+            )
+        )
+
+        let first = makeDetectorRecord(timestamp: Date(timeIntervalSince1970: 0))
+        XCTAssertEqual(machine.observe(first), .settling)
+
+        let settled = makeDetectorRecord(timestamp: Date(timeIntervalSince1970: 1.1))
+        XCTAssertEqual(machine.observe(settled), .armed)
+
+        machine.markCounted(at: settled.timestamp)
+        XCTAssertEqual(machine.state, .cooldown)
+
+        let cooled = makeDetectorRecord(timestamp: Date(timeIntervalSince1970: 1.7))
+        XCTAssertEqual(machine.observe(cooled), .armed)
+
+        let regimeChanged = makeDetectorRecord(timestamp: Date(timeIntervalSince1970: 1.8), pathChangedRecently: true)
+        XCTAssertEqual(machine.observe(regimeChanged), .suppressed)
+
+        let postSuppression = makeDetectorRecord(timestamp: Date(timeIntervalSince1970: 3.0))
+        XCTAssertEqual(machine.observe(postSuppression), .settling)
+        let rearmed = makeDetectorRecord(timestamp: Date(timeIntervalSince1970: 4.1))
+        XCTAssertEqual(machine.observe(rearmed), .armed)
+    }
+
+    /// Verifies one worker can satisfy different detector requirements without widening every detector's input batch.
+    func testPacketTelemetryWorkerProjectsDifferentViewsPerDetector() async throws {
+        let clock = DeterministicClock(startTime: Date(timeIntervalSince1970: 0))
+        let pipeline = PacketAnalyticsPipeline(
+            clock: clock,
+            burstTracker: BurstTracker(thresholdMs: 350),
+            signatureClassifier: SignatureClassifier(logger: StructuredLogger(sink: InMemoryLogSink()))
+        )
+        let narrowDetector = ProjectionRecordingDetector(
+            identifier: "narrow",
+            requirements: DetectorRequirements(recordKinds: [.flowOpen], featureFamilies: [])
+        )
+        let wideDetector = ProjectionRecordingDetector(
+            identifier: "wide",
+            requirements: DetectorRequirements(
+                recordKinds: [.flowOpen, .flowSlice],
+                featureFamilies: [.lineage]
+            )
+        )
+        let policy = PacketAnalyticsPipeline.EmissionPolicy(
+            allowDeepMetadata: false,
+            maxMetadataProbesPerBatch: 0,
+            emitFlowSlices: true,
+            flowSliceIntervalMs: 250,
+            emitFlowCloseEvents: false,
+            emitBurstShapeCounters: false,
+            emitDNSAssociationFields: false,
+            emitLineageFields: true,
+            emitPathRegimeFields: false,
+            emitServiceAttributionFields: false,
+            includeHostHints: false,
+            includeQUICIdentity: false,
+            activitySampleMinimumPackets: 1_024,
+            activitySampleMinimumBytes: 16 * 1_024 * 1_024,
+            activitySampleMinimumInterval: 60,
+            emitBurstEvents: false,
+            emitActivitySamples: false
+        )
+        let worker = PacketTelemetryWorker(
+            pipeline: pipeline,
+            packetStream: nil,
+            detectors: [narrowDetector, wideDetector],
+            logger: StructuredLogger(sink: InMemoryLogSink()),
+            processInfo: .processInfo,
+            emissionPolicyOverride: policy
+        )
+
+        let syn = Data(
+            makeIPv4TCPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [1, 1, 1, 1],
+                sourcePort: 50_000,
+                destinationPort: 443,
+                tcpFlags: 0x02,
+                payload: []
+            )
+        )
+        let payloadA = Data(
+            makeIPv4TCPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [1, 1, 1, 1],
+                sourcePort: 50_000,
+                destinationPort: 443,
+                tcpFlags: 0x18,
+                payload: Array(repeating: 0x17, count: 256)
+            )
+        )
+        let payloadB = Data(
+            makeIPv4TCPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [1, 1, 1, 1],
+                sourcePort: 50_000,
+                destinationPort: 443,
+                tcpFlags: 0x18,
+                payload: Array(repeating: 0x17, count: 256)
+            )
+        )
+
+        XCTAssertTrue(worker.submit(packets: [syn], families: [], direction: .outbound).accepted)
+        await worker.flushAndWait()
+        await clock.advance(by: 0.1)
+        XCTAssertTrue(worker.submit(packets: [payloadA], families: [], direction: .outbound).accepted)
+        await worker.flushAndWait()
+        await clock.advance(by: 0.2)
+        XCTAssertTrue(worker.submit(packets: [payloadB], families: [], direction: .outbound).accepted)
+        await worker.flushAndWait()
+        await worker.stopAndWait()
+
+        XCTAssertEqual(narrowDetector.recordedKinds(), [.flowOpen])
+        XCTAssertEqual(wideDetector.recordedKinds(), [.flowOpen, .flowSlice])
+        XCTAssertNotNil(wideDetector.firstLineageID())
+    }
+
     /// Verifies the persisted detector store round-trips durable detector summaries.
     func testDetectionStoreRoundTrip() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -881,6 +1448,47 @@ final class AnalyticsTests: XCTestCase {
         }
     }
 
+    private final class ProjectionRecordingDetector: TrafficDetector {
+        let identifier: String
+        let requirements: DetectorRequirements
+
+        private let lock = NSLock()
+        private var kinds: [PacketSampleKind] = []
+        private var lineageIDs: [UInt64] = []
+
+        init(identifier: String, requirements: DetectorRequirements) {
+            self.identifier = identifier
+            self.requirements = requirements
+        }
+
+        func ingest(_ records: DetectorRecordCollection) -> [DetectionEvent] {
+            lock.lock()
+            kinds.append(contentsOf: records.map(\.kind))
+            lineageIDs.append(contentsOf: records.compactMap(\.lineageID))
+            lock.unlock()
+            return []
+        }
+
+        func reset() {
+            lock.lock()
+            kinds.removeAll(keepingCapacity: false)
+            lineageIDs.removeAll(keepingCapacity: false)
+            lock.unlock()
+        }
+
+        func recordedKinds() -> [PacketSampleKind] {
+            lock.lock()
+            defer { lock.unlock() }
+            return kinds
+        }
+
+        func firstLineageID() -> UInt64? {
+            lock.lock()
+            defer { lock.unlock() }
+            return lineageIDs.first
+        }
+    }
+
     /// Verifies persisted provider stop records map to stable user-facing summaries.
     func testTunnelStopRecordSummaryMapping() {
         let userStop = TunnelStopRecord(timestamp: Date(timeIntervalSince1970: 0), reasonCode: 1, reasonName: "userInitiated")
@@ -931,7 +1539,26 @@ final class AnalyticsTests: XCTestCase {
         burstLargePacketCount: Int? = nil,
         burstUdpPacketCount: Int? = nil,
         burstTcpPacketCount: Int? = nil,
-        burstQuicInitialCount: Int? = nil
+        burstQuicInitialCount: Int? = nil,
+        associatedDomain: String? = nil,
+        associationSource: DetectorAssociationSource? = nil,
+        associationAgeMs: Int? = nil,
+        associationConfidence: Double? = nil,
+        lineageID: UInt64? = nil,
+        lineageGeneration: Int? = nil,
+        lineageAgeMs: Int? = nil,
+        lineageReuseGapMs: Int? = nil,
+        lineageReopenCount: Int? = nil,
+        lineageSiblingCount: Int? = nil,
+        pathEpoch: UInt32? = nil,
+        pathInterfaceClass: PathInterfaceClass? = nil,
+        pathIsExpensive: Bool? = nil,
+        pathIsConstrained: Bool? = nil,
+        pathSupportsDNS: Bool? = nil,
+        pathChangedRecently: Bool? = nil,
+        serviceFamily: String? = nil,
+        serviceFamilyConfidence: Double? = nil,
+        serviceAttributionSourceMask: UInt16? = nil
     ) -> PacketSampleStream.PacketStreamRecord {
         PacketSampleStream.PacketStreamRecord(
             kind: kind,
@@ -984,8 +1611,108 @@ final class AnalyticsTests: XCTestCase {
             burstLargePacketCount: burstLargePacketCount,
             burstUdpPacketCount: burstUdpPacketCount,
             burstTcpPacketCount: burstTcpPacketCount,
-            burstQuicInitialCount: burstQuicInitialCount
+            burstQuicInitialCount: burstQuicInitialCount,
+            associatedDomain: associatedDomain,
+            associationSource: associationSource,
+            associationAgeMs: associationAgeMs,
+            associationConfidence: associationConfidence,
+            lineageID: lineageID,
+            lineageGeneration: lineageGeneration,
+            lineageAgeMs: lineageAgeMs,
+            lineageReuseGapMs: lineageReuseGapMs,
+            lineageReopenCount: lineageReopenCount,
+            lineageSiblingCount: lineageSiblingCount,
+            pathEpoch: pathEpoch,
+            pathInterfaceClass: pathInterfaceClass,
+            pathIsExpensive: pathIsExpensive,
+            pathIsConstrained: pathIsConstrained,
+            pathSupportsDNS: pathSupportsDNS,
+            pathChangedRecently: pathChangedRecently,
+            serviceFamily: serviceFamily,
+            serviceFamilyConfidence: serviceFamilyConfidence,
+            serviceAttributionSourceMask: serviceAttributionSourceMask
         )
+    }
+
+    private func makeDetectorRecord(
+        timestamp: Date,
+        pathChangedRecently: Bool = false
+    ) -> DetectorRecord {
+        DetectorRecord(
+            kind: .flowOpen,
+            timestamp: timestamp,
+            direction: PacketDirection.outbound.rawValue,
+            bytes: 128,
+            packetCount: 1,
+            flowPacketCount: 1,
+            flowByteCount: 128,
+            protocolHint: "tcp",
+            ipVersion: 4,
+            transportProtocolNumber: 6,
+            sourcePort: 50_000,
+            destinationPort: 443,
+            flowHash: 0xfeed_beef,
+            textFlowId: nil,
+            sourceAddress: nil,
+            destinationAddress: nil,
+            registrableDomain: nil,
+            dnsQueryName: nil,
+            dnsCname: nil,
+            dnsAnswerAddresses: nil,
+            tlsServerName: nil,
+            quicVersion: nil,
+            quicPacketType: nil,
+            quicDestinationConnectionId: nil,
+            quicSourceConnectionId: nil,
+            classification: nil,
+            closeReason: nil,
+            largePacketCount: nil,
+            smallPacketCount: nil,
+            udpPacketCount: nil,
+            tcpPacketCount: nil,
+            quicInitialCount: nil,
+            tcpSynCount: nil,
+            tcpFinCount: nil,
+            tcpRstCount: nil,
+            burstDurationMs: nil,
+            burstPacketCount: nil,
+            leadingBytes200ms: nil,
+            leadingPackets200ms: nil,
+            leadingBytes600ms: nil,
+            leadingPackets600ms: nil,
+            burstLargePacketCount: nil,
+            burstUdpPacketCount: nil,
+            burstTcpPacketCount: nil,
+            burstQuicInitialCount: nil,
+            pathChangedRecently: pathChangedRecently
+        )
+    }
+
+    private func makeDNSResponsePayload(queryName: String, answerIPv4: [UInt8]) -> [UInt8] {
+        var payload: [UInt8] = [
+            0x12, 0x34,
+            0x81, 0x80,
+            0x00, 0x01,
+            0x00, 0x01,
+            0x00, 0x00,
+            0x00, 0x00
+        ]
+
+        for label in queryName.split(separator: ".") {
+            payload.append(UInt8(label.count))
+            payload.append(contentsOf: label.utf8)
+        }
+        payload.append(0x00)
+        payload.append(contentsOf: [0x00, 0x01, 0x00, 0x01])
+        payload.append(contentsOf: [
+            0xc0, 0x0c,
+            0x00, 0x01,
+            0x00, 0x01,
+            0x00, 0x00, 0x00, 0x3c,
+            0x00, 0x04
+        ])
+        payload.append(contentsOf: answerIPv4)
+        return payload
     }
 
     private func makeIPv4TCPPacket(

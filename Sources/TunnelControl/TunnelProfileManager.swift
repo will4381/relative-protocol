@@ -34,6 +34,7 @@ public enum TunnelProfileManager {
             "engineLogLevel": profile.engineLogLevel,
             "telemetryEnabled": profile.telemetryEnabled,
             "liveTapEnabled": profile.liveTapEnabled,
+            "liveTapIncludeFlowSlices": profile.liveTapIncludeFlowSlices,
             "liveTapMaxBytes": profile.liveTapMaxBytes,
             "signatureFileName": profile.signatureFileName,
             "relayHost": profile.relayEndpoint.host,
