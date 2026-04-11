@@ -173,6 +173,12 @@ The package writes small, explicit artifacts under the App Group container:
 <AppGroup>/Analytics/
   Detections/
     detections.json
+  TelemetryCaptures/
+    current-session.json
+    Sessions/
+      <session_id>/
+        capture-info.json
+        detector_records.jsonl
   last-stop.json
 <AppGroup>/Logs/
   events.current.jsonl
@@ -183,6 +189,7 @@ Persisted App Group artifacts are file-protected and excluded from device/iCloud
 
 The package does not persist the rolling live tap.
 It does persist bounded JSONL tunnel logs by default.
+It can also persist explicit session-scoped telemetry captures when the host app asks for them.
 
 ## Installation
 
@@ -335,8 +342,83 @@ Available operations:
 - `snapshot(from:packetLimit:)`
 - `clearRecentEvents(from:)`
 - `clearDetections(from:)`
+- `beginCapture(from:sessionID:)`
+- `flushCapture(from:sessionID:)`
+- `endCapture(from:sessionID:)`
+- `latestCaptureInfo(from:)`
 
 This uses Apple’s tunnel-provider messaging path rather than a shared file tail.
+
+## Session Capture / Export
+
+For automation and offline modeling, use the explicit session-capture flow instead of treating the live tap as the
+source of truth.
+
+Runtime contract:
+
+1. start capture from the containing app with a host-generated session id
+2. run the scenario
+3. flush or end capture
+4. export the finalized App Group file
+
+```swift
+import HostClient
+import NetworkExtension
+
+let telemetryClient = TunnelTelemetryClient()
+let captureStore = TunnelTelemetryCaptureStore(appGroupID: "group.com.example.vpn")
+
+let info = try await telemetryClient.beginCapture(from: manager.connection, sessionID: runID)
+print(info.state)
+
+// ... run the scenario ...
+
+_ = try await telemetryClient.endCapture(from: manager.connection, sessionID: runID)
+
+let destinationURL = outputRoot.appendingPathComponent("detector_records.jsonl", isDirectory: false)
+try captureStore.exportCapture(sessionID: runID, to: destinationURL)
+```
+
+Host-side APIs:
+
+- `TunnelTelemetryClient`
+  - `beginCapture(from:sessionID:)`
+  - `flushCapture(from:sessionID:)`
+  - `endCapture(from:sessionID:)`
+  - `latestCaptureInfo(from:)`
+- `TunnelTelemetryCaptureStore`
+  - `loadLatestInfo()`
+  - `loadInfo(sessionID:)`
+  - `captureURL(sessionID:)`
+  - `exportCapture(sessionID:to:)`
+  - `exportLatestCapture(to:)`
+
+Capture output:
+
+- one newline-delimited JSON row per runtime telemetry record
+- row type: `TelemetryCaptureRecord`
+- file name: `detector_records.jsonl`
+- stored in the App Group first, then exported by the containing app
+
+Each row includes:
+
+- `captureSessionId`
+- `exportedAtMs` on exported copies
+- `recordKind`
+- flow identifiers (`flowId`, `flowHash`, `textFlowId`)
+- packet-shape / control / burst-shape counters
+- host / DNS / TLS / QUIC hints
+- DNS association
+- lineage
+- path regime
+- service attribution
+
+Design notes:
+
+- capture runs at the compact runtime-record boundary, not from the foreground live tap
+- capture is ordered against packet batches through the same worker command queue
+- capture files are protected and excluded from backup like the rest of the App Group analytics surface
+- export rewrites `exportedAtMs` at copy time so the hot path only appends raw NDJSON rows
 
 ## Background Recovery
 

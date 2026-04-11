@@ -5,6 +5,7 @@ import Foundation
 public enum TunnelTelemetryClientError: LocalizedError {
     case invalidSession
     case providerReturnedNoResponse
+    case providerReturnedNoCaptureInfo
     case providerFailure(String)
     case unexpectedResponseKind(String)
 
@@ -14,6 +15,8 @@ public enum TunnelTelemetryClientError: LocalizedError {
             return "The VPN connection does not expose a tunnel provider session."
         case .providerReturnedNoResponse:
             return "The tunnel provider did not return telemetry data."
+        case .providerReturnedNoCaptureInfo:
+            return "The tunnel provider did not return telemetry capture info."
         case .providerFailure(let message):
             return "The tunnel provider reported an error: \(message)"
         case .unexpectedResponseKind(let kind):
@@ -50,6 +53,8 @@ public struct TunnelTelemetryClient: Sendable {
             throw TunnelTelemetryClientError.providerFailure(response.message ?? "unknown")
         case .cleared:
             throw TunnelTelemetryClientError.unexpectedResponseKind(response.kind.rawValue)
+        case .captureInfo:
+            throw TunnelTelemetryClientError.unexpectedResponseKind(response.kind.rawValue)
         }
     }
 
@@ -85,6 +90,67 @@ public struct TunnelTelemetryClient: Sendable {
         guard response.kind == .cleared else {
             throw TunnelTelemetryClientError.unexpectedResponseKind(response.kind.rawValue)
         }
+    }
+
+    public func beginCapture(from connection: NEVPNConnection, sessionID: String) async throws -> TelemetryCaptureInfo {
+        guard let session = connection as? NETunnelProviderSession else {
+            throw TunnelTelemetryClientError.invalidSession
+        }
+        return try await beginCapture(from: session, sessionID: sessionID)
+    }
+
+    public func beginCapture(from session: NETunnelProviderSession, sessionID: String) async throws -> TelemetryCaptureInfo {
+        try await captureInfo(for: .beginCapture(sessionID: sessionID), through: session)
+    }
+
+    public func flushCapture(from connection: NEVPNConnection, sessionID: String) async throws -> TelemetryCaptureInfo {
+        guard let session = connection as? NETunnelProviderSession else {
+            throw TunnelTelemetryClientError.invalidSession
+        }
+        return try await flushCapture(from: session, sessionID: sessionID)
+    }
+
+    public func flushCapture(from session: NETunnelProviderSession, sessionID: String) async throws -> TelemetryCaptureInfo {
+        try await captureInfo(for: .flushCapture(sessionID: sessionID), through: session)
+    }
+
+    public func endCapture(from connection: NEVPNConnection, sessionID: String) async throws -> TelemetryCaptureInfo {
+        guard let session = connection as? NETunnelProviderSession else {
+            throw TunnelTelemetryClientError.invalidSession
+        }
+        return try await endCapture(from: session, sessionID: sessionID)
+    }
+
+    public func endCapture(from session: NETunnelProviderSession, sessionID: String) async throws -> TelemetryCaptureInfo {
+        try await captureInfo(for: .endCapture(sessionID: sessionID), through: session)
+    }
+
+    public func latestCaptureInfo(from connection: NEVPNConnection) async throws -> TelemetryCaptureInfo {
+        guard let session = connection as? NETunnelProviderSession else {
+            throw TunnelTelemetryClientError.invalidSession
+        }
+        return try await latestCaptureInfo(from: session)
+    }
+
+    public func latestCaptureInfo(from session: NETunnelProviderSession) async throws -> TelemetryCaptureInfo {
+        try await captureInfo(for: .latestCaptureInfo, through: session)
+    }
+
+    private func captureInfo(
+        for request: TunnelTelemetryRequest,
+        through session: NETunnelProviderSession
+    ) async throws -> TelemetryCaptureInfo {
+        let response = try await send(request, through: session)
+        if response.kind == .failure {
+            throw TunnelTelemetryClientError.providerFailure(response.message ?? "unknown")
+        }
+        guard response.kind == .captureInfo else {
+            throw TunnelTelemetryClientError.unexpectedResponseKind(response.kind.rawValue)
+        }
+        guard let captureInfo = response.captureInfo else {
+            throw TunnelTelemetryClientError.providerReturnedNoCaptureInfo
+        }
+        return captureInfo
     }
 
     private func send(_ request: TunnelTelemetryRequest, through session: NETunnelProviderSession) async throws -> TunnelTelemetryResponse {

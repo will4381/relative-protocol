@@ -1509,6 +1509,135 @@ final class AnalyticsTests: XCTestCase {
         }
     }
 
+    /// Verifies capture-control requests and responses round-trip through the shared tunnel codec.
+    func testTunnelTelemetryCodecCaptureRoundTrip() throws {
+        let request = TunnelTelemetryRequest.beginCapture(sessionID: "run-123")
+        let decodedRequest = try TunnelTelemetryMessageCodec.decodeRequest(
+            TunnelTelemetryMessageCodec.encodeRequest(request)
+        )
+        XCTAssertEqual(decodedRequest.command, .beginCapture)
+        XCTAssertEqual(decodedRequest.sessionID, "run-123")
+
+        let info = TelemetryCaptureInfo(
+            sessionID: "run-123",
+            state: .capturing,
+            recordsRelativePath: "TelemetryCaptures/Sessions/run-123/detector_records.jsonl",
+            startedAt: Date(timeIntervalSince1970: 10),
+            latestRecordAt: Date(timeIntervalSince1970: 11),
+            finalizedAt: nil,
+            recordCount: 7
+        )
+        let decodedResponse = try TunnelTelemetryMessageCodec.decodeResponse(
+            TunnelTelemetryMessageCodec.encodeResponse(.captureInfo(info))
+        )
+        XCTAssertEqual(decodedResponse.kind, .captureInfo)
+        XCTAssertEqual(decodedResponse.captureInfo, info)
+    }
+
+    /// Verifies session-scoped capture writes raw NDJSON rows and export injects one `exportedAtMs` stamp.
+    func testPacketTelemetryWorkerCaptureSessionWritesAndExportsRecords() async throws {
+        let clock = DeterministicClock(startTime: Date(timeIntervalSince1970: 0))
+        let pipeline = PacketAnalyticsPipeline(
+            clock: clock,
+            burstTracker: BurstTracker(thresholdMs: 350),
+            signatureClassifier: SignatureClassifier(logger: StructuredLogger(sink: InMemoryLogSink()))
+        )
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let worker = PacketTelemetryWorker(
+            pipeline: pipeline,
+            packetStream: nil,
+            detectors: [],
+            captureRootURL: root,
+            logger: StructuredLogger(sink: InMemoryLogSink())
+        )
+
+        let started = try await worker.beginCapture(sessionID: "run-123")
+        XCTAssertEqual(started.state, .capturing)
+        XCTAssertEqual(started.recordCount, 0)
+
+        let dnsResponse = Data(
+            makeIPv4UDPPacket(
+                sourceAddress: [8, 8, 8, 8],
+                destinationAddress: [10, 0, 0, 2],
+                sourcePort: 53,
+                destinationPort: 53_000,
+                payload: makeDNSResponsePayload(
+                    queryName: "video.example.com",
+                    answerIPv4: [1, 1, 1, 1]
+                )
+            )
+        )
+        XCTAssertTrue(worker.submit(packets: [dnsResponse], families: [], direction: .inbound).accepted)
+        await worker.flushAndWait()
+
+        await clock.advance(by: 0.1)
+        let mediaPacket = Data(
+            makeIPv4UDPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [1, 1, 1, 1],
+                sourcePort: 53_001,
+                destinationPort: 443,
+                payload: Array(repeating: 0xc0, count: 1_024)
+            )
+        )
+        XCTAssertTrue(worker.submit(packets: [mediaPacket], families: [], direction: .outbound).accepted)
+        await worker.flushAndWait()
+
+        let flushed = try await worker.flushCapture(sessionID: "run-123")
+        XCTAssertGreaterThan(flushed.recordCount, 0)
+        XCTAssertEqual(flushed.state, .capturing)
+
+        let ended = try await worker.endCapture(sessionID: "run-123")
+        XCTAssertEqual(ended.state, .finalized)
+        XCTAssertNotNil(ended.finalizedAt)
+        XCTAssertGreaterThan(ended.recordCount, 0)
+
+        let rawRelativePath = try XCTUnwrap(ended.recordsRelativePath)
+        let rawURL = root.appendingPathComponent(rawRelativePath, isDirectory: false)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: rawURL.path))
+
+        let rawRecords = try decodeCaptureRecords(from: rawURL)
+        XCTAssertEqual(rawRecords.count, ended.recordCount)
+        XCTAssertTrue(rawRecords.allSatisfy { $0.captureSessionId == "run-123" })
+        XCTAssertTrue(rawRecords.allSatisfy { $0.exportedAtMs == nil })
+        XCTAssertTrue(rawRecords.contains(where: { $0.recordKind == .metadata && $0.dnsAnswerAddresses == ["1.1.1.1"] }))
+        XCTAssertTrue(rawRecords.contains(where: { $0.associatedDomain == "example.com" }))
+
+        let postEndPacket = Data(
+            makeIPv4UDPPacket(
+                sourceAddress: [10, 0, 0, 3],
+                destinationAddress: [9, 9, 9, 9],
+                sourcePort: 53_002,
+                destinationPort: 443,
+                payload: Array(repeating: 0xdd, count: 256)
+            )
+        )
+        XCTAssertTrue(worker.submit(packets: [postEndPacket], families: [], direction: .outbound).accepted)
+        await worker.flushAndWait()
+
+        let rawRecordsAfterEnd = try decodeCaptureRecords(from: rawURL)
+        XCTAssertEqual(rawRecordsAfterEnd.count, rawRecords.count)
+
+        let exportURL = root.appendingPathComponent("exported-detector-records.jsonl", isDirectory: false)
+        try TelemetryCaptureExporter.exportRecords(from: rawURL, to: exportURL)
+        let exportedRecords = try decodeCaptureRecords(from: exportURL)
+        XCTAssertEqual(exportedRecords.count, rawRecords.count)
+        let exportedAtMs = try XCTUnwrap(exportedRecords.first?.exportedAtMs)
+        XCTAssertTrue(exportedRecords.allSatisfy { $0.exportedAtMs == exportedAtMs })
+
+        await worker.stopAndWait()
+    }
+
+    private func decodeCaptureRecords(from url: URL) throws -> [TelemetryCaptureRecord] {
+        let payload = try Data(contentsOf: url)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .millisecondsSince1970
+        return try payload
+            .split(separator: 0x0A)
+            .filter { !$0.isEmpty }
+            .map { try decoder.decode(TelemetryCaptureRecord.self, from: Data($0)) }
+    }
+
     private func estimatedRecordSize(_ sample: PacketSample) -> Int {
         PacketSampleStream.estimatedRecordSize(for: sample)
     }

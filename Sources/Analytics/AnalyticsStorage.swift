@@ -41,9 +41,58 @@ public enum AnalyticsStoragePaths {
             .appendingPathComponent("AppSignatures", isDirectory: true)
     }
 
+    public static func telemetryCapturesRoot(appGroupID: String) throws -> URL {
+        try analyticsRoot(appGroupID: appGroupID)
+            .appendingPathComponent("TelemetryCaptures", isDirectory: true)
+    }
+
+    public static func telemetryCaptureCurrentInfoURL(appGroupID: String) throws -> URL {
+        try telemetryCapturesRoot(appGroupID: appGroupID)
+            .appendingPathComponent("current-session.json", isDirectory: false)
+    }
+
+    public static func telemetryCaptureSessionRoot(appGroupID: String, sessionID: String) throws -> URL {
+        try telemetryCapturesRoot(appGroupID: appGroupID)
+            .appendingPathComponent("Sessions", isDirectory: true)
+            .appendingPathComponent(sanitizedCaptureSessionID(sessionID), isDirectory: true)
+    }
+
+    public static func telemetryCaptureInfoURL(appGroupID: String, sessionID: String) throws -> URL {
+        try telemetryCaptureSessionRoot(appGroupID: appGroupID, sessionID: sessionID)
+            .appendingPathComponent("capture-info.json", isDirectory: false)
+    }
+
+    public static func telemetryCaptureRecordsURL(appGroupID: String, sessionID: String) throws -> URL {
+        try telemetryCaptureSessionRoot(appGroupID: appGroupID, sessionID: sessionID)
+            .appendingPathComponent("detector_records.jsonl", isDirectory: false)
+    }
+
+    public static func telemetryCaptureRelativeRecordsPath(sessionID: String) -> String {
+        [
+            "TelemetryCaptures",
+            "Sessions",
+            sanitizedCaptureSessionID(sessionID),
+            "detector_records.jsonl"
+        ].joined(separator: "/")
+    }
+
     public static func signatureURL(appGroupID: String, fileName: String) throws -> URL {
         try signaturesRoot(appGroupID: appGroupID)
             .appendingPathComponent(fileName, isDirectory: false)
+    }
+
+    private static func sanitizedCaptureSessionID(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return "session"
+        }
+
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_."))
+        let scalars = trimmed.unicodeScalars.map { scalar in
+            allowed.contains(scalar) ? Character(scalar) : "_"
+        }
+        let sanitized = String(scalars)
+        return sanitized.isEmpty ? "session" : sanitized
     }
 }
 
@@ -85,6 +134,18 @@ public enum ProtectedAnalyticsFileIO {
             withIntermediateDirectories: true,
             attributes: protectionAttributes
         )
+        try excludeFromBackupIfNeeded(url)
+    }
+
+    public static func prepareProtectedFile(at url: URL) throws {
+        let root = url.deletingLastPathComponent()
+        try createProtectedDirectory(at: root)
+        if !FileManager.default.fileExists(atPath: url.path) {
+            FileManager.default.createFile(atPath: url.path, contents: Data(), attributes: protectionAttributes)
+        }
+        if !protectionAttributes.isEmpty {
+            try FileManager.default.setAttributes(protectionAttributes, ofItemAtPath: url.path)
+        }
         try excludeFromBackupIfNeeded(url)
     }
 

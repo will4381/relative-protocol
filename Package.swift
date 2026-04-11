@@ -137,7 +137,7 @@ let package = Package(
         ),
         .testTarget(
             name: "AnalyticsTests",
-            dependencies: ["Analytics", "Observability", "TunnelRuntime"],
+            dependencies: ["Analytics", "HostClient", "Observability", "TunnelRuntime"],
             path: "Tests/AnalyticsTests",
             swiftSettings: strictSwiftSettings
         ),

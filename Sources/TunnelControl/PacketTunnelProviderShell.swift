@@ -559,6 +559,7 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
             detectors: detectors,
             initialDetectionSnapshot: initialDetectionSnapshot,
             detectionStore: detectionStore,
+            captureRootURL: root,
             logger: logger,
             includeFlowSlicesInLiveTap: profile.liveTapIncludeFlowSlices
         )
@@ -608,6 +609,62 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                     await telemetryWorker.clearDetectionsAndWait()
                 }
                 response = .cleared
+
+            case .beginCapture:
+                guard let telemetryWorker = snapshot.telemetryWorker else {
+                    response = .failure("telemetry-unavailable")
+                    break
+                }
+                guard let sessionID = request.sessionID else {
+                    response = .failure("missing-session-id")
+                    break
+                }
+                do {
+                    response = .captureInfo(try await telemetryWorker.beginCapture(sessionID: sessionID))
+                } catch {
+                    response = .failure(error.localizedDescription)
+                }
+
+            case .flushCapture:
+                guard let telemetryWorker = snapshot.telemetryWorker else {
+                    response = .failure("telemetry-unavailable")
+                    break
+                }
+                guard let sessionID = request.sessionID else {
+                    response = .failure("missing-session-id")
+                    break
+                }
+                do {
+                    response = .captureInfo(try await telemetryWorker.flushCapture(sessionID: sessionID))
+                } catch {
+                    response = .failure(error.localizedDescription)
+                }
+
+            case .endCapture:
+                guard let telemetryWorker = snapshot.telemetryWorker else {
+                    response = .failure("telemetry-unavailable")
+                    break
+                }
+                guard let sessionID = request.sessionID else {
+                    response = .failure("missing-session-id")
+                    break
+                }
+                do {
+                    response = .captureInfo(try await telemetryWorker.endCapture(sessionID: sessionID))
+                } catch {
+                    response = .failure(error.localizedDescription)
+                }
+
+            case .latestCaptureInfo:
+                guard let telemetryWorker = snapshot.telemetryWorker else {
+                    response = .captureInfo(.inactive)
+                    break
+                }
+                do {
+                    response = .captureInfo(try await telemetryWorker.latestCaptureInfo())
+                } catch {
+                    response = .failure(error.localizedDescription)
+                }
             }
         } catch {
             await snapshot.logger.log(

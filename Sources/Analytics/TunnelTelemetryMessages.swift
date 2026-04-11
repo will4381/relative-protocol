@@ -39,6 +39,10 @@ public enum TunnelTelemetryCommand: String, Codable, Sendable, Equatable {
     case snapshot
     case clearRecentEvents
     case clearDetections
+    case beginCapture
+    case endCapture
+    case flushCapture
+    case latestCaptureInfo
 }
 
 /// Request sent from the containing app to the packet tunnel provider.
@@ -47,15 +51,18 @@ public struct TunnelTelemetryRequest: Codable, Sendable, Equatable {
     public let version: Int
     public let command: TunnelTelemetryCommand
     public let packetLimit: Int?
+    public let sessionID: String?
 
     public init(
         version: Int = TunnelTelemetryProtocolVersion.current,
         command: TunnelTelemetryCommand,
-        packetLimit: Int? = nil
+        packetLimit: Int? = nil,
+        sessionID: String? = nil
     ) {
         self.version = version
         self.command = command
         self.packetLimit = packetLimit
+        self.sessionID = sessionID
     }
 
     public static func snapshot(packetLimit: Int? = nil) -> TunnelTelemetryRequest {
@@ -64,6 +71,20 @@ public struct TunnelTelemetryRequest: Codable, Sendable, Equatable {
 
     public static let clearRecentEvents = TunnelTelemetryRequest(command: .clearRecentEvents)
     public static let clearDetections = TunnelTelemetryRequest(command: .clearDetections)
+
+    public static func beginCapture(sessionID: String) -> TunnelTelemetryRequest {
+        TunnelTelemetryRequest(command: .beginCapture, sessionID: sessionID)
+    }
+
+    public static func endCapture(sessionID: String) -> TunnelTelemetryRequest {
+        TunnelTelemetryRequest(command: .endCapture, sessionID: sessionID)
+    }
+
+    public static func flushCapture(sessionID: String) -> TunnelTelemetryRequest {
+        TunnelTelemetryRequest(command: .flushCapture, sessionID: sessionID)
+    }
+
+    public static let latestCaptureInfo = TunnelTelemetryRequest(command: .latestCaptureInfo)
 }
 
 /// Foreground snapshot returned by the packet tunnel provider.
@@ -140,23 +161,27 @@ public struct TunnelTelemetryResponse: Codable, Sendable, Equatable {
     public enum Kind: String, Codable, Sendable, Equatable {
         case snapshot
         case cleared
+        case captureInfo
         case failure
     }
 
     public let version: Int
     public let kind: Kind
     public let snapshot: TunnelTelemetrySnapshot?
+    public let captureInfo: TelemetryCaptureInfo?
     public let message: String?
 
     public init(
         version: Int = TunnelTelemetryProtocolVersion.current,
         kind: Kind,
         snapshot: TunnelTelemetrySnapshot? = nil,
+        captureInfo: TelemetryCaptureInfo? = nil,
         message: String? = nil
     ) {
         self.version = version
         self.kind = kind
         self.snapshot = snapshot
+        self.captureInfo = captureInfo
         self.message = message
     }
 
@@ -166,8 +191,12 @@ public struct TunnelTelemetryResponse: Codable, Sendable, Equatable {
 
     public static let cleared = TunnelTelemetryResponse(kind: .cleared)
 
+    public static func captureInfo(_ captureInfo: TelemetryCaptureInfo) -> TunnelTelemetryResponse {
+        TunnelTelemetryResponse(kind: .captureInfo, snapshot: nil, captureInfo: captureInfo, message: nil)
+    }
+
     public static func failure(_ message: String) -> TunnelTelemetryResponse {
-        TunnelTelemetryResponse(kind: .failure, snapshot: nil, message: message)
+        TunnelTelemetryResponse(kind: .failure, snapshot: nil, captureInfo: nil, message: message)
     }
 }
 

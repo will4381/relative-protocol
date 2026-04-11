@@ -60,6 +60,46 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         }
     }
 
+    private enum CaptureControlError: LocalizedError, Sendable, Equatable {
+        case unavailable
+        case invalidSessionID
+        case captureAlreadyActive(String)
+        case noActiveCapture
+        case sessionMismatch(expected: String, got: String)
+
+        var errorDescription: String? {
+            switch self {
+            case .unavailable:
+                return "Telemetry capture is unavailable for this worker."
+            case .invalidSessionID:
+                return "Telemetry capture requires a non-empty session id."
+            case .captureAlreadyActive(let sessionID):
+                return "Telemetry capture is already active for session \(sessionID)."
+            case .noActiveCapture:
+                return "No telemetry capture session is active."
+            case .sessionMismatch(let expected, let got):
+                return "Telemetry capture session mismatch. Expected \(expected), got \(got)."
+            }
+        }
+    }
+
+    private final class CaptureInfoSignal: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<Result<TelemetryCaptureInfo, CaptureControlError>, Never>?
+
+        init(_ continuation: CheckedContinuation<Result<TelemetryCaptureInfo, CaptureControlError>, Never>) {
+            self.continuation = continuation
+        }
+
+        func resume(_ result: Result<TelemetryCaptureInfo, CaptureControlError>) {
+            lock.lock()
+            let continuation = self.continuation
+            self.continuation = nil
+            lock.unlock()
+            continuation?.resume(returning: result)
+        }
+    }
+
     private actor DetectionPersistenceCoordinator {
         private static let coalescingDelay: Duration = .milliseconds(250)
 
@@ -169,6 +209,10 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         case reset(CommandSignal?)
         case clearDetections(CommandSignal?)
         case barrier(CommandSignal?)
+        case beginCapture(String, CaptureInfoSignal?)
+        case flushCapture(String, CaptureInfoSignal?)
+        case endCapture(String, CaptureInfoSignal?)
+        case latestCaptureInfo(CaptureInfoSignal?)
         case stop(CommandSignal?)
     }
 
@@ -203,6 +247,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
     private let runtimePlan: DetectorRuntimePlan
     private let pathRegimeProvider: (any PathRegimeProvider)?
     private let liveTapPolicy: LiveTapPolicy
+    private let captureSink: TelemetryCaptureSink?
 
     private var workerTask: Task<Void, Never>?
 
@@ -217,6 +262,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         detectors: [any TrafficDetector] = [],
         initialDetectionSnapshot: DetectionSnapshot = .empty,
         detectionStore: DetectionStore? = nil,
+        captureRootURL: URL? = nil,
         logger: StructuredLogger,
         processInfo: ProcessInfo = .processInfo,
         includeFlowSlicesInLiveTap: Bool = false
@@ -227,6 +273,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
             detectors: detectors,
             initialDetectionSnapshot: initialDetectionSnapshot,
             detectionStore: detectionStore,
+            captureRootURL: captureRootURL,
             logger: logger,
             processInfo: processInfo,
             emissionPolicyOverride: nil,
@@ -241,6 +288,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         detectors: [any TrafficDetector] = [],
         initialDetectionSnapshot: DetectionSnapshot = .empty,
         detectionStore: DetectionStore? = nil,
+        captureRootURL: URL? = nil,
         logger: StructuredLogger,
         processInfo: ProcessInfo = .processInfo,
         emissionPolicyOverride: PacketAnalyticsPipeline.EmissionPolicy?,
@@ -256,12 +304,13 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         } else {
             self.detectionPersistence = nil
         }
+        self.captureSink = captureRootURL.map { TelemetryCaptureSink(analyticsRootURL: $0, logger: logger) }
         self.logger = logger
         self.processInfo = processInfo
         self.state = SharedState(initialDetectionSnapshot: initialDetectionSnapshot)
         self.emissionPolicyOverride = emissionPolicyOverride
         self.liveTapPolicy = .configured(includeFlowSlices: includeFlowSlicesInLiveTap)
-        if self.runtimePlan.needsPathRegime {
+        if self.runtimePlan.needsPathRegime || self.captureSink != nil {
             self.pathRegimeProvider = pathRegimeProvider ?? NWPathRegimeMonitor()
         } else {
             self.pathRegimeProvider = nil
@@ -286,8 +335,9 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         let runtimePlan = self.runtimePlan
         let pathRegimeProvider = self.pathRegimeProvider
         let liveTapPolicy = self.liveTapPolicy
+        let captureSink = self.captureSink
 
-        self.workerTask = Task { [state, pipeline, packetStream, detectors, detectionPersistence, logger, processInfo, emissionPolicyOverride, runtimePlan, pathRegimeProvider, liveTapPolicy] in
+        self.workerTask = Task { [state, pipeline, packetStream, detectors, detectionPersistence, logger, processInfo, emissionPolicyOverride, runtimePlan, pathRegimeProvider, liveTapPolicy, captureSink] in
             await Self.runLoop(
                 stream: stream,
                 state: state,
@@ -295,6 +345,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 packetStream: packetStream,
                 detectors: detectors,
                 detectionPersistence: detectionPersistence,
+                captureSink: captureSink,
                 logger: logger,
                 processInfo: processInfo,
                 emissionPolicyOverride: emissionPolicyOverride,
@@ -497,6 +548,26 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         await enqueueAndWait { .barrier($0) }
     }
 
+    /// Starts a session-scoped telemetry capture ordered against the worker's packet-batch queue.
+    public func beginCapture(sessionID: String) async throws -> TelemetryCaptureInfo {
+        try await enqueueCaptureCommandAndWait { .beginCapture(sessionID, $0) }
+    }
+
+    /// Flushes any pending capture rows for the active session and returns the latest summary.
+    public func flushCapture(sessionID: String) async throws -> TelemetryCaptureInfo {
+        try await enqueueCaptureCommandAndWait { .flushCapture(sessionID, $0) }
+    }
+
+    /// Ends the active session-scoped telemetry capture and finalizes the App Group file.
+    public func endCapture(sessionID: String) async throws -> TelemetryCaptureInfo {
+        try await enqueueCaptureCommandAndWait { .endCapture(sessionID, $0) }
+    }
+
+    /// Returns the latest capture summary known to the worker.
+    public func latestCaptureInfo() async throws -> TelemetryCaptureInfo {
+        try await enqueueCaptureCommandAndWait { .latestCaptureInfo($0) }
+    }
+
     /// Stops the worker without waiting for queued work or final persistence flushes.
     /// Use `stopAndWait()` when shutdown correctness matters.
     public func stop() {
@@ -523,6 +594,30 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         }
 
         await task?.value
+    }
+
+    private func enqueueCaptureCommandAndWait(
+        _ makeCommand: @escaping (CaptureInfoSignal) -> Command
+    ) async throws -> TelemetryCaptureInfo {
+        let (continuation, shouldSignal) = state.withLock { state in
+            (state.continuation, !state.isStopped)
+        }
+
+        guard shouldSignal, let continuation else {
+            throw CaptureControlError.unavailable
+        }
+
+        let result = await withCheckedContinuation { (signal: CheckedContinuation<Result<TelemetryCaptureInfo, CaptureControlError>, Never>) in
+            let captureSignal = CaptureInfoSignal(signal)
+            Self.yield(makeCommand(captureSignal), to: continuation, fallbackCaptureSignal: captureSignal)
+        }
+
+        switch result {
+        case .success(let info):
+            return info
+        case .failure(let error):
+            throw error
+        }
     }
 
     private static func didStartBatch(state: SharedState, byteCount: Int) {
@@ -598,6 +693,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         packetStream: PacketSampleStream?,
         detectors: [any TrafficDetector],
         detectionPersistence: DetectionPersistenceCoordinator?,
+        captureSink: TelemetryCaptureSink?,
         logger: StructuredLogger,
         processInfo: ProcessInfo,
         emissionPolicyOverride: PacketAnalyticsPipeline.EmissionPolicy?,
@@ -606,12 +702,17 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         liveTapPolicy: LiveTapPolicy
     ) async {
         var detailRecords: [PacketSampleStream.PacketStreamRecord] = []
+        var captureActive = false
 
         for await command in stream {
             switch command {
             case .batch(let batch):
                 Self.didStartBatch(state: state, byteCount: batch.byteCount)
-                let policy = emissionPolicyOverride ?? Self.currentEmissionPolicy(processInfo: processInfo, runtimePlan: runtimePlan)
+                let policy = emissionPolicyOverride ?? Self.currentEmissionPolicy(
+                    processInfo: processInfo,
+                    runtimePlan: runtimePlan,
+                    captureActive: captureActive
+                )
                 let runtimeContext = PacketAnalyticsPipeline.RuntimeContext(
                     pathRegime: policy.emitPathRegimeFields ? pathRegimeProvider?.currentSnapshot : nil
                 )
@@ -625,6 +726,10 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 )
                 guard !records.isEmpty else {
                     continue
+                }
+
+                if captureActive {
+                    await captureSink?.append(records: records)
                 }
 
                 if !detectors.isEmpty {
@@ -672,10 +777,62 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
             case .barrier(let signal):
                 signal?.resume()
 
+            case .beginCapture(let sessionID, let signal):
+                guard let captureSink else {
+                    signal?.resume(.failure(.unavailable))
+                    continue
+                }
+                do {
+                    let info = try await captureSink.begin(sessionID: sessionID)
+                    captureActive = info.state == .capturing
+                    signal?.resume(.success(info))
+                } catch let error as TelemetryCaptureSink.Error {
+                    signal?.resume(.failure(Self.captureControlError(from: error)))
+                } catch {
+                    signal?.resume(.failure(.unavailable))
+                }
+
+            case .flushCapture(let sessionID, let signal):
+                guard let captureSink else {
+                    signal?.resume(.failure(.unavailable))
+                    continue
+                }
+                do {
+                    let info = try await captureSink.flush(sessionID: sessionID)
+                    signal?.resume(.success(info))
+                } catch let error as TelemetryCaptureSink.Error {
+                    signal?.resume(.failure(Self.captureControlError(from: error)))
+                } catch {
+                    signal?.resume(.failure(.unavailable))
+                }
+
+            case .endCapture(let sessionID, let signal):
+                guard let captureSink else {
+                    signal?.resume(.failure(.unavailable))
+                    continue
+                }
+                do {
+                    let info = try await captureSink.end(sessionID: sessionID)
+                    captureActive = false
+                    signal?.resume(.success(info))
+                } catch let error as TelemetryCaptureSink.Error {
+                    signal?.resume(.failure(Self.captureControlError(from: error)))
+                } catch {
+                    signal?.resume(.failure(.unavailable))
+                }
+
+            case .latestCaptureInfo(let signal):
+                if let captureSink {
+                    signal?.resume(.success(await captureSink.latestCaptureInfo()))
+                } else {
+                    signal?.resume(.success(.inactive))
+                }
+
             case .stop(let signal):
                 detailRecords.removeAll(keepingCapacity: false)
                 Self.setBufferedRecordCount(state: state, 0)
                 Self.finishContinuation(state: state)
+                await captureSink?.shutdown()
                 await detectionPersistence?.flush()
                 signal?.resume()
                 return
@@ -684,6 +841,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
 
         detailRecords.removeAll(keepingCapacity: false)
         Self.setBufferedRecordCount(state: state, 0)
+        await captureSink?.shutdown()
         await detectionPersistence?.flush()
         pathRegimeProvider?.stop()
     }
@@ -807,8 +965,26 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
 
     private static func currentEmissionPolicy(
         processInfo: ProcessInfo,
-        runtimePlan: DetectorRuntimePlan
+        runtimePlan: DetectorRuntimePlan,
+        captureActive: Bool
     ) -> PacketAnalyticsPipeline.EmissionPolicy {
+        let needsFlowSlices = runtimePlan.needsFlowSlices || captureActive
+        let needsBurstShapeCounters = runtimePlan.needsBurstShapeCounters ||
+            runtimePlan.liveTapFeatureFamilies.contains(.burstShape) ||
+            captureActive
+        let needsDNSAssociation = runtimePlan.needsDNSAssociation || captureActive
+        let needsLineage = runtimePlan.needsLineage || captureActive
+        let needsPathRegime = runtimePlan.needsPathRegime || captureActive
+        let needsServiceAttribution = runtimePlan.needsServiceAttribution || captureActive
+        let needsQUICIdentity = runtimePlan.needsQUICIdentity ||
+            runtimePlan.liveTapFeatureFamilies.contains(.quicIdentity) ||
+            captureActive
+        let needsHostHints = runtimePlan.needsHostHints ||
+            runtimePlan.liveTapFeatureFamilies.contains(.hostHints) ||
+            captureActive
+        let needsDeepMetadata = runtimePlan.needsDeepMetadata || captureActive
+        let includeDNSAnswerAddresses = runtimePlan.unionFeatureFamilies.contains(.dnsAnswerAddresses) || captureActive
+        let flowSliceIntervalMs = captureActive ? min(runtimePlan.flowSliceIntervalMs, 250) : runtimePlan.flowSliceIntervalMs
         let thermalState = processInfo.thermalState
         let lowPowerModeEnabled = processInfo.isLowPowerModeEnabled
 
@@ -817,16 +993,16 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 allowDeepMetadata: false,
                 maxMetadataProbesPerBatch: 0,
                 emitFlowSlices: false,
-                flowSliceIntervalMs: runtimePlan.flowSliceIntervalMs,
+                flowSliceIntervalMs: flowSliceIntervalMs,
                 emitFlowCloseEvents: true,
-                emitBurstShapeCounters: runtimePlan.needsBurstShapeCounters || runtimePlan.liveTapFeatureFamilies.contains(.burstShape),
+                emitBurstShapeCounters: needsBurstShapeCounters,
                 emitDNSAssociationFields: false,
                 emitLineageFields: false,
-                emitPathRegimeFields: runtimePlan.needsPathRegime,
+                emitPathRegimeFields: needsPathRegime,
                 emitServiceAttributionFields: false,
-                includeHostHints: runtimePlan.liveTapFeatureFamilies.contains(.hostHints),
-                includeDNSAnswerAddresses: runtimePlan.unionFeatureFamilies.contains(.dnsAnswerAddresses),
-                includeQUICIdentity: runtimePlan.needsQUICIdentity || runtimePlan.liveTapFeatureFamilies.contains(.quicIdentity),
+                includeHostHints: runtimePlan.liveTapFeatureFamilies.contains(.hostHints) || captureActive,
+                includeDNSAnswerAddresses: includeDNSAnswerAddresses,
+                includeQUICIdentity: needsQUICIdentity,
                 activitySampleMinimumPackets: 2_048,
                 activitySampleMinimumBytes: 4_194_304,
                 activitySampleMinimumInterval: 30,
@@ -838,21 +1014,21 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         switch thermalState {
         case .nominal:
             return PacketAnalyticsPipeline.EmissionPolicy(
-                allowDeepMetadata: runtimePlan.needsDeepMetadata ||
+                allowDeepMetadata: needsDeepMetadata ||
                     runtimePlan.liveTapFeatureFamilies.contains(.hostHints) ||
                     runtimePlan.liveTapFeatureFamilies.contains(.dnsAnswerAddresses),
-                maxMetadataProbesPerBatch: runtimePlan.needsDeepMetadata ? 2 : 1,
-                emitFlowSlices: runtimePlan.needsFlowSlices,
-                flowSliceIntervalMs: runtimePlan.flowSliceIntervalMs,
+                maxMetadataProbesPerBatch: needsDeepMetadata ? 2 : 1,
+                emitFlowSlices: needsFlowSlices,
+                flowSliceIntervalMs: flowSliceIntervalMs,
                 emitFlowCloseEvents: true,
-                emitBurstShapeCounters: runtimePlan.needsBurstShapeCounters || runtimePlan.liveTapFeatureFamilies.contains(.burstShape),
-                emitDNSAssociationFields: runtimePlan.needsDNSAssociation,
-                emitLineageFields: runtimePlan.needsLineage,
-                emitPathRegimeFields: runtimePlan.needsPathRegime,
-                emitServiceAttributionFields: runtimePlan.needsServiceAttribution,
-                includeHostHints: runtimePlan.needsHostHints || runtimePlan.liveTapFeatureFamilies.contains(.hostHints),
-                includeDNSAnswerAddresses: runtimePlan.unionFeatureFamilies.contains(.dnsAnswerAddresses),
-                includeQUICIdentity: runtimePlan.needsQUICIdentity || runtimePlan.liveTapFeatureFamilies.contains(.quicIdentity),
+                emitBurstShapeCounters: needsBurstShapeCounters,
+                emitDNSAssociationFields: needsDNSAssociation,
+                emitLineageFields: needsLineage,
+                emitPathRegimeFields: needsPathRegime,
+                emitServiceAttributionFields: needsServiceAttribution,
+                includeHostHints: needsHostHints,
+                includeDNSAnswerAddresses: includeDNSAnswerAddresses,
+                includeQUICIdentity: needsQUICIdentity,
                 activitySampleMinimumPackets: 256,
                 activitySampleMinimumBytes: 524_288,
                 activitySampleMinimumInterval: 6,
@@ -861,19 +1037,19 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
             )
         case .fair:
             return PacketAnalyticsPipeline.EmissionPolicy(
-                allowDeepMetadata: runtimePlan.needsDeepMetadata,
-                maxMetadataProbesPerBatch: runtimePlan.needsDeepMetadata ? 1 : 0,
-                emitFlowSlices: runtimePlan.needsFlowSlices,
-                flowSliceIntervalMs: runtimePlan.flowSliceIntervalMs,
+                allowDeepMetadata: needsDeepMetadata,
+                maxMetadataProbesPerBatch: needsDeepMetadata ? 1 : 0,
+                emitFlowSlices: needsFlowSlices,
+                flowSliceIntervalMs: flowSliceIntervalMs,
                 emitFlowCloseEvents: true,
-                emitBurstShapeCounters: runtimePlan.needsBurstShapeCounters || runtimePlan.liveTapFeatureFamilies.contains(.burstShape),
-                emitDNSAssociationFields: runtimePlan.needsDNSAssociation,
-                emitLineageFields: runtimePlan.needsLineage,
-                emitPathRegimeFields: runtimePlan.needsPathRegime,
-                emitServiceAttributionFields: runtimePlan.needsServiceAttribution,
-                includeHostHints: runtimePlan.needsHostHints || runtimePlan.liveTapFeatureFamilies.contains(.hostHints),
-                includeDNSAnswerAddresses: runtimePlan.unionFeatureFamilies.contains(.dnsAnswerAddresses),
-                includeQUICIdentity: runtimePlan.needsQUICIdentity || runtimePlan.liveTapFeatureFamilies.contains(.quicIdentity),
+                emitBurstShapeCounters: needsBurstShapeCounters,
+                emitDNSAssociationFields: needsDNSAssociation,
+                emitLineageFields: needsLineage,
+                emitPathRegimeFields: needsPathRegime,
+                emitServiceAttributionFields: needsServiceAttribution,
+                includeHostHints: needsHostHints,
+                includeDNSAnswerAddresses: includeDNSAnswerAddresses,
+                includeQUICIdentity: needsQUICIdentity,
                 activitySampleMinimumPackets: 2_048,
                 activitySampleMinimumBytes: 4_194_304,
                 activitySampleMinimumInterval: 30,
@@ -885,16 +1061,16 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 allowDeepMetadata: false,
                 maxMetadataProbesPerBatch: 0,
                 emitFlowSlices: false,
-                flowSliceIntervalMs: runtimePlan.flowSliceIntervalMs,
+                flowSliceIntervalMs: flowSliceIntervalMs,
                 emitFlowCloseEvents: true,
-                emitBurstShapeCounters: runtimePlan.needsBurstShapeCounters || runtimePlan.liveTapFeatureFamilies.contains(.burstShape),
+                emitBurstShapeCounters: needsBurstShapeCounters,
                 emitDNSAssociationFields: false,
                 emitLineageFields: false,
-                emitPathRegimeFields: runtimePlan.needsPathRegime,
+                emitPathRegimeFields: needsPathRegime,
                 emitServiceAttributionFields: false,
-                includeHostHints: runtimePlan.liveTapFeatureFamilies.contains(.hostHints),
-                includeDNSAnswerAddresses: runtimePlan.unionFeatureFamilies.contains(.dnsAnswerAddresses),
-                includeQUICIdentity: runtimePlan.needsQUICIdentity || runtimePlan.liveTapFeatureFamilies.contains(.quicIdentity),
+                includeHostHints: runtimePlan.liveTapFeatureFamilies.contains(.hostHints) || captureActive,
+                includeDNSAnswerAddresses: includeDNSAnswerAddresses,
+                includeQUICIdentity: needsQUICIdentity,
                 activitySampleMinimumPackets: 2_048,
                 activitySampleMinimumBytes: 4_194_304,
                 activitySampleMinimumInterval: 30,
@@ -906,16 +1082,16 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 allowDeepMetadata: false,
                 maxMetadataProbesPerBatch: 0,
                 emitFlowSlices: false,
-                flowSliceIntervalMs: runtimePlan.flowSliceIntervalMs,
+                flowSliceIntervalMs: flowSliceIntervalMs,
                 emitFlowCloseEvents: true,
-                emitBurstShapeCounters: runtimePlan.needsBurstShapeCounters || runtimePlan.liveTapFeatureFamilies.contains(.burstShape),
+                emitBurstShapeCounters: needsBurstShapeCounters,
                 emitDNSAssociationFields: false,
                 emitLineageFields: false,
-                emitPathRegimeFields: runtimePlan.needsPathRegime,
+                emitPathRegimeFields: needsPathRegime,
                 emitServiceAttributionFields: false,
-                includeHostHints: runtimePlan.liveTapFeatureFamilies.contains(.hostHints),
-                includeDNSAnswerAddresses: runtimePlan.unionFeatureFamilies.contains(.dnsAnswerAddresses),
-                includeQUICIdentity: runtimePlan.needsQUICIdentity || runtimePlan.liveTapFeatureFamilies.contains(.quicIdentity),
+                includeHostHints: runtimePlan.liveTapFeatureFamilies.contains(.hostHints) || captureActive,
+                includeDNSAnswerAddresses: includeDNSAnswerAddresses,
+                includeQUICIdentity: needsQUICIdentity,
                 activitySampleMinimumPackets: 2_048,
                 activitySampleMinimumBytes: 4_194_304,
                 activitySampleMinimumInterval: 30,
@@ -970,6 +1146,21 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         }
     }
 
+    private static func captureControlError(from error: TelemetryCaptureSink.Error) -> CaptureControlError {
+        switch error {
+        case .invalidSessionID:
+            return .invalidSessionID
+        case .captureAlreadyActive(let sessionID):
+            return .captureAlreadyActive(sessionID)
+        case .noActiveCapture:
+            return .noActiveCapture
+        case .sessionMismatch(let expected, let got):
+            return .sessionMismatch(expected: expected, got: got)
+        case .unavailable:
+            return .unavailable
+        }
+    }
+
     private func enqueue(_ command: Command, markStopped: Bool = false) {
         let continuation: AsyncStream<Command>.Continuation? = state.withLock { state in
             guard !state.isStopped else {
@@ -1017,6 +1208,22 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
             break
         @unknown default:
             fallbackSignal?.resume()
+        }
+    }
+
+    private static func yield(
+        _ command: Command,
+        to continuation: AsyncStream<Command>.Continuation,
+        fallbackCaptureSignal: CaptureInfoSignal
+    ) {
+        let result = continuation.yield(command)
+        switch result {
+        case .terminated, .dropped(_):
+            fallbackCaptureSignal.resume(.failure(.unavailable))
+        case .enqueued(_):
+            break
+        @unknown default:
+            fallbackCaptureSignal.resume(.failure(.unavailable))
         }
     }
 }
