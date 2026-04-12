@@ -301,11 +301,14 @@ It is disabled by default so multipath stays an explicit host-app policy choice.
 `mtuStrategy` controls whether the package installs a fixed interface MTU or lets NetworkExtension derive the interface MTU from `tunnelOverheadBytes`.
 The package default for provider-configuration users is a fixed MTU of `1500`.
 Existing direct `TunnelProfile(...)` callers stay backward-compatible: if you pass only `mtu`, the profile uses `.fixed(mtu)`.
+When you choose `.automaticTunnelOverhead(...)`, the tunnel interface MTU is no longer fixed explicitly. In that mode, `mtu` remains a local buffer hint for relay/runtime code, while NetworkExtension derives the interface MTU from the active physical path.
 
 `dnsStrategy` controls whether the tunnel installs cleartext DNS, DNS-over-TLS, DNS-over-HTTPS, or no DNS override at all.
 The package default for provider-configuration users is `dnsStrategy = .noOverride`.
 
 Existing direct `TunnelProfile(...)` callers stay backward-compatible here too: if you pass only `dnsServers`, the profile uses `.cleartext(servers: dnsServers)`.
+If you want to preserve the system resolver path, set `dnsStrategy = .noOverride` explicitly. Do not rely on `dnsServers: []` with a missing `dnsStrategy`, because the direct `TunnelProfile(...)` initializer treats that as cleartext DNS configuration over the provided `dnsServers` array.
+When you choose `.tls(...)` or `.https(...)`, provide a real `serverName` or `serverURL` along with resolver IPs so the encrypted DNS policy is fully specified.
 
 Recommended host-app policies:
 
