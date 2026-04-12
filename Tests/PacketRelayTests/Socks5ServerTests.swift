@@ -152,6 +152,92 @@ final class Socks5ServerTests: XCTestCase {
         }
     }
 
+    func testRetryingTCPOutboundRetriesTimedOutAttempt() {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.retry-timeout")
+        let lock = NSLock()
+        var attempts: [ControlledTCPOutbound] = []
+        var secondAttempt: ControlledTCPOutbound?
+        let secondAttemptCreated = expectation(description: "second attempt created")
+        let ready = expectation(description: "retry eventually connects")
+
+        let outbound = RetryingTCPOutbound(
+            queue: queue,
+            logger: StructuredLogger(sink: InMemoryLogSink()),
+            policy: .init(attemptPreparingTimeout: 0.03, retryBackoff: 0.01, maxAttempts: 2, overallTimeout: 0.2)
+        ) { attemptIndex in
+            let attempt = ControlledTCPOutbound()
+            lock.lock()
+            attempts.append(attempt)
+            if attemptIndex == 2 {
+                secondAttempt = attempt
+            }
+            lock.unlock()
+            if attemptIndex == 2 {
+                secondAttemptCreated.fulfill()
+            }
+            return attempt
+        }
+
+        outbound.waitUntilReady { result in
+            switch result {
+            case .success:
+                ready.fulfill()
+            case .failure(let error):
+                XCTFail("Expected retry to succeed, got \(error)")
+            }
+        }
+
+        wait(for: [secondAttemptCreated], timeout: 1.0)
+
+        lock.lock()
+        let firstAttempt = attempts.first
+        let retryAttempt = secondAttempt
+        lock.unlock()
+
+        retryAttempt?.succeedConnect()
+        wait(for: [ready], timeout: 1.0)
+
+        XCTAssertTrue(firstAttempt?.cancelled == true)
+    }
+
+    func testRetryingTCPOutboundFailsAfterAttemptBudgetExhausted() {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.retry-exhausted")
+        let lock = NSLock()
+        var attempts: [ControlledTCPOutbound] = []
+        let failed = expectation(description: "connect fails after retries")
+
+        let outbound = RetryingTCPOutbound(
+            queue: queue,
+            logger: StructuredLogger(sink: InMemoryLogSink()),
+            policy: .init(attemptPreparingTimeout: 0.03, retryBackoff: 0.01, maxAttempts: 2, overallTimeout: 0.2)
+        ) { _ in
+            let attempt = ControlledTCPOutbound()
+            lock.lock()
+            attempts.append(attempt)
+            lock.unlock()
+            return attempt
+        }
+
+        outbound.waitUntilReady { result in
+            switch result {
+            case .success:
+                XCTFail("Expected timeout after exhausting retries")
+            case .failure(let error):
+                XCTAssertEqual(error.localizedDescription, "Outbound connection timed out")
+                failed.fulfill()
+            }
+        }
+
+        wait(for: [failed], timeout: 1.0)
+
+        lock.lock()
+        let snapshot = attempts
+        lock.unlock()
+
+        XCTAssertEqual(snapshot.count, 2)
+        XCTAssertTrue(snapshot.allSatisfy(\.cancelled))
+    }
+
     private static let greeting = Data([0x05, 0x01, 0x00])
 
     private static func connectRequest(host: String, port: UInt16) -> Data {

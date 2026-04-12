@@ -47,6 +47,26 @@ private func pathSummary(_ path: Network.NWPath?) -> String {
     return "status=\(pathStatusName(path.status)) uses=\(uses.joined(separator: ",")) available=\(available) expensive=\(path.isExpensive) constrained=\(path.isConstrained) ipv4=\(path.supportsIPv4) ipv6=\(path.supportsIPv6)"
 }
 
+private func durationMilliseconds(_ duration: TimeInterval) -> Int {
+    max(0, Int((duration * 1000).rounded()))
+}
+
+private func elapsedMilliseconds(since startedAt: Date?, now: Date = Date()) -> Int? {
+    guard let startedAt else {
+        return nil
+    }
+    return max(0, Int((now.timeIntervalSince(startedAt) * 1000).rounded()))
+}
+
+private extension Result where Success == Void, Failure == Error {
+    var failureError: Error? {
+        if case .failure(let error) = self {
+            return error
+        }
+        return nil
+    }
+}
+
 /// Abstraction over inbound SOCKS5 client connection transport.
 protocol Socks5InboundConnection: AnyObject {
     var stateUpdateHandler: (@Sendable (NWConnection.State) -> Void)? { get set }
@@ -70,16 +90,33 @@ protocol Socks5TCPOutbound: AnyObject, Sendable {
 /// Connection establishment errors surfaced before a SOCKS CONNECT reply is sent.
 private enum Socks5OutboundError: LocalizedError {
     case failed(String)
+    case timedOut
     case cancelled
 
     var errorDescription: String? {
         switch self {
         case .failed(let description):
             return description
+        case .timedOut:
+            return "Outbound connection timed out"
         case .cancelled:
             return "Outbound connection cancelled"
         }
     }
+}
+
+struct TCPConnectRetryPolicy: Sendable {
+    let attemptPreparingTimeout: TimeInterval
+    let retryBackoff: TimeInterval
+    let maxAttempts: Int
+    let overallTimeout: TimeInterval
+
+    static let `default` = TCPConnectRetryPolicy(
+        attemptPreparingTimeout: 2.5,
+        retryBackoff: 0.2,
+        maxAttempts: 2,
+        overallTimeout: 5.0
+    )
 }
 
 /// Extended outbound provider for SOCKS TCP + UDP backends.
@@ -311,6 +348,308 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5TCPOutbound {
     }
 }
 
+final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
+    private let queue: DispatchQueue
+    private let logger: StructuredLogger
+    private let policy: TCPConnectRetryPolicy
+    private let makeAttempt: (_ attemptIndex: Int) -> Socks5TCPOutbound
+
+    private var readyHandlers: [(@Sendable (Result<Void, Error>) -> Void)] = []
+    private var readyResult: Result<Void, Error>?
+    private var activeOutbound: Socks5TCPOutbound?
+    private var currentAttempt: Socks5TCPOutbound?
+    private var currentAttemptIndex = 0
+    private var startedAt: Date?
+    private var currentAttemptStartedAt: Date?
+    private var attemptTimeoutWorkItem: DispatchWorkItem?
+    private var retryWorkItem: DispatchWorkItem?
+    private var isCancelled = false
+
+    init(
+        queue: DispatchQueue,
+        logger: StructuredLogger,
+        policy: TCPConnectRetryPolicy = .default,
+        makeAttempt: @escaping (_ attemptIndex: Int) -> Socks5TCPOutbound
+    ) {
+        self.queue = queue
+        self.logger = logger
+        self.policy = policy
+        self.makeAttempt = makeAttempt
+    }
+
+    func waitUntilReady(completionHandler: @escaping @Sendable (Result<Void, Error>) -> Void) {
+        queue.async {
+            if let readyResult = self.readyResult {
+                completionHandler(readyResult)
+                return
+            }
+
+            self.readyHandlers.append(completionHandler)
+            if self.startedAt == nil {
+                self.startedAt = Date()
+            }
+            if self.currentAttempt == nil, self.retryWorkItem == nil {
+                self.startAttempt(reason: "initial")
+            }
+        }
+    }
+
+    func readMinimumLength(_ minimumLength: Int, maximumLength: Int, completionHandler: @escaping @Sendable (Data?, Error?) -> Void) {
+        queue.async {
+            guard let activeOutbound = self.activeOutbound else {
+                completionHandler(nil, self.readyResult?.failureError ?? Socks5OutboundError.failed("Outbound TCP not ready"))
+                return
+            }
+            activeOutbound.readMinimumLength(minimumLength, maximumLength: maximumLength, completionHandler: completionHandler)
+        }
+    }
+
+    func write(_ data: Data, completionHandler: @escaping @Sendable (Error?) -> Void) {
+        queue.async {
+            guard let activeOutbound = self.activeOutbound else {
+                completionHandler(self.readyResult?.failureError ?? Socks5OutboundError.failed("Outbound TCP not ready"))
+                return
+            }
+            activeOutbound.write(data, completionHandler: completionHandler)
+        }
+    }
+
+    func cancel() {
+        queue.async {
+            guard !self.isCancelled else { return }
+            self.isCancelled = true
+            self.cancelScheduledWork()
+            self.currentAttempt?.cancel()
+            self.activeOutbound?.cancel()
+            self.finishReadyHandlers(with: .failure(Socks5OutboundError.cancelled))
+        }
+    }
+
+    private func startAttempt(reason: String) {
+        guard !isCancelled, readyResult == nil else {
+            return
+        }
+        guard currentAttemptIndex < policy.maxAttempts else {
+            exhaustRetries(with: Socks5OutboundError.timedOut, event: "connect-exhausted", reason: reason)
+            return
+        }
+        if let overallElapsed = elapsedMilliseconds(since: startedAt),
+           overallElapsed >= durationMilliseconds(policy.overallTimeout) {
+            exhaustRetries(with: Socks5OutboundError.timedOut, event: "connect-overall-timeout", reason: reason)
+            return
+        }
+
+        currentAttemptIndex += 1
+        let attemptIndex = currentAttemptIndex
+        let outbound = makeAttempt(attemptIndex)
+        currentAttempt = outbound
+        currentAttemptStartedAt = Date()
+        log(
+            level: .debug,
+            event: "connect-attempt-started",
+            result: "attempt-\(attemptIndex)",
+            message: "Started outbound TCP connect attempt",
+            extraMetadata: [
+                "attempt_index": String(attemptIndex),
+                "max_attempts": String(policy.maxAttempts),
+                "attempt_timeout_ms": String(durationMilliseconds(policy.attemptPreparingTimeout)),
+                "overall_timeout_ms": String(durationMilliseconds(policy.overallTimeout)),
+                "retry_reason": reason
+            ]
+        )
+
+        armAttemptTimeout(attemptIndex: attemptIndex, outbound: outbound)
+        outbound.waitUntilReady { [weak self] result in
+            guard let self else { return }
+            self.queue.async {
+                self.handleAttemptCompletion(result: result, attemptIndex: attemptIndex, outbound: outbound)
+            }
+        }
+    }
+
+    private func armAttemptTimeout(attemptIndex: Int, outbound: Socks5TCPOutbound) {
+        attemptTimeoutWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard self.readyResult == nil, !self.isCancelled else { return }
+            guard self.currentAttemptIndex == attemptIndex, self.currentAttempt === outbound else { return }
+
+            self.log(
+                level: .warning,
+                event: "connect-timeout",
+                result: "attempt-\(attemptIndex)",
+                message: "Outbound TCP connect attempt timed out",
+                extraMetadata: [
+                    "attempt_index": String(attemptIndex),
+                    "max_attempts": String(self.policy.maxAttempts),
+                    "attempt_timeout_ms": String(durationMilliseconds(self.policy.attemptPreparingTimeout))
+                ]
+            )
+            outbound.cancel()
+            self.currentAttempt = nil
+            self.scheduleRetry(afterFailure: Socks5OutboundError.timedOut, reason: "preparing-timeout")
+        }
+        attemptTimeoutWorkItem = workItem
+        queue.asyncAfter(deadline: .now() + policy.attemptPreparingTimeout, execute: workItem)
+    }
+
+    private func handleAttemptCompletion(
+        result: Result<Void, Error>,
+        attemptIndex: Int,
+        outbound: Socks5TCPOutbound
+    ) {
+        guard !isCancelled, readyResult == nil else {
+            return
+        }
+        guard currentAttemptIndex == attemptIndex, currentAttempt === outbound else {
+            if case .success = result {
+                outbound.cancel()
+            }
+            return
+        }
+
+        attemptTimeoutWorkItem?.cancel()
+        attemptTimeoutWorkItem = nil
+
+        switch result {
+        case .success:
+            activeOutbound = outbound
+            currentAttempt = nil
+            log(
+                level: .notice,
+                event: "connect-attempt-succeeded",
+                result: "attempt-\(attemptIndex)",
+                message: "Outbound TCP connect attempt succeeded",
+                extraMetadata: [
+                    "attempt_index": String(attemptIndex),
+                    "max_attempts": String(policy.maxAttempts)
+                ]
+            )
+            finishReadyHandlers(with: .success(()))
+        case .failure(let error):
+            currentAttempt = nil
+            log(
+                level: .warning,
+                event: "connect-attempt-failed",
+                result: "attempt-\(attemptIndex)",
+                errorCode: error.localizedDescription,
+                message: "Outbound TCP connect attempt failed",
+                extraMetadata: [
+                    "attempt_index": String(attemptIndex),
+                    "max_attempts": String(policy.maxAttempts)
+                ]
+            )
+            scheduleRetry(afterFailure: error, reason: "attempt-failed")
+        }
+    }
+
+    private func scheduleRetry(afterFailure error: Error, reason: String) {
+        guard !isCancelled, readyResult == nil else {
+            return
+        }
+        guard currentAttemptIndex < policy.maxAttempts else {
+            exhaustRetries(with: error, event: "connect-exhausted", reason: reason)
+            return
+        }
+        if let overallElapsed = elapsedMilliseconds(since: startedAt),
+           overallElapsed >= durationMilliseconds(policy.overallTimeout) {
+            exhaustRetries(with: Socks5OutboundError.timedOut, event: "connect-overall-timeout", reason: reason)
+            return
+        }
+
+        retryWorkItem?.cancel()
+        let nextAttemptIndex = currentAttemptIndex + 1
+        log(
+            level: .notice,
+            event: "connect-retry-scheduled",
+            result: "attempt-\(nextAttemptIndex)",
+            errorCode: error.localizedDescription,
+            message: "Scheduling outbound TCP connect retry",
+            extraMetadata: [
+                "attempt_index": String(nextAttemptIndex),
+                "max_attempts": String(policy.maxAttempts),
+                "retry_backoff_ms": String(durationMilliseconds(policy.retryBackoff)),
+                "retry_reason": reason
+            ]
+        )
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.retryWorkItem = nil
+            self.startAttempt(reason: reason)
+        }
+        retryWorkItem = workItem
+        queue.asyncAfter(deadline: .now() + policy.retryBackoff, execute: workItem)
+    }
+
+    private func exhaustRetries(with error: Error, event: String, reason: String) {
+        cancelScheduledWork()
+        currentAttempt = nil
+        log(
+            level: .error,
+            event: event,
+            errorCode: error.localizedDescription,
+            message: "Outbound TCP connect attempts exhausted",
+            extraMetadata: [
+                "attempt_index": String(currentAttemptIndex),
+                "max_attempts": String(policy.maxAttempts),
+                "retry_reason": reason
+            ]
+        )
+        finishReadyHandlers(with: .failure(error))
+    }
+
+    private func cancelScheduledWork() {
+        attemptTimeoutWorkItem?.cancel()
+        attemptTimeoutWorkItem = nil
+        retryWorkItem?.cancel()
+        retryWorkItem = nil
+    }
+
+    private func finishReadyHandlers(with result: Result<Void, Error>) {
+        guard readyResult == nil else {
+            return
+        }
+        cancelScheduledWork()
+        readyResult = result
+        let handlers = readyHandlers
+        readyHandlers.removeAll(keepingCapacity: false)
+        for handler in handlers {
+            handler(result)
+        }
+    }
+
+    private func log(
+        level: LogLevel,
+        event: String,
+        result: String? = nil,
+        errorCode: String? = nil,
+        message: String,
+        extraMetadata: [String: String]
+    ) {
+        var metadata = extraMetadata
+        if let attemptElapsed = elapsedMilliseconds(since: currentAttemptStartedAt) {
+            metadata["attempt_elapsed_ms"] = String(attemptElapsed)
+        }
+        if let overallElapsed = elapsedMilliseconds(since: startedAt) {
+            metadata["overall_elapsed_ms"] = String(overallElapsed)
+        }
+        Task {
+            await logger.log(
+                level: level,
+                phase: .relay,
+                category: .relayTCP,
+                component: "RetryingTCPOutbound",
+                event: event,
+                result: result,
+                errorCode: errorCode,
+                message: message,
+                metadata: metadata
+            )
+        }
+    }
+}
+
 final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession {
     private let connection: NWConnection
     private let logger: StructuredLogger
@@ -471,17 +810,9 @@ final class PacketTunnelProviderAdapter: Socks5FullConnectionProvider {
             return InvalidEndpointTCPOutbound(logger: logger, hostname: endpoint.hostname, port: endpoint.port)
         }
 
-        let parameters = enableTLS ? NWParameters.tls : NWParameters.tcp
-        if #available(iOS 18.0, macOS 15.0, *) {
-            // Docs: https://developer.apple.com/documentation/networkextension/nepackettunnelprovider
-            if let virtualInterface = provider.virtualInterface {
-                parameters.prohibitedInterfaces = [virtualInterface]
-            }
+        return RetryingTCPOutbound(queue: queue, logger: logger) { _ in
+            return self.makeSingleNWConnection(host: endpoint.hostname, port: port, enableTLS: enableTLS)
         }
-
-        let host = NWEndpoint.Host(endpoint.hostname)
-        let connection = NWConnection(host: host, port: port, using: parameters)
-        return NWConnectionTCPAdapter(connection, queue: queue, logger: logger)
     }
 
     private func makeNWUDPSession(to endpoint: NWHostEndpoint) -> Socks5UDPSession {
@@ -502,6 +833,19 @@ final class PacketTunnelProviderAdapter: Socks5FullConnectionProvider {
         let host = NWEndpoint.Host(endpoint.hostname)
         let connection = NWConnection(host: host, port: port, using: parameters)
         return NWConnectionUDPSessionAdapter(connection, queue: queue, logger: logger)
+    }
+
+    private func makeSingleNWConnection(host: String, port: Network.NWEndpoint.Port, enableTLS: Bool) -> Socks5TCPOutbound {
+        let parameters = enableTLS ? NWParameters.tls : NWParameters.tcp
+        if #available(iOS 18.0, macOS 15.0, *) {
+            // Docs: https://developer.apple.com/documentation/networkextension/nepackettunnelprovider
+            if let virtualInterface = provider.virtualInterface {
+                parameters.prohibitedInterfaces = [virtualInterface]
+            }
+        }
+
+        let connection = NWConnection(host: NWEndpoint.Host(host), port: port, using: parameters)
+        return NWConnectionTCPAdapter(connection, queue: queue, logger: logger)
     }
 }
 
