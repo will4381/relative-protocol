@@ -173,6 +173,7 @@ final class Socks5UDPRelayTests: XCTestCase {
         )
 
         wait(for: [firstCreated], timeout: 1.0)
+        queue.sync {}
         XCTAssertEqual(relay.activeSessionCount, 0)
         let firstSession = try XCTUnwrap(provider.sessions.first)
         XCTAssertTrue(firstSession.cancelled)
