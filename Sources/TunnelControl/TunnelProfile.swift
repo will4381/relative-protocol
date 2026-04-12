@@ -8,8 +8,10 @@ public struct TunnelProfile: Sendable, Equatable {
     public let appGroupID: String
     /// Remote address required by `NEPacketTunnelNetworkSettings`.
     public let tunnelRemoteAddress: String
-    /// Virtual tunnel interface MTU.
+    /// MTU hint used for local packet buffers and for fixed interface MTU strategies.
     public let mtu: Int
+    /// Controls how packet-tunnel MTU settings are installed on the virtual interface.
+    public let mtuStrategy: TunnelMTUStrategy
     /// Enables or disables IPv6 settings installation.
     public let ipv6Enabled: Bool
     /// Enables `NWParameters.MultipathServiceType.handover` for outbound TCP connects.
@@ -19,7 +21,8 @@ public struct TunnelProfile: Sendable, Equatable {
     public let ipv4Router: String
     public let ipv6Address: String
     public let ipv6PrefixLength: Int
-    public let dnsServers: [String]
+    /// Controls which DNS settings are installed on the tunnel interface.
+    public let dnsStrategy: TunnelDNSStrategy
     public let engineSocksPort: UInt16
     public let engineLogLevel: String
     public let telemetryEnabled: Bool
@@ -30,11 +33,17 @@ public struct TunnelProfile: Sendable, Equatable {
     public let relayEndpoint: RelayEndpoint
     public let dataplaneConfigJSON: String
 
+    /// Resolver IPs associated with the active DNS strategy.
+    public var dnsServers: [String] {
+        dnsStrategy.servers
+    }
+
     /// Creates a fully-specified tunnel profile.
     /// - Parameters:
     ///   - appGroupID: App Group identifier for shared data paths.
     ///   - tunnelRemoteAddress: Tunnel remote address required by NetworkExtension.
-    ///   - mtu: Virtual interface MTU.
+    ///   - mtu: MTU hint used for local packet buffers and fixed interface MTU strategies.
+    ///   - mtuStrategy: Controls how interface MTU settings are applied. Defaults to `.fixed(mtu)` for backward compatibility.
     ///   - ipv6Enabled: Controls whether IPv6 settings are installed.
     ///   - tcpMultipathHandoverEnabled: Enables multipath handover for outbound TCP connections.
     ///   - ipv4Address: Assigned IPv4 address.
@@ -42,7 +51,8 @@ public struct TunnelProfile: Sendable, Equatable {
     ///   - ipv4Router: Default IPv4 router.
     ///   - ipv6Address: Assigned IPv6 address.
     ///   - ipv6PrefixLength: IPv6 prefix length.
-    ///   - dnsServers: DNS servers pushed to the tunnel interface.
+    ///   - dnsServers: DNS servers pushed to the tunnel interface when `dnsStrategy` is not supplied.
+    ///   - dnsStrategy: Controls which DNS settings are installed. Defaults to cleartext DNS over `dnsServers`.
     ///   - engineSocksPort: Local SOCKS server listen port.
     ///   - engineLogLevel: Dataplane log level hint.
     ///   - telemetryEnabled: Enables sparse analytics and detector execution inside the tunnel extension.
@@ -59,6 +69,7 @@ public struct TunnelProfile: Sendable, Equatable {
         appGroupID: String,
         tunnelRemoteAddress: String,
         mtu: Int,
+        mtuStrategy: TunnelMTUStrategy? = nil,
         ipv6Enabled: Bool,
         tcpMultipathHandoverEnabled: Bool,
         ipv4Address: String,
@@ -67,6 +78,7 @@ public struct TunnelProfile: Sendable, Equatable {
         ipv6Address: String,
         ipv6PrefixLength: Int,
         dnsServers: [String],
+        dnsStrategy: TunnelDNSStrategy? = nil,
         engineSocksPort: UInt16,
         engineLogLevel: String,
         telemetryEnabled: Bool,
@@ -79,7 +91,8 @@ public struct TunnelProfile: Sendable, Equatable {
     ) {
         self.appGroupID = appGroupID
         self.tunnelRemoteAddress = tunnelRemoteAddress
-        self.mtu = mtu
+        self.mtu = max(256, mtu)
+        self.mtuStrategy = mtuStrategy ?? .fixed(self.mtu)
         self.ipv6Enabled = ipv6Enabled
         self.tcpMultipathHandoverEnabled = tcpMultipathHandoverEnabled
         self.ipv4Address = ipv4Address
@@ -87,7 +100,7 @@ public struct TunnelProfile: Sendable, Equatable {
         self.ipv4Router = ipv4Router
         self.ipv6Address = ipv6Address
         self.ipv6PrefixLength = ipv6PrefixLength
-        self.dnsServers = dnsServers
+        self.dnsStrategy = dnsStrategy ?? .cleartext(servers: dnsServers)
         self.engineSocksPort = engineSocksPort
         self.engineLogLevel = engineLogLevel
         self.telemetryEnabled = telemetryEnabled
@@ -105,11 +118,17 @@ public struct TunnelProfile: Sendable, Equatable {
         let relayHost = providerConfiguration["relayHost"] as? String ?? "127.0.0.1"
         let relayPort = uint16(providerConfiguration["relayPort"], default: 1080)
         let useUDP = providerConfiguration["relayUDP"] as? Bool ?? false
+        let mtuValue = providerConfiguration["mtu"] == nil
+            ? TunnelMTUStrategy.recommendedGeneric.bufferMTUHint
+            : int(providerConfiguration["mtu"], default: TunnelMTUStrategy.recommendedGeneric.bufferMTUHint)
+        let mtuStrategy = mtuStrategy(from: providerConfiguration, legacyMTU: mtuValue)
+        let dnsStrategy = dnsStrategy(from: providerConfiguration)
 
         return TunnelProfile(
             appGroupID: providerConfiguration["appGroupID"] as? String ?? "",
             tunnelRemoteAddress: providerConfiguration["tunnelRemoteAddress"] as? String ?? "127.0.0.1",
-            mtu: int(providerConfiguration["mtu"], default: 1500),
+            mtu: mtuValue,
+            mtuStrategy: mtuStrategy,
             ipv6Enabled: bool(providerConfiguration["ipv6Enabled"], default: true),
             tcpMultipathHandoverEnabled: bool(providerConfiguration["tcpMultipathHandoverEnabled"], default: false),
             ipv4Address: providerConfiguration["ipv4Address"] as? String ?? "10.0.0.2",
@@ -117,7 +136,8 @@ public struct TunnelProfile: Sendable, Equatable {
             ipv4Router: providerConfiguration["ipv4Router"] as? String ?? "10.0.0.1",
             ipv6Address: providerConfiguration["ipv6Address"] as? String ?? "fd00:1::2",
             ipv6PrefixLength: int(providerConfiguration["ipv6PrefixLength"], default: 64),
-            dnsServers: providerConfiguration["dnsServers"] as? [String] ?? ["1.1.1.1"],
+            dnsServers: dnsStrategy.servers,
+            dnsStrategy: dnsStrategy,
             engineSocksPort: uint16(providerConfiguration["engineSocksPort"], default: 1080),
             engineLogLevel: providerConfiguration["engineLogLevel"] as? String ?? "warn",
             telemetryEnabled: bool(providerConfiguration["telemetryEnabled"], default: true),
@@ -174,5 +194,104 @@ public struct TunnelProfile: Sendable, Equatable {
             return (value as NSString).boolValue
         }
         return defaultValue
+    }
+
+    private static func string(_ value: Any?) -> String? {
+        if let value = value as? String {
+            return value
+        }
+        return nil
+    }
+
+    private static func stringArray(_ value: Any?) -> [String]? {
+        if let value = value as? [String] {
+            return value
+        }
+        if let value = value as? [Any] {
+            let strings = value.compactMap { $0 as? String }
+            return strings.isEmpty ? nil : strings
+        }
+        return nil
+    }
+
+    private static func mtuStrategy(from providerConfiguration: [String: Any], legacyMTU: Int) -> TunnelMTUStrategy {
+        guard let rawStrategy = string(providerConfiguration["mtuStrategy"]) else {
+            if providerConfiguration["mtu"] != nil {
+                return .fixed(legacyMTU)
+            }
+            return .recommendedGeneric
+        }
+
+        switch rawStrategy {
+        case "automaticTunnelOverhead":
+            return .automaticTunnelOverhead(
+                max(0, int(providerConfiguration["tunnelOverheadBytes"], default: 80))
+            )
+        case "fixed":
+            fallthrough
+        default:
+            return .fixed(legacyMTU)
+        }
+    }
+
+    private static func dnsStrategy(from providerConfiguration: [String: Any]) -> TunnelDNSStrategy {
+        let legacyServers = stringArray(providerConfiguration["dnsServers"])
+        guard let rawStrategy = providerConfiguration["dnsStrategy"] as? [String: Any],
+              let type = string(rawStrategy["type"]) else {
+            if let legacyServers, !legacyServers.isEmpty {
+                return .cleartext(servers: legacyServers)
+            }
+            return .recommendedDefault
+        }
+
+        switch type {
+        case "none":
+            return .noOverride
+        case "tls":
+            let servers = stringArray(rawStrategy["servers"]) ?? legacyServers ?? TunnelDNSStrategy.defaultPublicResolvers
+            let serverName = string(rawStrategy["serverName"]) ?? ""
+            if serverName.isEmpty {
+                return .cleartext(
+                    servers: servers,
+                    matchDomains: stringArray(rawStrategy["matchDomains"]),
+                    matchDomainsNoSearch: bool(rawStrategy["matchDomainsNoSearch"], default: false),
+                    allowFailover: bool(rawStrategy["allowFailover"], default: false)
+                )
+            }
+            return .tls(
+                servers: servers,
+                serverName: serverName,
+                matchDomains: stringArray(rawStrategy["matchDomains"]),
+                matchDomainsNoSearch: bool(rawStrategy["matchDomainsNoSearch"], default: false),
+                allowFailover: bool(rawStrategy["allowFailover"], default: false)
+            )
+        case "https":
+            let servers = stringArray(rawStrategy["servers"]) ?? legacyServers ?? TunnelDNSStrategy.defaultPublicResolvers
+            let serverURL = string(rawStrategy["serverURL"]) ?? ""
+            if serverURL.isEmpty {
+                return .cleartext(
+                    servers: servers,
+                    matchDomains: stringArray(rawStrategy["matchDomains"]),
+                    matchDomainsNoSearch: bool(rawStrategy["matchDomainsNoSearch"], default: false),
+                    allowFailover: bool(rawStrategy["allowFailover"], default: false)
+                )
+            }
+            return .https(
+                servers: servers,
+                serverURL: serverURL,
+                matchDomains: stringArray(rawStrategy["matchDomains"]),
+                matchDomainsNoSearch: bool(rawStrategy["matchDomainsNoSearch"], default: false),
+                allowFailover: bool(rawStrategy["allowFailover"], default: false)
+            )
+        case "cleartext":
+            fallthrough
+        default:
+            return .cleartext(
+                servers: stringArray(rawStrategy["servers"]) ?? legacyServers ?? TunnelDNSStrategy.defaultPublicResolvers,
+                matchDomains: stringArray(rawStrategy["matchDomains"]),
+                matchDomainsNoSearch: bool(rawStrategy["matchDomainsNoSearch"], default: false),
+                allowFailover: bool(rawStrategy["allowFailover"], default: false)
+            )
+        }
     }
 }

@@ -19,7 +19,7 @@ public enum TunnelProfileManager {
         let proto = NETunnelProviderProtocol()
         proto.providerBundleIdentifier = providerBundleIdentifier
         proto.serverAddress = profile.tunnelRemoteAddress
-        proto.providerConfiguration = [
+        var configuration: [String: Any] = [
             "appGroupID": profile.appGroupID,
             "tunnelRemoteAddress": profile.tunnelRemoteAddress,
             "mtu": profile.mtu,
@@ -43,6 +43,11 @@ public enum TunnelProfileManager {
             "relayUDP": profile.relayEndpoint.useUDP,
             "dataplaneConfigJSON": profile.dataplaneConfigJSON
         ]
+        for (key, value) in profile.mtuStrategy.providerConfiguration {
+            configuration[key] = value
+        }
+        configuration["dnsStrategy"] = profile.dnsStrategy.providerConfiguration
+        proto.providerConfiguration = configuration
         manager.protocolConfiguration = proto
         manager.localizedDescription = localizedDescription
         manager.isEnabled = true

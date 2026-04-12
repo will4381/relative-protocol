@@ -252,9 +252,11 @@ Important fields in `TunnelProfile`:
 - `appGroupID`
 - `tunnelRemoteAddress`
 - `mtu`
+- `mtuStrategy`
 - `ipv6Enabled`
 - `tcpMultipathHandoverEnabled`
 - `dnsServers`
+- `dnsStrategy`
 - `engineSocksPort`
 - `engineLogLevel`
 - `telemetryEnabled`
@@ -285,6 +287,52 @@ It does not mean every sparse detector record kind is surfaced to the app.
 
 `tcpMultipathHandoverEnabled = true` opts outbound TCP connects into `NWParameters.MultipathServiceType.handover`.
 It is disabled by default so multipath stays an explicit host-app policy choice.
+
+`mtuStrategy` controls whether the package installs a fixed interface MTU or lets NetworkExtension derive the interface MTU from `tunnelOverheadBytes`.
+The package default for provider-configuration users is a fixed MTU of `1500`.
+Existing direct `TunnelProfile(...)` callers stay backward-compatible: if you pass only `mtu`, the profile uses `.fixed(mtu)`.
+
+`dnsStrategy` controls whether the tunnel installs cleartext DNS, DNS-over-TLS, DNS-over-HTTPS, or no DNS override at all.
+The package default for provider-configuration users is `dnsStrategy = .noOverride`.
+
+Existing direct `TunnelProfile(...)` callers stay backward-compatible here too: if you pass only `dnsServers`, the profile uses `.cleartext(servers: dnsServers)`.
+
+Recommended host-app policies:
+
+- generic compatibility default: `mtuStrategy = .fixed(1500)`
+- protocol-aware UDP tunnel: `mtuStrategy = .automaticTunnelOverhead(80)` when you know your encapsulation overhead
+- full-tunnel DNS with public resolvers: `dnsStrategy = .cleartext(servers: TunnelDNSStrategy.defaultPublicResolvers)`
+- compatibility-first fallback: `dnsStrategy = .cleartext(..., allowFailover: true)` on iOS 26+
+- preserve system DNS: `dnsStrategy = .noOverride`
+
+Example:
+
+```swift
+let profile = TunnelProfile(
+    appGroupID: "group.com.example.vpn",
+    tunnelRemoteAddress: "127.0.0.1",
+    mtu: 1_500,
+    mtuStrategy: .fixed(1_500),
+    ipv6Enabled: true,
+    tcpMultipathHandoverEnabled: false,
+    ipv4Address: "10.0.0.2",
+    ipv4SubnetMask: "255.255.255.0",
+    ipv4Router: "10.0.0.1",
+    ipv6Address: "fd00:1::2",
+    ipv6PrefixLength: 64,
+    dnsServers: [],
+    dnsStrategy: .noOverride,
+    engineSocksPort: 0,
+    engineLogLevel: "info",
+    telemetryEnabled: true,
+    liveTapEnabled: true,
+    liveTapIncludeFlowSlices: true,
+    liveTapMaxBytes: 1_048_576,
+    signatureFileName: "app_signatures.json",
+    relayEndpoint: RelayEndpoint(host: "127.0.0.1", port: 1080, useUDP: false),
+    dataplaneConfigJSON: "{}"
+)
+```
 
 Current default split:
 

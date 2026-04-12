@@ -32,11 +32,67 @@ public enum TunnelNetworkSettingsFactory {
             settings.ipv6Settings = ipv6
         }
 
-        // Docs: https://developer.apple.com/documentation/networkextension/nednssettings
-        settings.dnsSettings = NEDNSSettings(servers: profile.dnsServers)
-        settings.mtu = NSNumber(value: profile.mtu)
-        settings.tunnelOverheadBytes = 0
+        settings.dnsSettings = makeDNSSettings(strategy: profile.dnsStrategy)
+        applyMTUStrategy(profile.mtuStrategy, to: settings)
 
         return settings
+    }
+
+    private static func makeDNSSettings(strategy: TunnelDNSStrategy) -> NEDNSSettings? {
+        switch strategy {
+        case .noOverride:
+            return nil
+        case .cleartext(let servers, let matchDomains, let matchDomainsNoSearch, let allowFailover):
+            let dnsSettings = NEDNSSettings(servers: servers)
+            configureCommonDNSSettings(
+                dnsSettings,
+                matchDomains: matchDomains,
+                matchDomainsNoSearch: matchDomainsNoSearch,
+                allowFailover: allowFailover
+            )
+            return dnsSettings
+        case .tls(let servers, let serverName, let matchDomains, let matchDomainsNoSearch, let allowFailover):
+            let dnsSettings = NEDNSOverTLSSettings(servers: servers)
+            dnsSettings.serverName = serverName
+            configureCommonDNSSettings(
+                dnsSettings,
+                matchDomains: matchDomains,
+                matchDomainsNoSearch: matchDomainsNoSearch,
+                allowFailover: allowFailover
+            )
+            return dnsSettings
+        case .https(let servers, let serverURL, let matchDomains, let matchDomainsNoSearch, let allowFailover):
+            let dnsSettings = NEDNSOverHTTPSSettings(servers: servers)
+            dnsSettings.serverURL = URL(string: serverURL)
+            configureCommonDNSSettings(
+                dnsSettings,
+                matchDomains: matchDomains,
+                matchDomainsNoSearch: matchDomainsNoSearch,
+                allowFailover: allowFailover
+            )
+            return dnsSettings
+        }
+    }
+
+    private static func configureCommonDNSSettings(
+        _ dnsSettings: NEDNSSettings,
+        matchDomains: [String]?,
+        matchDomainsNoSearch: Bool,
+        allowFailover: Bool
+    ) {
+        dnsSettings.matchDomains = matchDomains
+        dnsSettings.matchDomainsNoSearch = matchDomainsNoSearch
+        if #available(iOS 26.0, macOS 26.0, tvOS 26.0, *) {
+            dnsSettings.allowFailover = allowFailover
+        }
+    }
+
+    private static func applyMTUStrategy(_ strategy: TunnelMTUStrategy, to settings: NEPacketTunnelNetworkSettings) {
+        switch strategy {
+        case .fixed(let mtu):
+            settings.mtu = NSNumber(value: mtu)
+        case .automaticTunnelOverhead(let overhead):
+            settings.tunnelOverheadBytes = NSNumber(value: overhead)
+        }
     }
 }
