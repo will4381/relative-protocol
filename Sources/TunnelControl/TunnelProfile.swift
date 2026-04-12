@@ -12,6 +12,8 @@ public struct TunnelProfile: Sendable, Equatable {
     public let mtu: Int
     /// Enables or disables IPv6 settings installation.
     public let ipv6Enabled: Bool
+    /// Enables `NWParameters.MultipathServiceType.handover` for outbound TCP connects.
+    public let tcpMultipathHandoverEnabled: Bool
     public let ipv4Address: String
     public let ipv4SubnetMask: String
     public let ipv4Router: String
@@ -34,6 +36,7 @@ public struct TunnelProfile: Sendable, Equatable {
     ///   - tunnelRemoteAddress: Tunnel remote address required by NetworkExtension.
     ///   - mtu: Virtual interface MTU.
     ///   - ipv6Enabled: Controls whether IPv6 settings are installed.
+    ///   - tcpMultipathHandoverEnabled: Enables multipath handover for outbound TCP connections.
     ///   - ipv4Address: Assigned IPv4 address.
     ///   - ipv4SubnetMask: Assigned IPv4 subnet mask.
     ///   - ipv4Router: Default IPv4 router.
@@ -57,6 +60,7 @@ public struct TunnelProfile: Sendable, Equatable {
         tunnelRemoteAddress: String,
         mtu: Int,
         ipv6Enabled: Bool,
+        tcpMultipathHandoverEnabled: Bool,
         ipv4Address: String,
         ipv4SubnetMask: String,
         ipv4Router: String,
@@ -77,6 +81,7 @@ public struct TunnelProfile: Sendable, Equatable {
         self.tunnelRemoteAddress = tunnelRemoteAddress
         self.mtu = mtu
         self.ipv6Enabled = ipv6Enabled
+        self.tcpMultipathHandoverEnabled = tcpMultipathHandoverEnabled
         self.ipv4Address = ipv4Address
         self.ipv4SubnetMask = ipv4SubnetMask
         self.ipv4Router = ipv4Router
@@ -106,6 +111,7 @@ public struct TunnelProfile: Sendable, Equatable {
             tunnelRemoteAddress: providerConfiguration["tunnelRemoteAddress"] as? String ?? "127.0.0.1",
             mtu: int(providerConfiguration["mtu"], default: 1500),
             ipv6Enabled: bool(providerConfiguration["ipv6Enabled"], default: true),
+            tcpMultipathHandoverEnabled: bool(providerConfiguration["tcpMultipathHandoverEnabled"], default: false),
             ipv4Address: providerConfiguration["ipv4Address"] as? String ?? "10.0.0.2",
             ipv4SubnetMask: providerConfiguration["ipv4SubnetMask"] as? String ?? "255.255.255.0",
             ipv4Router: providerConfiguration["ipv4Router"] as? String ?? "10.0.0.1",

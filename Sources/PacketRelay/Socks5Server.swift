@@ -119,6 +119,24 @@ struct TCPConnectRetryPolicy: Sendable {
     )
 }
 
+public struct Socks5TCPPathSettings: Sendable {
+    public let retryOnBetterPathDuringConnect: Bool
+    public let betterPathRetryMinimumElapsed: TimeInterval
+    public let multipathServiceType: NWParameters.MultipathServiceType?
+
+    public init(
+        retryOnBetterPathDuringConnect: Bool = true,
+        betterPathRetryMinimumElapsed: TimeInterval = 0.75,
+        multipathServiceType: NWParameters.MultipathServiceType? = nil
+    ) {
+        self.retryOnBetterPathDuringConnect = retryOnBetterPathDuringConnect
+        self.betterPathRetryMinimumElapsed = betterPathRetryMinimumElapsed
+        self.multipathServiceType = multipathServiceType
+    }
+
+    public static let `default` = Socks5TCPPathSettings()
+}
+
 /// Extended outbound provider for SOCKS TCP + UDP backends.
 protocol Socks5FullConnectionProvider: Socks5ConnectionProvider {
     func makeTCPConnection(
@@ -127,6 +145,14 @@ protocol Socks5FullConnectionProvider: Socks5ConnectionProvider {
         tlsParameters: NWTLSParameters?,
         delegate: NWTCPConnectionAuthenticationDelegate?
     ) -> Socks5TCPOutbound
+}
+
+enum TCPOutboundEvent: Sendable {
+    case betterPathAvailable
+}
+
+protocol Socks5PathAwareTCPOutbound: Socks5TCPOutbound {
+    var eventHandler: ((TCPOutboundEvent) -> Void)? { get set }
 }
 
 /// `Socks5InboundConnection` adapter for `NWConnection`.
@@ -168,13 +194,14 @@ final class SocksInboundNWConnectionAdapter: @unchecked Sendable, Socks5InboundC
     }
 }
 
-final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5TCPOutbound {
+final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbound {
     private let connection: NWConnection
     private let queue: DispatchQueue
     private let logger: StructuredLogger
     private var readyHandlers: [(@Sendable (Result<Void, Error>) -> Void)] = []
     private var readyResult: Result<Void, Error>?
     private var didStart = false
+    var eventHandler: ((TCPOutboundEvent) -> Void)?
 
     /// - Parameters:
     ///   - connection: Outbound Network.framework connection.
@@ -321,6 +348,7 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5TCPOutbound {
         guard betterPathAvailable else {
             return
         }
+        eventHandler?(.betterPathAvailable)
         Task {
             await logger.log(
                 level: .debug,
@@ -352,12 +380,13 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
     private let queue: DispatchQueue
     private let logger: StructuredLogger
     private let policy: TCPConnectRetryPolicy
-    private let makeAttempt: (_ attemptIndex: Int) -> Socks5TCPOutbound
+    private let pathSettings: Socks5TCPPathSettings
+    private let makeAttempt: (_ attemptIndex: Int) -> Socks5PathAwareTCPOutbound
 
     private var readyHandlers: [(@Sendable (Result<Void, Error>) -> Void)] = []
     private var readyResult: Result<Void, Error>?
     private var activeOutbound: Socks5TCPOutbound?
-    private var currentAttempt: Socks5TCPOutbound?
+    private var currentAttempt: Socks5PathAwareTCPOutbound?
     private var currentAttemptIndex = 0
     private var startedAt: Date?
     private var currentAttemptStartedAt: Date?
@@ -369,11 +398,13 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
         queue: DispatchQueue,
         logger: StructuredLogger,
         policy: TCPConnectRetryPolicy = .default,
-        makeAttempt: @escaping (_ attemptIndex: Int) -> Socks5TCPOutbound
+        pathSettings: Socks5TCPPathSettings = .default,
+        makeAttempt: @escaping (_ attemptIndex: Int) -> Socks5PathAwareTCPOutbound
     ) {
         self.queue = queue
         self.logger = logger
         self.policy = policy
+        self.pathSettings = pathSettings
         self.makeAttempt = makeAttempt
     }
 
@@ -442,6 +473,12 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
         currentAttemptIndex += 1
         let attemptIndex = currentAttemptIndex
         let outbound = makeAttempt(attemptIndex)
+        outbound.eventHandler = { [weak self, weak outbound] event in
+            guard let self, let outbound else { return }
+            self.queue.async {
+                self.handleAttemptEvent(event, attemptIndex: attemptIndex, outbound: outbound)
+            }
+        }
         currentAttempt = outbound
         currentAttemptStartedAt = Date()
         log(
@@ -467,7 +504,61 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
         }
     }
 
-    private func armAttemptTimeout(attemptIndex: Int, outbound: Socks5TCPOutbound) {
+    private func handleAttemptEvent(
+        _ event: TCPOutboundEvent,
+        attemptIndex: Int,
+        outbound: Socks5PathAwareTCPOutbound
+    ) {
+        guard !isCancelled, readyResult == nil else {
+            return
+        }
+        guard currentAttemptIndex == attemptIndex, currentAttempt === outbound, activeOutbound == nil else {
+            return
+        }
+
+        switch event {
+        case .betterPathAvailable:
+            guard pathSettings.retryOnBetterPathDuringConnect else {
+                return
+            }
+            let minimumElapsedMs = durationMilliseconds(pathSettings.betterPathRetryMinimumElapsed)
+            let attemptElapsedMs = elapsedMilliseconds(since: currentAttemptStartedAt) ?? 0
+            guard attemptElapsedMs >= minimumElapsedMs else {
+                log(
+                    level: .debug,
+                    event: "connect-better-path-deferred",
+                    result: "attempt-\(attemptIndex)",
+                    message: "Ignoring better-path signal because the connect attempt is still young",
+                    extraMetadata: [
+                        "attempt_index": String(attemptIndex),
+                        "minimum_elapsed_ms": String(minimumElapsedMs)
+                    ]
+                )
+                return
+            }
+
+            attemptTimeoutWorkItem?.cancel()
+            attemptTimeoutWorkItem = nil
+            currentAttempt = nil
+            log(
+                level: .notice,
+                event: "connect-better-path-retry",
+                result: "attempt-\(attemptIndex)",
+                message: "Replacing outbound TCP connect attempt because a better path is available",
+                extraMetadata: [
+                    "attempt_index": String(attemptIndex),
+                    "minimum_elapsed_ms": String(minimumElapsedMs)
+                ]
+            )
+            outbound.cancel()
+            scheduleRetry(
+                afterFailure: Socks5OutboundError.failed("Replaced by preferred path"),
+                reason: "better-path"
+            )
+        }
+    }
+
+    private func armAttemptTimeout(attemptIndex: Int, outbound: Socks5PathAwareTCPOutbound) {
         attemptTimeoutWorkItem?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
@@ -496,7 +587,7 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
     private func handleAttemptCompletion(
         result: Result<Void, Error>,
         attemptIndex: Int,
-        outbound: Socks5TCPOutbound
+        outbound: Socks5PathAwareTCPOutbound
     ) {
         guard !isCancelled, readyResult == nil else {
             return
@@ -817,15 +908,22 @@ final class PacketTunnelProviderAdapter: @unchecked Sendable, Socks5FullConnecti
     private let provider: NEPacketTunnelProvider
     private let queue: DispatchQueue
     private let logger: StructuredLogger
+    private let tcpPathSettings: Socks5TCPPathSettings
 
     /// - Parameters:
     ///   - provider: Active packet tunnel provider.
     ///   - queue: Queue for outbound Network.framework connection callbacks.
     ///   - logger: Structured logger for outbound path events.
-    init(provider: NEPacketTunnelProvider, queue: DispatchQueue, logger: StructuredLogger) {
+    init(
+        provider: NEPacketTunnelProvider,
+        queue: DispatchQueue,
+        logger: StructuredLogger,
+        tcpPathSettings: Socks5TCPPathSettings = .default
+    ) {
         self.provider = provider
         self.queue = queue
         self.logger = logger
+        self.tcpPathSettings = tcpPathSettings
     }
 
     func makeTCPConnection(
@@ -850,7 +948,7 @@ final class PacketTunnelProviderAdapter: @unchecked Sendable, Socks5FullConnecti
             return InvalidEndpointTCPOutbound(logger: logger, hostname: endpoint.hostname, port: endpoint.port)
         }
 
-        return RetryingTCPOutbound(queue: queue, logger: logger) { _ in
+        return RetryingTCPOutbound(queue: queue, logger: logger, pathSettings: tcpPathSettings) { _ in
             return self.makeSingleNWConnection(host: endpoint.hostname, port: port, enableTLS: enableTLS)
         }
     }
@@ -875,9 +973,11 @@ final class PacketTunnelProviderAdapter: @unchecked Sendable, Socks5FullConnecti
         return NWConnectionUDPSessionAdapter(connection, queue: queue, logger: logger)
     }
 
-    private func makeSingleNWConnection(host: String, port: Network.NWEndpoint.Port, enableTLS: Bool) -> Socks5TCPOutbound {
+    private func makeSingleNWConnection(host: String, port: Network.NWEndpoint.Port, enableTLS: Bool) -> Socks5PathAwareTCPOutbound {
         let parameters = enableTLS ? NWParameters.tls : NWParameters.tcp
-        parameters.multipathServiceType = .handover
+        if let multipathServiceType = tcpPathSettings.multipathServiceType {
+            parameters.multipathServiceType = multipathServiceType
+        }
         if #available(iOS 18.0, macOS 15.0, *) {
             // Docs: https://developer.apple.com/documentation/networkextension/nepackettunnelprovider
             if let virtualInterface = provider.virtualInterface {
@@ -1026,7 +1126,13 @@ public final class Socks5Server: @unchecked Sendable {
     ///   - queue: Serial queue for listener + connection events.
     ///   - mtu: MTU hint used by UDP relay.
     ///   - logger: Structured logger.
-    public convenience init(provider: NEPacketTunnelProvider, queue: DispatchQueue, mtu: Int, logger: StructuredLogger) {
+    public convenience init(
+        provider: NEPacketTunnelProvider,
+        queue: DispatchQueue,
+        mtu: Int,
+        logger: StructuredLogger,
+        tcpPathSettings: Socks5TCPPathSettings = .default
+    ) {
         let connectionQueueLabelPrefix = queue.label.isEmpty ? "com.vpnbridge.tunnel.relay.session" : "\(queue.label).session"
         self.init(
             queue: queue,
@@ -1036,7 +1142,12 @@ public final class Socks5Server: @unchecked Sendable {
                 DispatchQueue(label: "\(connectionQueueLabelPrefix).\(UUID().uuidString)", qos: .userInitiated)
             },
             providerFactory: { connectionQueue in
-                PacketTunnelProviderAdapter(provider: provider, queue: connectionQueue, logger: logger)
+                PacketTunnelProviderAdapter(
+                    provider: provider,
+                    queue: connectionQueue,
+                    logger: logger,
+                    tcpPathSettings: tcpPathSettings
+                )
             }
         )
     }

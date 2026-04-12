@@ -154,6 +154,12 @@ let package = Package(
             swiftSettings: strictSwiftSettings
         ),
         .testTarget(
+            name: "TunnelControlTests",
+            dependencies: ["TunnelControl", "PacketRelay"],
+            path: "Tests/TunnelControlTests",
+            swiftSettings: strictSwiftSettings
+        ),
+        .testTarget(
             name: "HarnessLocalTests",
             dependencies: ["HarnessLocal", "Analytics", "TunnelRuntime"],
             path: "Tests/HarnessLocalTests",

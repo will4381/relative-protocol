@@ -477,7 +477,18 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
     /// - Parameter profile: Active tunnel profile.
     /// - Returns: Bound SOCKS listen port.
     private func startSocksServer(profile: TunnelProfile, logger: StructuredLogger) async throws -> (server: Socks5Server, port: UInt16) {
-        let server = Socks5Server(provider: self, queue: relayQueue, mtu: profile.mtu, logger: logger)
+        let tcpPathSettings = Socks5TCPPathSettings(
+            retryOnBetterPathDuringConnect: true,
+            betterPathRetryMinimumElapsed: 0.75,
+            multipathServiceType: profile.tcpMultipathHandoverEnabled ? .handover : nil
+        )
+        let server = Socks5Server(
+            provider: self,
+            queue: relayQueue,
+            mtu: profile.mtu,
+            logger: logger,
+            tcpPathSettings: tcpPathSettings
+        )
         return try await withCheckedThrowingContinuation { continuation in
             server.start(port: profile.engineSocksPort) { result in
                 switch result {

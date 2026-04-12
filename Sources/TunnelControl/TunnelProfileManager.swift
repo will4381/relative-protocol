@@ -24,6 +24,7 @@ public enum TunnelProfileManager {
             "tunnelRemoteAddress": profile.tunnelRemoteAddress,
             "mtu": profile.mtu,
             "ipv6Enabled": profile.ipv6Enabled,
+            "tcpMultipathHandoverEnabled": profile.tcpMultipathHandoverEnabled,
             "ipv4Address": profile.ipv4Address,
             "ipv4SubnetMask": profile.ipv4SubnetMask,
             "ipv4Router": profile.ipv4Router,

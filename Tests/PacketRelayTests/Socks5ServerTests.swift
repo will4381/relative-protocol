@@ -238,6 +238,60 @@ final class Socks5ServerTests: XCTestCase {
         XCTAssertTrue(snapshot.allSatisfy(\.cancelled))
     }
 
+    func testRetryingTCPOutboundRetriesWhenBetterPathBecomesAvailable() {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.retry-better-path")
+        let lock = NSLock()
+        var attempts: [ControlledTCPOutbound] = []
+        var secondAttempt: ControlledTCPOutbound?
+        let firstAttemptCreated = expectation(description: "first attempt created")
+        let secondAttemptCreated = expectation(description: "second attempt created")
+        let ready = expectation(description: "retry eventually connects")
+
+        let outbound = RetryingTCPOutbound(
+            queue: queue,
+            logger: StructuredLogger(sink: InMemoryLogSink()),
+            policy: .init(attemptPreparingTimeout: 1.0, retryBackoff: 0.01, maxAttempts: 2, overallTimeout: 2.0),
+            pathSettings: .init(retryOnBetterPathDuringConnect: true, betterPathRetryMinimumElapsed: 0.0, multipathServiceType: nil)
+        ) { attemptIndex in
+            let attempt = ControlledTCPOutbound()
+            lock.lock()
+            attempts.append(attempt)
+            if attemptIndex == 1 {
+                firstAttemptCreated.fulfill()
+            }
+            if attemptIndex == 2 {
+                secondAttempt = attempt
+            }
+            lock.unlock()
+            if attemptIndex == 2 {
+                secondAttemptCreated.fulfill()
+            }
+            return attempt
+        }
+
+        outbound.waitUntilReady { result in
+            switch result {
+            case .success:
+                ready.fulfill()
+            case .failure(let error):
+                XCTFail("Expected better-path retry to succeed, got \(error)")
+            }
+        }
+
+        wait(for: [firstAttemptCreated], timeout: 1.0)
+
+        lock.lock()
+        let firstAttempt = attempts.first
+        lock.unlock()
+        firstAttempt?.emit(.betterPathAvailable)
+
+        wait(for: [secondAttemptCreated], timeout: 1.0)
+        secondAttempt?.succeedConnect()
+        wait(for: [ready], timeout: 1.0)
+
+        XCTAssertTrue(firstAttempt?.cancelled == true)
+    }
+
     private static let greeting = Data([0x05, 0x01, 0x00])
 
     private static func connectRequest(host: String, port: UInt16) -> Data {
@@ -313,7 +367,7 @@ private final class FakeInboundConnection: Socks5InboundConnection {
     }
 }
 
-private final class ControlledTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
+private final class ControlledTCPOutbound: @unchecked Sendable, Socks5PathAwareTCPOutbound {
     private var readyHandlers: [(@Sendable (Result<Void, Error>) -> Void)] = []
     private var pendingReadHandlers: [(@Sendable (Data?, Error?) -> Void)] = []
     private var pendingWriteHandlers: [(@Sendable (Error?) -> Void)] = []
@@ -322,6 +376,7 @@ private final class ControlledTCPOutbound: @unchecked Sendable, Socks5TCPOutboun
     private(set) var cancelled = false
     private(set) var readRequests = 0
     var autoCompleteWrites = true
+    var eventHandler: ((TCPOutboundEvent) -> Void)?
 
     func waitUntilReady(completionHandler: @escaping @Sendable (Result<Void, Error>) -> Void) {
         readyHandlers.append(completionHandler)
@@ -364,6 +419,10 @@ private final class ControlledTCPOutbound: @unchecked Sendable, Socks5TCPOutboun
         for handler in handlers {
             handler(.failure(error))
         }
+    }
+
+    func emit(_ event: TCPOutboundEvent) {
+        eventHandler?(event)
     }
 
     func queueRead(_ data: Data?, error: Error? = nil) {

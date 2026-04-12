@@ -253,6 +253,7 @@ Important fields in `TunnelProfile`:
 - `tunnelRemoteAddress`
 - `mtu`
 - `ipv6Enabled`
+- `tcpMultipathHandoverEnabled`
 - `dnsServers`
 - `engineSocksPort`
 - `engineLogLevel`
@@ -281,6 +282,9 @@ Keep this off for normal product reads and enable it only when you intentionally
 `liveTapEnabled` only has effect when `telemetryEnabled` is also `true`.
 The default live tap stays lean even when detector telemetry is richer.
 It does not mean every sparse detector record kind is surfaced to the app.
+
+`tcpMultipathHandoverEnabled = true` opts outbound TCP connects into `NWParameters.MultipathServiceType.handover`.
+It is disabled by default so multipath stays an explicit host-app policy choice.
 
 Current default split:
 
