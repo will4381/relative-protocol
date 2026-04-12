@@ -382,7 +382,7 @@ private final class ControlledTCPOutbound: @unchecked Sendable, Socks5TCPOutboun
     }
 }
 
-private final class FakeProvider: Socks5FullConnectionProvider {
+private final class FakeProvider: Socks5FullConnectionProvider, @unchecked Sendable {
     private let outbound: ControlledTCPOutbound
 
     init(outbound: ControlledTCPOutbound) {

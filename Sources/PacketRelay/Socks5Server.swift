@@ -653,8 +653,9 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
 final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession {
     private let connection: NWConnection
     private let logger: StructuredLogger
-    private var readHandler: (@Sendable ([Data]?, Error?) -> Void)?
+    private var readHandler: (@Sendable (Data?, Error?) -> Void)?
     private var isCancelled = false
+    var eventHandler: ((Socks5UDPSessionEvent) -> Void)?
 
     /// - Parameters:
     ///   - connection: Outbound UDP connection.
@@ -672,20 +673,35 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
         connection.viabilityUpdateHandler = { [weak self] isViable in
             self?.handleViabilityUpdate(isViable)
         }
+        connection.betterPathUpdateHandler = { [weak self] betterPathAvailable in
+            self?.handleBetterPathUpdate(betterPathAvailable)
+        }
         // Docs: https://developer.apple.com/documentation/network/nwconnection/start(queue:)
         connection.start(queue: queue)
     }
 
-    func setReadHandler(_ handler: @escaping @Sendable ([Data]?, Error?) -> Void, maxDatagrams: Int) {
-        _ = maxDatagrams
+    func setReadHandler(_ handler: @escaping @Sendable (Data?, Error?) -> Void) {
         readHandler = handler
         receiveNext()
     }
 
     func writeDatagram(_ datagram: Data, completionHandler: @escaping @Sendable (Error?) -> Void) {
+        let maximumDatagramSize = connection.maximumDatagramSize
+        if maximumDatagramSize > 0, datagram.count > maximumDatagramSize {
+            completionHandler(
+                Socks5OutboundError.failed(
+                    "UDP datagram exceeds maximumDatagramSize (\(maximumDatagramSize))"
+                )
+            )
+            return
+        }
         connection.send(content: datagram, completion: .contentProcessed { error in
             completionHandler(error)
         })
+    }
+
+    func restart() {
+        connection.restart()
     }
 
     func cancel() {
@@ -695,7 +711,10 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
 
     private func handleState(_ state: NWConnection.State) {
         switch state {
+        case .ready:
+            eventHandler?(.ready)
         case .waiting(let error):
+            eventHandler?(.waiting)
             Task {
                 await logger.log(
                     level: .warning,
@@ -709,6 +728,7 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
                 )
             }
         case .failed(let error):
+            eventHandler?(.failed)
             Task {
                 await logger.log(
                     level: .error,
@@ -742,6 +762,7 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
     }
 
     private func handleViabilityUpdate(_ isViable: Bool) {
+        eventHandler?(.viabilityChanged(isViable))
         Task {
             await logger.log(
                 level: .debug,
@@ -756,6 +777,25 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
         }
     }
 
+    private func handleBetterPathUpdate(_ betterPathAvailable: Bool) {
+        guard betterPathAvailable else {
+            return
+        }
+        eventHandler?(.betterPathAvailable)
+        Task {
+            await logger.log(
+                level: .debug,
+                phase: .path,
+                category: .relayUDP,
+                component: "NWConnectionUDPSessionAdapter",
+                event: "better-path-available",
+                result: "preferred-path",
+                message: "Outbound UDP has a better path available",
+                metadata: ["path": pathSummary(connection.currentPath)]
+            )
+        }
+    }
+
     private func receiveNext() {
         guard !isCancelled else { return }
         connection.receiveMessage { [weak self] data, _, _, error in
@@ -765,7 +805,7 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
                 return
             }
             if let data {
-                self.readHandler?([data], nil)
+                self.readHandler?(data, nil)
             }
             self.receiveNext()
         }
@@ -773,7 +813,7 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
 }
 
 /// Provider adapter that always uses Network.framework egress on supported deployment targets.
-final class PacketTunnelProviderAdapter: Socks5FullConnectionProvider {
+final class PacketTunnelProviderAdapter: @unchecked Sendable, Socks5FullConnectionProvider {
     private let provider: NEPacketTunnelProvider
     private let queue: DispatchQueue
     private let logger: StructuredLogger
@@ -837,6 +877,7 @@ final class PacketTunnelProviderAdapter: Socks5FullConnectionProvider {
 
     private func makeSingleNWConnection(host: String, port: Network.NWEndpoint.Port, enableTLS: Bool) -> Socks5TCPOutbound {
         let parameters = enableTLS ? NWParameters.tls : NWParameters.tcp
+        parameters.multipathServiceType = .handover
         if #available(iOS 18.0, macOS 15.0, *) {
             // Docs: https://developer.apple.com/documentation/networkextension/nepackettunnelprovider
             if let virtualInterface = provider.virtualInterface {
@@ -891,7 +932,7 @@ private final class InvalidEndpointTCPOutbound: @unchecked Sendable, Socks5TCPOu
     func cancel() {}
 }
 
-private final class InvalidEndpointUDPSession: Socks5UDPSession {
+private final class InvalidEndpointUDPSession: @unchecked Sendable, Socks5UDPSession {
     private let logger: StructuredLogger
     private let hostname: String
     private let port: String
@@ -902,8 +943,9 @@ private final class InvalidEndpointUDPSession: Socks5UDPSession {
         self.port = port
     }
 
-    func setReadHandler(_ handler: @escaping @Sendable ([Data]?, Error?) -> Void, maxDatagrams: Int) {
-        _ = maxDatagrams
+    var eventHandler: ((Socks5UDPSessionEvent) -> Void)?
+
+    func setReadHandler(_ handler: @escaping @Sendable (Data?, Error?) -> Void) {
         let logger = logger
         let hostname = hostname
         let port = port
@@ -927,6 +969,8 @@ private final class InvalidEndpointUDPSession: Socks5UDPSession {
         completionHandler(Socks5OutboundError.failed("Invalid UDP endpoint \(hostname):\(port)"))
     }
 
+    func restart() {}
+
     func cancel() {}
 }
 
@@ -938,9 +982,11 @@ public enum Socks5ServerError: Error {
 /// Queue ownership: listener state and `connections` map are mutated on `queue`.
 public final class Socks5Server: @unchecked Sendable {
     private let logger: StructuredLogger
-    private let provider: Socks5FullConnectionProvider
     private let queue: DispatchQueue
     private let mtu: Int
+    private let makeConnectionQueue: @Sendable () -> DispatchQueue
+    private let providerFactory: @Sendable (DispatchQueue) -> Socks5FullConnectionProvider
+    private let queueSpecificKey = DispatchSpecificKey<UInt8>()
 
     private var listener: NWListener?
     private var connections: [ObjectIdentifier: Socks5Connection] = [:]
@@ -951,10 +997,27 @@ public final class Socks5Server: @unchecked Sendable {
     ///   - mtu: MTU hint forwarded to UDP relay handlers.
     ///   - logger: Structured logger for server lifecycle and failures.
     init(provider: Socks5FullConnectionProvider, queue: DispatchQueue, mtu: Int, logger: StructuredLogger) {
-        self.provider = provider
+        self.providerFactory = { _ in provider }
+        self.makeConnectionQueue = { queue }
         self.queue = queue
         self.mtu = mtu
         self.logger = logger
+        self.queue.setSpecific(key: queueSpecificKey, value: 1)
+    }
+
+    private init(
+        queue: DispatchQueue,
+        mtu: Int,
+        logger: StructuredLogger,
+        makeConnectionQueue: @escaping @Sendable () -> DispatchQueue,
+        providerFactory: @escaping @Sendable (DispatchQueue) -> Socks5FullConnectionProvider
+    ) {
+        self.queue = queue
+        self.mtu = mtu
+        self.logger = logger
+        self.makeConnectionQueue = makeConnectionQueue
+        self.providerFactory = providerFactory
+        self.queue.setSpecific(key: queueSpecificKey, value: 1)
     }
 
     /// Convenience initializer that binds server egress to `NEPacketTunnelProvider`.
@@ -964,7 +1027,18 @@ public final class Socks5Server: @unchecked Sendable {
     ///   - mtu: MTU hint used by UDP relay.
     ///   - logger: Structured logger.
     public convenience init(provider: NEPacketTunnelProvider, queue: DispatchQueue, mtu: Int, logger: StructuredLogger) {
-        self.init(provider: PacketTunnelProviderAdapter(provider: provider, queue: queue, logger: logger), queue: queue, mtu: mtu, logger: logger)
+        let connectionQueueLabelPrefix = queue.label.isEmpty ? "com.vpnbridge.tunnel.relay.session" : "\(queue.label).session"
+        self.init(
+            queue: queue,
+            mtu: mtu,
+            logger: logger,
+            makeConnectionQueue: {
+                DispatchQueue(label: "\(connectionQueueLabelPrefix).\(UUID().uuidString)", qos: .userInitiated)
+            },
+            providerFactory: { connectionQueue in
+                PacketTunnelProviderAdapter(provider: provider, queue: connectionQueue, logger: logger)
+            }
+        )
     }
 
     /// Starts SOCKS5 listening on loopback.
@@ -978,10 +1052,12 @@ public final class Socks5Server: @unchecked Sendable {
 
     /// Stops listener and all active SOCKS sessions.
     public func stop() {
-        listener?.cancel()
-        listener = nil
-        connections.values.forEach { $0.stop() }
-        connections.removeAll()
+        performOnQueue {
+            self.listener?.cancel()
+            self.listener = nil
+            self.connections.values.forEach { $0.stop() }
+            self.connections.removeAll()
+        }
     }
 
     private func startListener(port: UInt16, remainingAttempts: Int, completion: @escaping @Sendable (Result<UInt16, Error>) -> Void) {
@@ -1068,15 +1144,18 @@ public final class Socks5Server: @unchecked Sendable {
 
         listener.newConnectionHandler = { [weak self] connection in
             guard let self else { return }
+            let connectionQueue = self.makeConnectionQueue()
             let session = Socks5Connection(
                 connection: SocksInboundNWConnectionAdapter(connection),
-                provider: self.provider,
-                queue: self.queue,
+                provider: self.providerFactory(connectionQueue),
+                queue: connectionQueue,
                 mtu: self.mtu,
                 logger: self.logger
             )
             session.onClose = { [weak self] in
-                self?.connections.removeValue(forKey: ObjectIdentifier(connection))
+                self?.performOnQueue {
+                    self?.connections.removeValue(forKey: ObjectIdentifier(connection))
+                }
             }
             self.connections[ObjectIdentifier(connection)] = session
             session.start()
@@ -1096,6 +1175,14 @@ public final class Socks5Server: @unchecked Sendable {
             return code == .EADDRINUSE
         default:
             return false
+        }
+    }
+
+    private func performOnQueue(_ work: @escaping () -> Void) {
+        if DispatchQueue.getSpecific(key: queueSpecificKey) != nil {
+            work()
+        } else {
+            queue.sync(execute: work)
         }
     }
 }

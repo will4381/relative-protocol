@@ -136,6 +136,149 @@ final class Socks5UDPRelayTests: XCTestCase {
         wait(for: [sessionCreated], timeout: 1.0)
     }
 
+    func testUDPRelayEvictsSessionAfterWriteFailure() throws {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.udp.write-failure")
+        let provider = FakeUDPProvider()
+        let relay = try Socks5UDPRelay(
+            provider: provider,
+            queue: queue,
+            mtu: 1_500,
+            logger: StructuredLogger(sink: InMemoryLogSink())
+        )
+        relay.start()
+        defer {
+            relay.stop()
+        }
+
+        let clientSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        XCTAssertGreaterThanOrEqual(clientSocket, 0)
+        defer { close(clientSocket) }
+
+        let firstCreated = expectation(description: "first udp session created")
+        let secondCreated = expectation(description: "second udp session created")
+        provider.onCreate = { session in
+            if provider.sessions.count == 1 {
+                session.failNextWrite = true
+                firstCreated.fulfill()
+            } else if provider.sessions.count == 2 {
+                secondCreated.fulfill()
+            }
+        }
+
+        try sendClientDatagram(
+            socketFD: clientSocket,
+            relayPort: relay.port,
+            destinationAddress: .ipv4("1.1.1.1"),
+            destinationPort: 53
+        )
+
+        wait(for: [firstCreated], timeout: 1.0)
+        XCTAssertEqual(relay.activeSessionCount, 0)
+        let firstSession = try XCTUnwrap(provider.sessions.first)
+        XCTAssertTrue(firstSession.cancelled)
+
+        try sendClientDatagram(
+            socketFD: clientSocket,
+            relayPort: relay.port,
+            destinationAddress: .ipv4("1.1.1.1"),
+            destinationPort: 53
+        )
+
+        wait(for: [secondCreated], timeout: 1.0)
+        XCTAssertEqual(relay.activeSessionCount, 1)
+    }
+
+    func testUDPRelayMarksBetterPathSessionForReplacement() throws {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.udp.better-path")
+        let provider = FakeUDPProvider()
+        let relay = try Socks5UDPRelay(
+            provider: provider,
+            queue: queue,
+            mtu: 1_500,
+            logger: StructuredLogger(sink: InMemoryLogSink())
+        )
+        relay.start()
+        defer {
+            relay.stop()
+        }
+
+        let clientSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        XCTAssertGreaterThanOrEqual(clientSocket, 0)
+        defer { close(clientSocket) }
+
+        let firstCreated = expectation(description: "first udp session created")
+        let secondCreated = expectation(description: "second udp session created after path change")
+        provider.onCreate = { _ in
+            if provider.sessions.count == 1 {
+                firstCreated.fulfill()
+            } else if provider.sessions.count == 2 {
+                secondCreated.fulfill()
+            }
+        }
+
+        try sendClientDatagram(
+            socketFD: clientSocket,
+            relayPort: relay.port,
+            destinationAddress: .ipv4("1.1.1.1"),
+            destinationPort: 53
+        )
+        wait(for: [firstCreated], timeout: 1.0)
+
+        let firstSession = try XCTUnwrap(provider.sessions.first)
+        queue.sync {
+            firstSession.eventHandler?(.betterPathAvailable)
+        }
+
+        try sendClientDatagram(
+            socketFD: clientSocket,
+            relayPort: relay.port,
+            destinationAddress: .ipv4("1.1.1.1"),
+            destinationPort: 53
+        )
+        wait(for: [secondCreated], timeout: 1.0)
+
+        XCTAssertTrue(firstSession.cancelled)
+        XCTAssertEqual(relay.activeSessionCount, 1)
+    }
+
+    func testUDPRelayRestartsSessionWhenWaiting() throws {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.udp.waiting")
+        let provider = FakeUDPProvider()
+        let relay = try Socks5UDPRelay(
+            provider: provider,
+            queue: queue,
+            mtu: 1_500,
+            logger: StructuredLogger(sink: InMemoryLogSink())
+        )
+        relay.start()
+        defer {
+            relay.stop()
+        }
+
+        let clientSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        XCTAssertGreaterThanOrEqual(clientSocket, 0)
+        defer { close(clientSocket) }
+
+        let created = expectation(description: "udp session created")
+        provider.onCreate = { _ in created.fulfill() }
+
+        try sendClientDatagram(
+            socketFD: clientSocket,
+            relayPort: relay.port,
+            destinationAddress: .ipv4("1.1.1.1"),
+            destinationPort: 53
+        )
+        wait(for: [created], timeout: 1.0)
+
+        let session = try XCTUnwrap(provider.sessions.first)
+        queue.sync {
+            session.eventHandler?(.waiting)
+        }
+
+        XCTAssertEqual(session.restartCount, 1)
+        XCTAssertEqual(relay.activeSessionCount, 1)
+    }
+
     private func sendClientDatagram(
         socketFD: Int32,
         relayPort: UInt16,
@@ -184,7 +327,7 @@ private final class TestClock: @unchecked Sendable {
     }
 }
 
-private final class FakeUDPProvider: Socks5ConnectionProvider {
+private final class FakeUDPProvider: Socks5ConnectionProvider, @unchecked Sendable {
     private(set) var sessions: [FakeUDPSession] = []
     var onCreate: ((FakeUDPSession) -> Void)?
 
@@ -196,19 +339,35 @@ private final class FakeUDPProvider: Socks5ConnectionProvider {
     }
 }
 
-private final class FakeUDPSession: Socks5UDPSession {
-    private var readHandler: (([Data]?, Error?) -> Void)?
+private final class FakeUDPSession: Socks5UDPSession, @unchecked Sendable {
+    private var readHandler: ((Data?, Error?) -> Void)?
     private(set) var cancelled = false
+    private(set) var restartCount = 0
+    var failNextWrite = false
+    var eventHandler: ((Socks5UDPSessionEvent) -> Void)?
 
-    func setReadHandler(_ handler: @escaping ([Data]?, Error?) -> Void, maxDatagrams _: Int) {
+    func setReadHandler(_ handler: @escaping (Data?, Error?) -> Void) {
         readHandler = handler
     }
 
     func writeDatagram(_: Data, completionHandler: @escaping (Error?) -> Void) {
+        if failNextWrite {
+            failNextWrite = false
+            completionHandler(TestUDPError.writeFailed)
+            return
+        }
         completionHandler(nil)
+    }
+
+    func restart() {
+        restartCount += 1
     }
 
     func cancel() {
         cancelled = true
     }
+}
+
+private enum TestUDPError: LocalizedError {
+    case writeFailed
 }

@@ -12,14 +12,24 @@ protocol Socks5UDPRelayProtocol: AnyObject {
 }
 
 /// UDP session abstraction used by SOCKS relay to support Network/NetworkExtension backends.
-protocol Socks5UDPSession: AnyObject {
-    func setReadHandler(_ handler: @escaping @Sendable ([Data]?, Error?) -> Void, maxDatagrams: Int)
+protocol Socks5UDPSession: AnyObject, Sendable {
+    var eventHandler: ((Socks5UDPSessionEvent) -> Void)? { get set }
+    func setReadHandler(_ handler: @escaping @Sendable (Data?, Error?) -> Void)
     func writeDatagram(_ datagram: Data, completionHandler: @escaping @Sendable (Error?) -> Void)
+    func restart()
     func cancel()
 }
 
+enum Socks5UDPSessionEvent: Sendable {
+    case ready
+    case waiting
+    case failed
+    case viabilityChanged(Bool)
+    case betterPathAvailable
+}
+
 /// Factory interface used by relay to create outbound UDP sessions.
-protocol Socks5ConnectionProvider: AnyObject {
+protocol Socks5ConnectionProvider: AnyObject, Sendable {
     // Docs: https://developer.apple.com/documentation/networkextension/nwhostendpoint
     func makeUDPSession(to endpoint: NWHostEndpoint) -> Socks5UDPSession
 }
@@ -38,10 +48,11 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
         let port: UInt16
     }
 
-    private struct SessionEntry {
+    private struct SessionEntry: Sendable {
         let session: Socks5UDPSession
         var lastUsedAt: Date
         var lastUsedSequence: UInt64
+        var needsReplacement: Bool
     }
 
     private struct SessionUsageStamp {
@@ -188,19 +199,24 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
             reapIdleSessions(now: now)
             let key = SessionKey(address: packet.address, port: packet.port)
             let entry = sessionEntry(for: key, now: now)
+            let session = entry.session
             entry.session.writeDatagram(packet.payload) { [weak self] error in
                 guard let self, let error else { return }
-                let logger = self.logger
-                Task {
-                    await logger.log(
-                        level: .error,
-                        phase: .relay,
-                        category: .relayUDP,
-                        component: "Socks5UDPRelay",
-                        event: "write-failed",
-                        errorCode: String(describing: error),
-                        message: "UDP relay write failed"
-                    )
+                self.performOnQueue {
+                    guard self.isCurrentSession(session, for: key) else { return }
+                    self.removeSession(for: key)
+                    let logger = self.logger
+                    Task {
+                        await logger.log(
+                            level: .error,
+                            phase: .relay,
+                            category: .relayUDP,
+                            component: "Socks5UDPRelay",
+                            event: "write-failed",
+                            errorCode: String(describing: error),
+                            message: "UDP relay write failed"
+                        )
+                    }
                 }
             }
         }
@@ -219,8 +235,12 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
     }
 
     private func sessionEntry(for key: SessionKey, now: Date) -> SessionEntry {
-        if sessions[key] != nil {
+        if let entry = sessions[key], !entry.needsReplacement {
             return markSessionUsed(for: key, at: now)
+        }
+
+        if sessions[key] != nil {
+            removeSession(for: key)
         }
 
         evictOldestSessionIfNeeded()
@@ -236,7 +256,29 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
         // Docs: https://developer.apple.com/documentation/networkextension/nwhostendpoint
         let endpoint = NWHostEndpoint(hostname: hostString, port: String(key.port))
         let session = provider.makeUDPSession(to: endpoint)
-        session.setReadHandler({ [weak self] datagrams, error in
+        session.eventHandler = { [weak self, weak session] event in
+            guard let self, let session else { return }
+            self.performOnQueue {
+                guard self.isCurrentSession(session, for: key) else { return }
+                switch event {
+                case .ready:
+                    self.clearReplacementNeed(for: key)
+                case .waiting:
+                    session.restart()
+                case .failed:
+                    self.removeSession(for: key)
+                case .viabilityChanged(let isViable):
+                    if isViable {
+                        self.clearReplacementNeed(for: key)
+                    } else {
+                        self.markSessionNeedsReplacement(for: key)
+                    }
+                case .betterPathAvailable:
+                    self.markSessionNeedsReplacement(for: key)
+                }
+            }
+        }
+        session.setReadHandler({ [weak self] datagram, error in
             guard let self else { return }
             if let error {
                 self.removeSession(for: key)
@@ -254,18 +296,17 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
                 }
                 return
             }
-            guard let datagrams, !datagrams.isEmpty else { return }
+            guard let datagram else { return }
             _ = self.markSessionUsed(for: key, at: self.nowProvider())
-            for datagram in datagrams {
-                let response = Socks5Codec.buildUDPPacket(address: key.address, port: key.port, payload: datagram)
-                self.sendToClient(response)
-            }
-        }, maxDatagrams: 32)
+            let response = Socks5Codec.buildUDPPacket(address: key.address, port: key.port, payload: datagram)
+            self.sendToClient(response)
+        })
 
         let entry = SessionEntry(
             session: session,
             lastUsedAt: now,
-            lastUsedSequence: nextSessionUsageSequence()
+            lastUsedSequence: nextSessionUsageSequence(),
+            needsReplacement: false
         )
         sessions[key] = entry
         sessionUsageQueue.append(SessionUsageStamp(key: key, sequence: entry.lastUsedSequence))
@@ -315,6 +356,29 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
             return
         }
         entry.session.cancel()
+    }
+
+    private func markSessionNeedsReplacement(for key: SessionKey) {
+        guard var entry = sessions[key] else {
+            return
+        }
+        entry.needsReplacement = true
+        sessions[key] = entry
+    }
+
+    private func clearReplacementNeed(for key: SessionKey) {
+        guard var entry = sessions[key] else {
+            return
+        }
+        entry.needsReplacement = false
+        sessions[key] = entry
+    }
+
+    private func isCurrentSession(_ session: Socks5UDPSession, for key: SessionKey) -> Bool {
+        guard let entry = sessions[key] else {
+            return false
+        }
+        return entry.session === session
     }
 
     private func nextSessionUsageSequence() -> UInt64 {
