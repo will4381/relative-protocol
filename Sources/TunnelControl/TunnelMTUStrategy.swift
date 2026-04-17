@@ -8,7 +8,7 @@ public enum TunnelMTUStrategy: Sendable, Equatable {
     case automaticTunnelOverhead(Int)
 
     /// Compatibility-first default when the host app does not provide an explicit MTU policy.
-    public static let recommendedGeneric = TunnelMTUStrategy.fixed(1_500)
+    public static let recommendedGeneric = TunnelMTUStrategy.fixed(1_280)
     /// Reasonable worst-case overhead for WireGuard-like UDP tunnels over IPv6.
     public static let recommendedWireGuardLikeOverhead = TunnelMTUStrategy.automaticTunnelOverhead(80)
 

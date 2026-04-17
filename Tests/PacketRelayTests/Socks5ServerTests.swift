@@ -292,6 +292,44 @@ final class Socks5ServerTests: XCTestCase {
         XCTAssertTrue(firstAttempt?.cancelled == true)
     }
 
+    func testRetryingTCPOutboundHonorsOverallTimeoutBudget() {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.retry-overall-timeout")
+        let lock = NSLock()
+        var attempts: [ControlledTCPOutbound] = []
+        let failed = expectation(description: "connect fails after overall timeout")
+
+        let outbound = RetryingTCPOutbound(
+            queue: queue,
+            logger: StructuredLogger(sink: InMemoryLogSink()),
+            policy: .init(attemptPreparingTimeout: 0.2, retryBackoff: 0.01, maxAttempts: 3, overallTimeout: 0.05)
+        ) { _ in
+            let attempt = ControlledTCPOutbound()
+            lock.lock()
+            attempts.append(attempt)
+            lock.unlock()
+            return attempt
+        }
+
+        outbound.waitUntilReady { result in
+            switch result {
+            case .success:
+                XCTFail("Expected overall timeout to fail connection")
+            case .failure(let error):
+                XCTAssertEqual(error.localizedDescription, "Outbound connection timed out")
+                failed.fulfill()
+            }
+        }
+
+        wait(for: [failed], timeout: 1.0)
+
+        lock.lock()
+        let snapshot = attempts
+        lock.unlock()
+
+        XCTAssertEqual(snapshot.count, 1)
+        XCTAssertTrue(snapshot.first?.cancelled == true)
+    }
+
     private static let greeting = Data([0x05, 0x01, 0x00])
 
     private static func connectRequest(host: String, port: UInt16) -> Data {
@@ -377,6 +415,7 @@ private final class ControlledTCPOutbound: @unchecked Sendable, Socks5PathAwareT
     private(set) var readRequests = 0
     var autoCompleteWrites = true
     var eventHandler: ((TCPOutboundEvent) -> Void)?
+    var pathSnapshot = "status=unknown uses=unknown"
 
     func waitUntilReady(completionHandler: @escaping @Sendable (Result<Void, Error>) -> Void) {
         readyHandlers.append(completionHandler)

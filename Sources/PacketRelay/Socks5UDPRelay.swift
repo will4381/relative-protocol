@@ -41,6 +41,8 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
         static let maxSessions = 256
         static let idleTimeoutSeconds: TimeInterval = 60
         static let usageQueueCompactionThreshold = 128
+        static let pmtuReplacementThreshold = 3
+        static let pmtuReplacementWindowSeconds: TimeInterval = 5
     }
 
     private struct SessionKey: Hashable, Sendable {
@@ -49,10 +51,19 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
     }
 
     private struct SessionEntry: Sendable {
+        struct PMTUFeedback: Sendable {
+            var latestObservedMaximumDatagramSize: Int?
+            var minimumObservedMaximumDatagramSize: Int?
+            var oversizedDropCount: Int
+            var lastOversizedDropAt: Date?
+            var lastPathSummary: String?
+        }
+
         let session: Socks5UDPSession
         var lastUsedAt: Date
         var lastUsedSequence: UInt64
         var needsReplacement: Bool
+        var pmtuFeedback: PMTUFeedback
     }
 
     private struct SessionUsageStamp {
@@ -204,6 +215,24 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
                 guard let self, let error else { return }
                 self.performOnQueue {
                     guard self.isCurrentSession(session, for: key) else { return }
+                    if let metadata = self.handleDatagramLimitError(error, for: key, at: self.nowProvider()) {
+                        let logger = self.logger
+                        Task {
+                            await logger.log(
+                                level: metadata["replacement_scheduled"] == "true" ? .error : .warning,
+                                phase: .relay,
+                                category: .relayUDP,
+                                component: "Socks5UDPRelay",
+                                event: "write-failed",
+                                errorCode: Socks5UDPDatagramError.datagramTooLargeErrorCode,
+                                message: metadata["replacement_scheduled"] == "true"
+                                    ? "UDP relay repeatedly hit live datagram ceiling; scheduling session replacement"
+                                    : "UDP relay dropped oversized datagram without resetting session",
+                                metadata: metadata
+                            )
+                        }
+                        return
+                    }
                     self.removeSession(for: key)
                     let logger = self.logger
                     Task {
@@ -306,7 +335,14 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
             session: session,
             lastUsedAt: now,
             lastUsedSequence: nextSessionUsageSequence(),
-            needsReplacement: false
+            needsReplacement: false,
+            pmtuFeedback: .init(
+                latestObservedMaximumDatagramSize: nil,
+                minimumObservedMaximumDatagramSize: nil,
+                oversizedDropCount: 0,
+                lastOversizedDropAt: nil,
+                lastPathSummary: nil
+            )
         )
         sessions[key] = entry
         sessionUsageQueue.append(SessionUsageStamp(key: key, sequence: entry.lastUsedSequence))
@@ -356,6 +392,62 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
             return
         }
         entry.session.cancel()
+    }
+
+    private func handleDatagramLimitError(
+        _ error: Error,
+        for key: SessionKey,
+        at now: Date
+    ) -> [String: String]? {
+        guard let error = error as? Socks5UDPDatagramError else {
+            return nil
+        }
+        guard case .exceedsMaximumDatagramSize(let datagramSize, let maximumDatagramSize, let pathSummary) = error,
+              var entry = sessions[key]
+        else {
+            return nil
+        }
+
+        if let lastOversizedDropAt = entry.pmtuFeedback.lastOversizedDropAt,
+           now.timeIntervalSince(lastOversizedDropAt) > SessionPolicy.pmtuReplacementWindowSeconds {
+            entry.pmtuFeedback.oversizedDropCount = 0
+        }
+
+        entry.pmtuFeedback.latestObservedMaximumDatagramSize = maximumDatagramSize
+        if let minimumObservedMaximumDatagramSize = entry.pmtuFeedback.minimumObservedMaximumDatagramSize {
+            entry.pmtuFeedback.minimumObservedMaximumDatagramSize = min(
+                minimumObservedMaximumDatagramSize,
+                maximumDatagramSize
+            )
+        } else {
+            entry.pmtuFeedback.minimumObservedMaximumDatagramSize = maximumDatagramSize
+        }
+        entry.pmtuFeedback.oversizedDropCount += 1
+        entry.pmtuFeedback.lastOversizedDropAt = now
+        entry.pmtuFeedback.lastPathSummary = pathSummary
+
+        let replacementScheduled = entry.pmtuFeedback.oversizedDropCount >= SessionPolicy.pmtuReplacementThreshold
+        if replacementScheduled {
+            entry.needsReplacement = true
+        }
+        sessions[key] = entry
+
+        return [
+            "error_kind": "maximum-datagram-size",
+            "datagram_size": String(datagramSize),
+            "maximum_datagram_size": String(maximumDatagramSize),
+            "latest_observed_maximum_datagram_size": String(
+                entry.pmtuFeedback.latestObservedMaximumDatagramSize ?? maximumDatagramSize
+            ),
+            "minimum_observed_maximum_datagram_size": String(
+                entry.pmtuFeedback.minimumObservedMaximumDatagramSize ?? maximumDatagramSize
+            ),
+            "oversized_drop_count": String(entry.pmtuFeedback.oversizedDropCount),
+            "pmtu_feedback_window_seconds": String(Int(SessionPolicy.pmtuReplacementWindowSeconds)),
+            "replacement_scheduled": replacementScheduled ? "true" : "false",
+            "session_retained": "true",
+            "path": pathSummary,
+        ]
     }
 
     private func markSessionNeedsReplacement(for key: SessionKey) {

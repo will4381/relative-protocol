@@ -15,12 +15,15 @@ It is designed so the tunnel can stay alive and keep detecting while the contain
   - outbound TCP now uses bounded connect attempts with retry for stalled `NWConnection.State.preparing`
   - outbound UDP sessions now restart or rotate on `waiting`, `failed`, write-side failure, and better-path replacement signals
   - outbound TCP better-path handling is now explicit during connect attempts instead of log-only
+  - isolated UDP oversize / PMTU drops no longer tear down the whole relay immediately
+  - `engineSocksPort = 0` now round-trips correctly through provider configuration so the local SOCKS listener can stay ephemeral
 - relay concurrency cleanup
   - per-connection relay work now runs off dedicated queues instead of funneling all flow callbacks through one shared queue
 - explicit network policy surface
   - added `TunnelMTUStrategy` so hosts can choose fixed MTU or automatic `tunnelOverheadBytes`
   - added `TunnelDNSStrategy` for cleartext DNS, DNS-over-TLS, DNS-over-HTTPS, or no DNS override
   - provider-configuration defaults are now explicit package policy instead of hidden hardcoded values
+  - host apps that care about Wi-Fi <-> cellular continuity should now strongly consider enabling `tcpMultipathHandoverEnabled`
 - detector-grade sparse record expansion
   - added `flowSlice` records on a bounded cadence
   - added explicit `flowClose` records
@@ -296,10 +299,11 @@ The default live tap stays lean even when detector telemetry is richer.
 It does not mean every sparse detector record kind is surfaced to the app.
 
 `tcpMultipathHandoverEnabled = true` opts outbound TCP connects into `NWParameters.MultipathServiceType.handover`.
-It is disabled by default so multipath stays an explicit host-app policy choice.
+It is still disabled by default so multipath stays an explicit host-app policy choice, but mobile products that expect Wi-Fi <-> cellular transitions should generally enable it.
+When enabled, Console.app may show benign multipath socket diagnostics such as `Can't get TCP_INFO on a multipath socket`; treat those as framework noise unless they correlate with real relay failures.
 
 `mtuStrategy` controls whether the package installs a fixed interface MTU or lets NetworkExtension derive the interface MTU from `tunnelOverheadBytes`.
-The package default for provider-configuration users is a fixed MTU of `1500`.
+The package default for provider-configuration users is a fixed MTU of `1280`.
 Existing direct `TunnelProfile(...)` callers stay backward-compatible: if you pass only `mtu`, the profile uses `.fixed(mtu)`.
 When you choose `.automaticTunnelOverhead(...)`, the tunnel interface MTU is no longer fixed explicitly. In that mode, `mtu` remains a local buffer hint for relay/runtime code, while NetworkExtension derives the interface MTU from the active physical path.
 
@@ -310,13 +314,19 @@ Existing direct `TunnelProfile(...)` callers stay backward-compatible here too: 
 If you want to preserve the system resolver path, set `dnsStrategy = .noOverride` explicitly. Do not rely on `dnsServers: []` with a missing `dnsStrategy`, because the direct `TunnelProfile(...)` initializer treats that as cleartext DNS configuration over the provided `dnsServers` array.
 When you choose `.tls(...)` or `.https(...)`, provide a real `serverName` or `serverURL` along with resolver IPs so the encrypted DNS policy is fully specified.
 
+`engineSocksPort` controls the local SOCKS listener inside the tunnel process.
+Set `engineSocksPort = 0` if you want the system to choose a free ephemeral port and avoid collisions with stale profiles, parallel test installs, or other local listeners.
+That `0` value now survives `providerConfiguration` decoding instead of being rewritten to the legacy `1080` default.
+
 Recommended host-app policies:
 
-- generic compatibility default: `mtuStrategy = .fixed(1500)`
+- generic compatibility default: `mtuStrategy = .fixed(1280)`
 - protocol-aware UDP tunnel: `mtuStrategy = .automaticTunnelOverhead(80)` when you know your encapsulation overhead
 - full-tunnel DNS with public resolvers: `dnsStrategy = .cleartext(servers: TunnelDNSStrategy.defaultPublicResolvers)`
 - compatibility-first fallback: `dnsStrategy = .cleartext(..., allowFailover: true)` on iOS 26+
 - preserve system DNS: `dnsStrategy = .noOverride`
+- mobility-sensitive app traffic: `tcpMultipathHandoverEnabled = true`
+- collision-resistant local relay: `engineSocksPort = 0`
 
 Example:
 
@@ -324,10 +334,10 @@ Example:
 let profile = TunnelProfile(
     appGroupID: "group.com.example.vpn",
     tunnelRemoteAddress: "127.0.0.1",
-    mtu: 1_500,
-    mtuStrategy: .fixed(1_500),
+    mtu: 1_280,
+    mtuStrategy: .fixed(1_280),
     ipv6Enabled: true,
-    tcpMultipathHandoverEnabled: false,
+    tcpMultipathHandoverEnabled: true,
     ipv4Address: "10.0.0.2",
     ipv4SubnetMask: "255.255.255.0",
     ipv4Router: "10.0.0.1",
@@ -355,33 +365,42 @@ If you upgrade the package, you automatically get:
 - bounded TCP connect timeout and retry
 - UDP session restart and replacement on bad-path signals
 - better-path-aware outbound TCP connect policy
+- isolated UDP PMTU / oversize drops no longer kill the whole UDP relay path
+- correct preservation of `engineSocksPort = 0` when decoding `providerConfiguration`
 
 Network policy defaults do change if your extension relies on `TunnelProfile.from(providerConfiguration:)` with missing keys.
 
 Migration rules:
 
 1. If your app constructs `TunnelProfile(...)` directly and already passes `mtu` and `dnsServers`, behavior stays backward-compatible.
-2. If your extension decodes sparse `providerConfiguration` and relied on package defaults, be explicit now. The package default policy is `mtuStrategy = .fixed(1500)` and `dnsStrategy = .noOverride`.
+2. If your extension decodes sparse `providerConfiguration` and relied on package defaults, be explicit now. The package default policy is `mtuStrategy = .fixed(1280)` and `dnsStrategy = .noOverride`.
 3. If you want the old “always install public cleartext DNS” behavior, set it explicitly with `dnsStrategy = .cleartext(servers: TunnelDNSStrategy.defaultPublicResolvers)` instead of depending on defaults.
 4. If you know your tunnel encapsulation overhead, prefer `mtuStrategy = .automaticTunnelOverhead(...)` instead of guessing fixed MTU values.
-5. Leave `tcpMultipathHandoverEnabled` disabled unless your product has a specific reason to opt into Multipath TCP handover.
+5. If your product needs better continuity across Wi-Fi <-> cellular transitions, enable `tcpMultipathHandoverEnabled = true`. Leave it off only if you intentionally want to avoid Multipath TCP handover.
+6. If you run multiple local profiles, test harnesses, or extension builds on the same device, prefer `engineSocksPort = 0` so the tunnel binds an ephemeral local SOCKS port instead of relying on the legacy fixed `1080` port.
 
 Recommended migration profiles:
 
 - compatibility-first
-  - `mtuStrategy = .fixed(1500)`
+  - `mtuStrategy = .fixed(1280)`
   - `dnsStrategy = .noOverride`
+  - `tcpMultipathHandoverEnabled = true` for mobility-sensitive clients
+  - `engineSocksPort = 0`
 - explicit public-DNS full tunnel
-  - `mtuStrategy = .fixed(1500)`
+  - `mtuStrategy = .fixed(1280)`
   - `dnsStrategy = .cleartext(servers: TunnelDNSStrategy.defaultPublicResolvers)`
+  - `tcpMultipathHandoverEnabled = true` for mobility-sensitive clients
+  - `engineSocksPort = 0`
 - protocol-aware UDP tunnel
   - `mtuStrategy = .automaticTunnelOverhead(80)`
   - choose `dnsStrategy` explicitly instead of inheriting package defaults
+  - `tcpMultipathHandoverEnabled = true` when you expect network transitions during long-lived TCP sessions
+  - `engineSocksPort = 0`
 
 Operational note:
 
 - the package now exposes the DNS/MTU choices as policy, but the right DNS choice is still network-dependent
-- in our own device testing, `1500 + explicit public DNS` performed better than `1500 + noOverride` on at least one real handoff scenario
+- on handoff-sensitive UDP paths, the relay now keeps sessions alive on isolated `maximumDatagramSize` drops and schedules controlled replacement only after repeated oversize failures
 - if your product depends on consistent resolver behavior, encode that policy explicitly in the host app instead of treating defaults as contract
 
 Current default split:
