@@ -138,7 +138,7 @@ public struct TunnelProfile: Sendable, Equatable {
             ipv6PrefixLength: int(providerConfiguration["ipv6PrefixLength"], default: 64),
             dnsServers: dnsStrategy.servers,
             dnsStrategy: dnsStrategy,
-            engineSocksPort: uint16(providerConfiguration["engineSocksPort"], default: 1080),
+            engineSocksPort: uint16AllowingZero(providerConfiguration["engineSocksPort"], default: 1080),
             engineLogLevel: providerConfiguration["engineLogLevel"] as? String ?? "warn",
             telemetryEnabled: bool(providerConfiguration["telemetryEnabled"], default: true),
             liveTapEnabled: bool(providerConfiguration["liveTapEnabled"], default: false),
@@ -174,6 +174,18 @@ public struct TunnelProfile: Sendable, Equatable {
     private static func uint16(_ value: Any?, default defaultValue: UInt16) -> UInt16 {
         let parsed = int(value, default: Int(defaultValue))
         if parsed <= 0 {
+            return defaultValue
+        }
+        return UInt16(clamping: parsed)
+    }
+
+    /// Parses a `UInt16` while preserving zero for callers that explicitly want an ephemeral port.
+    /// - Parameters:
+    ///   - value: Candidate port value.
+    ///   - defaultValue: Fallback port when parsing fails.
+    private static func uint16AllowingZero(_ value: Any?, default defaultValue: UInt16) -> UInt16 {
+        let parsed = int(value, default: Int(defaultValue))
+        if parsed < 0 {
             return defaultValue
         }
         return UInt16(clamping: parsed)

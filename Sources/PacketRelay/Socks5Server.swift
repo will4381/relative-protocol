@@ -105,6 +105,26 @@ private enum Socks5OutboundError: LocalizedError {
     }
 }
 
+enum Socks5UDPDatagramError: LocalizedError, Equatable, Sendable {
+    case exceedsMaximumDatagramSize(datagramSize: Int, maximumDatagramSize: Int, pathSummary: String)
+
+    static let datagramTooLargeErrorCode = "udp-datagram-too-large"
+
+    var errorDescription: String? {
+        switch self {
+        case .exceedsMaximumDatagramSize(let datagramSize, let maximumDatagramSize, _):
+            return "UDP datagram size \(datagramSize) exceeds maximumDatagramSize (\(maximumDatagramSize))"
+        }
+    }
+
+    var errorCode: String {
+        switch self {
+        case .exceedsMaximumDatagramSize:
+            return Self.datagramTooLargeErrorCode
+        }
+    }
+}
+
 struct TCPConnectRetryPolicy: Sendable {
     let attemptPreparingTimeout: TimeInterval
     let retryBackoff: TimeInterval
@@ -112,10 +132,10 @@ struct TCPConnectRetryPolicy: Sendable {
     let overallTimeout: TimeInterval
 
     static let `default` = TCPConnectRetryPolicy(
-        attemptPreparingTimeout: 2.5,
-        retryBackoff: 0.2,
-        maxAttempts: 2,
-        overallTimeout: 5.0
+        attemptPreparingTimeout: 3.0,
+        retryBackoff: 0.1,
+        maxAttempts: 3,
+        overallTimeout: 9.0
     )
 }
 
@@ -153,6 +173,7 @@ enum TCPOutboundEvent: Sendable {
 
 protocol Socks5PathAwareTCPOutbound: Socks5TCPOutbound {
     var eventHandler: ((TCPOutboundEvent) -> Void)? { get set }
+    var pathSnapshot: String { get }
 }
 
 /// `Socks5InboundConnection` adapter for `NWConnection`.
@@ -201,6 +222,7 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
     private var readyHandlers: [(@Sendable (Result<Void, Error>) -> Void)] = []
     private var readyResult: Result<Void, Error>?
     private var didStart = false
+    private var lastKnownPathSummary = "status=unknown uses=unknown"
     var eventHandler: ((TCPOutboundEvent) -> Void)?
 
     /// - Parameters:
@@ -223,6 +245,10 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
         connection.betterPathUpdateHandler = { [weak self] betterPathAvailable in
             self?.handleBetterPathUpdate(betterPathAvailable)
         }
+    }
+
+    var pathSnapshot: String {
+        lastKnownPathSummary
     }
 
     func waitUntilReady(completionHandler: @escaping @Sendable (Result<Void, Error>) -> Void) {
@@ -277,7 +303,7 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
                     component: "NWConnectionTCPAdapter",
                     event: "ready",
                     message: "Outbound TCP ready",
-                    metadata: ["path": pathSummary(connection.currentPath)]
+                    metadata: ["path": lastKnownPathSummary]
                 )
             }
         case .waiting(let error):
@@ -290,7 +316,7 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
                     event: "waiting",
                     errorCode: error.localizedDescription,
                     message: "Outbound TCP waiting",
-                    metadata: ["path": pathSummary(connection.currentPath)]
+                    metadata: ["path": lastKnownPathSummary]
                 )
             }
         case .failed(let error):
@@ -304,7 +330,7 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
                     event: "failed",
                     errorCode: error.localizedDescription,
                     message: "Outbound TCP failed",
-                    metadata: ["path": pathSummary(connection.currentPath)]
+                    metadata: ["path": lastKnownPathSummary]
                 )
             }
         case .cancelled:
@@ -315,6 +341,7 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
     }
 
     private func handlePathUpdate(_ path: Network.NWPath) {
+        lastKnownPathSummary = pathSummary(path)
         Task {
             await logger.log(
                 level: .debug,
@@ -324,7 +351,7 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
                 event: "path-update",
                 result: pathStatusName(path.status),
                 message: "Outbound TCP path updated",
-                metadata: ["path": pathSummary(path)]
+                metadata: ["path": lastKnownPathSummary]
             )
         }
     }
@@ -339,7 +366,7 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
                 event: "viability-update",
                 result: isViable ? "viable" : "not-viable",
                 message: "Outbound TCP viability changed",
-                metadata: ["path": pathSummary(connection.currentPath)]
+                metadata: ["path": lastKnownPathSummary]
             )
         }
     }
@@ -358,7 +385,7 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
                 event: "better-path-available",
                 result: "preferred-path",
                 message: "Outbound TCP has a better path available",
-                metadata: ["path": pathSummary(connection.currentPath)]
+                metadata: ["path": lastKnownPathSummary]
             )
         }
     }
@@ -391,6 +418,7 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
     private var startedAt: Date?
     private var currentAttemptStartedAt: Date?
     private var attemptTimeoutWorkItem: DispatchWorkItem?
+    private var overallTimeoutWorkItem: DispatchWorkItem?
     private var retryWorkItem: DispatchWorkItem?
     private var isCancelled = false
 
@@ -418,6 +446,7 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
             self.readyHandlers.append(completionHandler)
             if self.startedAt == nil {
                 self.startedAt = Date()
+                self.armOverallTimeout()
             }
             if self.currentAttempt == nil, self.retryWorkItem == nil {
                 self.startAttempt(reason: "initial")
@@ -482,17 +511,18 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
         currentAttempt = outbound
         currentAttemptStartedAt = Date()
         log(
-            level: .debug,
-            event: "connect-attempt-started",
-            result: "attempt-\(attemptIndex)",
-            message: "Started outbound TCP connect attempt",
-            extraMetadata: [
-                "attempt_index": String(attemptIndex),
-                "max_attempts": String(policy.maxAttempts),
-                "attempt_timeout_ms": String(durationMilliseconds(policy.attemptPreparingTimeout)),
-                "overall_timeout_ms": String(durationMilliseconds(policy.overallTimeout)),
-                "retry_reason": reason
-            ]
+                level: .debug,
+                event: "connect-attempt-started",
+                result: "attempt-\(attemptIndex)",
+                message: "Started outbound TCP connect attempt",
+                extraMetadata: [
+                    "attempt_index": String(attemptIndex),
+                    "max_attempts": String(policy.maxAttempts),
+                    "attempt_timeout_ms": String(durationMilliseconds(policy.attemptPreparingTimeout)),
+                    "overall_timeout_ms": String(durationMilliseconds(policy.overallTimeout)),
+                    "retry_reason": reason,
+                    "path": outbound.pathSnapshot
+                ]
         )
 
         armAttemptTimeout(attemptIndex: attemptIndex, outbound: outbound)
@@ -531,7 +561,8 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
                     message: "Ignoring better-path signal because the connect attempt is still young",
                     extraMetadata: [
                         "attempt_index": String(attemptIndex),
-                        "minimum_elapsed_ms": String(minimumElapsedMs)
+                        "minimum_elapsed_ms": String(minimumElapsedMs),
+                        "path": outbound.pathSnapshot
                     ]
                 )
                 return
@@ -547,7 +578,8 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
                 message: "Replacing outbound TCP connect attempt because a better path is available",
                 extraMetadata: [
                     "attempt_index": String(attemptIndex),
-                    "minimum_elapsed_ms": String(minimumElapsedMs)
+                    "minimum_elapsed_ms": String(minimumElapsedMs),
+                    "path": outbound.pathSnapshot
                 ]
             )
             outbound.cancel()
@@ -573,7 +605,8 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
                 extraMetadata: [
                     "attempt_index": String(attemptIndex),
                     "max_attempts": String(self.policy.maxAttempts),
-                    "attempt_timeout_ms": String(durationMilliseconds(self.policy.attemptPreparingTimeout))
+                    "attempt_timeout_ms": String(durationMilliseconds(self.policy.attemptPreparingTimeout)),
+                    "path": outbound.pathSnapshot
                 ]
             )
             outbound.cancel()
@@ -582,6 +615,20 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
         }
         attemptTimeoutWorkItem = workItem
         queue.asyncAfter(deadline: .now() + policy.attemptPreparingTimeout, execute: workItem)
+    }
+
+    private func armOverallTimeout() {
+        overallTimeoutWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard self.readyResult == nil, !self.isCancelled else { return }
+
+            self.currentAttempt?.cancel()
+            self.currentAttempt = nil
+            self.exhaustRetries(with: Socks5OutboundError.timedOut, event: "connect-overall-timeout", reason: "overall-timeout")
+        }
+        overallTimeoutWorkItem = workItem
+        queue.asyncAfter(deadline: .now() + policy.overallTimeout, execute: workItem)
     }
 
     private func handleAttemptCompletion(
@@ -613,7 +660,8 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
                 message: "Outbound TCP connect attempt succeeded",
                 extraMetadata: [
                     "attempt_index": String(attemptIndex),
-                    "max_attempts": String(policy.maxAttempts)
+                    "max_attempts": String(policy.maxAttempts),
+                    "path": outbound.pathSnapshot
                 ]
             )
             finishReadyHandlers(with: .success(()))
@@ -627,7 +675,8 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
                 message: "Outbound TCP connect attempt failed",
                 extraMetadata: [
                     "attempt_index": String(attemptIndex),
-                    "max_attempts": String(policy.maxAttempts)
+                    "max_attempts": String(policy.maxAttempts),
+                    "path": outbound.pathSnapshot
                 ]
             )
             scheduleRetry(afterFailure: error, reason: "attempt-failed")
@@ -693,6 +742,8 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
     private func cancelScheduledWork() {
         attemptTimeoutWorkItem?.cancel()
         attemptTimeoutWorkItem = nil
+        overallTimeoutWorkItem?.cancel()
+        overallTimeoutWorkItem = nil
         retryWorkItem?.cancel()
         retryWorkItem = nil
     }
@@ -780,8 +831,10 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
         let maximumDatagramSize = connection.maximumDatagramSize
         if maximumDatagramSize > 0, datagram.count > maximumDatagramSize {
             completionHandler(
-                Socks5OutboundError.failed(
-                    "UDP datagram exceeds maximumDatagramSize (\(maximumDatagramSize))"
+                Socks5UDPDatagramError.exceedsMaximumDatagramSize(
+                    datagramSize: datagram.count,
+                    maximumDatagramSize: maximumDatagramSize,
+                    pathSummary: pathSummary(connection.currentPath)
                 )
             )
             return

@@ -158,7 +158,7 @@ final class Socks5UDPRelayTests: XCTestCase {
         let secondCreated = expectation(description: "second udp session created")
         provider.onCreate = { session in
             if provider.sessions.count == 1 {
-                session.failNextWrite = true
+                session.nextWriteError = TestUDPError.writeFailed
                 firstCreated.fulfill()
             } else if provider.sessions.count == 2 {
                 secondCreated.fulfill()
@@ -187,6 +187,170 @@ final class Socks5UDPRelayTests: XCTestCase {
 
         wait(for: [secondCreated], timeout: 1.0)
         XCTAssertEqual(relay.activeSessionCount, 1)
+    }
+
+    func testUDPRelayRetainsSessionAfterDatagramTooLargeWriteFailure() async throws {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.udp.datagram-too-large")
+        let sink = InMemoryLogSink()
+        let provider = FakeUDPProvider()
+        let relay = try Socks5UDPRelay(
+            provider: provider,
+            queue: queue,
+            mtu: 1_500,
+            logger: StructuredLogger(sink: sink)
+        )
+        relay.start()
+        defer {
+            relay.stop()
+        }
+
+        let clientSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        XCTAssertGreaterThanOrEqual(clientSocket, 0)
+        defer { close(clientSocket) }
+
+        let created = expectation(description: "udp session created")
+        provider.onCreate = { session in
+            if provider.sessions.count == 1 {
+                session.nextWriteError = Socks5UDPDatagramError.exceedsMaximumDatagramSize(
+                    datagramSize: 1_400,
+                    maximumDatagramSize: 1_382,
+                    pathSummary: "status=satisfied uses=cellular"
+                )
+                created.fulfill()
+            }
+        }
+
+        try sendClientDatagram(
+            socketFD: clientSocket,
+            relayPort: relay.port,
+            destinationAddress: .ipv4("1.1.1.1"),
+            destinationPort: 53
+        )
+
+        await fulfillment(of: [created], timeout: 1.0)
+
+        let firstSession = try XCTUnwrap(provider.sessions.first)
+        queue.sync {}
+        XCTAssertEqual(relay.activeSessionCount, 1)
+        XCTAssertFalse(firstSession.cancelled)
+
+        try sendClientDatagram(
+            socketFD: clientSocket,
+            relayPort: relay.port,
+            destinationAddress: .ipv4("1.1.1.1"),
+            destinationPort: 53
+        )
+
+        queue.sync {}
+        XCTAssertEqual(provider.sessions.count, 1)
+        XCTAssertEqual(relay.activeSessionCount, 1)
+
+        let records = try await eventuallyFetchRecords(from: sink) { records in
+            records.contains {
+                $0.component == "Socks5UDPRelay" &&
+                    $0.event == "write-failed" &&
+                    $0.errorCode == "udp-datagram-too-large"
+            }
+        }
+        let record = try XCTUnwrap(records.last(where: { $0.errorCode == "udp-datagram-too-large" }))
+        XCTAssertEqual(record.metadata["datagram_size"], "1400")
+        XCTAssertEqual(record.metadata["maximum_datagram_size"], "1382")
+        XCTAssertEqual(record.metadata["session_retained"], "true")
+    }
+
+    func testUDPRelaySchedulesReplacementAfterRepeatedDatagramTooLargeFailures() async throws {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.udp.datagram-too-large-replacement")
+        let sink = InMemoryLogSink()
+        let provider = FakeUDPProvider()
+        let relay = try Socks5UDPRelay(
+            provider: provider,
+            queue: queue,
+            mtu: 1_500,
+            logger: StructuredLogger(sink: sink)
+        )
+        relay.start()
+        defer {
+            relay.stop()
+        }
+
+        let clientSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        XCTAssertGreaterThanOrEqual(clientSocket, 0)
+        defer { close(clientSocket) }
+
+        let firstCreated = expectation(description: "first udp session created")
+        let secondCreated = expectation(description: "replacement udp session created")
+        provider.onCreate = { session in
+            if provider.sessions.count == 1 {
+                session.writeErrors = [
+                    Socks5UDPDatagramError.exceedsMaximumDatagramSize(
+                        datagramSize: 1_400,
+                        maximumDatagramSize: 1_382,
+                        pathSummary: "status=satisfied uses=cellular"
+                    ),
+                    Socks5UDPDatagramError.exceedsMaximumDatagramSize(
+                        datagramSize: 1_399,
+                        maximumDatagramSize: 1_382,
+                        pathSummary: "status=satisfied uses=cellular"
+                    ),
+                    Socks5UDPDatagramError.exceedsMaximumDatagramSize(
+                        datagramSize: 1_398,
+                        maximumDatagramSize: 1_382,
+                        pathSummary: "status=satisfied uses=cellular"
+                    )
+                ]
+                firstCreated.fulfill()
+            } else if provider.sessions.count == 2 {
+                secondCreated.fulfill()
+            }
+        }
+
+        try sendClientDatagram(
+            socketFD: clientSocket,
+            relayPort: relay.port,
+            destinationAddress: .ipv4("1.1.1.1"),
+            destinationPort: 53
+        )
+        await fulfillment(of: [firstCreated], timeout: 1.0)
+
+        try sendClientDatagram(
+            socketFD: clientSocket,
+            relayPort: relay.port,
+            destinationAddress: .ipv4("1.1.1.1"),
+            destinationPort: 53
+        )
+        try sendClientDatagram(
+            socketFD: clientSocket,
+            relayPort: relay.port,
+            destinationAddress: .ipv4("1.1.1.1"),
+            destinationPort: 53
+        )
+
+        queue.sync {}
+        XCTAssertEqual(relay.activeSessionCount, 1)
+        XCTAssertEqual(provider.sessions.count, 1)
+        XCTAssertFalse(provider.sessions[0].cancelled)
+
+        try sendClientDatagram(
+            socketFD: clientSocket,
+            relayPort: relay.port,
+            destinationAddress: .ipv4("1.1.1.1"),
+            destinationPort: 53
+        )
+
+        await fulfillment(of: [secondCreated], timeout: 1.0)
+        XCTAssertEqual(relay.activeSessionCount, 1)
+        XCTAssertTrue(provider.sessions[0].cancelled)
+
+        let records = try await eventuallyFetchRecords(from: sink) { records in
+            records.contains {
+                $0.component == "Socks5UDPRelay" &&
+                    $0.event == "write-failed" &&
+                    $0.metadata["replacement_scheduled"] == "true"
+            }
+        }
+        let record = try XCTUnwrap(records.last(where: { $0.metadata["replacement_scheduled"] == "true" }))
+        XCTAssertEqual(record.metadata["oversized_drop_count"], "3")
+        XCTAssertEqual(record.metadata["minimum_observed_maximum_datagram_size"], "1382")
     }
 
     func testUDPRelayMarksBetterPathSessionForReplacement() throws {
@@ -344,7 +508,8 @@ private final class FakeUDPSession: Socks5UDPSession, @unchecked Sendable {
     private var readHandler: ((Data?, Error?) -> Void)?
     private(set) var cancelled = false
     private(set) var restartCount = 0
-    var failNextWrite = false
+    var nextWriteError: Error?
+    var writeErrors: [Error] = []
     var eventHandler: ((Socks5UDPSessionEvent) -> Void)?
 
     func setReadHandler(_ handler: @escaping (Data?, Error?) -> Void) {
@@ -352,9 +517,13 @@ private final class FakeUDPSession: Socks5UDPSession, @unchecked Sendable {
     }
 
     func writeDatagram(_: Data, completionHandler: @escaping (Error?) -> Void) {
-        if failNextWrite {
-            failNextWrite = false
-            completionHandler(TestUDPError.writeFailed)
+        if !writeErrors.isEmpty {
+            completionHandler(writeErrors.removeFirst())
+            return
+        }
+        if let nextWriteError {
+            self.nextWriteError = nil
+            completionHandler(nextWriteError)
             return
         }
         completionHandler(nil)
@@ -371,4 +540,18 @@ private final class FakeUDPSession: Socks5UDPSession, @unchecked Sendable {
 
 private enum TestUDPError: LocalizedError {
     case writeFailed
+}
+
+private func eventuallyFetchRecords(
+    from sink: InMemoryLogSink,
+    predicate: @escaping ([LogEnvelope]) -> Bool
+) async throws -> [LogEnvelope] {
+    for _ in 0..<20 {
+        let records = await sink.snapshot()
+        if predicate(records) {
+            return records
+        }
+        try await Task.sleep(for: .milliseconds(25))
+    }
+    return await sink.snapshot()
 }

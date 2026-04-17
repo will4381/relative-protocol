@@ -8,7 +8,7 @@ final class TunnelControlTests: XCTestCase {
     func testTunnelProfileDefaultsUseRecommendedDNSAndMTUStrategy() {
         let profile = TunnelProfile.from(providerConfiguration: [:])
         XCTAssertFalse(profile.tcpMultipathHandoverEnabled)
-        XCTAssertEqual(profile.mtu, 1_500)
+        XCTAssertEqual(profile.mtu, 1_280)
         XCTAssertEqual(profile.mtuStrategy, .recommendedGeneric)
         XCTAssertEqual(profile.dnsStrategy, .recommendedDefault)
     }
@@ -18,6 +18,14 @@ final class TunnelControlTests: XCTestCase {
             "tcpMultipathHandoverEnabled": true
         ])
         XCTAssertTrue(profile.tcpMultipathHandoverEnabled)
+    }
+
+    func testTunnelProfilePreservesEphemeralEngineSocksPort() {
+        let profile = TunnelProfile.from(providerConfiguration: [
+            "engineSocksPort": 0
+        ])
+
+        XCTAssertEqual(profile.engineSocksPort, 0)
     }
 
     func testTunnelProfileParsesAutomaticTunnelOverheadAndHTTPSDNSStrategy() {
