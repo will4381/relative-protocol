@@ -91,6 +91,94 @@ final class TunnelControlTests: XCTestCase {
         XCTAssertEqual(dnsStrategy["matchDomains"] as? [String], ["corp.example"])
     }
 
+    func testTunnelProfileManagerPreservesUnknownProviderConfigurationKeys() throws {
+        let manager = NETunnelProviderManager()
+        let existingProto = NETunnelProviderProtocol()
+        existingProto.providerBundleIdentifier = "com.example.tunnel"
+        existingProto.serverAddress = "127.0.0.1"
+        existingProto.providerConfiguration = [
+            "appGroupID": "group.example",
+            "mtuStrategy": "automaticTunnelOverhead",
+            "tunnelOverheadBytes": 92,
+            "vpnConfigVersion": 4,
+            "hostOwnedFlag": "keep-me"
+        ]
+        manager.protocolConfiguration = existingProto
+
+        let profile = makeProfile(
+            mtu: 1_280,
+            mtuStrategy: .fixed(1_280),
+            dnsStrategy: .cleartext(servers: TunnelDNSStrategy.defaultPublicResolvers),
+            tcpMultipathHandoverEnabled: true
+        )
+
+        TunnelProfileManager.configure(
+            manager: manager,
+            profile: profile,
+            providerBundleIdentifier: "com.example.tunnel",
+            localizedDescription: "Test Tunnel"
+        )
+
+        let proto = try XCTUnwrap(manager.protocolConfiguration as? NETunnelProviderProtocol)
+        let configuration = try XCTUnwrap(proto.providerConfiguration)
+        XCTAssertEqual((configuration["vpnConfigVersion"] as? NSNumber)?.intValue, 4)
+        XCTAssertEqual(configuration["hostOwnedFlag"] as? String, "keep-me")
+        XCTAssertEqual((configuration["mtu"] as? NSNumber)?.intValue, 1_280)
+        XCTAssertEqual(configuration["mtuStrategy"] as? String, "fixed")
+        XCTAssertNil(configuration["tunnelOverheadBytes"])
+    }
+
+    func testTunnelProfileManagerPreservesHostOwnedKeysAcrossRepeatedReconfigure() throws {
+        let manager = NETunnelProviderManager()
+        let existingProto = NETunnelProviderProtocol()
+        existingProto.providerBundleIdentifier = "com.example.tunnel"
+        existingProto.serverAddress = "127.0.0.1"
+        existingProto.providerConfiguration = [
+            "appGroupID": "group.example",
+            "vpnConfigVersion": 4,
+            "hostOwnedFlag": "keep-me"
+        ]
+        manager.protocolConfiguration = existingProto
+
+        TunnelProfileManager.configure(
+            manager: manager,
+            profile: makeProfile(
+                mtu: 1_280,
+                mtuStrategy: .fixed(1_280),
+                dnsStrategy: .cleartext(servers: TunnelDNSStrategy.defaultPublicResolvers),
+                tcpMultipathHandoverEnabled: true
+            ),
+            providerBundleIdentifier: "com.example.tunnel",
+            localizedDescription: "Test Tunnel"
+        )
+
+        TunnelProfileManager.configure(
+            manager: manager,
+            profile: makeProfile(
+                mtu: 1_280,
+                mtuStrategy: .automaticTunnelOverhead(80),
+                dnsStrategy: .tls(
+                    servers: ["1.1.1.1", "1.0.0.1"],
+                    serverName: "one.one.one.one"
+                ),
+                tcpMultipathHandoverEnabled: true
+            ),
+            providerBundleIdentifier: "com.example.tunnel",
+            localizedDescription: "Test Tunnel"
+        )
+
+        let proto = try XCTUnwrap(manager.protocolConfiguration as? NETunnelProviderProtocol)
+        let configuration = try XCTUnwrap(proto.providerConfiguration)
+        XCTAssertEqual((configuration["vpnConfigVersion"] as? NSNumber)?.intValue, 4)
+        XCTAssertEqual(configuration["hostOwnedFlag"] as? String, "keep-me")
+        XCTAssertEqual(configuration["mtuStrategy"] as? String, "automaticTunnelOverhead")
+        XCTAssertEqual((configuration["tunnelOverheadBytes"] as? NSNumber)?.intValue, 80)
+        XCTAssertEqual(configuration["dnsServers"] as? [String], ["1.1.1.1", "1.0.0.1"])
+        let dnsStrategy = try XCTUnwrap(configuration["dnsStrategy"] as? [String: Any])
+        XCTAssertEqual(dnsStrategy["type"] as? String, "tls")
+        XCTAssertEqual(dnsStrategy["serverName"] as? String, "one.one.one.one")
+    }
+
     func testSettingsFactoryUsesFixedMTUAndCleartextDNS() throws {
         let profile = makeProfile(
             appGroupID: "group.example",

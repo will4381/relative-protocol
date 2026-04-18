@@ -3,6 +3,34 @@ import NetworkExtension
 
 /// Host-side helper for creating and updating a tunnel provider profile.
 public enum TunnelProfileManager {
+    private static let managedProviderConfigurationKeys: Set<String> = [
+        "appGroupID",
+        "tunnelRemoteAddress",
+        "mtu",
+        "mtuStrategy",
+        "tunnelOverheadBytes",
+        "ipv6Enabled",
+        "tcpMultipathHandoverEnabled",
+        "ipv4Address",
+        "ipv4SubnetMask",
+        "ipv4Router",
+        "ipv6Address",
+        "ipv6PrefixLength",
+        "dnsServers",
+        "dnsStrategy",
+        "engineSocksPort",
+        "engineLogLevel",
+        "telemetryEnabled",
+        "liveTapEnabled",
+        "liveTapIncludeFlowSlices",
+        "liveTapMaxBytes",
+        "signatureFileName",
+        "relayHost",
+        "relayPort",
+        "relayUDP",
+        "dataplaneConfigJSON"
+    ]
+
     // Docs: https://developer.apple.com/documentation/networkextension/netunnelprovidermanager
     /// Applies `TunnelProfile` values onto a `NETunnelProviderManager`.
     /// - Parameters:
@@ -16,10 +44,12 @@ public enum TunnelProfileManager {
         providerBundleIdentifier: String,
         localizedDescription: String
     ) {
+        let preservedConfiguration = preservedProviderConfiguration(from: manager.protocolConfiguration)
         let proto = NETunnelProviderProtocol()
         proto.providerBundleIdentifier = providerBundleIdentifier
         proto.serverAddress = profile.tunnelRemoteAddress
-        var configuration: [String: Any] = [
+        var configuration = preservedConfiguration
+        let normalizedConfiguration: [String: Any] = [
             "appGroupID": profile.appGroupID,
             "tunnelRemoteAddress": profile.tunnelRemoteAddress,
             "mtu": profile.mtu,
@@ -43,6 +73,9 @@ public enum TunnelProfileManager {
             "relayUDP": profile.relayEndpoint.useUDP,
             "dataplaneConfigJSON": profile.dataplaneConfigJSON
         ]
+        for (key, value) in normalizedConfiguration {
+            configuration[key] = value
+        }
         for (key, value) in profile.mtuStrategy.providerConfiguration {
             configuration[key] = value
         }
@@ -51,5 +84,20 @@ public enum TunnelProfileManager {
         manager.protocolConfiguration = proto
         manager.localizedDescription = localizedDescription
         manager.isEnabled = true
+    }
+
+    private static func preservedProviderConfiguration(
+        from configuration: NEVPNProtocol?
+    ) -> [String: Any] {
+        guard let proto = configuration as? NETunnelProviderProtocol,
+              let providerConfiguration = proto.providerConfiguration else {
+            return [:]
+        }
+
+        return providerConfiguration.reduce(into: [:]) { partialResult, pair in
+            if !managedProviderConfigurationKeys.contains(pair.key) {
+                partialResult[pair.key] = pair.value
+            }
+        }
     }
 }
