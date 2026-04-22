@@ -85,4 +85,75 @@ final class ObservabilityTests: XCTestCase {
         XCTAssertTrue(envelope.renderedForUnifiedLog.contains("errorCode=EHOSTUNREACH"))
         XCTAssertTrue(envelope.renderedForUnifiedLog.contains("metadata={path=wifi}"))
     }
+
+    /// Verifies duplicate high-volume events can be coalesced without losing the suppression count.
+    func testRateLimitedLoggerSuppressesDuplicateEventsWithinWindow() async {
+        let sink = InMemoryLogSink()
+        let logger = StructuredLogger(sink: sink)
+        let firstEmission = Date(timeIntervalSince1970: 100)
+
+        await logger.logRateLimited(
+            key: "relay.udp.waiting.cellular",
+            minimumInterval: 10,
+            now: firstEmission,
+            level: .warning,
+            phase: .relay,
+            category: .relayUDP,
+            component: "NWConnectionUDPSessionAdapter",
+            event: "waiting",
+            errorCode: "Network is down",
+            message: "Outbound UDP waiting",
+            metadata: ["path": "cellular"]
+        )
+        await logger.logRateLimited(
+            key: "relay.udp.waiting.cellular",
+            minimumInterval: 10,
+            now: firstEmission.addingTimeInterval(1),
+            level: .warning,
+            phase: .relay,
+            category: .relayUDP,
+            component: "NWConnectionUDPSessionAdapter",
+            event: "waiting",
+            errorCode: "Network is down",
+            message: "Outbound UDP waiting",
+            metadata: ["path": "cellular"]
+        )
+        await logger.logRateLimited(
+            key: "relay.udp.waiting.cellular",
+            minimumInterval: 10,
+            now: firstEmission.addingTimeInterval(2),
+            level: .warning,
+            phase: .relay,
+            category: .relayUDP,
+            component: "NWConnectionUDPSessionAdapter",
+            event: "waiting",
+            errorCode: "Network is down",
+            message: "Outbound UDP waiting",
+            metadata: ["path": "cellular"]
+        )
+
+        var records = await sink.snapshot()
+        XCTAssertEqual(records.count, 1)
+        XCTAssertNil(records.first?.metadata["suppressed_duplicate_count"])
+
+        await logger.logRateLimited(
+            key: "relay.udp.waiting.cellular",
+            minimumInterval: 10,
+            now: firstEmission.addingTimeInterval(11),
+            level: .warning,
+            phase: .relay,
+            category: .relayUDP,
+            component: "NWConnectionUDPSessionAdapter",
+            event: "waiting",
+            errorCode: "Network is down",
+            message: "Outbound UDP waiting",
+            metadata: ["path": "cellular"]
+        )
+
+        records = await sink.snapshot()
+        XCTAssertEqual(records.count, 2)
+        XCTAssertEqual(records[1].metadata["suppressed_duplicate_count"], "2")
+        XCTAssertEqual(records[1].metadata["rate_limit_window_ms"], "10000")
+        XCTAssertEqual(records[1].metadata["category"], LogCategory.relayUDP.rawValue)
+    }
 }

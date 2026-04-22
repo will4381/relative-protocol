@@ -793,6 +793,8 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
 }
 
 final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession {
+    private static let waitingLogMinimumInterval: TimeInterval = 10
+
     private let connection: NWConnection
     private let logger: StructuredLogger
     private var readHandler: (@Sendable (Data?, Error?) -> Void)?
@@ -860,7 +862,10 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
         case .waiting(let error):
             eventHandler?(.waiting)
             Task {
-                await logger.log(
+                let path = pathSummary(connection.currentPath)
+                await logger.logRateLimited(
+                    key: "NWConnectionUDPSessionAdapter.waiting.\(error.localizedDescription).\(path)",
+                    minimumInterval: Self.waitingLogMinimumInterval,
                     level: .warning,
                     phase: .relay,
                     category: .relayUDP,
@@ -868,7 +873,7 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
                     event: "waiting",
                     errorCode: error.localizedDescription,
                     message: "Outbound UDP waiting",
-                    metadata: ["path": pathSummary(connection.currentPath)]
+                    metadata: ["path": path]
                 )
             }
         case .failed(let error):
