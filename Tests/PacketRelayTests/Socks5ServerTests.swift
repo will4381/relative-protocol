@@ -330,6 +330,61 @@ final class Socks5ServerTests: XCTestCase {
         XCTAssertTrue(snapshot.first?.cancelled == true)
     }
 
+    func testInboundReadFailureIsLoggedBeforeClose() async throws {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.inbound-read-failure")
+        let sink = InMemoryLogSink()
+        let inbound = FakeInboundConnection()
+        let outbound = ControlledTCPOutbound()
+        let provider = FakeProvider(outbound: outbound)
+        let connection = Socks5Connection(
+            connection: inbound,
+            provider: provider,
+            queue: queue,
+            mtu: 1500,
+            logger: StructuredLogger(sink: sink)
+        )
+
+        queue.sync {
+            connection.start()
+            inbound.failReceive(.posix(.ECONNRESET))
+        }
+
+        let records = try await eventuallyFetchRecords(from: sink) { records in
+            records.contains { $0.component == "Socks5Connection" && $0.event == "inbound-read-failed" }
+        }
+        XCTAssertTrue(records.contains { $0.component == "Socks5Connection" && $0.event == "inbound-read-failed" })
+        XCTAssertTrue(inbound.cancelled)
+    }
+
+    func testOutboundReadFailureIsLoggedBeforeClose() async throws {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.outbound-read-failure")
+        let sink = InMemoryLogSink()
+        let inbound = FakeInboundConnection()
+        let outbound = ControlledTCPOutbound()
+        let provider = FakeProvider(outbound: outbound)
+        let connection = Socks5Connection(
+            connection: inbound,
+            provider: provider,
+            queue: queue,
+            mtu: 1500,
+            logger: StructuredLogger(sink: sink)
+        )
+
+        queue.sync {
+            connection.start()
+            inbound.push(Self.greeting)
+            inbound.push(Self.connectRequest(host: "example.com", port: 443))
+            outbound.succeedConnect()
+            outbound.queueRead(nil, error: TestConnectError.refused)
+        }
+
+        let records = try await eventuallyFetchRecords(from: sink) { records in
+            records.contains { $0.component == "Socks5Connection" && $0.event == "outbound-read-failed" }
+        }
+        XCTAssertTrue(records.contains { $0.component == "Socks5Connection" && $0.event == "outbound-read-failed" })
+        XCTAssertTrue(inbound.cancelled)
+    }
+
     private static let greeting = Data([0x05, 0x01, 0x00])
 
     private static func connectRequest(host: String, port: UInt16) -> Data {
@@ -396,6 +451,12 @@ private final class FakeInboundConnection: Socks5InboundConnection {
         XCTAssertFalse(pendingReceives.isEmpty)
         let completion = pendingReceives.removeFirst()
         completion(data, nil, isComplete, error)
+    }
+
+    func failReceive(_ error: NWError) {
+        XCTAssertFalse(pendingReceives.isEmpty)
+        let completion = pendingReceives.removeFirst()
+        completion(nil, nil, false, error)
     }
 
     func completeNextSend(error: NWError? = nil) {
@@ -499,4 +560,18 @@ private final class FakeProvider: Socks5FullConnectionProvider, @unchecked Senda
     func makeUDPSession(to _: NWHostEndpoint) -> any Socks5UDPSession {
         fatalError("UDP not exercised in SOCKS CONNECT tests")
     }
+}
+
+private func eventuallyFetchRecords(
+    from sink: InMemoryLogSink,
+    predicate: @escaping ([LogEnvelope]) -> Bool
+) async throws -> [LogEnvelope] {
+    for _ in 0..<20 {
+        let records = await sink.snapshot()
+        if predicate(records) {
+            return records
+        }
+        try await Task.sleep(for: .milliseconds(25))
+    }
+    return await sink.snapshot()
 }

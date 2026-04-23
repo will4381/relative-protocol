@@ -124,6 +124,15 @@ public actor DataplaneHandle {
         }
         let result = rp_dp_stop(managedHandle.rawHandle)
         guard result == 0 else {
+            await logger.log(
+                level: .error,
+                phase: .relay,
+                category: .dataplane,
+                component: "DataplaneHandle",
+                event: "stop-failed",
+                errorCode: String(result),
+                message: "Failed to stop dataplane"
+            )
             throw DataplaneError.stopFailed(code: result)
         }
     }

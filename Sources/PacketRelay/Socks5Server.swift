@@ -216,6 +216,8 @@ final class SocksInboundNWConnectionAdapter: @unchecked Sendable, Socks5InboundC
 }
 
 final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbound {
+    private static let waitingLogMinimumInterval: TimeInterval = 10
+
     private let connection: NWConnection
     private let queue: DispatchQueue
     private let logger: StructuredLogger
@@ -308,7 +310,10 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
             }
         case .waiting(let error):
             Task {
-                await logger.log(
+                let path = lastKnownPathSummary
+                await logger.logRateLimited(
+                    key: "NWConnectionTCPAdapter.waiting.\(error.localizedDescription).\(path)",
+                    minimumInterval: Self.waitingLogMinimumInterval,
                     level: .warning,
                     phase: .relay,
                     category: .relayTCP,
@@ -316,7 +321,7 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
                     event: "waiting",
                     errorCode: error.localizedDescription,
                     message: "Outbound TCP waiting",
-                    metadata: ["path": lastKnownPathSummary]
+                    metadata: ["path": path]
                 )
             }
         case .failed(let error):
@@ -1246,6 +1251,18 @@ public final class Socks5Server: @unchecked Sendable {
             // Docs: https://developer.apple.com/documentation/network/nwlistener/init(using:on:)
             listener = try NWListener(using: parameters, on: .any)
         } catch {
+            Task {
+                await logger.log(
+                    level: .error,
+                    phase: .relay,
+                    category: .relayTCP,
+                    component: "Socks5Server",
+                    event: "listener-create-failed",
+                    errorCode: String(describing: error),
+                    message: "Failed to create SOCKS5 listener",
+                    metadata: ["port": String(port)]
+                )
+            }
             completion(.failure(error))
             return
         }
@@ -1277,6 +1294,22 @@ public final class Socks5Server: @unchecked Sendable {
                     listener.cancel()
                     self.listener = nil
                     let nextPort = self.pickEphemeralPort()
+                    Task {
+                        await self.logger.log(
+                            level: .warning,
+                            phase: .relay,
+                            category: .relayTCP,
+                            component: "Socks5Server",
+                            event: "listener-port-retry",
+                            errorCode: error.localizedDescription,
+                            message: "SOCKS5 listener port was already in use; retrying on another port",
+                            metadata: [
+                                "failed_port": String(port),
+                                "next_port": String(nextPort),
+                                "remaining_attempts": String(remainingAttempts - 1)
+                            ]
+                        )
+                    }
                     self.startListener(port: nextPort, remainingAttempts: remainingAttempts - 1, completion: completion)
                     return
                 }
@@ -1490,7 +1523,12 @@ final class Socks5Connection: @unchecked Sendable {
                     self.buffer.append(data)
                     self.processBuffer()
                 }
-                if isComplete || error != nil {
+                if let error {
+                    self.logInboundReadFailure(error)
+                    self.stop()
+                    return
+                }
+                if isComplete {
                     self.stop()
                     return
                 }
@@ -1516,7 +1554,14 @@ final class Socks5Connection: @unchecked Sendable {
         case .greeting:
             guard let methods = Socks5Codec.parseGreeting(&buffer) else { return }
             let method: UInt8 = methods.contains(0x00) ? 0x00 : 0xFF
-            connection.send(content: Socks5Codec.buildMethodSelection(method: method), completion: .contentProcessed { _ in })
+            connection.send(content: Socks5Codec.buildMethodSelection(method: method), completion: .contentProcessed { [weak self] error in
+                guard let self, let error else { return }
+                self.runOnQueue {
+                    guard !self.isClosed else { return }
+                    self.logInboundWriteFailure(error, event: "greeting-write-failed", message: "SOCKS5 greeting reply write failed")
+                    self.stop()
+                }
+            })
             if method == 0x00 {
                 state = .request
                 processBuffer()
@@ -1580,11 +1625,25 @@ final class Socks5Connection: @unchecked Sendable {
                     self.state = .tcpProxy(outbound)
                     self.connection.send(
                         content: Socks5Codec.buildReply(code: 0x00, bindAddress: .ipv4("0.0.0.0"), bindPort: 0),
-                        completion: .contentProcessed { _ in }
+                        completion: .contentProcessed { [weak self] error in
+                            guard let self else { return }
+                            self.runOnQueue {
+                                guard !self.isClosed else { return }
+                                if let error {
+                                    self.logInboundWriteFailure(
+                                        error,
+                                        event: "connect-reply-write-failed",
+                                        message: "SOCKS5 connect success reply write failed"
+                                    )
+                                    self.stop()
+                                    return
+                                }
+                                self.armOutboundReadIfNeeded(outbound)
+                                self.processBuffer()
+                                self.armInboundReceiveIfNeeded()
+                            }
+                        }
                     )
-                    self.armOutboundReadIfNeeded(outbound)
-                    self.processBuffer()
-                    self.armInboundReceiveIfNeeded()
                 case .failure(let error):
                     Task {
                         await self.logger.log(
@@ -1623,11 +1682,21 @@ final class Socks5Connection: @unchecked Sendable {
                 if let data, !data.isEmpty {
                     self.forwardToInbound(data, outbound: outbound)
                     return
-                } else if data == nil {
+                } else if let error {
+                    Task {
+                        await self.logger.log(
+                            level: .error,
+                            phase: .relay,
+                            category: .relayTCP,
+                            component: "Socks5Connection",
+                            event: "outbound-read-failed",
+                            errorCode: error.localizedDescription,
+                            message: "SOCKS5 outbound read failed"
+                        )
+                    }
                     self.stop()
                     return
-                }
-                if error != nil {
+                } else if data == nil {
                     self.stop()
                     return
                 }
@@ -1691,6 +1760,34 @@ final class Socks5Connection: @unchecked Sendable {
                 self.armOutboundReadIfNeeded(outbound)
             }
         })
+    }
+
+    private func logInboundReadFailure(_ error: Error) {
+        Task {
+            await logger.log(
+                level: .error,
+                phase: .relay,
+                category: .relayTCP,
+                component: "Socks5Connection",
+                event: "inbound-read-failed",
+                errorCode: error.localizedDescription,
+                message: "SOCKS5 inbound read failed"
+            )
+        }
+    }
+
+    private func logInboundWriteFailure(_ error: Error, event: String, message: String) {
+        Task {
+            await logger.log(
+                level: .error,
+                phase: .relay,
+                category: .relayTCP,
+                component: "Socks5Connection",
+                event: event,
+                errorCode: error.localizedDescription,
+                message: message
+            )
+        }
     }
 
     private func runOnQueue(_ block: @escaping @Sendable () -> Void) {

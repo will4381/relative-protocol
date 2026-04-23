@@ -550,13 +550,23 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
         let nameResult = withUnsafeMutablePointer(to: &actual) {
             getsockname(fd, UnsafeMutableRawPointer($0).assumingMemoryBound(to: sockaddr.self), &actualLen)
         }
-        if nameResult == 0 {
-            port = UInt16(bigEndian: actual.sin_port)
+        guard nameResult == 0 else {
+            let error = POSIXError(.init(rawValue: errno) ?? .EINVAL)
+            close(fd)
+            throw error
         }
+        port = UInt16(bigEndian: actual.sin_port)
 
         let flags = fcntl(fd, F_GETFL, 0)
-        if flags >= 0 {
-            _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+        guard flags >= 0 else {
+            let error = POSIXError(.init(rawValue: errno) ?? .EINVAL)
+            close(fd)
+            throw error
+        }
+        guard fcntl(fd, F_SETFL, flags | O_NONBLOCK) >= 0 else {
+            let error = POSIXError(.init(rawValue: errno) ?? .EINVAL)
+            close(fd)
+            throw error
         }
 
         socketFD = fd
