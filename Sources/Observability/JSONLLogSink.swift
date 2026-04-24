@@ -51,7 +51,7 @@ public struct JSONLDropCounters: Sendable, Equatable {
 public actor JSONLLogSink: LogSink {
     private static var protectionAttributes: [FileAttributeKey: Any] {
 #if os(iOS) || os(tvOS) || os(watchOS) || os(visionOS)
-        [.protectionKey: FileProtectionType.complete]
+        [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication]
 #else
         [:]
 #endif

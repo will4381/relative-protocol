@@ -89,10 +89,18 @@ public struct TunnelProfile: Sendable, Equatable {
         relayEndpoint: RelayEndpoint,
         dataplaneConfigJSON: String
     ) {
+        let requestedMTU = max(256, mtu)
+        let resolvedMTUStrategy = mtuStrategy ?? .fixed(requestedMTU)
+
         self.appGroupID = appGroupID
         self.tunnelRemoteAddress = tunnelRemoteAddress
-        self.mtu = max(256, mtu)
-        self.mtuStrategy = mtuStrategy ?? .fixed(self.mtu)
+        self.mtuStrategy = resolvedMTUStrategy
+        switch resolvedMTUStrategy {
+        case .fixed(let fixedMTU):
+            self.mtu = max(256, fixedMTU)
+        case .automaticTunnelOverhead:
+            self.mtu = max(requestedMTU, resolvedMTUStrategy.bufferMTUHint)
+        }
         self.ipv6Enabled = ipv6Enabled
         self.tcpMultipathHandoverEnabled = tcpMultipathHandoverEnabled
         self.ipv4Address = ipv4Address
@@ -118,10 +126,14 @@ public struct TunnelProfile: Sendable, Equatable {
         let relayHost = providerConfiguration["relayHost"] as? String ?? "127.0.0.1"
         let relayPort = uint16(providerConfiguration["relayPort"], default: 1080)
         let useUDP = providerConfiguration["relayUDP"] as? Bool ?? false
-        let mtuValue = providerConfiguration["mtu"] == nil
-            ? TunnelMTUStrategy.recommendedGeneric.bufferMTUHint
+        let configuredMTU = providerConfiguration["mtu"] == nil
+            ? nil
             : int(providerConfiguration["mtu"], default: TunnelMTUStrategy.recommendedGeneric.bufferMTUHint)
-        let mtuStrategy = mtuStrategy(from: providerConfiguration, legacyMTU: mtuValue)
+        let mtuStrategy = mtuStrategy(
+            from: providerConfiguration,
+            legacyMTU: configuredMTU ?? TunnelMTUStrategy.recommendedGeneric.bufferMTUHint
+        )
+        let mtuValue = configuredMTU ?? mtuStrategy.bufferMTUHint
         let dnsStrategy = dnsStrategy(from: providerConfiguration)
 
         return TunnelProfile(
@@ -148,6 +160,54 @@ public struct TunnelProfile: Sendable, Equatable {
             relayEndpoint: RelayEndpoint(host: relayHost, port: relayPort, useUDP: useUDP),
             dataplaneConfigJSON: providerConfiguration["dataplaneConfigJSON"] as? String ?? "{}"
         )
+    }
+
+    /// Builds a runtime profile for the packet tunnel extension and rejects sparse or hostile configuration.
+    /// Decision: tests and host-side builders may still use `from(providerConfiguration:)` for compatibility/defaults,
+    /// but the extension must fail closed instead of installing full-device routes from an empty dictionary.
+    public static func validatedRuntimeProfile(providerConfiguration: [String: Any]) throws -> TunnelProfile {
+        let profile = from(providerConfiguration: providerConfiguration)
+        var missing: [String] = []
+
+        if string(providerConfiguration["appGroupID"])?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            missing.append("appGroupID")
+        }
+        if string(providerConfiguration["tunnelRemoteAddress"])?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            missing.append("tunnelRemoteAddress")
+        }
+        if string(providerConfiguration["ipv4Address"])?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            missing.append("ipv4Address")
+        }
+        if string(providerConfiguration["ipv4SubnetMask"])?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            missing.append("ipv4SubnetMask")
+        }
+        if string(providerConfiguration["ipv4Router"])?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            missing.append("ipv4Router")
+        }
+        if providerConfiguration["engineSocksPort"] == nil {
+            missing.append("engineSocksPort")
+        }
+        if providerConfiguration["relayHost"] == nil {
+            missing.append("relayHost")
+        }
+        if providerConfiguration["relayPort"] == nil {
+            missing.append("relayPort")
+        }
+
+        guard missing.isEmpty else {
+            throw TunnelProfileValidationError.missingRequiredKeys(missing.sorted())
+        }
+        guard profile.mtu >= 1_280 else {
+            throw TunnelProfileValidationError.invalidValue(key: "mtu", reason: "must be at least 1280")
+        }
+        guard profile.ipv6PrefixLength > 0, profile.ipv6PrefixLength <= 128 else {
+            throw TunnelProfileValidationError.invalidValue(key: "ipv6PrefixLength", reason: "must be in 1...128")
+        }
+        guard profile.relayEndpoint.port > 0 else {
+            throw TunnelProfileValidationError.invalidValue(key: "relayPort", reason: "must be greater than zero")
+        }
+        try validateDataplaneConfig(profile.dataplaneConfigJSON)
+        return profile
     }
 
     /// Parses an integer-like value from `Any`.
@@ -304,6 +364,45 @@ public struct TunnelProfile: Sendable, Equatable {
                 matchDomainsNoSearch: bool(rawStrategy["matchDomainsNoSearch"], default: false),
                 allowFailover: bool(rawStrategy["allowFailover"], default: false)
             )
+        }
+    }
+
+    private static func validateDataplaneConfig(_ config: String) throws {
+        let trimmed = config.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != "{}" else {
+            return
+        }
+
+        let lower = trimmed.lowercased()
+        let blockedTokens = [
+            "pid-file",
+            "post-up-script",
+            "pre-down-script",
+            "daemon"
+        ]
+        if let token = blockedTokens.first(where: { lower.contains($0) }) {
+            throw TunnelProfileValidationError.unsafeDataplaneConfig(token)
+        }
+
+        if lower.contains("log-file:") && !lower.contains("log-file: stderr") && !lower.contains("log-file:'stderr'") && !lower.contains("log-file: 'stderr'") {
+            throw TunnelProfileValidationError.unsafeDataplaneConfig("log-file")
+        }
+    }
+}
+
+public enum TunnelProfileValidationError: LocalizedError, Equatable, Sendable {
+    case missingRequiredKeys([String])
+    case invalidValue(key: String, reason: String)
+    case unsafeDataplaneConfig(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .missingRequiredKeys(let keys):
+            return "Tunnel provider configuration is missing required keys: \(keys.joined(separator: ", "))."
+        case .invalidValue(let key, let reason):
+            return "Tunnel provider configuration value '\(key)' is invalid: \(reason)."
+        case .unsafeDataplaneConfig(let token):
+            return "Tunnel dataplane configuration contains unsupported production token '\(token)'."
         }
     }
 }

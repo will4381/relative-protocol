@@ -9,6 +9,8 @@ public enum TunnelMTUStrategy: Sendable, Equatable {
 
     /// Compatibility-first default when the host app does not provide an explicit MTU policy.
     public static let recommendedGeneric = TunnelMTUStrategy.fixed(1_280)
+    /// Internal packet buffer ceiling used when NetworkExtension derives the interface MTU.
+    public static let automaticBufferMTUHint = 1_500
     /// Reasonable worst-case overhead for WireGuard-like UDP tunnels over IPv6.
     public static let recommendedWireGuardLikeOverhead = TunnelMTUStrategy.automaticTunnelOverhead(80)
 
@@ -18,7 +20,7 @@ public enum TunnelMTUStrategy: Sendable, Equatable {
         case .fixed(let mtu):
             return max(256, mtu)
         case .automaticTunnelOverhead:
-            return TunnelMTUStrategy.recommendedGeneric.bufferMTUHint
+            return TunnelMTUStrategy.automaticBufferMTUHint
         }
     }
 

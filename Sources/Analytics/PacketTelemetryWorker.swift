@@ -6,8 +6,15 @@ import TunnelRuntime
 /// Decision: one worker task is cheaper than spawning a `Task` for every packet batch on the provider hot path.
 public final class PacketTelemetryWorker: @unchecked Sendable {
     private enum QueuePolicy {
-        static let maxQueuedBatches = 2
-        static let maxQueuedBytes = 256 * 1024
+        static let maxQueuedBatches = 512
+        static let maxQueuedBytes = 4 * 1024 * 1024
+        static let payloadOnlyQueuedBatches = 384
+        static let payloadOnlyQueuedBytes = 3 * 1024 * 1024
+    }
+
+    private enum TrackingMode {
+        case full
+        case payloadOnlyUnderPressure
     }
 
     private enum DetailPolicy {
@@ -41,6 +48,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
 
     private enum DetectionPolicy {
         static let maxRecentEvents = 96
+        static let maxCountedTargets = 256
     }
 
     private final class CommandSignal: @unchecked Sendable {
@@ -321,40 +329,41 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
     /// Enqueues one raw packet batch for telemetry processing.
     /// Decision: the worker performs one cheap, synchronous packet-summary pass here so batches that contain only
     /// uninteresting traffic (for example, pure TCP ACKs) never enter the async telemetry pipeline at all. The worker
-    /// also does a cheap queue-state admission check before parsing so shed mode avoids unnecessary hot-thread work.
+    /// also switches to payload-only tracking under pressure so short TCP lifecycle bursts do not crowd out useful
+    /// packet diagnostics.
     /// Queue byte admission happens after prefiltering so dropped-batch accounting reflects post-filter telemetry cost.
     public func submit(packets: [Data], families: [Int32], direction: PacketDirection) -> SubmitResult {
-        let initialDecision: SubmitResult? = state.withLock { state in
+        let initialDecision: (SubmitResult?, TrackingMode) = state.withLock { state in
             guard !state.isStopped else {
-                return SubmitResult(
-                    accepted: false,
-                    skipped: false,
-                    shouldLogSheddingStart: false,
-                    queuedBatches: state.queuedBatches,
-                    queuedBytes: state.queuedBytes,
-                    droppedBatches: state.droppedBatches
+                return (
+                    SubmitResult(
+                        accepted: false,
+                        skipped: false,
+                        shouldLogSheddingStart: false,
+                        queuedBatches: state.queuedBatches,
+                        queuedBytes: state.queuedBytes,
+                        droppedBatches: state.droppedBatches
+                    ),
+                    .payloadOnlyUnderPressure
                 )
             }
-            if state.queuedBatches >= QueuePolicy.maxQueuedBatches {
-                state.droppedBatches += 1
-                let shouldLogSheddingStart = !state.hasEnteredShedMode
-                state.hasEnteredShedMode = true
-                return SubmitResult(
-                    accepted: false,
-                    skipped: false,
-                    shouldLogSheddingStart: shouldLogSheddingStart,
-                    queuedBatches: state.queuedBatches,
-                    queuedBytes: state.queuedBytes,
-                    droppedBatches: state.droppedBatches
-                )
-            }
-            return nil
+
+            let trackingMode: TrackingMode =
+                state.queuedBatches >= QueuePolicy.payloadOnlyQueuedBatches ||
+                state.queuedBytes >= QueuePolicy.payloadOnlyQueuedBytes
+                ? .payloadOnlyUnderPressure
+                : .full
+
+            return (
+                nil,
+                trackingMode
+            )
         }
-        if let initialDecision {
+        if let initialDecision = initialDecision.0 {
             return initialDecision
         }
 
-        let filtered = Self.prefilter(packets: packets, families: families)
+        let filtered = Self.prefilter(packets: packets, families: families, trackingMode: initialDecision.1)
 
         return state.withLock { state in
             guard !state.isStopped else {
@@ -493,7 +502,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
     }
 
     /// Waits until all previously enqueued telemetry work has been processed.
-    func flushAndWait() async {
+    public func flushAndWait() async {
         await enqueueAndWait { .barrier($0) }
     }
 
@@ -570,6 +579,25 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
 
             if recentEvents.count > DetectionPolicy.maxRecentEvents {
                 recentEvents.removeFirst(recentEvents.count - DetectionPolicy.maxRecentEvents)
+            }
+            if countsByTarget.count > DetectionPolicy.maxCountedTargets {
+                let retainedTargets = Set(
+                    recentEvents
+                        .compactMap(\.target)
+                        .filter { !$0.isEmpty }
+                        .suffix(DetectionPolicy.maxCountedTargets)
+                )
+                let overflow = countsByTarget
+                    .filter { !retainedTargets.contains($0.key) }
+                    .sorted {
+                        if $0.value == $1.value {
+                            return $0.key < $1.key
+                        }
+                        return $0.value < $1.value
+                    }
+                for entry in overflow.prefix(countsByTarget.count - DetectionPolicy.maxCountedTargets) {
+                    countsByTarget.removeValue(forKey: entry.key)
+                }
             }
 
             let snapshot = DetectionSnapshot(
@@ -927,7 +955,8 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
 
     private static func prefilter(
         packets: [Data],
-        families: [Int32]
+        families: [Int32],
+        trackingMode: TrackingMode = .full
     ) -> (packets: [Data], families: [Int32], summaries: [FastPacketSummary], byteCount: Int) {
         guard !packets.isEmpty else {
             return ([], [], [], 0)
@@ -944,7 +973,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         for (index, packet) in packets.enumerated() {
             let familyHint = families.indices.contains(index) ? families[index] : 0
             guard let summary = FastPacketSummary(data: packet, ipVersionHint: familyHint),
-                  shouldTrack(summary: summary) else {
+                  shouldTrack(summary: summary, trackingMode: trackingMode) else {
                 continue
             }
 
@@ -957,9 +986,12 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         return (filteredPackets, filteredFamilies, filteredSummaries, totalBytes)
     }
 
-    private static func shouldTrack(summary: FastPacketSummary) -> Bool {
+    private static func shouldTrack(summary: FastPacketSummary, trackingMode: TrackingMode = .full) -> Bool {
         switch summary.transport {
         case .tcp:
+            if trackingMode == .payloadOnlyUnderPressure {
+                return summary.hasTransportPayload
+            }
             return summary.hasTransportPayload || summary.isTCPControlSignal
         case .udp:
             return summary.hasTransportPayload

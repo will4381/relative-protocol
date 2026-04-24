@@ -300,10 +300,10 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
                     if isViable {
                         self.clearReplacementNeed(for: key)
                     } else {
-                        self.markSessionNeedsReplacement(for: key)
+                        self.replaceSession(for: key, reason: "not-viable")
                     }
                 case .betterPathAvailable:
-                    self.markSessionNeedsReplacement(for: key)
+                    self.replaceSession(for: key, reason: "better-path")
                 }
             }
         }
@@ -392,6 +392,25 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
             return
         }
         entry.session.cancel()
+    }
+
+    private func replaceSession(for key: SessionKey, reason: String) {
+        guard sessions[key] != nil else {
+            return
+        }
+        removeSession(for: key)
+        _ = createSession(for: key, now: nowProvider())
+        Task {
+            await logger.log(
+                level: .notice,
+                phase: .relay,
+                category: .relayUDP,
+                component: "Socks5UDPRelay",
+                event: "session-replaced",
+                result: reason,
+                message: "Replaced UDP session after Network.framework path signal"
+            )
+        }
     }
 
     private func handleDatagramLimitError(

@@ -11,6 +11,49 @@ final class TunnelControlTests: XCTestCase {
         XCTAssertEqual(profile.mtu, 1_280)
         XCTAssertEqual(profile.mtuStrategy, .recommendedGeneric)
         XCTAssertEqual(profile.dnsStrategy, .recommendedDefault)
+        XCTAssertEqual(profile.dnsServers, [])
+    }
+
+    func testRuntimeProfileValidationFailsClosedForEmptyProviderConfiguration() {
+        XCTAssertThrowsError(try TunnelProfile.validatedRuntimeProfile(providerConfiguration: [:])) { error in
+            guard case TunnelProfileValidationError.missingRequiredKeys(let keys) = error else {
+                XCTFail("Expected missingRequiredKeys, got \(error)")
+                return
+            }
+            XCTAssertTrue(keys.contains("appGroupID"))
+            XCTAssertTrue(keys.contains("engineSocksPort"))
+        }
+    }
+
+    func testRuntimeProfileValidationRejectsUnsafeRawDataplaneConfig() {
+        var configuration = makeRuntimeProviderConfiguration()
+        configuration["dataplaneConfigJSON"] = """
+        tunnel:
+          name: tun0
+        misc:
+          pid-file: /tmp/vpnbridge.pid
+        """
+
+        XCTAssertThrowsError(try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)) { error in
+            XCTAssertEqual(error as? TunnelProfileValidationError, .unsafeDataplaneConfig("pid-file"))
+        }
+    }
+
+    func testRuntimeProfileValidationAcceptsCompleteProviderConfiguration() throws {
+        let profile = try TunnelProfile.validatedRuntimeProfile(providerConfiguration: makeRuntimeProviderConfiguration())
+        XCTAssertEqual(profile.appGroupID, "group.example")
+        XCTAssertEqual(profile.engineSocksPort, 0)
+        XCTAssertEqual(profile.dnsStrategy, .recommendedDefault)
+    }
+
+    func testAutomaticTunnelOverheadUsesSafeInternalMTUBuffer() {
+        let profile = TunnelProfile.from(providerConfiguration: [
+            "mtuStrategy": "automaticTunnelOverhead",
+            "tunnelOverheadBytes": 80
+        ])
+
+        XCTAssertEqual(profile.mtuStrategy, .automaticTunnelOverhead(80))
+        XCTAssertEqual(profile.mtu, TunnelMTUStrategy.automaticBufferMTUHint)
     }
 
     func testTunnelProfileParsesTCPMultipathHandoverFlag() {
@@ -80,6 +123,7 @@ final class TunnelControlTests: XCTestCase {
 
         let proto = try XCTUnwrap(manager.protocolConfiguration as? NETunnelProviderProtocol)
         let configuration = try XCTUnwrap(proto.providerConfiguration)
+        XCTAssertEqual((configuration["vpnBridgeProfileVersion"] as? NSNumber)?.intValue, TunnelProfileManager.currentProviderConfigurationVersion)
         let flag = (configuration["tcpMultipathHandoverEnabled"] as? NSNumber)?.boolValue
         XCTAssertEqual(flag, true)
         XCTAssertEqual(configuration["mtuStrategy"] as? String, "automaticTunnelOverhead")
@@ -272,5 +316,30 @@ final class TunnelControlTests: XCTestCase {
             relayEndpoint: RelayEndpoint(host: "127.0.0.1", port: 1080, useUDP: false),
             dataplaneConfigJSON: "{}"
         )
+    }
+
+    private func makeRuntimeProviderConfiguration() -> [String: Any] {
+        [
+            "appGroupID": "group.example",
+            "tunnelRemoteAddress": "127.0.0.1",
+            "mtu": 1_280,
+            "ipv6Enabled": true,
+            "ipv4Address": "10.0.0.2",
+            "ipv4SubnetMask": "255.255.255.0",
+            "ipv4Router": "10.0.0.1",
+            "ipv6Address": "fd00:1::2",
+            "ipv6PrefixLength": 64,
+            "engineSocksPort": 0,
+            "engineLogLevel": "warn",
+            "telemetryEnabled": true,
+            "liveTapEnabled": false,
+            "liveTapIncludeFlowSlices": false,
+            "liveTapMaxBytes": 5_000_000,
+            "signatureFileName": "app_signatures.json",
+            "relayHost": "127.0.0.1",
+            "relayPort": 1080,
+            "relayUDP": false,
+            "dataplaneConfigJSON": "{}"
+        ]
     }
 }

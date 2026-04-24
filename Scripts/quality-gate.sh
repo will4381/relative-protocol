@@ -37,4 +37,10 @@ run_stage() {
 run_stage "swift build" swift build
 run_stage "swift test" swift test
 
+if [[ -n "${VPN_BRIDGE_IOS_PROJECT:-}" && -n "${VPN_BRIDGE_IOS_SCHEME:-}" ]]; then
+  run_stage "iOS extension smoke build" Scripts/ios-extension-smoke.sh
+else
+  echo "==> iOS extension smoke build skipped (set VPN_BRIDGE_IOS_PROJECT and VPN_BRIDGE_IOS_SCHEME)"
+fi
+
 echo "quality-gate: PASS"

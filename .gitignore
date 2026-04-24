@@ -2,7 +2,19 @@
 /.gomodcache
 /.swift-module-cache
 .tmp/
-Example/
+
+# Keep the example app source in review while ignoring local Xcode/user artifacts below.
+/Example/*
+!/Example/Example/
+!/Example/Example/**
+!/Example/Example Tunnel/
+!/Example/Example Tunnel/**
+!/Example/Example.xcodeproj/
+!/Example/Example.xcodeproj/project.pbxproj
+!/Example/Example.xcodeproj/project.xcworkspace/
+!/Example/Example.xcodeproj/project.xcworkspace/contents.xcworkspacedata
+!/Example/Example.xcodeproj/xcshareddata/
+!/Example/Example.xcodeproj/xcshareddata/**
 
 # SwiftPM build outputs
 /RelativeProtocol/.build/

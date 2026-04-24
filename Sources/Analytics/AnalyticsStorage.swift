@@ -53,7 +53,7 @@ public enum AnalyticsStoragePaths {
 public enum ProtectedAnalyticsFileIO {
     private static var protectionAttributes: [FileAttributeKey: Any] {
 #if os(iOS) || os(tvOS) || os(watchOS) || os(visionOS)
-        [.protectionKey: FileProtectionType.complete]
+        [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication]
 #else
         [:]
 #endif
@@ -61,7 +61,7 @@ public enum ProtectedAnalyticsFileIO {
 
     private static var writeOptions: Data.WritingOptions {
 #if os(iOS) || os(tvOS) || os(watchOS) || os(visionOS)
-        [.atomic, .completeFileProtection]
+        [.atomic, .completeFileProtectionUntilFirstUserAuthentication]
 #else
         [.atomic]
 #endif
