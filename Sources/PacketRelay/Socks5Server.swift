@@ -132,10 +132,10 @@ struct TCPConnectRetryPolicy: Sendable {
     let overallTimeout: TimeInterval
 
     static let `default` = TCPConnectRetryPolicy(
-        attemptPreparingTimeout: 3.0,
-        retryBackoff: 0.1,
-        maxAttempts: 3,
-        overallTimeout: 9.0
+        attemptPreparingTimeout: 8.0,
+        retryBackoff: 0.5,
+        maxAttempts: 4,
+        overallTimeout: 30.0
     )
 }
 
@@ -1144,6 +1144,10 @@ public enum Socks5ServerError: Error {
 /// Local SOCKS5 server that handles CONNECT and UDP ASSOCIATE from the dataplane.
 /// Queue ownership: listener state and `connections` map are mutated on `queue`.
 public final class Socks5Server: @unchecked Sendable {
+    private enum ServerPolicy {
+        static let maxConnections = 1024
+    }
+
     private let logger: StructuredLogger
     private let queue: DispatchQueue
     private let mtu: Int
@@ -1229,8 +1233,9 @@ public final class Socks5Server: @unchecked Sendable {
         performOnQueue {
             self.listener?.cancel()
             self.listener = nil
-            self.connections.values.forEach { $0.stop() }
+            let sessions = Array(self.connections.values)
             self.connections.removeAll()
+            sessions.forEach { $0.stop() }
         }
     }
 
@@ -1346,6 +1351,25 @@ public final class Socks5Server: @unchecked Sendable {
 
         listener.newConnectionHandler = { [weak self] connection in
             guard let self else { return }
+            guard self.connections.count < ServerPolicy.maxConnections else {
+                connection.cancel()
+                Task {
+                    await self.logger.log(
+                        level: .warning,
+                        phase: .relay,
+                        category: .relayTCP,
+                        component: "Socks5Server",
+                        event: "connection-limit-reached",
+                        result: "rejected",
+                        message: "Rejected inbound SOCKS5 connection because the server connection cap is reached",
+                        metadata: [
+                            "active_connections": String(self.connections.count),
+                            "max_connections": String(ServerPolicy.maxConnections)
+                        ]
+                    )
+                }
+                return
+            }
             let connectionQueue = self.makeConnectionQueue()
             let session = Socks5Connection(
                 connection: SocksInboundNWConnectionAdapter(connection),
@@ -1409,6 +1433,10 @@ private final class CompletionGate: @unchecked Sendable {
 /// Per-client SOCKS connection state machine.
 /// Invariant: transitions are serialized by callbacks running on `queue`.
 final class Socks5Connection: @unchecked Sendable {
+    private enum ConnectionPolicy {
+        static let maxBufferedBytes = 256 * 1024
+    }
+
     private enum State {
         case greeting
         case request
@@ -1491,6 +1519,12 @@ final class Socks5Connection: @unchecked Sendable {
 
     /// Idempotently closes this connection and any outbound resources.
     func stop() {
+        runOnQueue { [weak self] in
+            self?.stopOnQueue()
+        }
+    }
+
+    private func stopOnQueue() {
         guard !isClosed else { return }
         isClosed = true
         switch state {
@@ -1520,6 +1554,9 @@ final class Socks5Connection: @unchecked Sendable {
                 self.inboundReceiveArmed = false
 
                 if let data, !data.isEmpty {
+                    guard self.admitInboundBufferBytes(data.count) else {
+                        return
+                    }
                     self.buffer.append(data)
                     self.processBuffer()
                 }
@@ -1587,6 +1624,30 @@ final class Socks5Connection: @unchecked Sendable {
         case .udpProxy:
             buffer.removeAll()
         }
+    }
+
+    private func admitInboundBufferBytes(_ byteCount: Int) -> Bool {
+        guard buffer.count + byteCount <= ConnectionPolicy.maxBufferedBytes else {
+            Task {
+                await logger.log(
+                    level: .warning,
+                    phase: .relay,
+                    category: .relayTCP,
+                    component: "Socks5Connection",
+                    event: "inbound-buffer-limit-reached",
+                    result: "closed",
+                    message: "Closing SOCKS5 connection because inbound buffering exceeded the per-session cap",
+                    metadata: [
+                        "buffered_bytes": String(buffer.count),
+                        "incoming_bytes": String(byteCount),
+                        "max_buffered_bytes": String(ConnectionPolicy.maxBufferedBytes)
+                    ]
+                )
+            }
+            stop()
+            return false
+        }
+        return true
     }
 
     private func handleRequest(_ request: Socks5Request) {
@@ -1683,17 +1744,7 @@ final class Socks5Connection: @unchecked Sendable {
                     self.forwardToInbound(data, outbound: outbound)
                     return
                 } else if let error {
-                    Task {
-                        await self.logger.log(
-                            level: .error,
-                            phase: .relay,
-                            category: .relayTCP,
-                            component: "Socks5Connection",
-                            event: "outbound-read-failed",
-                            errorCode: error.localizedDescription,
-                            message: "SOCKS5 outbound read failed"
-                        )
-                    }
+                    self.logOutboundReadError(error)
                     self.stop()
                     return
                 } else if data == nil {
@@ -1704,6 +1755,29 @@ final class Socks5Connection: @unchecked Sendable {
                 self.armOutboundReadIfNeeded(outbound)
             }
         }
+    }
+
+    private func logOutboundReadError(_ error: any Error) {
+        let benignRemoteClose = Self.isBenignOutboundReadClose(error)
+        Task {
+            await logger.log(
+                level: benignRemoteClose ? .notice : .error,
+                phase: .relay,
+                category: .relayTCP,
+                component: "Socks5Connection",
+                event: benignRemoteClose ? "outbound-read-closed" : "outbound-read-failed",
+                errorCode: error.localizedDescription,
+                message: benignRemoteClose ? "SOCKS5 outbound read closed" : "SOCKS5 outbound read failed"
+            )
+        }
+    }
+
+    private static func isBenignOutboundReadClose(_ error: any Error) -> Bool {
+        guard let nwError = error as? NWError,
+              case .posix(let code) = nwError else {
+            return false
+        }
+        return code == .ENOMSG
     }
 
     private func forwardToOutbound(_ data: Data, outbound: Socks5TCPOutbound) {

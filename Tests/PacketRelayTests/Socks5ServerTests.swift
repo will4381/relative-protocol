@@ -112,6 +112,30 @@ final class Socks5ServerTests: XCTestCase {
         }
     }
 
+    func testConnectingTCPBufferLimitClosesConnection() {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.buffer-limit")
+        let inbound = FakeInboundConnection()
+        let outbound = ControlledTCPOutbound()
+        let provider = FakeProvider(outbound: outbound)
+        let connection = Socks5Connection(
+            connection: inbound,
+            provider: provider,
+            queue: queue,
+            mtu: 1500,
+            logger: StructuredLogger(sink: InMemoryLogSink())
+        )
+
+        queue.sync {
+            connection.start()
+            inbound.push(Self.greeting)
+            inbound.push(Self.connectRequest(host: "example.com", port: 443))
+            inbound.push(Data(repeating: 0x41, count: 256 * 1024 + 1))
+
+            XCTAssertTrue(inbound.cancelled)
+            XCTAssertTrue(outbound.writes.isEmpty)
+        }
+    }
+
     /// Verifies outbound reads wait for the previous inbound send to finish before requesting more data.
     func testTCPProxyPausesOutboundReadsUntilInboundSendCompletes() {
         let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.reverse-backpressure")
@@ -385,6 +409,36 @@ final class Socks5ServerTests: XCTestCase {
         XCTAssertTrue(inbound.cancelled)
     }
 
+    func testOutboundReadENOMSGIsLoggedAsNormalClose() async throws {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.outbound-read-close")
+        let sink = InMemoryLogSink()
+        let inbound = FakeInboundConnection()
+        let outbound = ControlledTCPOutbound()
+        let provider = FakeProvider(outbound: outbound)
+        let connection = Socks5Connection(
+            connection: inbound,
+            provider: provider,
+            queue: queue,
+            mtu: 1500,
+            logger: StructuredLogger(sink: sink)
+        )
+
+        queue.sync {
+            connection.start()
+            inbound.push(Self.greeting)
+            inbound.push(Self.connectRequest(host: "example.com", port: 443))
+            outbound.succeedConnect()
+            outbound.queueRead(nil, error: NWError.posix(.ENOMSG))
+        }
+
+        let records = try await eventuallyFetchRecords(from: sink) { records in
+            records.contains { $0.component == "Socks5Connection" && $0.event == "outbound-read-closed" }
+        }
+        XCTAssertTrue(records.contains { $0.component == "Socks5Connection" && $0.event == "outbound-read-closed" && $0.level == .notice })
+        XCTAssertFalse(records.contains { $0.component == "Socks5Connection" && $0.event == "outbound-read-failed" })
+        XCTAssertTrue(inbound.cancelled)
+    }
+
     private static let greeting = Data([0x05, 0x01, 0x00])
 
     private static func connectRequest(host: String, port: UInt16) -> Data {
@@ -468,6 +522,7 @@ private final class FakeInboundConnection: Socks5InboundConnection {
 
 private final class ControlledTCPOutbound: @unchecked Sendable, Socks5PathAwareTCPOutbound {
     private var readyHandlers: [(@Sendable (Result<Void, Error>) -> Void)] = []
+    private var readyResult: Result<Void, Error>?
     private var pendingReadHandlers: [(@Sendable (Data?, Error?) -> Void)] = []
     private var pendingWriteHandlers: [(@Sendable (Error?) -> Void)] = []
     private var queuedReads: [(Data?, Error?)] = []
@@ -479,6 +534,10 @@ private final class ControlledTCPOutbound: @unchecked Sendable, Socks5PathAwareT
     var pathSnapshot = "status=unknown uses=unknown"
 
     func waitUntilReady(completionHandler: @escaping @Sendable (Result<Void, Error>) -> Void) {
+        if let readyResult {
+            completionHandler(readyResult)
+            return
+        }
         readyHandlers.append(completionHandler)
     }
 
@@ -506,6 +565,8 @@ private final class ControlledTCPOutbound: @unchecked Sendable, Socks5PathAwareT
     }
 
     func succeedConnect() {
+        guard readyResult == nil else { return }
+        readyResult = .success(())
         let handlers = readyHandlers
         readyHandlers.removeAll(keepingCapacity: false)
         for handler in handlers {
@@ -514,6 +575,8 @@ private final class ControlledTCPOutbound: @unchecked Sendable, Socks5PathAwareT
     }
 
     func failConnect(_ error: Error) {
+        guard readyResult == nil else { return }
+        readyResult = .failure(error)
         let handlers = readyHandlers
         readyHandlers.removeAll(keepingCapacity: false)
         for handler in handlers {

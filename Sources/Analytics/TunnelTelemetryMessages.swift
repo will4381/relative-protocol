@@ -39,6 +39,7 @@ public enum TunnelTelemetryCommand: String, Codable, Sendable, Equatable {
     case snapshot
     case clearRecentEvents
     case clearDetections
+    case flush
 }
 
 /// Request sent from the containing app to the packet tunnel provider.
@@ -64,6 +65,7 @@ public struct TunnelTelemetryRequest: Codable, Sendable, Equatable {
 
     public static let clearRecentEvents = TunnelTelemetryRequest(command: .clearRecentEvents)
     public static let clearDetections = TunnelTelemetryRequest(command: .clearDetections)
+    public static let flush = TunnelTelemetryRequest(command: .flush)
 }
 
 /// Foreground snapshot returned by the packet tunnel provider.
@@ -140,6 +142,7 @@ public struct TunnelTelemetryResponse: Codable, Sendable, Equatable {
     public enum Kind: String, Codable, Sendable, Equatable {
         case snapshot
         case cleared
+        case flushed
         case failure
     }
 
@@ -165,6 +168,8 @@ public struct TunnelTelemetryResponse: Codable, Sendable, Equatable {
     }
 
     public static let cleared = TunnelTelemetryResponse(kind: .cleared)
+
+    public static let flushed = TunnelTelemetryResponse(kind: .flushed)
 
     public static func failure(_ message: String) -> TunnelTelemetryResponse {
         TunnelTelemetryResponse(kind: .failure, snapshot: nil, message: message)

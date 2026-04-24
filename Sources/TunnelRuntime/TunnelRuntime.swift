@@ -59,7 +59,7 @@ public actor TunnelRuntime {
         sessionId = newSessionId
 
         await logger.log(
-            level: .info,
+            level: .notice,
             phase: .lifecycle,
             category: .control,
             component: "TunnelRuntime",
@@ -103,11 +103,16 @@ public actor TunnelRuntime {
                 callbacks: callbacks,
                 logger: logger
             )
-            try await handle.start(tunFD: tunFD)
             dataplane = handle
+            try await handle.start(tunFD: tunFD)
             state = .running
             await publishSnapshot()
         } catch {
+            if let dataplane {
+                try? await dataplane.stop()
+                await dataplane.destroy()
+                self.dataplane = nil
+            }
             state = .failed
             await logger.log(
                 level: .error,
@@ -134,13 +139,31 @@ public actor TunnelRuntime {
 
         state = .stopping
         if let dataplane {
-            try await dataplane.stop()
+            do {
+                try await dataplane.stop()
+            } catch {
+                await dataplane.destroy()
+                self.dataplane = nil
+                state = .failed
+                await logger.log(
+                    level: .error,
+                    phase: .lifecycle,
+                    category: .control,
+                    component: "TunnelRuntime",
+                    event: "stop-failed",
+                    runId: runId,
+                    sessionId: sessionId,
+                    errorCode: String(describing: error),
+                    message: "Runtime dataplane stop failed; handle was destroyed"
+                )
+                throw error
+            }
             await dataplane.destroy()
             self.dataplane = nil
         }
         state = .idle
         await logger.log(
-            level: .info,
+            level: .notice,
             phase: .lifecycle,
             category: .control,
             component: "TunnelRuntime",

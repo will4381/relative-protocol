@@ -353,7 +353,7 @@ final class Socks5UDPRelayTests: XCTestCase {
         XCTAssertEqual(record.metadata["minimum_observed_maximum_datagram_size"], "1382")
     }
 
-    func testUDPRelayMarksBetterPathSessionForReplacement() throws {
+    func testUDPRelayReplacesBetterPathSessionImmediately() throws {
         let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.udp.better-path")
         let provider = FakeUDPProvider()
         let relay = try Socks5UDPRelay(
@@ -393,20 +393,13 @@ final class Socks5UDPRelayTests: XCTestCase {
         queue.sync {
             firstSession.eventHandler?(.betterPathAvailable)
         }
-
-        try sendClientDatagram(
-            socketFD: clientSocket,
-            relayPort: relay.port,
-            destinationAddress: .ipv4("1.1.1.1"),
-            destinationPort: 53
-        )
         wait(for: [secondCreated], timeout: 1.0)
 
         XCTAssertTrue(firstSession.cancelled)
         XCTAssertEqual(relay.activeSessionCount, 1)
     }
 
-    func testUDPRelayRestartsSessionWhenWaiting() throws {
+    func testUDPRelayRestartsWaitingSession() throws {
         let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.udp.waiting")
         let provider = FakeUDPProvider()
         let relay = try Socks5UDPRelay(
@@ -424,8 +417,12 @@ final class Socks5UDPRelayTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(clientSocket, 0)
         defer { close(clientSocket) }
 
-        let created = expectation(description: "udp session created")
-        provider.onCreate = { _ in created.fulfill() }
+        let firstCreated = expectation(description: "first udp session created")
+        provider.onCreate = { _ in
+            if provider.sessions.count == 1 {
+                firstCreated.fulfill()
+            }
+        }
 
         try sendClientDatagram(
             socketFD: clientSocket,
@@ -433,7 +430,7 @@ final class Socks5UDPRelayTests: XCTestCase {
             destinationAddress: .ipv4("1.1.1.1"),
             destinationPort: 53
         )
-        wait(for: [created], timeout: 1.0)
+        wait(for: [firstCreated], timeout: 1.0)
 
         let session = try XCTUnwrap(provider.sessions.first)
         queue.sync {
@@ -441,6 +438,17 @@ final class Socks5UDPRelayTests: XCTestCase {
         }
 
         XCTAssertEqual(session.restartCount, 1)
+        XCTAssertEqual(relay.activeSessionCount, 1)
+
+        try sendClientDatagram(
+            socketFD: clientSocket,
+            relayPort: relay.port,
+            destinationAddress: .ipv4("1.1.1.1"),
+            destinationPort: 53
+        )
+        queue.sync {}
+        XCTAssertFalse(session.cancelled)
+        XCTAssertEqual(provider.sessions.count, 1)
         XCTAssertEqual(relay.activeSessionCount, 1)
     }
 

@@ -1500,6 +1500,17 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertFalse(failureStop.isUserInitiated)
     }
 
+    /// Verifies the app/provider codec supports an explicit telemetry drain command.
+    func testTunnelTelemetryCodecRoundTripsFlushCommand() throws {
+        let requestData = try TunnelTelemetryMessageCodec.encodeRequest(.flush)
+        let request = try TunnelTelemetryMessageCodec.decodeRequest(requestData)
+        XCTAssertEqual(request.command, .flush)
+
+        let responseData = try TunnelTelemetryMessageCodec.encodeResponse(.flushed)
+        let response = try TunnelTelemetryMessageCodec.decodeResponse(responseData)
+        XCTAssertEqual(response.kind, .flushed)
+    }
+
     /// Verifies the app/provider codec rejects explicit schema-version mismatches cleanly.
     func testTunnelTelemetryCodecRejectsUnsupportedVersion() throws {
         let requestData = #"{"version":99,"command":"snapshot","packetLimit":null}"#.data(using: .utf8)!

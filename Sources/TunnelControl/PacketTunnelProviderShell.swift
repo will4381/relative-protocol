@@ -1,5 +1,6 @@
 import Analytics
 import Foundation
+import Network
 import NetworkExtension
 import Observability
 import PacketRelay
@@ -52,6 +53,13 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
         var waitingForBackpressureRelief = false
         var isStopping = false
         var pendingOutbound: [PendingOutboundBatch] = []
+        var startupTask: Task<Void, Never>?
+        var startupGeneration: UInt64 = 0
+        var activeStartupID: UInt64?
+        var startupRuntime: TunnelRuntime?
+        var startupTunBridge: TunSocketBridge?
+        var startupSocksServer: Socks5Server?
+        var startupTelemetryWorker: PacketTelemetryWorker?
     }
 
     /// Snapshot extracted under lock so cleanup can run without holding shared-state synchronization.
@@ -61,6 +69,11 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
         let tunBridge: TunSocketBridge?
         let socksServer: Socks5Server?
         let telemetryWorker: PacketTelemetryWorker?
+        let startupTask: Task<Void, Never>?
+        let startupRuntime: TunnelRuntime?
+        let startupTunBridge: TunSocketBridge?
+        let startupSocksServer: Socks5Server?
+        let startupTelemetryWorker: PacketTelemetryWorker?
     }
 
     /// One-shot callback wrapper used when framework completion handlers need to cross into `Task`.
@@ -119,32 +132,72 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
 
         // Docs: https://developer.apple.com/documentation/networkextension/netunnelproviderprotocol/providerconfiguration
         let providerConfig = (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration ?? [:]
-        let profile = TunnelProfile.from(providerConfiguration: providerConfig)
+        let profile: TunnelProfile
+        do {
+            profile = try TunnelProfile.validatedRuntimeProfile(providerConfiguration: providerConfig)
+        } catch {
+            let logger = withState { $0.logger }
+            Task {
+                await logger.log(
+                    level: .error,
+                    phase: .lifecycle,
+                    category: .control,
+                    component: "PacketTunnelProviderShell",
+                    event: "profile-validation-failed",
+                    errorCode: String(describing: error),
+                    message: "Refusing to start tunnel with incomplete or unsafe provider configuration"
+                )
+            }
+            signposts.end(.startup, state: startupInterval, message: "invalid-profile")
+            completion.call(error)
+            return
+        }
         let settings = TunnelNetworkSettingsFactory.makeSettings(profile: profile)
+        let startupID = beginStartup()
 
-        Task {
+        let startupTask = Task {
             let logger = self.makeLogger(profile: profile)
+            var startupRuntime: TunnelRuntime?
             var startupTelemetryWorker: PacketTelemetryWorker?
             var startupSocksServer: Socks5Server?
             var startupBridge: TunSocketBridge?
             do {
+                try self.checkStartupCurrent(startupID)
                 let runtime = TunnelRuntime(
                     clock: SystemClock(),
                     runIdGenerator: RandomRunIdGenerator(),
                     randomSource: SystemRandomSource(),
                     logger: logger
                 )
+                startupRuntime = runtime
+                recordStartupResources(startupID: startupID, runtime: runtime)
+                await logger.log(
+                    level: .notice,
+                    phase: .lifecycle,
+                    category: .control,
+                    component: "PacketTunnelProviderShell",
+                    event: "profile-validated",
+                    message: "Tunnel profile validated"
+                )
                 let telemetryWorker = try await self.makeTelemetryWorker(profile: profile, clock: SystemClock(), logger: logger)
                 startupTelemetryWorker = telemetryWorker
+                recordStartupResources(startupID: startupID, telemetryWorker: telemetryWorker)
+                try self.checkStartupCurrent(startupID)
+                await self.preflightDefaultPath(logger: logger)
+                try self.checkStartupCurrent(startupID)
 
                 let settingsInterval = signposts.begin(.settingsApply, message: "setTunnelNetworkSettings")
                 try await apply(settings)
+                try self.checkStartupCurrent(startupID)
                 signposts.end(.settingsApply, state: settingsInterval, message: "ok")
 
                 let (socksServer, socksPort) = try await startSocksServer(profile: profile, logger: logger)
                 startupSocksServer = socksServer
+                recordStartupResources(startupID: startupID, socksServer: socksServer)
+                try self.checkStartupCurrent(startupID)
                 let bridge = try TunSocketBridge(mtu: profile.mtu, queue: ioQueue, logger: logger)
                 startupBridge = bridge
+                recordStartupResources(startupID: startupID, tunBridge: bridge)
                 bridge.onBackpressureRelieved = { [weak self] in
                     self?.resumePacketReadLoopIfNeeded()
                 }
@@ -152,19 +205,22 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                     self?.handleInboundPackets(packets, families: families)
                 }
 
-                installStartedComponents(
+                let dataplaneConfig = makeDataplaneConfig(profile: profile, socksPort: socksPort)
+                try await runtime.start(configJSON: dataplaneConfig, tunFD: bridge.engineFD)
+                try self.checkStartupCurrent(startupID)
+
+                try installStartedComponents(
+                    startupID: startupID,
                     logger: logger,
                     runtime: runtime,
                     tunBridge: bridge,
                     socksServer: socksServer,
                     telemetryWorker: telemetryWorker
                 )
+                startupRuntime = nil
                 startupTelemetryWorker = nil
                 startupSocksServer = nil
                 startupBridge = nil
-
-                let dataplaneConfig = makeDataplaneConfig(profile: profile, socksPort: socksPort)
-                try await runtime.start(configJSON: dataplaneConfig, tunFD: bridge.engineFD)
 
                 let relayLoopInterval = signposts.begin(.relayLoop, message: "packet-flow-loop")
                 ioQueue.async { [weak self] in
@@ -181,17 +237,22 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                     message: "Tunnel started",
                     metadata: [
                         "socks_port": String(socksPort),
-                        "mtu": String(profile.mtu)
+                        "mtu": String(profile.mtu),
+                        "mtu_strategy": Self.mtuStrategySummary(profile.mtuStrategy),
+                        "dns_strategy": Self.dnsStrategySummary(profile.dnsStrategy)
                     ]
                 )
                 signposts.end(.startup, state: startupInterval, message: "ok")
                 completion.call(nil)
             } catch {
                 await cleanupAfterFailedStart(
+                    startupID: startupID,
+                    startupRuntime: startupRuntime,
                     startupTelemetryWorker: startupTelemetryWorker,
                     startupSocksServer: startupSocksServer,
                     startupBridge: startupBridge
                 )
+                clearStartupIfCurrent(startupID)
                 await logger.log(
                     level: .error,
                     phase: .lifecycle,
@@ -205,6 +266,7 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                 completion.call(error)
             }
         }
+        recordStartupTask(startupTask, startupID: startupID)
     }
 
     // Docs: https://developer.apple.com/documentation/networkextension/nepackettunnelprovider/stoptunnel(with:completionhandler:)
@@ -216,7 +278,11 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
         let completion = CallbackBox<Void> { _ in completionHandler() }
         Task {
             let snapshot = takeCleanupSnapshot(markStopping: true)
+            snapshot.startupTask?.cancel()
             if let telemetryWorker = snapshot.telemetryWorker {
+                await telemetryWorker.stopAndWait()
+            }
+            if let telemetryWorker = snapshot.startupTelemetryWorker {
                 await telemetryWorker.stopAndWait()
             }
             do {
@@ -233,11 +299,40 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                 )
             }
 
-            snapshot.tunBridge?.stop()
-            snapshot.socksServer?.stop()
             if let runtime = snapshot.runtime {
-                try? await runtime.stop()
+                do {
+                    try await runtime.stop()
+                } catch {
+                    await snapshot.logger.log(
+                        level: .error,
+                        phase: .lifecycle,
+                        category: .control,
+                        component: "PacketTunnelProviderShell",
+                        event: "runtime-stop-failed",
+                        errorCode: String(describing: error),
+                        message: "Runtime stop returned an error during tunnel shutdown"
+                    )
+                }
             }
+            if let runtime = snapshot.startupRuntime {
+                do {
+                    try await runtime.stop()
+                } catch {
+                    await snapshot.logger.log(
+                        level: .error,
+                        phase: .lifecycle,
+                        category: .control,
+                        component: "PacketTunnelProviderShell",
+                        event: "startup-runtime-stop-failed",
+                        errorCode: String(describing: error),
+                        message: "Startup runtime stop returned an error during tunnel shutdown"
+                    )
+                }
+            }
+            snapshot.tunBridge?.stop()
+            snapshot.startupTunBridge?.stop()
+            snapshot.socksServer?.stop()
+            snapshot.startupSocksServer?.stop()
 
             await snapshot.logger.log(
                 level: .notice,
@@ -430,6 +525,8 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                     message: "Failed to write packets to NEPacketTunnelFlow"
                 )
             }
+            failTunnelForPacketFlowWrite(logger: snapshot.logger)
+            return
         }
 
         emitHealthSampleIfNeeded(trigger: "inbound", logger: snapshot.logger)
@@ -619,6 +716,12 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                     await telemetryWorker.clearDetectionsAndWait()
                 }
                 response = .cleared
+
+            case .flush:
+                if let telemetryWorker = snapshot.telemetryWorker {
+                    await telemetryWorker.flushAndWait()
+                }
+                response = .flushed
             }
         } catch {
             await snapshot.logger.log(
@@ -676,9 +779,12 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
         lines.append("misc:")
         lines.append("  log-file: stderr")
         lines.append("  log-level: \(normalizedEngineLogLevel(profile.engineLogLevel))")
+        lines.append("  task-stack-size: 65536")
+        lines.append("  max-session-count: 1024")
+        lines.append("  udp-recv-buffer-size: 131072")
         lines.append("  connect-timeout: 10000")
         lines.append("  tcp-read-write-timeout: 300000")
-        lines.append("  udp-read-write-timeout: 60000")
+        lines.append("  udp-read-write-timeout: 15000")
         return lines.joined(separator: "\n")
     }
 
@@ -710,6 +816,78 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
             .appendingPathComponent("VPNBridge-Analytics", isDirectory: true)
     }
 
+    private func preflightDefaultPath(logger: StructuredLogger) async {
+        let path = await sampleDefaultNetworkPath()
+        let summary = Self.providerPathSummary(path)
+        guard path.status == .satisfied else {
+            await logger.log(
+                level: .warning,
+                phase: .path,
+                category: .control,
+                component: "PacketTunnelProviderShell",
+                event: "default-path-unsatisfied",
+                result: "observed",
+                message: "Underlying network path is not satisfied at startup; continuing so Network.framework can wait and recover",
+                metadata: ["path": summary]
+            )
+            return
+        }
+        await logger.log(
+            level: .notice,
+            phase: .path,
+            category: .control,
+            component: "PacketTunnelProviderShell",
+            event: "default-path-satisfied",
+            result: "ok",
+            message: "Underlying network path is satisfied before tunnel routes are installed",
+            metadata: ["path": summary]
+        )
+    }
+
+    private func sampleDefaultNetworkPath() async -> Network.NWPath {
+        await withCheckedContinuation { continuation in
+            let monitor = Network.NWPathMonitor()
+            let queue = DispatchQueue(label: "com.vpnbridge.tunnel.path-preflight", qos: .utility)
+            let gate = CallbackBox<Network.NWPath> { path in
+                monitor.cancel()
+                continuation.resume(returning: path)
+            }
+
+            monitor.pathUpdateHandler = { path in
+                if path.status == .satisfied {
+                    gate.call(path)
+                }
+            }
+            monitor.start(queue: queue)
+            queue.asyncAfter(deadline: .now() + 1.5) {
+                gate.call(monitor.currentPath)
+            }
+        }
+    }
+
+    private static func providerPathSummary(_ path: Network.NWPath) -> String {
+        var uses: [String] = []
+        if path.usesInterfaceType(Network.NWInterface.InterfaceType.cellular) { uses.append("cellular") }
+        if path.usesInterfaceType(Network.NWInterface.InterfaceType.wifi) { uses.append("wifi") }
+        if path.usesInterfaceType(Network.NWInterface.InterfaceType.wiredEthernet) { uses.append("wired") }
+        if path.usesInterfaceType(Network.NWInterface.InterfaceType.loopback) { uses.append("loopback") }
+        if uses.isEmpty { uses.append("other") }
+
+        let status: String
+        switch path.status {
+        case .satisfied:
+            status = "satisfied"
+        case .unsatisfied:
+            status = "unsatisfied"
+        case .requiresConnection:
+            status = "requires-connection"
+        @unknown default:
+            status = "unknown"
+        }
+
+        return "status=\(status) uses=\(uses.joined(separator: ",")) expensive=\(path.isExpensive) constrained=\(path.isConstrained) ipv4=\(path.supportsIPv4) ipv6=\(path.supportsIPv6) dns=\(path.supportsDNS)"
+    }
+
     /// Builds logger fanout (OSLog + JSONL sink) for the active profile.
     /// - Parameter profile: Active tunnel profile.
     private func makeLogger(profile: TunnelProfile) -> StructuredLogger {
@@ -735,7 +913,7 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
             policy: JSONLRotationPolicy(maxBytesPerFile: 1_048_576, maxFiles: 8, maxTotalBytes: 8_388_608),
             eventQueueLabel: "tunnel"
         )
-        sinks.append(MinimumLevelLogSink(minimumLevel: .notice, sink: jsonSink))
+        sinks.append(MinimumLevelLogSink(minimumLevel: .info, sink: jsonSink))
 
         return StructuredLogger(sink: FanoutLogSink(sinks: sinks))
     }
@@ -830,13 +1008,17 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
     /// Installs fully initialized runtime components into provider state after startup succeeds.
     /// Preconditions: every dependency is ready to be used by packet I/O callbacks.
     private func installStartedComponents(
+        startupID: UInt64,
         logger: StructuredLogger,
         runtime: TunnelRuntime,
         tunBridge: TunSocketBridge,
         socksServer: Socks5Server,
         telemetryWorker: PacketTelemetryWorker?
-    ) {
+    ) throws {
         withState { state in
+            guard state.activeStartupID == startupID, !state.isStopping else {
+                return
+            }
             state.logger = logger
             state.runtime = runtime
             state.tunBridge = tunBridge
@@ -850,6 +1032,19 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
             state.waitingForBackpressureRelief = false
             state.isStopping = false
             state.pendingOutbound.removeAll(keepingCapacity: false)
+            state.activeStartupID = nil
+            state.startupTask = nil
+            state.startupRuntime = nil
+            state.startupTunBridge = nil
+            state.startupSocksServer = nil
+            state.startupTelemetryWorker = nil
+        }
+
+        let isInstalled = withState { state in
+            state.runtime === runtime
+        }
+        if !isInstalled {
+            throw TunnelProviderError.startCancelled
         }
     }
 
@@ -868,13 +1063,105 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                 runtime: state.runtime,
                 tunBridge: state.tunBridge,
                 socksServer: state.socksServer,
-                telemetryWorker: state.telemetryWorker
+                telemetryWorker: state.telemetryWorker,
+                startupTask: state.startupTask,
+                startupRuntime: state.startupRuntime,
+                startupTunBridge: state.startupTunBridge,
+                startupSocksServer: state.startupSocksServer,
+                startupTelemetryWorker: state.startupTelemetryWorker
             )
             state.runtime = nil
             state.tunBridge = nil
             state.socksServer = nil
             state.telemetryWorker = nil
+            state.startupTask = nil
+            state.activeStartupID = nil
+            state.startupRuntime = nil
+            state.startupTunBridge = nil
+            state.startupSocksServer = nil
+            state.startupTelemetryWorker = nil
             return snapshot
+        }
+    }
+
+    private func beginStartup() -> UInt64 {
+        withState { state in
+            state.startupGeneration &+= 1
+            state.activeStartupID = state.startupGeneration
+            state.startupTask = nil
+            state.isStopping = false
+            state.pendingOutbound.removeAll(keepingCapacity: false)
+            state.waitingForBackpressureRelief = false
+            state.startupRuntime = nil
+            state.startupTunBridge = nil
+            state.startupSocksServer = nil
+            state.startupTelemetryWorker = nil
+            return state.startupGeneration
+        }
+    }
+
+    private func recordStartupTask(_ task: Task<Void, Never>, startupID: UInt64) {
+        let shouldCancel = withState { state in
+            guard state.activeStartupID == startupID, !state.isStopping else {
+                return true
+            }
+            state.startupTask = task
+            return false
+        }
+        if shouldCancel {
+            task.cancel()
+        }
+    }
+
+    private func checkStartupCurrent(_ startupID: UInt64) throws {
+        if Task.isCancelled {
+            throw TunnelProviderError.startCancelled
+        }
+        let isCurrent = withState { state in
+            state.activeStartupID == startupID && !state.isStopping
+        }
+        if !isCurrent {
+            throw TunnelProviderError.startCancelled
+        }
+    }
+
+    private func clearStartupIfCurrent(_ startupID: UInt64) {
+        withState { state in
+            guard state.activeStartupID == startupID else {
+                return
+            }
+            state.activeStartupID = nil
+            state.startupTask = nil
+            state.startupRuntime = nil
+            state.startupTunBridge = nil
+            state.startupSocksServer = nil
+            state.startupTelemetryWorker = nil
+        }
+    }
+
+    private func recordStartupResources(
+        startupID: UInt64,
+        runtime: TunnelRuntime? = nil,
+        tunBridge: TunSocketBridge? = nil,
+        socksServer: Socks5Server? = nil,
+        telemetryWorker: PacketTelemetryWorker? = nil
+    ) {
+        withState { state in
+            guard state.activeStartupID == startupID, !state.isStopping else {
+                return
+            }
+            if let runtime {
+                state.startupRuntime = runtime
+            }
+            if let tunBridge {
+                state.startupTunBridge = tunBridge
+            }
+            if let socksServer {
+                state.startupSocksServer = socksServer
+            }
+            if let telemetryWorker {
+                state.startupTelemetryWorker = telemetryWorker
+            }
         }
     }
 
@@ -1111,6 +1398,31 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
         cancelTunnelWithError(TunnelProviderError.bridgeWriteFailed(code: errorCode))
     }
 
+    private func failTunnelForPacketFlowWrite(logger: StructuredLogger) {
+        let shouldCancel = withState { state in
+            guard !state.isStopping else { return false }
+            state.isStopping = true
+            state.waitingForBackpressureRelief = false
+            state.pendingOutbound.removeAll(keepingCapacity: false)
+            return true
+        }
+        guard shouldCancel else {
+            return
+        }
+
+        Task {
+            await logger.log(
+                level: .error,
+                phase: .packetOut,
+                category: .control,
+                component: "PacketTunnelProviderShell",
+                event: "packet-flow-write-terminal",
+                message: "Cancelling tunnel after NEPacketTunnelFlow rejected inbound packets"
+            )
+        }
+        cancelTunnelWithError(TunnelProviderError.packetFlowWriteFailed)
+    }
+
     // Docs: https://developer.apple.com/documentation/networkextension/netunnelprovider/settunnelnetworksettings(_:completionhandler:)
     /// Async wrapper around callback-based `setTunnelNetworkSettings`.
     /// - Parameter settings: Tunnel interface settings to apply.
@@ -1130,6 +1442,8 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
     /// Decision: startup can fail before freshly created components are published into shared provider state, so this
     /// cleanup path must tear down both staged local resources and anything already installed.
     private func cleanupAfterFailedStart(
+        startupID: UInt64,
+        startupRuntime: TunnelRuntime? = nil,
         startupTelemetryWorker: PacketTelemetryWorker? = nil,
         startupSocksServer: Socks5Server? = nil,
         startupBridge: TunSocketBridge? = nil
@@ -1137,18 +1451,58 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
         if let startupTelemetryWorker {
             await startupTelemetryWorker.stopAndWait()
         }
+        if let startupRuntime {
+            try? await startupRuntime.stop()
+        }
         startupBridge?.stop()
         startupSocksServer?.stop()
+
+        let shouldCleanSharedState = withState { state in
+            state.activeStartupID == startupID
+        }
+        guard shouldCleanSharedState else {
+            return
+        }
 
         let snapshot = takeCleanupSnapshot(markStopping: true)
         if let telemetryWorker = snapshot.telemetryWorker {
             await telemetryWorker.stopAndWait()
         }
+        if let telemetryWorker = snapshot.startupTelemetryWorker {
+            await telemetryWorker.stopAndWait()
+        }
 
-        snapshot.tunBridge?.stop()
-        snapshot.socksServer?.stop()
         if let runtime = snapshot.runtime {
             try? await runtime.stop()
+        }
+        if let runtime = snapshot.startupRuntime {
+            try? await runtime.stop()
+        }
+        snapshot.tunBridge?.stop()
+        snapshot.startupTunBridge?.stop()
+        snapshot.socksServer?.stop()
+        snapshot.startupSocksServer?.stop()
+    }
+
+    private static func mtuStrategySummary(_ strategy: TunnelMTUStrategy) -> String {
+        switch strategy {
+        case .fixed(let mtu):
+            return "fixed:\(mtu)"
+        case .automaticTunnelOverhead(let overhead):
+            return "automatic-overhead:\(overhead)"
+        }
+    }
+
+    private static func dnsStrategySummary(_ strategy: TunnelDNSStrategy) -> String {
+        switch strategy {
+        case .noOverride:
+            return "none"
+        case .cleartext(let servers, _, _, let allowFailover):
+            return "cleartext:\(servers.count):failover-\(allowFailover)"
+        case .tls(let servers, _, _, _, let allowFailover):
+            return "tls:\(servers.count):failover-\(allowFailover)"
+        case .https(let servers, _, _, _, let allowFailover):
+            return "https:\(servers.count):failover-\(allowFailover)"
         }
     }
 }
@@ -1172,11 +1526,20 @@ private enum PendingDrainOutcome {
 
 private enum TunnelProviderError: LocalizedError {
     case bridgeWriteFailed(code: Int32)
+    case packetFlowWriteFailed
+    case startCancelled
+    case defaultPathUnsatisfied(String)
 
     var errorDescription: String? {
         switch self {
         case .bridgeWriteFailed(let code):
             return "Bridge write failed with errno \(code)"
+        case .packetFlowWriteFailed:
+            return "Packet flow rejected packets"
+        case .startCancelled:
+            return "Tunnel start was cancelled"
+        case .defaultPathUnsatisfied(let summary):
+            return "Underlying network path is not satisfied: \(summary)"
         }
     }
 }

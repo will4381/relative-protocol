@@ -48,7 +48,7 @@ public struct TunnelTelemetryClient: Sendable {
             return snapshot
         case .failure:
             throw TunnelTelemetryClientError.providerFailure(response.message ?? "unknown")
-        case .cleared:
+        case .cleared, .flushed:
             throw TunnelTelemetryClientError.unexpectedResponseKind(response.kind.rawValue)
         }
     }
@@ -66,6 +66,23 @@ public struct TunnelTelemetryClient: Sendable {
             throw TunnelTelemetryClientError.providerFailure(response.message ?? "unknown")
         }
         guard response.kind == .cleared else {
+            throw TunnelTelemetryClientError.unexpectedResponseKind(response.kind.rawValue)
+        }
+    }
+
+    public func flushTelemetry(from connection: NEVPNConnection) async throws {
+        guard let session = connection as? NETunnelProviderSession else {
+            throw TunnelTelemetryClientError.invalidSession
+        }
+        try await flushTelemetry(from: session)
+    }
+
+    public func flushTelemetry(from session: NETunnelProviderSession) async throws {
+        let response = try await send(.flush, through: session)
+        if response.kind == .failure {
+            throw TunnelTelemetryClientError.providerFailure(response.message ?? "unknown")
+        }
+        guard response.kind == .flushed else {
             throw TunnelTelemetryClientError.unexpectedResponseKind(response.kind.rawValue)
         }
     }

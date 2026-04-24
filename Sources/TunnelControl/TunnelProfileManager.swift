@@ -3,7 +3,10 @@ import NetworkExtension
 
 /// Host-side helper for creating and updating a tunnel provider profile.
 public enum TunnelProfileManager {
+    public static let currentProviderConfigurationVersion = 1
+
     private static let managedProviderConfigurationKeys: Set<String> = [
+        "vpnBridgeProfileVersion",
         "appGroupID",
         "tunnelRemoteAddress",
         "mtu",
@@ -50,6 +53,7 @@ public enum TunnelProfileManager {
         proto.serverAddress = profile.tunnelRemoteAddress
         var configuration = preservedConfiguration
         let normalizedConfiguration: [String: Any] = [
+            "vpnBridgeProfileVersion": currentProviderConfigurationVersion,
             "appGroupID": profile.appGroupID,
             "tunnelRemoteAddress": profile.tunnelRemoteAddress,
             "mtu": profile.mtu,

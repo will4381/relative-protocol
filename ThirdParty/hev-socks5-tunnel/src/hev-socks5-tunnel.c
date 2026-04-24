@@ -40,6 +40,7 @@
 #include "hev-socks5-tunnel.h"
 
 static int run;
+static int stop_requested;
 static int tun_fd = -1;
 static int tun_fd_local;
 static int session_count;
@@ -49,6 +50,8 @@ static size_t stat_tx_packets;
 static size_t stat_rx_packets;
 static size_t stat_tx_bytes;
 static size_t stat_rx_bytes;
+
+extern void rp_dp_hev_notify_ready (void);
 
 static struct netif netif;
 static struct tcp_pcb *tcp;
@@ -665,6 +668,7 @@ hev_socks5_tunnel_fini (void)
     stat_rx_packets = 0;
     stat_tx_bytes = 0;
     stat_rx_bytes = 0;
+    stop_requested = 0;
 }
 
 int
@@ -682,6 +686,9 @@ hev_socks5_tunnel_run (void)
     hev_task_run (task_lwip_timer, lwip_timer_task_entry, NULL);
 
     run = 1;
+    rp_dp_hev_notify_ready ();
+    if (READ_ONCE (stop_requested))
+        hev_socks5_tunnel_stop ();
     hev_task_system_run ();
 
     return 0;
@@ -692,19 +699,19 @@ hev_socks5_tunnel_stop (void)
 {
     int res;
     int fd;
+    uint8_t val = 1;
 
     LOG_D ("socks5 tunnel stop");
 
-    for (;;) {
-        fd = READ_ONCE (event_fds[1]);
-        if (fd >= 0)
-            break;
-        /* Wait for async initialization */
-        usleep (100 * 1000);
-    }
+    stop_requested = 1;
+    fd = READ_ONCE (event_fds[1]);
+    if (fd < 0)
+        return;
 
-    res = write (fd, &res, 1);
-    assert (res > 0 && "socks5 tunnel write event");
+    res = write (fd, &val, sizeof (val));
+    if (res < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+        errno != EBADF && errno != EPIPE)
+        LOG_W ("socks5 tunnel write event");
 }
 
 void

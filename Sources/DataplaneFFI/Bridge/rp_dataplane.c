@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <unistd.h>
 
 #define RP_DP_API_VERSION 1
@@ -22,6 +23,7 @@ static const char *RP_DP_RUNNING_MSG = "dataplane-running";
 static const char *RP_DP_STOPPED_MSG = "dataplane-stopped";
 static const char *RP_DP_EXITED_MSG = "dataplane-exited";
 static const char *RP_DP_EXITED_ERROR_MSG = "dataplane-exited-error";
+static const char *RP_DP_READY_MSG = "dataplane-ready";
 
 /*
  * Vendored symbols exported by HevSocks5Tunnel. We declare them here to avoid
@@ -36,10 +38,13 @@ extern void hev_socks5_tunnel_stats(size_t *tx_packets, size_t *tx_bytes,
 
 static uint8_t rp_dp_callback_queue_key;
 static uint8_t rp_dp_worker_queue_key;
+static pthread_mutex_t rp_dp_global_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct rp_dp_handle *rp_dp_active_handle;
 
 struct rp_dp_handle {
     dispatch_queue_t callback_queue;
     dispatch_queue_t worker_queue;
+    dispatch_semaphore_t startup_semaphore;
     rp_dp_callbacks_t callbacks;
     void *user_ctx;
     rp_dp_stats_t stats;
@@ -48,6 +53,9 @@ struct rp_dp_handle {
     int32_t tun_fd;
     uint8_t started;
     uint8_t stopping;
+    uint8_t ready;
+    uint8_t exited;
+    int32_t exit_code;
 };
 
 static int32_t rp_dp_reentrant_call_guard(void)
@@ -160,6 +168,37 @@ static void rp_dp_wait_worker_if_needed(struct rp_dp_handle *handle)
     });
 }
 
+void rp_dp_hev_notify_ready(void)
+{
+    int should_stop = 0;
+
+    pthread_mutex_lock(&rp_dp_global_lock);
+    struct rp_dp_handle *handle = rp_dp_active_handle;
+    if (handle != NULL) {
+        handle->ready = 1;
+        should_stop = handle->stopping != 0;
+        if (handle->startup_semaphore != NULL) {
+            dispatch_semaphore_signal(handle->startup_semaphore);
+        }
+        rp_dp_dispatch_state(handle, RP_DP_STATE_RUNNING);
+        rp_dp_dispatch_log(handle, RP_DP_READY_MSG);
+    }
+    pthread_mutex_unlock(&rp_dp_global_lock);
+
+    if (should_stop) {
+        hev_socks5_tunnel_quit();
+    }
+}
+
+static void rp_dp_clear_active_handle_if_current(struct rp_dp_handle *handle)
+{
+    pthread_mutex_lock(&rp_dp_global_lock);
+    if (rp_dp_active_handle == handle) {
+        rp_dp_active_handle = NULL;
+    }
+    pthread_mutex_unlock(&rp_dp_global_lock);
+}
+
 rp_dp_version_t rp_dp_get_version(void)
 {
     rp_dp_version_t version;
@@ -188,6 +227,7 @@ rp_dp_handle_t *rp_dp_create(const char *config_json,
         "com.vpnbridge.dataplane.callback", DISPATCH_QUEUE_SERIAL);
     handle->worker_queue = dispatch_queue_create(
         "com.vpnbridge.dataplane.worker", DISPATCH_QUEUE_SERIAL);
+    handle->startup_semaphore = dispatch_semaphore_create(0);
     dispatch_queue_set_specific(handle->callback_queue, &rp_dp_callback_queue_key,
                                 handle, NULL);
     dispatch_queue_set_specific(handle->worker_queue, &rp_dp_worker_queue_key,
@@ -196,6 +236,9 @@ rp_dp_handle_t *rp_dp_create(const char *config_json,
     handle->user_ctx = user_ctx;
     handle->started = 0;
     handle->stopping = 0;
+    handle->ready = 0;
+    handle->exited = 0;
+    handle->exit_code = 0;
     handle->tun_fd = -1;
 
     if (config_json == NULL || config_json[0] == '\0') {
@@ -233,14 +276,25 @@ int32_t rp_dp_start(rp_dp_handle_t *opaque_handle, int32_t tun_fd)
         return 0;
     }
 
+    pthread_mutex_lock(&rp_dp_global_lock);
+    if (rp_dp_active_handle != NULL && rp_dp_active_handle != handle) {
+        pthread_mutex_unlock(&rp_dp_global_lock);
+        return -5;
+    }
+    rp_dp_active_handle = handle;
+    pthread_mutex_unlock(&rp_dp_global_lock);
+
     handle->tun_fd = tun_fd;
     handle->started = 1;
     handle->stopping = 0;
-
-    rp_dp_dispatch_state(handle, RP_DP_STATE_RUNNING);
-    rp_dp_dispatch_log(handle, RP_DP_RUNNING_MSG);
+    handle->ready = 0;
+    handle->exited = 0;
+    handle->exit_code = 0;
 
     if (rp_dp_is_deterministic_local_mode(handle) && tun_fd == 0) {
+        handle->ready = 1;
+        rp_dp_dispatch_state(handle, RP_DP_STATE_RUNNING);
+        rp_dp_dispatch_log(handle, RP_DP_RUNNING_MSG);
         return 0;
     }
 
@@ -255,6 +309,8 @@ int32_t rp_dp_start(rp_dp_handle_t *opaque_handle, int32_t tun_fd)
             handle->tun_fd);
 
         rp_dp_refresh_stats(handle);
+        handle->exit_code = result;
+        handle->exited = 1;
         handle->started = 0;
 
         if (result == 0) {
@@ -268,9 +324,29 @@ int32_t rp_dp_start(rp_dp_handle_t *opaque_handle, int32_t tun_fd)
         if (!handle->stopping) {
             rp_dp_dispatch_state(handle, RP_DP_STATE_STOPPED);
         }
+        rp_dp_clear_active_handle_if_current(handle);
+        if (handle->startup_semaphore != NULL) {
+            dispatch_semaphore_signal(handle->startup_semaphore);
+        }
     });
 
-    return 0;
+    intptr_t wait_result = dispatch_semaphore_wait(
+        handle->startup_semaphore,
+        dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+    if (wait_result != 0) {
+        handle->stopping = 1;
+        rp_dp_clear_active_handle_if_current(handle);
+        hev_socks5_tunnel_quit();
+        rp_dp_dispatch_log(handle, "dataplane-start-timeout");
+        return -6;
+    }
+    if (handle->ready != 0) {
+        rp_dp_dispatch_log(handle, RP_DP_RUNNING_MSG);
+        return 0;
+    }
+
+    rp_dp_clear_active_handle_if_current(handle);
+    return handle->exit_code == 0 ? -7 : handle->exit_code;
 }
 
 int32_t rp_dp_stop(rp_dp_handle_t *opaque_handle)
@@ -288,6 +364,8 @@ int32_t rp_dp_stop(rp_dp_handle_t *opaque_handle)
 
     if (rp_dp_is_deterministic_local_mode(handle) && handle->tun_fd == 0) {
         handle->started = 0;
+        handle->ready = 0;
+        rp_dp_clear_active_handle_if_current(handle);
         rp_dp_dispatch_state(handle, RP_DP_STATE_STOPPED);
         rp_dp_dispatch_log(handle, RP_DP_STOPPED_MSG);
         return 0;
@@ -298,6 +376,8 @@ int32_t rp_dp_stop(rp_dp_handle_t *opaque_handle)
     rp_dp_wait_worker_if_needed(handle);
     handle->started = 0;
     handle->stopping = 0;
+    handle->ready = 0;
+    rp_dp_clear_active_handle_if_current(handle);
 
     rp_dp_refresh_stats(handle);
     rp_dp_dispatch_state(handle, RP_DP_STATE_STOPPED);
@@ -325,6 +405,7 @@ void rp_dp_destroy(rp_dp_handle_t *opaque_handle)
 #if OS_OBJECT_USE_OBJC
     handle->callback_queue = NULL;
     handle->worker_queue = NULL;
+    handle->startup_semaphore = NULL;
 #else
     if (handle->callback_queue != NULL) {
         dispatch_release(handle->callback_queue);
@@ -333,6 +414,10 @@ void rp_dp_destroy(rp_dp_handle_t *opaque_handle)
     if (handle->worker_queue != NULL) {
         dispatch_release(handle->worker_queue);
         handle->worker_queue = NULL;
+    }
+    if (handle->startup_semaphore != NULL) {
+        dispatch_release(handle->startup_semaphore);
+        handle->startup_semaphore = NULL;
     }
 #endif
 
