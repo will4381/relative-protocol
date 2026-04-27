@@ -452,16 +452,103 @@ final class Socks5UDPRelayTests: XCTestCase {
         XCTAssertEqual(relay.activeSessionCount, 1)
     }
 
+    func testUDPRelayKeepsLargeSocksDatagramPayloadIntact() throws {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.udp.large-payload")
+        let provider = FakeUDPProvider()
+        let relay = try Socks5UDPRelay(
+            provider: provider,
+            queue: queue,
+            mtu: 512,
+            logger: StructuredLogger(sink: InMemoryLogSink())
+        )
+        relay.start()
+        defer {
+            relay.stop()
+        }
+
+        let clientSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        XCTAssertGreaterThanOrEqual(clientSocket, 0)
+        defer { close(clientSocket) }
+
+        let sessionCreated = expectation(description: "udp session created")
+        provider.onCreate = { _ in
+            sessionCreated.fulfill()
+        }
+
+        let payload = Data(repeating: 0x5A, count: 2_048)
+        try sendClientDatagram(
+            socketFD: clientSocket,
+            relayPort: relay.port,
+            destinationAddress: .ipv4("1.1.1.1"),
+            destinationPort: 53,
+            payload: payload
+        )
+
+        wait(for: [sessionCreated], timeout: 1.0)
+        queue.sync {}
+        let session = try XCTUnwrap(provider.sessions.first)
+        XCTAssertEqual(session.writtenDatagrams, [payload])
+    }
+
+    func testUDPRelayDropsDatagramsFromUnexpectedClientEndpoint() throws {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.udp.client-lock")
+        let provider = FakeUDPProvider()
+        let relay = try Socks5UDPRelay(
+            provider: provider,
+            queue: queue,
+            mtu: 1_500,
+            logger: StructuredLogger(sink: InMemoryLogSink())
+        )
+        relay.start()
+        defer {
+            relay.stop()
+        }
+
+        let firstClient = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        XCTAssertGreaterThanOrEqual(firstClient, 0)
+        let secondClient = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        XCTAssertGreaterThanOrEqual(secondClient, 0)
+        defer {
+            close(firstClient)
+            close(secondClient)
+        }
+
+        let sessionCreated = expectation(description: "first udp session created")
+        provider.onCreate = { _ in
+            sessionCreated.fulfill()
+        }
+
+        try sendClientDatagram(
+            socketFD: firstClient,
+            relayPort: relay.port,
+            destinationAddress: .ipv4("1.1.1.1"),
+            destinationPort: 53
+        )
+        wait(for: [sessionCreated], timeout: 1.0)
+
+        try sendClientDatagram(
+            socketFD: secondClient,
+            relayPort: relay.port,
+            destinationAddress: .ipv4("8.8.8.8"),
+            destinationPort: 53
+        )
+
+        queue.sync {}
+        XCTAssertEqual(provider.sessions.count, 1)
+        XCTAssertEqual(relay.activeSessionCount, 1)
+    }
+
     private func sendClientDatagram(
         socketFD: Int32,
         relayPort: UInt16,
         destinationAddress: Socks5Address,
-        destinationPort: UInt16
+        destinationPort: UInt16,
+        payload: Data = Data([0x01, 0x02, 0x03, 0x04])
     ) throws {
-        let payload = Socks5Codec.buildUDPPacket(
+        let frame = Socks5Codec.buildUDPPacket(
             address: destinationAddress,
             port: destinationPort,
-            payload: Data([0x01, 0x02, 0x03, 0x04])
+            payload: payload
         )
 
         var address = sockaddr_in()
@@ -470,7 +557,7 @@ final class Socks5UDPRelayTests: XCTestCase {
         address.sin_port = relayPort.bigEndian
         address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
 
-        let sent = payload.withUnsafeBytes { buffer -> Int in
+        let sent = frame.withUnsafeBytes { buffer -> Int in
             guard let baseAddress = buffer.baseAddress else {
                 return -1
             }
@@ -478,7 +565,7 @@ final class Socks5UDPRelayTests: XCTestCase {
                 sendto(
                     socketFD,
                     baseAddress,
-                    payload.count,
+                    frame.count,
                     0,
                     UnsafeRawPointer($0).assumingMemoryBound(to: sockaddr.self),
                     socklen_t(MemoryLayout<sockaddr_in>.size)
@@ -486,7 +573,7 @@ final class Socks5UDPRelayTests: XCTestCase {
             }
         }
 
-        if sent != payload.count {
+        if sent != frame.count {
             throw POSIXError(.init(rawValue: errno) ?? .EINVAL)
         }
     }
@@ -516,6 +603,7 @@ private final class FakeUDPSession: Socks5UDPSession, @unchecked Sendable {
     private var readHandler: ((Data?, Error?) -> Void)?
     private(set) var cancelled = false
     private(set) var restartCount = 0
+    private(set) var writtenDatagrams: [Data] = []
     var nextWriteError: Error?
     var writeErrors: [Error] = []
     var eventHandler: ((Socks5UDPSessionEvent) -> Void)?
@@ -524,7 +612,8 @@ private final class FakeUDPSession: Socks5UDPSession, @unchecked Sendable {
         readHandler = handler
     }
 
-    func writeDatagram(_: Data, completionHandler: @escaping (Error?) -> Void) {
+    func writeDatagram(_ datagram: Data, completionHandler: @escaping (Error?) -> Void) {
+        writtenDatagrams.append(datagram)
         if !writeErrors.isEmpty {
             completionHandler(writeErrors.removeFirst())
             return

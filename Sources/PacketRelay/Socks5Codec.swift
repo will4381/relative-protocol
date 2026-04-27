@@ -75,6 +75,7 @@ public enum Socks5Codec {
         guard version == 0x05 else { return nil }
         let commandRaw = buffer[buffer.startIndex + 1]
         guard let command = Socks5Command(rawValue: commandRaw) else { return nil }
+        guard buffer[buffer.startIndex + 2] == 0x00 else { return nil }
         let atyp = buffer[buffer.startIndex + 3]
         var index = buffer.startIndex + 4
 
@@ -83,6 +84,23 @@ public enum Socks5Codec {
         let port = UInt16(buffer[index]) << 8 | UInt16(buffer[index + 1])
         buffer.removeSubrange(buffer.startIndex ..< index + 2)
         return Socks5Request(command: command, address: address, port: port)
+    }
+
+    /// Returns the SOCKS5 reply code for a syntactically invalid request prefix, or `nil` if more bytes are needed.
+    /// RFC 1928 reserves byte 2 as `0x00`; unsupported commands and address types have specific reply codes.
+    public static func requestFailureReplyCode(_ buffer: Data) -> UInt8? {
+        guard buffer.count >= 4 else { return nil }
+        guard buffer[buffer.startIndex] == 0x05 else { return 0x01 }
+        let commandRaw = buffer[buffer.startIndex + 1]
+        if Socks5Command(rawValue: commandRaw) == nil {
+            return 0x07
+        }
+        guard buffer[buffer.startIndex + 2] == 0x00 else { return 0x01 }
+        let atyp = buffer[buffer.startIndex + 3]
+        if atyp != 0x01, atyp != 0x03, atyp != 0x04 {
+            return 0x08
+        }
+        return nil
     }
 
     /// Parses a SOCKS5 UDP request/response frame.

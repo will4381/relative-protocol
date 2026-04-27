@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import PacketRelay
 
@@ -123,12 +124,12 @@ public struct TunnelProfile: Sendable, Equatable {
     /// Builds a normalized profile from `NETunnelProviderProtocol.providerConfiguration`.
     /// - Parameter providerConfiguration: Arbitrary key/value dictionary supplied by host app.
     public static func from(providerConfiguration: [String: Any]) -> TunnelProfile {
-        let relayHost = providerConfiguration["relayHost"] as? String ?? "127.0.0.1"
-        let relayPort = uint16(providerConfiguration["relayPort"], default: 1080)
-        let useUDP = providerConfiguration["relayUDP"] as? Bool ?? false
-        let configuredMTU = providerConfiguration["mtu"] == nil
+        let relayHost = providerConfiguration[TunnelProviderConfigurationKey.relayHost] as? String ?? "127.0.0.1"
+        let relayPort = uint16(providerConfiguration[TunnelProviderConfigurationKey.relayPort], default: 1080)
+        let useUDP = providerConfiguration[TunnelProviderConfigurationKey.relayUDP] as? Bool ?? false
+        let configuredMTU = providerConfiguration[TunnelProviderConfigurationKey.mtu] == nil
             ? nil
-            : int(providerConfiguration["mtu"], default: TunnelMTUStrategy.recommendedGeneric.bufferMTUHint)
+            : int(providerConfiguration[TunnelProviderConfigurationKey.mtu], default: TunnelMTUStrategy.recommendedGeneric.bufferMTUHint)
         let mtuStrategy = mtuStrategy(
             from: providerConfiguration,
             legacyMTU: configuredMTU ?? TunnelMTUStrategy.recommendedGeneric.bufferMTUHint
@@ -137,28 +138,28 @@ public struct TunnelProfile: Sendable, Equatable {
         let dnsStrategy = dnsStrategy(from: providerConfiguration)
 
         return TunnelProfile(
-            appGroupID: providerConfiguration["appGroupID"] as? String ?? "",
-            tunnelRemoteAddress: providerConfiguration["tunnelRemoteAddress"] as? String ?? "127.0.0.1",
+            appGroupID: providerConfiguration[TunnelProviderConfigurationKey.appGroupID] as? String ?? "",
+            tunnelRemoteAddress: providerConfiguration[TunnelProviderConfigurationKey.tunnelRemoteAddress] as? String ?? "127.0.0.1",
             mtu: mtuValue,
             mtuStrategy: mtuStrategy,
-            ipv6Enabled: bool(providerConfiguration["ipv6Enabled"], default: true),
-            tcpMultipathHandoverEnabled: bool(providerConfiguration["tcpMultipathHandoverEnabled"], default: false),
-            ipv4Address: providerConfiguration["ipv4Address"] as? String ?? "10.0.0.2",
-            ipv4SubnetMask: providerConfiguration["ipv4SubnetMask"] as? String ?? "255.255.255.0",
-            ipv4Router: providerConfiguration["ipv4Router"] as? String ?? "10.0.0.1",
-            ipv6Address: providerConfiguration["ipv6Address"] as? String ?? "fd00:1::2",
-            ipv6PrefixLength: int(providerConfiguration["ipv6PrefixLength"], default: 64),
+            ipv6Enabled: bool(providerConfiguration[TunnelProviderConfigurationKey.ipv6Enabled], default: true),
+            tcpMultipathHandoverEnabled: bool(providerConfiguration[TunnelProviderConfigurationKey.tcpMultipathHandoverEnabled], default: false),
+            ipv4Address: providerConfiguration[TunnelProviderConfigurationKey.ipv4Address] as? String ?? "10.0.0.2",
+            ipv4SubnetMask: providerConfiguration[TunnelProviderConfigurationKey.ipv4SubnetMask] as? String ?? "255.255.255.0",
+            ipv4Router: providerConfiguration[TunnelProviderConfigurationKey.ipv4Router] as? String ?? "10.0.0.1",
+            ipv6Address: providerConfiguration[TunnelProviderConfigurationKey.ipv6Address] as? String ?? "fd00:1::2",
+            ipv6PrefixLength: int(providerConfiguration[TunnelProviderConfigurationKey.ipv6PrefixLength], default: 64),
             dnsServers: dnsStrategy.servers,
             dnsStrategy: dnsStrategy,
-            engineSocksPort: uint16AllowingZero(providerConfiguration["engineSocksPort"], default: 1080),
-            engineLogLevel: providerConfiguration["engineLogLevel"] as? String ?? "warn",
-            telemetryEnabled: bool(providerConfiguration["telemetryEnabled"], default: true),
-            liveTapEnabled: bool(providerConfiguration["liveTapEnabled"], default: false),
-            liveTapIncludeFlowSlices: bool(providerConfiguration["liveTapIncludeFlowSlices"], default: false),
-            liveTapMaxBytes: int(providerConfiguration["liveTapMaxBytes"], default: 5_000_000),
-            signatureFileName: providerConfiguration["signatureFileName"] as? String ?? "app_signatures.json",
+            engineSocksPort: uint16AllowingZero(providerConfiguration[TunnelProviderConfigurationKey.engineSocksPort], default: 1080),
+            engineLogLevel: providerConfiguration[TunnelProviderConfigurationKey.engineLogLevel] as? String ?? "warn",
+            telemetryEnabled: bool(providerConfiguration[TunnelProviderConfigurationKey.telemetryEnabled], default: true),
+            liveTapEnabled: bool(providerConfiguration[TunnelProviderConfigurationKey.liveTapEnabled], default: false),
+            liveTapIncludeFlowSlices: bool(providerConfiguration[TunnelProviderConfigurationKey.liveTapIncludeFlowSlices], default: false),
+            liveTapMaxBytes: int(providerConfiguration[TunnelProviderConfigurationKey.liveTapMaxBytes], default: 5_000_000),
+            signatureFileName: providerConfiguration[TunnelProviderConfigurationKey.signatureFileName] as? String ?? "app_signatures.json",
             relayEndpoint: RelayEndpoint(host: relayHost, port: relayPort, useUDP: useUDP),
-            dataplaneConfigJSON: providerConfiguration["dataplaneConfigJSON"] as? String ?? "{}"
+            dataplaneConfigJSON: providerConfiguration[TunnelProviderConfigurationKey.dataplaneConfigJSON] as? String ?? "{}"
         )
     }
 
@@ -169,43 +170,66 @@ public struct TunnelProfile: Sendable, Equatable {
         let profile = from(providerConfiguration: providerConfiguration)
         var missing: [String] = []
 
-        if string(providerConfiguration["appGroupID"])?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
-            missing.append("appGroupID")
+        if string(providerConfiguration[TunnelProviderConfigurationKey.appGroupID])?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            missing.append(TunnelProviderConfigurationKey.appGroupID)
         }
-        if string(providerConfiguration["tunnelRemoteAddress"])?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
-            missing.append("tunnelRemoteAddress")
+        if string(providerConfiguration[TunnelProviderConfigurationKey.tunnelRemoteAddress])?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            missing.append(TunnelProviderConfigurationKey.tunnelRemoteAddress)
         }
-        if string(providerConfiguration["ipv4Address"])?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
-            missing.append("ipv4Address")
+        if string(providerConfiguration[TunnelProviderConfigurationKey.ipv4Address])?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            missing.append(TunnelProviderConfigurationKey.ipv4Address)
         }
-        if string(providerConfiguration["ipv4SubnetMask"])?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
-            missing.append("ipv4SubnetMask")
+        if string(providerConfiguration[TunnelProviderConfigurationKey.ipv4SubnetMask])?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            missing.append(TunnelProviderConfigurationKey.ipv4SubnetMask)
         }
-        if string(providerConfiguration["ipv4Router"])?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
-            missing.append("ipv4Router")
+        if string(providerConfiguration[TunnelProviderConfigurationKey.ipv4Router])?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            missing.append(TunnelProviderConfigurationKey.ipv4Router)
         }
-        if providerConfiguration["engineSocksPort"] == nil {
-            missing.append("engineSocksPort")
+        if profile.ipv6Enabled,
+           string(providerConfiguration[TunnelProviderConfigurationKey.ipv6Address])?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            missing.append(TunnelProviderConfigurationKey.ipv6Address)
         }
-        if providerConfiguration["relayHost"] == nil {
-            missing.append("relayHost")
+        if providerConfiguration[TunnelProviderConfigurationKey.engineSocksPort] == nil {
+            missing.append(TunnelProviderConfigurationKey.engineSocksPort)
         }
-        if providerConfiguration["relayPort"] == nil {
-            missing.append("relayPort")
+        if providerConfiguration[TunnelProviderConfigurationKey.relayHost] == nil {
+            missing.append(TunnelProviderConfigurationKey.relayHost)
+        }
+        if providerConfiguration[TunnelProviderConfigurationKey.relayPort] == nil {
+            missing.append(TunnelProviderConfigurationKey.relayPort)
         }
 
         guard missing.isEmpty else {
             throw TunnelProfileValidationError.missingRequiredKeys(missing.sorted())
         }
         guard profile.mtu >= 1_280 else {
-            throw TunnelProfileValidationError.invalidValue(key: "mtu", reason: "must be at least 1280")
+            throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.mtu, reason: "must be at least 1280")
+        }
+        guard isValidHostNameOrAddress(profile.tunnelRemoteAddress) else {
+            throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.tunnelRemoteAddress, reason: "must be a hostname or IP literal without whitespace")
+        }
+        guard isValidIPv4Address(profile.ipv4Address) else {
+            throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.ipv4Address, reason: "must be a valid IPv4 address")
+        }
+        guard isValidIPv4SubnetMask(profile.ipv4SubnetMask) else {
+            throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.ipv4SubnetMask, reason: "must be a contiguous IPv4 subnet mask")
+        }
+        guard isValidIPv4Address(profile.ipv4Router) else {
+            throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.ipv4Router, reason: "must be a valid IPv4 address")
         }
         guard profile.ipv6PrefixLength > 0, profile.ipv6PrefixLength <= 128 else {
-            throw TunnelProfileValidationError.invalidValue(key: "ipv6PrefixLength", reason: "must be in 1...128")
+            throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.ipv6PrefixLength, reason: "must be in 1...128")
+        }
+        if profile.ipv6Enabled, !isValidIPv6Address(profile.ipv6Address) {
+            throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.ipv6Address, reason: "must be a valid IPv6 address when IPv6 is enabled")
         }
         guard profile.relayEndpoint.port > 0 else {
-            throw TunnelProfileValidationError.invalidValue(key: "relayPort", reason: "must be greater than zero")
+            throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.relayPort, reason: "must be greater than zero")
         }
+        guard isValidHostNameOrAddress(profile.relayEndpoint.host) else {
+            throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.relayHost, reason: "must be a hostname or IP literal without whitespace")
+        }
+        try validateDNSStrategy(profile.dnsStrategy)
         try validateDataplaneConfig(profile.dataplaneConfigJSON)
         return profile
     }
@@ -287,8 +311,8 @@ public struct TunnelProfile: Sendable, Equatable {
     }
 
     private static func mtuStrategy(from providerConfiguration: [String: Any], legacyMTU: Int) -> TunnelMTUStrategy {
-        guard let rawStrategy = string(providerConfiguration["mtuStrategy"]) else {
-            if providerConfiguration["mtu"] != nil {
+        guard let rawStrategy = string(providerConfiguration[TunnelProviderConfigurationKey.mtuStrategy]) else {
+            if providerConfiguration[TunnelProviderConfigurationKey.mtu] != nil {
                 return .fixed(legacyMTU)
             }
             return .recommendedGeneric
@@ -297,7 +321,7 @@ public struct TunnelProfile: Sendable, Equatable {
         switch rawStrategy {
         case "automaticTunnelOverhead":
             return .automaticTunnelOverhead(
-                max(0, int(providerConfiguration["tunnelOverheadBytes"], default: 80))
+                max(0, int(providerConfiguration[TunnelProviderConfigurationKey.tunnelOverheadBytes], default: 80))
             )
         case "fixed":
             fallthrough
@@ -307,8 +331,8 @@ public struct TunnelProfile: Sendable, Equatable {
     }
 
     private static func dnsStrategy(from providerConfiguration: [String: Any]) -> TunnelDNSStrategy {
-        let legacyServers = stringArray(providerConfiguration["dnsServers"])
-        guard let rawStrategy = providerConfiguration["dnsStrategy"] as? [String: Any],
+        let legacyServers = stringArray(providerConfiguration[TunnelProviderConfigurationKey.dnsServers])
+        guard let rawStrategy = providerConfiguration[TunnelProviderConfigurationKey.dnsStrategy] as? [String: Any],
               let type = string(rawStrategy["type"]) else {
             if let legacyServers, !legacyServers.isEmpty {
                 return .cleartext(servers: legacyServers)
@@ -322,14 +346,6 @@ public struct TunnelProfile: Sendable, Equatable {
         case "tls":
             let servers = stringArray(rawStrategy["servers"]) ?? legacyServers ?? TunnelDNSStrategy.defaultPublicResolvers
             let serverName = string(rawStrategy["serverName"]) ?? ""
-            if serverName.isEmpty {
-                return .cleartext(
-                    servers: servers,
-                    matchDomains: stringArray(rawStrategy["matchDomains"]),
-                    matchDomainsNoSearch: bool(rawStrategy["matchDomainsNoSearch"], default: false),
-                    allowFailover: bool(rawStrategy["allowFailover"], default: false)
-                )
-            }
             return .tls(
                 servers: servers,
                 serverName: serverName,
@@ -340,14 +356,6 @@ public struct TunnelProfile: Sendable, Equatable {
         case "https":
             let servers = stringArray(rawStrategy["servers"]) ?? legacyServers ?? TunnelDNSStrategy.defaultPublicResolvers
             let serverURL = string(rawStrategy["serverURL"]) ?? ""
-            if serverURL.isEmpty {
-                return .cleartext(
-                    servers: servers,
-                    matchDomains: stringArray(rawStrategy["matchDomains"]),
-                    matchDomainsNoSearch: bool(rawStrategy["matchDomainsNoSearch"], default: false),
-                    allowFailover: bool(rawStrategy["allowFailover"], default: false)
-                )
-            }
             return .https(
                 servers: servers,
                 serverURL: serverURL,
@@ -365,6 +373,89 @@ public struct TunnelProfile: Sendable, Equatable {
                 allowFailover: bool(rawStrategy["allowFailover"], default: false)
             )
         }
+    }
+
+    private static func validateDNSStrategy(_ strategy: TunnelDNSStrategy) throws {
+        switch strategy {
+        case .noOverride:
+            return
+        case .cleartext(let servers, let matchDomains, _, _):
+            try validateDNSServers(servers, key: TunnelProviderConfigurationKey.dnsServers)
+            try validateMatchDomains(matchDomains)
+        case .tls(let servers, let serverName, let matchDomains, _, _):
+            try validateDNSServers(servers, key: TunnelProviderConfigurationKey.dnsServers)
+            guard isValidHostNameOrAddress(serverName) else {
+                throw TunnelProfileValidationError.invalidValue(
+                    key: "\(TunnelProviderConfigurationKey.dnsStrategy).serverName",
+                    reason: "must be a DNS-over-TLS server name without whitespace"
+                )
+            }
+            try validateMatchDomains(matchDomains)
+        case .https(let servers, let serverURL, let matchDomains, _, _):
+            try validateDNSServers(servers, key: TunnelProviderConfigurationKey.dnsServers)
+            guard let url = URL(string: serverURL),
+                  url.scheme?.lowercased() == "https",
+                  url.host?.isEmpty == false else {
+                throw TunnelProfileValidationError.invalidValue(
+                    key: "\(TunnelProviderConfigurationKey.dnsStrategy).serverURL",
+                    reason: "must be an HTTPS URL with a host"
+                )
+            }
+            try validateMatchDomains(matchDomains)
+        }
+    }
+
+    private static func validateDNSServers(_ servers: [String], key: String) throws {
+        guard !servers.isEmpty else {
+            throw TunnelProfileValidationError.invalidValue(key: key, reason: "must include at least one resolver IP")
+        }
+        guard servers.allSatisfy({ isValidIPv4Address($0) || isValidIPv6Address($0) }) else {
+            throw TunnelProfileValidationError.invalidValue(key: key, reason: "must contain only IPv4 or IPv6 resolver addresses")
+        }
+    }
+
+    private static func validateMatchDomains(_ matchDomains: [String]?) throws {
+        guard let matchDomains else {
+            return
+        }
+        if matchDomains.contains(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || containsWhitespace($0) }) {
+            throw TunnelProfileValidationError.invalidValue(
+                key: "\(TunnelProviderConfigurationKey.dnsStrategy).matchDomains",
+                reason: "must contain non-empty domain names without whitespace"
+            )
+        }
+    }
+
+    private static func isValidIPv4Address(_ value: String) -> Bool {
+        var address = in_addr()
+        return value.withCString { inet_pton(AF_INET, $0, &address) } == 1
+    }
+
+    private static func isValidIPv6Address(_ value: String) -> Bool {
+        var address = in6_addr()
+        return value.withCString { inet_pton(AF_INET6, $0, &address) } == 1
+    }
+
+    private static func isValidIPv4SubnetMask(_ value: String) -> Bool {
+        var address = in_addr()
+        guard value.withCString({ inet_pton(AF_INET, $0, &address) }) == 1 else {
+            return false
+        }
+        let mask = UInt32(bigEndian: address.s_addr)
+        guard mask != 0 else {
+            return false
+        }
+        let inverse = ~mask
+        return inverse &+ 1 == 0 || (inverse & (inverse &+ 1)) == 0
+    }
+
+    private static func isValidHostNameOrAddress(_ value: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !trimmed.isEmpty && trimmed == value && !containsWhitespace(value)
+    }
+
+    private static func containsWhitespace(_ value: String) -> Bool {
+        value.rangeOfCharacter(from: .whitespacesAndNewlines) != nil
     }
 
     private static func validateDataplaneConfig(_ config: String) throws {

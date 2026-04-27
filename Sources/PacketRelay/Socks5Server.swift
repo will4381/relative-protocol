@@ -1519,8 +1519,8 @@ final class Socks5Connection: @unchecked Sendable {
 
     /// Idempotently closes this connection and any outbound resources.
     func stop() {
-        runOnQueue { [weak self] in
-            self?.stopOnQueue()
+        runOnQueue {
+            self.stopOnQueue()
         }
     }
 
@@ -1606,6 +1606,11 @@ final class Socks5Connection: @unchecked Sendable {
                 stop()
             }
         case .request:
+            if let failureCode = Socks5Codec.requestFailureReplyCode(buffer) {
+                buffer.removeAll(keepingCapacity: false)
+                sendFailure(replyCode: failureCode)
+                return
+            }
             guard let request = Socks5Codec.parseRequest(&buffer) else { return }
             handleRequest(request)
         case .connectingTCP:
@@ -1657,7 +1662,7 @@ final class Socks5Connection: @unchecked Sendable {
         case .udpAssociate:
             startUDPRelay()
         case .bind:
-            sendFailure()
+            sendFailure(replyCode: 0x07)
         }
     }
 

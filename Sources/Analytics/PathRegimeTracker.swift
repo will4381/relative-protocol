@@ -31,20 +31,6 @@ internal protocol PathRegimeProvider: Sendable {
     func stop()
 }
 
-internal final class StaticPathRegimeProvider: PathRegimeProvider, @unchecked Sendable {
-    private let snapshotValue: PathRegimeSnapshot
-
-    init(snapshot: PathRegimeSnapshot) {
-        self.snapshotValue = snapshot
-    }
-
-    var currentSnapshot: PathRegimeSnapshot {
-        snapshotValue
-    }
-
-    func stop() {}
-}
-
 /// `NWPathMonitor` is the Apple-supported way to react to path changes without leaving the packet-tunnel model.
 /// Docs: https://developer.apple.com/documentation/network/nwpathmonitor
 /// Docs: https://developer.apple.com/documentation/network/nwpath/usesinterfacetype(_:)

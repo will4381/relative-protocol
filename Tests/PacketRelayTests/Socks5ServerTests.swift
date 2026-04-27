@@ -77,6 +77,93 @@ final class Socks5ServerTests: XCTestCase {
         }
     }
 
+    func testMalformedRequestReservedByteSendsGeneralFailure() {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.invalid-rsv")
+        let inbound = FakeInboundConnection()
+        let outbound = ControlledTCPOutbound()
+        let provider = FakeProvider(outbound: outbound)
+        let connection = Socks5Connection(
+            connection: inbound,
+            provider: provider,
+            queue: queue,
+            mtu: 1500,
+            logger: StructuredLogger(sink: InMemoryLogSink())
+        )
+
+        queue.sync {
+            connection.start()
+            inbound.push(Self.greeting)
+            inbound.push(Self.request(command: 0x01, reserved: 0x01, host: "example.com", port: 443))
+
+            XCTAssertEqual(
+                inbound.sentPayloads,
+                [
+                    Socks5Codec.buildMethodSelection(method: 0x00),
+                    Socks5Codec.buildReply(code: 0x01, bindAddress: .ipv4("0.0.0.0"), bindPort: 0)
+                ]
+            )
+            XCTAssertTrue(inbound.cancelled)
+        }
+    }
+
+    func testBindRequestSendsCommandNotSupported() {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.bind")
+        let inbound = FakeInboundConnection()
+        let outbound = ControlledTCPOutbound()
+        let provider = FakeProvider(outbound: outbound)
+        let connection = Socks5Connection(
+            connection: inbound,
+            provider: provider,
+            queue: queue,
+            mtu: 1500,
+            logger: StructuredLogger(sink: InMemoryLogSink())
+        )
+
+        queue.sync {
+            connection.start()
+            inbound.push(Self.greeting)
+            inbound.push(Self.request(command: 0x02, host: "example.com", port: 443))
+
+            XCTAssertEqual(
+                inbound.sentPayloads,
+                [
+                    Socks5Codec.buildMethodSelection(method: 0x00),
+                    Socks5Codec.buildReply(code: 0x07, bindAddress: .ipv4("0.0.0.0"), bindPort: 0)
+                ]
+            )
+            XCTAssertTrue(inbound.cancelled)
+        }
+    }
+
+    func testUnsupportedCommandSendsCommandNotSupported() {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.unsupported-command")
+        let inbound = FakeInboundConnection()
+        let outbound = ControlledTCPOutbound()
+        let provider = FakeProvider(outbound: outbound)
+        let connection = Socks5Connection(
+            connection: inbound,
+            provider: provider,
+            queue: queue,
+            mtu: 1500,
+            logger: StructuredLogger(sink: InMemoryLogSink())
+        )
+
+        queue.sync {
+            connection.start()
+            inbound.push(Self.greeting)
+            inbound.push(Self.request(command: 0x09, host: "example.com", port: 443))
+
+            XCTAssertEqual(
+                inbound.sentPayloads,
+                [
+                    Socks5Codec.buildMethodSelection(method: 0x00),
+                    Socks5Codec.buildReply(code: 0x07, bindAddress: .ipv4("0.0.0.0"), bindPort: 0)
+                ]
+            )
+            XCTAssertTrue(inbound.cancelled)
+        }
+    }
+
     /// Verifies inbound client reads pause while one outbound relay write is still in flight.
     func testTCPProxyPausesInboundReadsUntilOutboundWriteCompletes() {
         let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.backpressure")
@@ -110,6 +197,28 @@ final class Socks5ServerTests: XCTestCase {
             inbound.push(Data("second".utf8))
             XCTAssertEqual(outbound.writes, [Data("first".utf8), Data("second".utf8)])
         }
+    }
+
+    func testStopRetainsConnectionUntilQueuedCleanupRuns() {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.stop-retains")
+        let inbound = FakeInboundConnection()
+        let outbound = ControlledTCPOutbound()
+        let provider = FakeProvider(outbound: outbound)
+        var connection: Socks5Connection? = Socks5Connection(
+            connection: inbound,
+            provider: provider,
+            queue: queue,
+            mtu: 1500,
+            logger: StructuredLogger(sink: InMemoryLogSink())
+        )
+
+        queue.suspend()
+        connection?.stop()
+        connection = nil
+        queue.resume()
+        queue.sync {}
+
+        XCTAssertTrue(inbound.cancelled)
     }
 
     func testConnectingTCPBufferLimitClosesConnection() {
@@ -442,9 +551,13 @@ final class Socks5ServerTests: XCTestCase {
     private static let greeting = Data([0x05, 0x01, 0x00])
 
     private static func connectRequest(host: String, port: UInt16) -> Data {
+        request(command: 0x01, host: host, port: port)
+    }
+
+    private static func request(command: UInt8, reserved: UInt8 = 0x00, host: String, port: UInt16) -> Data {
         let hostBytes = Array(host.utf8)
         return Data(
-            [0x05, 0x01, 0x00, 0x03, UInt8(hostBytes.count)] +
+            [0x05, command, reserved, 0x03, UInt8(hostBytes.count)] +
             hostBytes +
             [UInt8((port >> 8) & 0xFF), UInt8(port & 0xFF)]
         )

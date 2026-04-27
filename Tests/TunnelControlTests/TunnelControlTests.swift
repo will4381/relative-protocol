@@ -39,6 +39,60 @@ final class TunnelControlTests: XCTestCase {
         }
     }
 
+    func testRuntimeProfileValidationRejectsMalformedNetworkAddresses() {
+        var configuration = makeRuntimeProviderConfiguration()
+        configuration["ipv4Address"] = "10.0.0.999"
+
+        XCTAssertThrowsError(try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)) { error in
+            XCTAssertEqual(
+                error as? TunnelProfileValidationError,
+                .invalidValue(key: "ipv4Address", reason: "must be a valid IPv4 address")
+            )
+        }
+
+        configuration = makeRuntimeProviderConfiguration()
+        configuration["ipv4SubnetMask"] = "255.0.255.0"
+
+        XCTAssertThrowsError(try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)) { error in
+            XCTAssertEqual(
+                error as? TunnelProfileValidationError,
+                .invalidValue(key: "ipv4SubnetMask", reason: "must be a contiguous IPv4 subnet mask")
+            )
+        }
+    }
+
+    func testRuntimeProfileValidationRejectsIncompleteEncryptedDNS() {
+        var configuration = makeRuntimeProviderConfiguration()
+        configuration["dnsStrategy"] = [
+            "type": "tls",
+            "servers": ["1.1.1.1"]
+        ]
+
+        XCTAssertThrowsError(try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)) { error in
+            XCTAssertEqual(
+                error as? TunnelProfileValidationError,
+                .invalidValue(
+                    key: "dnsStrategy.serverName",
+                    reason: "must be a DNS-over-TLS server name without whitespace"
+                )
+            )
+        }
+
+        configuration = makeRuntimeProviderConfiguration()
+        configuration["dnsStrategy"] = [
+            "type": "https",
+            "servers": ["1.1.1.1"],
+            "serverURL": "http://dns.example/dns-query"
+        ]
+
+        XCTAssertThrowsError(try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)) { error in
+            XCTAssertEqual(
+                error as? TunnelProfileValidationError,
+                .invalidValue(key: "dnsStrategy.serverURL", reason: "must be an HTTPS URL with a host")
+            )
+        }
+    }
+
     func testRuntimeProfileValidationAcceptsCompleteProviderConfiguration() throws {
         let profile = try TunnelProfile.validatedRuntimeProfile(providerConfiguration: makeRuntimeProviderConfiguration())
         XCTAssertEqual(profile.appGroupID, "group.example")

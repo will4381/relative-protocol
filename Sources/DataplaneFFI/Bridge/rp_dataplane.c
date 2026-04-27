@@ -40,6 +40,7 @@ static uint8_t rp_dp_callback_queue_key;
 static uint8_t rp_dp_worker_queue_key;
 static pthread_mutex_t rp_dp_global_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct rp_dp_handle *rp_dp_active_handle;
+static uint32_t rp_dp_tcp_isn_counter;
 
 struct rp_dp_handle {
     dispatch_queue_t callback_queue;
@@ -142,10 +143,12 @@ static void rp_dp_refresh_stats(struct rp_dp_handle *handle)
     }
 
     hev_socks5_tunnel_stats(&tx_packets, &tx_bytes, &rx_packets, &rx_bytes);
+    pthread_mutex_lock(&rp_dp_global_lock);
     handle->stats.packets_in = (uint64_t)rx_packets;
     handle->stats.bytes_in = (uint64_t)rx_bytes;
     handle->stats.packets_out = (uint64_t)tx_packets;
     handle->stats.bytes_out = (uint64_t)tx_bytes;
+    pthread_mutex_unlock(&rp_dp_global_lock);
 }
 
 static int rp_dp_is_deterministic_local_mode(struct rp_dp_handle *handle)
@@ -171,20 +174,25 @@ static void rp_dp_wait_worker_if_needed(struct rp_dp_handle *handle)
 void rp_dp_hev_notify_ready(void)
 {
     int should_stop = 0;
+    struct rp_dp_handle *handle = NULL;
+    dispatch_semaphore_t startup_semaphore = NULL;
 
     pthread_mutex_lock(&rp_dp_global_lock);
-    struct rp_dp_handle *handle = rp_dp_active_handle;
+    handle = rp_dp_active_handle;
     if (handle != NULL) {
         handle->ready = 1;
         should_stop = handle->stopping != 0;
-        if (handle->startup_semaphore != NULL) {
-            dispatch_semaphore_signal(handle->startup_semaphore);
-        }
-        rp_dp_dispatch_state(handle, RP_DP_STATE_RUNNING);
-        rp_dp_dispatch_log(handle, RP_DP_READY_MSG);
+        startup_semaphore = handle->startup_semaphore;
     }
     pthread_mutex_unlock(&rp_dp_global_lock);
 
+    if (startup_semaphore != NULL) {
+        dispatch_semaphore_signal(startup_semaphore);
+    }
+    if (handle != NULL) {
+        rp_dp_dispatch_state(handle, RP_DP_STATE_RUNNING);
+        rp_dp_dispatch_log(handle, RP_DP_READY_MSG);
+    }
     if (should_stop) {
         hev_socks5_tunnel_quit();
     }
@@ -272,27 +280,28 @@ int32_t rp_dp_start(rp_dp_handle_t *opaque_handle, int32_t tun_fd)
     if (handle->config_json == NULL || handle->config_len == 0) {
         return -4;
     }
+    pthread_mutex_lock(&rp_dp_global_lock);
     if (handle->started != 0) {
+        pthread_mutex_unlock(&rp_dp_global_lock);
         return 0;
     }
-
-    pthread_mutex_lock(&rp_dp_global_lock);
     if (rp_dp_active_handle != NULL && rp_dp_active_handle != handle) {
         pthread_mutex_unlock(&rp_dp_global_lock);
         return -5;
     }
     rp_dp_active_handle = handle;
-    pthread_mutex_unlock(&rp_dp_global_lock);
-
     handle->tun_fd = tun_fd;
     handle->started = 1;
     handle->stopping = 0;
     handle->ready = 0;
     handle->exited = 0;
     handle->exit_code = 0;
+    pthread_mutex_unlock(&rp_dp_global_lock);
 
     if (rp_dp_is_deterministic_local_mode(handle) && tun_fd == 0) {
+        pthread_mutex_lock(&rp_dp_global_lock);
         handle->ready = 1;
+        pthread_mutex_unlock(&rp_dp_global_lock);
         rp_dp_dispatch_state(handle, RP_DP_STATE_RUNNING);
         rp_dp_dispatch_log(handle, RP_DP_RUNNING_MSG);
         return 0;
@@ -303,15 +312,27 @@ int32_t rp_dp_start(rp_dp_handle_t *opaque_handle, int32_t tun_fd)
          * Do not redirect process-wide stderr inside the extension process.
          * Blocking global file descriptors is a liveness risk under load.
          */
+        int32_t worker_tun_fd;
+        const char *worker_config_json;
+        size_t worker_config_len;
+        pthread_mutex_lock(&rp_dp_global_lock);
+        worker_tun_fd = handle->tun_fd;
+        worker_config_json = handle->config_json;
+        worker_config_len = handle->config_len;
+        pthread_mutex_unlock(&rp_dp_global_lock);
+
         int result = hev_socks5_tunnel_main_from_str(
-            (const unsigned char *)handle->config_json,
-            (unsigned int)handle->config_len,
-            handle->tun_fd);
+            (const unsigned char *)worker_config_json,
+            (unsigned int)worker_config_len,
+            worker_tun_fd);
 
         rp_dp_refresh_stats(handle);
+        pthread_mutex_lock(&rp_dp_global_lock);
         handle->exit_code = result;
         handle->exited = 1;
         handle->started = 0;
+        int should_dispatch_stopped = !handle->stopping;
+        pthread_mutex_unlock(&rp_dp_global_lock);
 
         if (result == 0) {
             rp_dp_dispatch_logf(handle, "%s exit_code=%d", RP_DP_EXITED_MSG,
@@ -321,7 +342,7 @@ int32_t rp_dp_start(rp_dp_handle_t *opaque_handle, int32_t tun_fd)
                                 RP_DP_EXITED_ERROR_MSG, result);
         }
 
-        if (!handle->stopping) {
+        if (should_dispatch_stopped) {
             rp_dp_dispatch_state(handle, RP_DP_STATE_STOPPED);
         }
         rp_dp_clear_active_handle_if_current(handle);
@@ -334,19 +355,25 @@ int32_t rp_dp_start(rp_dp_handle_t *opaque_handle, int32_t tun_fd)
         handle->startup_semaphore,
         dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
     if (wait_result != 0) {
+        pthread_mutex_lock(&rp_dp_global_lock);
         handle->stopping = 1;
+        pthread_mutex_unlock(&rp_dp_global_lock);
         rp_dp_clear_active_handle_if_current(handle);
         hev_socks5_tunnel_quit();
         rp_dp_dispatch_log(handle, "dataplane-start-timeout");
         return -6;
     }
-    if (handle->ready != 0) {
+    pthread_mutex_lock(&rp_dp_global_lock);
+    uint8_t ready = handle->ready;
+    int32_t exit_code = handle->exit_code;
+    pthread_mutex_unlock(&rp_dp_global_lock);
+    if (ready != 0) {
         rp_dp_dispatch_log(handle, RP_DP_RUNNING_MSG);
         return 0;
     }
 
     rp_dp_clear_active_handle_if_current(handle);
-    return handle->exit_code == 0 ? -7 : handle->exit_code;
+    return exit_code == 0 ? -7 : exit_code;
 }
 
 int32_t rp_dp_stop(rp_dp_handle_t *opaque_handle)
@@ -358,25 +385,35 @@ int32_t rp_dp_stop(rp_dp_handle_t *opaque_handle)
     if (rp_dp_reentrant_call_guard() != 0) {
         return -2;
     }
-    if (handle->started == 0) {
+    pthread_mutex_lock(&rp_dp_global_lock);
+    uint8_t started = handle->started;
+    int32_t tun_fd = handle->tun_fd;
+    pthread_mutex_unlock(&rp_dp_global_lock);
+    if (started == 0) {
         return 0;
     }
 
-    if (rp_dp_is_deterministic_local_mode(handle) && handle->tun_fd == 0) {
+    if (rp_dp_is_deterministic_local_mode(handle) && tun_fd == 0) {
+        pthread_mutex_lock(&rp_dp_global_lock);
         handle->started = 0;
         handle->ready = 0;
+        pthread_mutex_unlock(&rp_dp_global_lock);
         rp_dp_clear_active_handle_if_current(handle);
         rp_dp_dispatch_state(handle, RP_DP_STATE_STOPPED);
         rp_dp_dispatch_log(handle, RP_DP_STOPPED_MSG);
         return 0;
     }
 
+    pthread_mutex_lock(&rp_dp_global_lock);
     handle->stopping = 1;
+    pthread_mutex_unlock(&rp_dp_global_lock);
     hev_socks5_tunnel_quit();
     rp_dp_wait_worker_if_needed(handle);
+    pthread_mutex_lock(&rp_dp_global_lock);
     handle->started = 0;
     handle->stopping = 0;
     handle->ready = 0;
+    pthread_mutex_unlock(&rp_dp_global_lock);
     rp_dp_clear_active_handle_if_current(handle);
 
     rp_dp_refresh_stats(handle);
@@ -392,7 +429,10 @@ void rp_dp_destroy(rp_dp_handle_t *opaque_handle)
         return;
     }
 
-    if (handle->started != 0) {
+    pthread_mutex_lock(&rp_dp_global_lock);
+    uint8_t started = handle->started;
+    pthread_mutex_unlock(&rp_dp_global_lock);
+    if (started != 0) {
         (void)rp_dp_stop(handle);
     }
 
@@ -441,15 +481,24 @@ int32_t rp_dp_get_stats(rp_dp_handle_t *opaque_handle, rp_dp_stats_t *out_stats)
     }
 
     rp_dp_refresh_stats(handle);
+    pthread_mutex_lock(&rp_dp_global_lock);
     *out_stats = handle->stats;
+    pthread_mutex_unlock(&rp_dp_global_lock);
     return 0;
 }
 
-/*
- * lwIP expects this symbol when its random macro is enabled.
- * We provide it in first-party bridge code to avoid patching vendored sources.
- */
-uint32_t lwip_port_rand(void)
+uint32_t lwip_port_tcp_isn(const void *local_ip,
+                           uint16_t local_port,
+                           const void *remote_ip,
+                           uint16_t remote_port)
 {
-    return (uint32_t)rand();
+    (void)local_ip;
+    (void)remote_ip;
+
+    pthread_mutex_lock(&rp_dp_global_lock);
+    rp_dp_tcp_isn_counter += 64000u + (arc4random() & 0xffu);
+    uint32_t counter = rp_dp_tcp_isn_counter;
+    pthread_mutex_unlock(&rp_dp_global_lock);
+
+    return arc4random() ^ counter ^ ((uint32_t)local_port << 16) ^ (uint32_t)remote_port;
 }

@@ -11,6 +11,14 @@ It is designed so the tunnel can stay alive and keep detecting while the contain
 
 ## Recent Changes
 
+- protocol and production hardening
+  - runtime provider configuration now fails closed for malformed IP addresses, subnet masks, relay hosts, DNS resolvers, DNS-over-TLS server names, and DNS-over-HTTPS URLs
+  - encrypted DNS configuration no longer silently downgrades to cleartext when `serverName` or `serverURL` is missing
+  - SOCKS5 request parsing now rejects invalid reserved bytes and returns command/address-specific failure codes for unsupported requests
+  - UDP ASSOCIATE now pins relay traffic to the original localhost client endpoint for the association
+  - dataplane bridge lifecycle fields and stats updates are protected by one synchronization boundary
+  - lwIP random source ports and TCP initial sequence numbers now use the first-party secure randomness hooks
+  - `Scripts/quality-gate.sh` now validates `Config/PerfBaseline.json` and can compare metrics through `VPN_BRIDGE_PERF_RESULTS`
 - transport recovery hardening
   - outbound TCP now uses bounded connect attempts with retry for stalled `NWConnection.State.preparing`
   - outbound UDP sessions now restart or rotate on `waiting`, `failed`, write-side failure, and better-path replacement signals
@@ -313,6 +321,7 @@ The package default for provider-configuration users is `dnsStrategy = .noOverri
 Existing direct `TunnelProfile(...)` callers stay backward-compatible here too: if you pass only `dnsServers`, the profile uses `.cleartext(servers: dnsServers)`.
 If you want to preserve the system resolver path, set `dnsStrategy = .noOverride` explicitly. Do not rely on `dnsServers: []` with a missing `dnsStrategy`, because the direct `TunnelProfile(...)` initializer treats that as cleartext DNS configuration over the provided `dnsServers` array.
 When you choose `.tls(...)` or `.https(...)`, provide a real `serverName` or `serverURL` along with resolver IPs so the encrypted DNS policy is fully specified.
+Runtime provider-configuration validation fails closed for incomplete encrypted DNS rather than downgrading that policy to cleartext.
 
 `engineSocksPort` controls the local SOCKS listener inside the tunnel process.
 Set `engineSocksPort = 0` if you want the system to choose a free ephemeral port and avoid collisions with stale profiles, parallel test installs, or other local listeners.
@@ -378,6 +387,7 @@ Migration rules:
 4. If you know your tunnel encapsulation overhead, prefer `mtuStrategy = .automaticTunnelOverhead(...)` instead of guessing fixed MTU values.
 5. If your product needs better continuity across Wi-Fi <-> cellular transitions, enable `tcpMultipathHandoverEnabled = true`. Leave it off only if you intentionally want to avoid Multipath TCP handover.
 6. If you run multiple local profiles, test harnesses, or extension builds on the same device, prefer `engineSocksPort = 0` so the tunnel binds an ephemeral local SOCKS port instead of relying on the legacy fixed `1080` port.
+7. If you configure encrypted DNS, provide complete resolver IPs plus the required DoT `serverName` or DoH `serverURL`; incomplete encrypted DNS now fails startup validation instead of falling back to cleartext.
 
 Recommended migration profiles:
 
@@ -402,6 +412,61 @@ Operational note:
 - the package now exposes the DNS/MTU choices as policy, but the right DNS choice is still network-dependent
 - on handoff-sensitive UDP paths, the relay now keeps sessions alive on isolated `maximumDatagramSize` drops and schedules controlled replacement only after repeated oversize failures
 - if your product depends on consistent resolver behavior, encode that policy explicitly in the host app instead of treating defaults as contract
+
+## Production Best Practices
+
+The safest production posture is explicit policy plus observability.
+Do not let VPN-critical behavior depend on sparse provider configuration, hidden defaults, or foreground-only app state.
+
+Recommended baseline:
+
+- use `TunnelProfileManager.configure(...)` to write the provider configuration
+- set `engineSocksPort = 0` so the local SOCKS listener uses an ephemeral free port
+- set `mtuStrategy = .fixed(1280)` unless you know the exact encapsulation overhead
+- set `dnsStrategy` explicitly for your product and network environment
+- enable `tcpMultipathHandoverEnabled = true` for consumer mobile products that should survive Wi-Fi/cellular handoff
+- keep `telemetryEnabled = true` in production so detectors, stop breadcrumbs, health samples, and bounded logs exist when something goes wrong
+- keep `liveTapEnabled = true` for support/debug builds, but keep `liveTapIncludeFlowSlices = false` unless you are intentionally collecting richer foreground diagnostics
+- read `TunnelStopStore` and JSONL logs after every unexpected disconnect before changing tunnel behavior
+
+DNS policy guidance:
+
+- `.noOverride` has the smallest failure surface on captive, enterprise, school, hotel, and carrier-managed networks because it preserves the system resolver path
+- `.cleartext(servers:allowFailover:)` is appropriate when the product needs full-tunnel public resolver behavior and you accept that some networks block or intercept public DNS
+- `.tls(...)` and `.https(...)` should only be used with fully specified resolver IPs plus server name or URL
+- do not rely on `dnsServers` alone as a production contract; encode `dnsStrategy`
+- if a host app offers Adaptive DNS, make it observable: show the selected mode, active installed strategy, and current path DNS support
+
+MTU policy guidance:
+
+- fixed `1280` is the conservative compatibility default for iPhone deployments
+- automatic `tunnelOverheadBytes` is useful only when the host app knows the real encapsulation overhead
+- keep NetworkExtension settings, bridge buffers, and dataplane buffers aligned; do not allow one layer to infer a larger packet size than the others can hold
+- investigate dropped packets, repeated UDP oversize failures, or sustained QUIC failures before raising MTU
+
+Lifecycle guidance:
+
+- start NetworkExtension settings, relay, dataplane, and packet loops as one ordered runtime
+- stop the dataplane before closing TUN, bridge, or listener resources
+- treat dataplane startup timeout as a failed start that must clean up HEV state and clear the active handle
+- do not fail provider startup just because an initial path sample is transiently unsatisfied; allow Network.framework connections to recover from `waiting` when the path changes
+- make reconnect idempotent: repeated connect/disconnect cycles should not depend on stale file descriptors, stale SOCKS ports, or stale profile state
+
+UDP and QUIC guidance:
+
+- actively replace UDP sessions on better-path signals and persistent `waiting`
+- keep isolated datagram-too-large failures from tearing down the whole UDP relay
+- treat each SOCKS UDP ASSOCIATE as owned by its original localhost client endpoint; packets from a different source endpoint are dropped for association safety
+- monitor QUIC separately from TCP because QUIC can look healthy at the TCP layer while being pinned to a stale NAT/path
+- expect UDP session replacement notices during Wi-Fi/cellular handoff; they are healthy when followed by successful probes and zero sustained drops
+
+Telemetry and logging guidance:
+
+- use structured event names as the operational contract, not raw console text
+- watch `start-success`, `stop`, `health-sample`, `connect-timeout`, `connect-overall-timeout`, `outbound-connect-failed`, `outbound-read-failed`, `session-replaced`, and telemetry shedding events
+- alert on sustained `packet_batches_dropped`, nonzero `pending_outbound_packets`, bridge backpressure, repeated TCP overall timeouts, and unexpected stop reasons
+- treat one-off normal stream closes as lower priority when retries recover and health samples remain clean
+- preserve bounded App Group logs in support builds; do not add unbounded packet logging to debug production issues
 
 Current default split:
 
@@ -1242,6 +1307,63 @@ If you are debugging model-backed detectors, also record:
 - feature-vector shape
 - scoring latency bucket
 
+### On-device stress matrix
+
+The Example app includes a real-device stress matrix under `Example/`.
+Use it before releasing changes that touch tunnel startup, DNS, MTU, relay behavior, telemetry, UDP, QUIC, or path transitions.
+
+Recommended test order:
+
+1. install the Example app and tunnel extension on a physical iPhone
+2. choose `Adaptive` DNS unless you are testing a specific resolver policy
+3. run the matrix on normal Wi-Fi
+4. turn Wi-Fi off and run on cellular/5G
+5. start on Wi-Fi, run the matrix, and switch to cellular after roughly `15s`
+6. start on cellular, run the matrix, and switch to Wi-Fi after roughly `15s`
+7. repeat on known-problem networks when available: captive portal, hotel/public Wi-Fi, enterprise Wi-Fi, school Wi-Fi, IPv4-only networks, and constrained/low-data-mode paths
+
+What a healthy run looks like:
+
+- `failedProbes = 0`
+- blocked probes only for environments that were not actually present
+- `effectiveDNS` matches the active installed profile, not just the selected UI mode
+- `packet_batches_dropped = 0` or does not continue climbing after a short burst
+- `packet_batches_inflight = 0` after the run settles
+- `pending_outbound_packets = 0`
+- `bridge_backpressured = false`
+- no sustained `connect-overall-timeout`
+- no repeated `outbound-connect-failed`
+- UDP `session-replaced` events appear during path changes and are followed by successful UDP/QUIC probes
+
+How to interpret blocked rows:
+
+- blocked is not a failed probe
+- captive portal blocks on clean networks because the Example app cannot manufacture a real captive portal
+- public Wi-Fi blocks unless Wi-Fi is active, and iOS does not expose whether the Wi-Fi is truly public
+- cellular and 5G rows block when the active path is Wi-Fi
+- Wi-Fi rows block when the active path is cellular
+- iOS exposes `.cellular`, not the radio generation, so the `5G` row proves cellular burst behavior rather than a guaranteed 5G modem state
+
+Where to pull artifacts from:
+
+```text
+<AppGroup>/StressReports/stress-<timestamp>.json
+<AppGroup>/Logs/events.current.jsonl
+<AppGroup>/Logs/events.<timestamp>.<sequence>.jsonl
+<AppGroup>/Analytics/last-stop.json
+```
+
+Useful device-side checks:
+
+- compare the report time window against JSONL logs
+- confirm `PacketTunnelProviderShell start-success` reports the expected `dns_strategy`, `mtu`, `mtu_strategy`, and `socks_port`
+- inspect `health-sample` around the stress window
+- count warning/error events inside the stress window, not across stale rotated logs
+- separate relay failures from telemetry shedding; telemetry drops do not necessarily mean internet packets were dropped
+
+The top-level report path summary is the path sampled at run start.
+For transition runs, use per-row details and JSONL path/UDP replacement logs to confirm when the active path changed.
+
 ## Profiling Guidance
 
 Use Instruments in separate passes.
@@ -1263,12 +1385,32 @@ Recommended order:
 
 Before calling a build production-ready, validate:
 
-1. `30–60 min` soak with no unexpected tunnel exits
-2. Wi‑Fi / `5G` / `LTE` / degraded-network switching
-3. background correctness with the containing app suspended
-4. persisted detector outputs remain correct after resume
-5. no steady memory climb in `VM Tracker`
-6. normal usage stays `Nominal` in `Energy Log`
+1. `swift test`
+2. iOS app/tunnel-extension build with signing disabled or a real development profile
+3. `Scripts/quality-gate.sh`
+4. physical-device stress matrix on Wi-Fi
+5. physical-device stress matrix on cellular/5G
+6. Wi-Fi to cellular transition during the matrix
+7. cellular to Wi-Fi transition during the matrix
+8. `30–60 min` soak with no unexpected tunnel exits
+9. background correctness with the containing app suspended
+10. persisted detector outputs remain correct after resume
+11. no steady memory climb in `VM Tracker`
+12. normal usage stays `Nominal` in `Energy Log`
+13. no sustained telemetry shedding, bridge backpressure, or pending outbound queue growth
+14. no repeated TCP overall timeouts or UDP waiting loops after path changes
+
+`Scripts/quality-gate.sh` always validates the perf baseline schema.
+To enforce real perf numbers, set `VPN_BRIDGE_PERF_RESULTS` to a JSON file containing either a metrics object or a metrics array with `name` and `value` fields.
+
+Recent production-candidate baseline:
+
+- Wi-Fi Adaptive: `PASS`, `1143` probes, `0` failed
+- Cellular/5G Adaptive: `PASS`, `1176` probes, `0` failed
+- Wi-Fi to cellular transition: `PASS`, `1037` probes, `0` failed
+- Cellular to Wi-Fi transition: `PASS`, `1282` probes, `0` failed
+
+Blocked rows in that baseline were expected environment gates, not failed tunnel probes.
 
 ## Background Correctness Rules
 

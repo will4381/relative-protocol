@@ -38,6 +38,11 @@
 #ifndef LWIP_LWIPOPTS_H
 #define LWIP_LWIPOPTS_H
 
+#include <stdlib.h>
+
+#define LWIP_RAND() ((u32_t)arc4random())
+#define LWIP_HOOK_FILENAME "lwip_port_hooks.h"
+
 /*
  * Include user defined options first. Anything not defined in these files
  * will be set to standard values. Override anything you don't like!

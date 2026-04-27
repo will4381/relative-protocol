@@ -354,6 +354,24 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 ? .payloadOnlyUnderPressure
                 : .full
 
+            if state.queuedBatches >= QueuePolicy.maxQueuedBatches ||
+                state.queuedBytes >= QueuePolicy.maxQueuedBytes {
+                state.droppedBatches += 1
+                let shouldLogSheddingStart = !state.hasEnteredShedMode
+                state.hasEnteredShedMode = true
+                return (
+                    SubmitResult(
+                        accepted: false,
+                        skipped: false,
+                        shouldLogSheddingStart: shouldLogSheddingStart,
+                        queuedBatches: state.queuedBatches,
+                        queuedBytes: state.queuedBytes,
+                        droppedBatches: state.droppedBatches
+                    ),
+                    trackingMode
+                )
+            }
+
             return (
                 nil,
                 trackingMode

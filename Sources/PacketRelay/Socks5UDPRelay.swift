@@ -40,9 +40,11 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
     private enum SessionPolicy {
         static let maxSessions = 256
         static let idleTimeoutSeconds: TimeInterval = 60
+        static let idleReapIntervalSeconds: TimeInterval = 10
         static let usageQueueCompactionThreshold = 128
         static let pmtuReplacementThreshold = 3
         static let pmtuReplacementWindowSeconds: TimeInterval = 5
+        static let maxSocksDatagramBytes = 65_535
     }
 
     private struct SessionKey: Hashable, Sendable {
@@ -71,6 +73,11 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
         let sequence: UInt64
     }
 
+    private struct IPv4ClientEndpoint: Equatable {
+        let address: in_addr_t
+        let port: in_port_t
+    }
+
     private let logger: StructuredLogger
     private let provider: Socks5ConnectionProvider
     private let queue: DispatchQueue
@@ -84,6 +91,8 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
     private var sessions: [SessionKey: SessionEntry] = [:]
     private var sessionUsageQueue: ArraySlice<SessionUsageStamp> = []
     private var nextUsageSequence: UInt64 = 0
+    private var nextIdleReapAt = Date.distantPast
+    private var clientEndpoint: IPv4ClientEndpoint?
     private var clientAddress = sockaddr_storage()
     private var clientAddressLen: socklen_t = 0
 
@@ -161,6 +170,8 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
             sessions.removeAll()
             sessionUsageQueue.removeAll(keepingCapacity: false)
             nextUsageSequence = 0
+            nextIdleReapAt = Date.distantPast
+            clientEndpoint = nil
             clientAddress = sockaddr_storage()
             clientAddressLen = 0
             closeSocketIfNeeded()
@@ -168,8 +179,7 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
     }
 
     private func drainReadable() {
-        let bufferSize = mtu + 256
-        var buffer = [UInt8](repeating: 0, count: bufferSize)
+        var buffer = [UInt8](repeating: 0, count: SessionPolicy.maxSocksDatagramBytes)
 
         while true {
             var addr = sockaddr_storage()
@@ -197,17 +207,19 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
             }
             guard bytes > 0 else { break }
 
+            guard rememberOrValidateClient(addr, addrLen: addrLen) else {
+                logUnauthorizedClientDatagram()
+                continue
+            }
+
             guard let packet = buffer.withUnsafeBufferPointer({ ptr in
                 Socks5Codec.parseUDPPacket(ptr, count: bytes)
             }) else {
                 continue
             }
 
-            clientAddress = addr
-            clientAddressLen = addrLen
-
             let now = nowProvider()
-            reapIdleSessions(now: now)
+            reapIdleSessionsIfNeeded(now: now)
             let key = SessionKey(address: packet.address, port: packet.port)
             let entry = sessionEntry(for: key, now: now)
             let session = entry.session
@@ -249,6 +261,14 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
                 }
             }
         }
+    }
+
+    private func reapIdleSessionsIfNeeded(now: Date) {
+        guard now >= nextIdleReapAt else {
+            return
+        }
+        reapIdleSessions(now: now)
+        nextIdleReapAt = now.addingTimeInterval(SessionPolicy.idleReapIntervalSeconds)
     }
 
     func reapIdleSessions(now: Date) {
@@ -469,14 +489,6 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
         ]
     }
 
-    private func markSessionNeedsReplacement(for key: SessionKey) {
-        guard var entry = sessions[key] else {
-            return
-        }
-        entry.needsReplacement = true
-        sessions[key] = entry
-    }
-
     private func clearReplacementNeed(for key: SessionKey) {
         guard var entry = sessions[key] else {
             return
@@ -539,6 +551,48 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
                     )
                 }
             }
+        }
+    }
+
+    private func rememberOrValidateClient(_ address: sockaddr_storage, addrLen: socklen_t) -> Bool {
+        guard let endpoint = ipv4ClientEndpoint(from: address, addrLen: addrLen) else {
+            return false
+        }
+        if let clientEndpoint {
+            return clientEndpoint == endpoint
+        }
+        clientEndpoint = endpoint
+        clientAddress = address
+        clientAddressLen = addrLen
+        return true
+    }
+
+    private func ipv4ClientEndpoint(from address: sockaddr_storage, addrLen: socklen_t) -> IPv4ClientEndpoint? {
+        guard addrLen >= socklen_t(MemoryLayout<sockaddr_in>.size),
+              Int32(address.ss_family) == AF_INET else {
+            return nil
+        }
+        return withUnsafePointer(to: address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { ipv4 in
+                IPv4ClientEndpoint(address: ipv4.pointee.sin_addr.s_addr, port: ipv4.pointee.sin_port)
+            }
+        }
+    }
+
+    private func logUnauthorizedClientDatagram() {
+        let logger = self.logger
+        Task {
+            await logger.logRateLimited(
+                key: "Socks5UDPRelay.unauthorized-client",
+                minimumInterval: 10,
+                level: .warning,
+                phase: .relay,
+                category: .relayUDP,
+                component: "Socks5UDPRelay",
+                event: "unauthorized-client-datagram",
+                result: "dropped",
+                message: "Dropped UDP ASSOCIATE datagram from an endpoint outside the established client association"
+            )
         }
     }
 
