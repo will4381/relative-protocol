@@ -425,6 +425,43 @@ final class Socks5ServerTests: XCTestCase {
         XCTAssertTrue(firstAttempt?.cancelled == true)
     }
 
+    func testRetryingTCPOutboundRestartsWaitingAttempt() {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.retry-waiting")
+        let attempt = ControlledTCPOutbound()
+        let restarted = expectation(description: "waiting attempt restarted")
+        let ready = expectation(description: "waiting attempt eventually connects")
+        attempt.onRestart = {
+            restarted.fulfill()
+        }
+
+        let outbound = RetryingTCPOutbound(
+            queue: queue,
+            logger: StructuredLogger(sink: InMemoryLogSink()),
+            policy: .init(attemptPreparingTimeout: 1.0, retryBackoff: 0.01, maxAttempts: 2, overallTimeout: 2.0),
+            pathSettings: .init(retryOnBetterPathDuringConnect: true, betterPathRetryMinimumElapsed: 0.0, multipathServiceType: nil)
+        ) { _ in
+            attempt
+        }
+
+        outbound.waitUntilReady { result in
+            switch result {
+            case .success:
+                ready.fulfill()
+            case .failure(let error):
+                XCTFail("Expected waiting attempt restart to recover, got \(error)")
+            }
+        }
+
+        queue.sync {
+            attempt.emit(.waiting)
+        }
+
+        wait(for: [restarted], timeout: 1.0)
+        XCTAssertEqual(attempt.restartCount, 1)
+        attempt.succeedConnect()
+        wait(for: [ready], timeout: 1.0)
+    }
+
     func testRetryingTCPOutboundHonorsOverallTimeoutBudget() {
         let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.retry-overall-timeout")
         let lock = NSLock()
@@ -642,7 +679,9 @@ private final class ControlledTCPOutbound: @unchecked Sendable, Socks5PathAwareT
     private(set) var writes: [Data] = []
     private(set) var cancelled = false
     private(set) var readRequests = 0
+    private(set) var restartCount = 0
     var autoCompleteWrites = true
+    var onRestart: (() -> Void)?
     var eventHandler: ((TCPOutboundEvent) -> Void)?
     var pathSnapshot = "status=unknown uses=unknown"
 
@@ -675,6 +714,11 @@ private final class ControlledTCPOutbound: @unchecked Sendable, Socks5PathAwareT
 
     func cancel() {
         cancelled = true
+    }
+
+    func restart() {
+        restartCount += 1
+        onRestart?()
     }
 
     func succeedConnect() {

@@ -141,15 +141,18 @@ struct TCPConnectRetryPolicy: Sendable {
 
 public struct Socks5TCPPathSettings: Sendable {
     public let retryOnBetterPathDuringConnect: Bool
+    public let restartWaitingConnectionsDuringConnect: Bool
     public let betterPathRetryMinimumElapsed: TimeInterval
     public let multipathServiceType: NWParameters.MultipathServiceType?
 
     public init(
         retryOnBetterPathDuringConnect: Bool = true,
+        restartWaitingConnectionsDuringConnect: Bool = true,
         betterPathRetryMinimumElapsed: TimeInterval = 0.75,
         multipathServiceType: NWParameters.MultipathServiceType? = nil
     ) {
         self.retryOnBetterPathDuringConnect = retryOnBetterPathDuringConnect
+        self.restartWaitingConnectionsDuringConnect = restartWaitingConnectionsDuringConnect
         self.betterPathRetryMinimumElapsed = betterPathRetryMinimumElapsed
         self.multipathServiceType = multipathServiceType
     }
@@ -169,11 +172,13 @@ protocol Socks5FullConnectionProvider: Socks5ConnectionProvider {
 
 enum TCPOutboundEvent: Sendable {
     case betterPathAvailable
+    case waiting
 }
 
 protocol Socks5PathAwareTCPOutbound: Socks5TCPOutbound {
     var eventHandler: ((TCPOutboundEvent) -> Void)? { get set }
     var pathSnapshot: String { get }
+    func restart()
 }
 
 /// `Socks5InboundConnection` adapter for `NWConnection`.
@@ -286,6 +291,10 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
         connection.cancel()
     }
 
+    func restart() {
+        connection.restart()
+    }
+
     private func startIfNeeded() {
         guard !didStart else { return }
         didStart = true
@@ -309,6 +318,7 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
                 )
             }
         case .waiting(let error):
+            eventHandler?(.waiting)
             Task {
                 let path = lastKnownPathSummary
                 await logger.logRateLimited(
@@ -552,6 +562,21 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
         }
 
         switch event {
+        case .waiting:
+            guard pathSettings.restartWaitingConnectionsDuringConnect else {
+                return
+            }
+            log(
+                level: .notice,
+                event: "connect-waiting-restart",
+                result: "attempt-\(attemptIndex)",
+                message: "Restarting outbound TCP connect attempt because Network.framework is waiting for a usable path",
+                extraMetadata: [
+                    "attempt_index": String(attemptIndex),
+                    "path": outbound.pathSnapshot
+                ]
+            )
+            outbound.restart()
         case .betterPathAvailable:
             guard pathSettings.retryOnBetterPathDuringConnect else {
                 return

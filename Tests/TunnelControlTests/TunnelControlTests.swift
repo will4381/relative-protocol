@@ -93,6 +93,46 @@ final class TunnelControlTests: XCTestCase {
         }
     }
 
+    func testRuntimeProfileValidationAcceptsDefaultDNSMatchDomain() throws {
+        var configuration = makeRuntimeProviderConfiguration()
+        configuration["dnsStrategy"] = [
+            "type": "https",
+            "servers": ["8.8.8.8", "8.8.4.4"],
+            "serverURL": "https://dns.google/dns-query",
+            "matchDomains": [""]
+        ]
+
+        let profile = try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)
+        XCTAssertEqual(
+            profile.dnsStrategy,
+            .https(
+                servers: ["8.8.8.8", "8.8.4.4"],
+                serverURL: "https://dns.google/dns-query",
+                matchDomains: [""]
+            )
+        )
+    }
+
+    func testRuntimeProfileValidationRejectsWhitespaceDNSMatchDomain() {
+        var configuration = makeRuntimeProviderConfiguration()
+        configuration["dnsStrategy"] = [
+            "type": "https",
+            "servers": ["8.8.8.8", "8.8.4.4"],
+            "serverURL": "https://dns.google/dns-query",
+            "matchDomains": [" "]
+        ]
+
+        XCTAssertThrowsError(try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)) { error in
+            XCTAssertEqual(
+                error as? TunnelProfileValidationError,
+                .invalidValue(
+                    key: "dnsStrategy.matchDomains",
+                    reason: "must contain domain names without whitespace; use an empty string only for the default domain"
+                )
+            )
+        }
+    }
+
     func testRuntimeProfileValidationAcceptsCompleteProviderConfiguration() throws {
         let profile = try TunnelProfile.validatedRuntimeProfile(providerConfiguration: makeRuntimeProviderConfiguration())
         XCTAssertEqual(profile.appGroupID, "group.example")
