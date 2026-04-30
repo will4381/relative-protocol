@@ -141,15 +141,18 @@ struct TCPConnectRetryPolicy: Sendable {
 
 public struct Socks5TCPPathSettings: Sendable {
     public let retryOnBetterPathDuringConnect: Bool
+    public let restartWaitingConnectionsDuringConnect: Bool
     public let betterPathRetryMinimumElapsed: TimeInterval
     public let multipathServiceType: NWParameters.MultipathServiceType?
 
     public init(
         retryOnBetterPathDuringConnect: Bool = true,
+        restartWaitingConnectionsDuringConnect: Bool = true,
         betterPathRetryMinimumElapsed: TimeInterval = 0.75,
         multipathServiceType: NWParameters.MultipathServiceType? = nil
     ) {
         self.retryOnBetterPathDuringConnect = retryOnBetterPathDuringConnect
+        self.restartWaitingConnectionsDuringConnect = restartWaitingConnectionsDuringConnect
         self.betterPathRetryMinimumElapsed = betterPathRetryMinimumElapsed
         self.multipathServiceType = multipathServiceType
     }
@@ -169,11 +172,13 @@ protocol Socks5FullConnectionProvider: Socks5ConnectionProvider {
 
 enum TCPOutboundEvent: Sendable {
     case betterPathAvailable
+    case waiting
 }
 
 protocol Socks5PathAwareTCPOutbound: Socks5TCPOutbound {
     var eventHandler: ((TCPOutboundEvent) -> Void)? { get set }
     var pathSnapshot: String { get }
+    func restart()
 }
 
 /// `Socks5InboundConnection` adapter for `NWConnection`.
@@ -286,6 +291,10 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
         connection.cancel()
     }
 
+    func restart() {
+        connection.restart()
+    }
+
     private func startIfNeeded() {
         guard !didStart else { return }
         didStart = true
@@ -309,6 +318,7 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
                 )
             }
         case .waiting(let error):
+            eventHandler?(.waiting)
             Task {
                 let path = lastKnownPathSummary
                 await logger.logRateLimited(
@@ -552,6 +562,21 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
         }
 
         switch event {
+        case .waiting:
+            guard pathSettings.restartWaitingConnectionsDuringConnect else {
+                return
+            }
+            log(
+                level: .notice,
+                event: "connect-waiting-restart",
+                result: "attempt-\(attemptIndex)",
+                message: "Restarting outbound TCP connect attempt because Network.framework is waiting for a usable path",
+                extraMetadata: [
+                    "attempt_index": String(attemptIndex),
+                    "path": outbound.pathSnapshot
+                ]
+            )
+            outbound.restart()
         case .betterPathAvailable:
             guard pathSettings.retryOnBetterPathDuringConnect else {
                 return
@@ -1430,6 +1455,203 @@ private final class CompletionGate: @unchecked Sendable {
     }
 }
 
+/// Relays HEV's TCP-carried UDP stream mode (`FWD_UDP`) to outbound UDP sessions.
+final class Socks5TCPForwardUDPRelay: @unchecked Sendable {
+    private struct SessionKey: Hashable, Sendable {
+        let address: Socks5Address
+        let port: UInt16
+    }
+
+    private enum SessionPolicy {
+        static let maxSessions = 256
+    }
+
+    private let provider: Socks5ConnectionProvider
+    private let queue: DispatchQueue
+    private let queueSpecificKey = DispatchSpecificKey<UInt8>()
+    private let logger: StructuredLogger
+    private let sendToClient: @Sendable (Data) -> Void
+
+    private var sessions: [SessionKey: Socks5UDPSession] = [:]
+    private var sessionOrder: [SessionKey] = []
+    private var isStopped = false
+
+    init(
+        provider: Socks5ConnectionProvider,
+        queue: DispatchQueue,
+        logger: StructuredLogger,
+        sendToClient: @escaping @Sendable (Data) -> Void
+    ) {
+        self.provider = provider
+        self.queue = queue
+        self.logger = logger
+        self.sendToClient = sendToClient
+        self.queue.setSpecific(key: queueSpecificKey, value: 1)
+    }
+
+    func handleInboundBuffer(_ buffer: inout Data) -> Bool {
+        while !buffer.isEmpty {
+            switch Socks5Codec.parseTCPForwardUDPPacket(buffer) {
+            case .needsMoreData:
+                return true
+            case .invalid:
+                return false
+            case .packet(let packet, let consumedBytes):
+                buffer.removeSubrange(buffer.startIndex ..< buffer.startIndex + consumedBytes)
+                forward(packet)
+            }
+        }
+        return true
+    }
+
+    func stop() {
+        guard !isStopped else { return }
+        isStopped = true
+        sessions.values.forEach { $0.cancel() }
+        sessions.removeAll(keepingCapacity: false)
+        sessionOrder.removeAll(keepingCapacity: false)
+    }
+
+    private func forward(_ packet: Socks5UDPPacket) {
+        guard !isStopped else { return }
+        let key = SessionKey(address: packet.address, port: packet.port)
+        let session = session(for: key)
+        session.writeDatagram(packet.payload) { [weak self, weak session] error in
+            guard let self, let session, let error else { return }
+            self.runOnQueue {
+                guard !self.isStopped, self.sessions[key] === session else { return }
+                self.removeSession(for: key)
+                Task {
+                    await self.logger.log(
+                        level: .error,
+                        phase: .relay,
+                        category: .relayUDP,
+                        component: "Socks5TCPForwardUDPRelay",
+                        event: "write-failed",
+                        errorCode: String(describing: error),
+                        message: "TCP-carried UDP relay write failed"
+                    )
+                }
+            }
+        }
+    }
+
+    private func session(for key: SessionKey) -> Socks5UDPSession {
+        if let session = sessions[key] {
+            return session
+        }
+
+        evictOldestSessionIfNeeded()
+        return createSession(for: key)
+    }
+
+    private func createSession(for key: SessionKey) -> Socks5UDPSession {
+        let hostString: String
+        switch key.address {
+        case .ipv4(let value), .ipv6(let value), .domain(let value):
+            hostString = value
+        }
+
+        let endpoint = NWHostEndpoint(hostname: hostString, port: String(key.port))
+        let session = provider.makeUDPSession(to: endpoint)
+        sessions[key] = session
+        sessionOrder.append(key)
+
+        session.eventHandler = { [weak self, weak session] event in
+            guard let self, let session else { return }
+            self.runOnQueue {
+                guard !self.isStopped, self.sessions[key] === session else { return }
+                switch event {
+                case .ready:
+                    break
+                case .waiting:
+                    self.replaceSession(for: key, reason: "waiting")
+                case .failed:
+                    self.replaceSession(for: key, reason: "failed")
+                case .viabilityChanged(let isViable):
+                    if !isViable {
+                        self.replaceSession(for: key, reason: "not-viable")
+                    }
+                case .betterPathAvailable:
+                    self.replaceSession(for: key, reason: "better-path")
+                }
+            }
+        }
+
+        session.setReadHandler { [weak self, weak session] datagram, error in
+            guard let self, let session else { return }
+            self.runOnQueue {
+                guard !self.isStopped, self.sessions[key] === session else { return }
+                if let error {
+                    self.removeSession(for: key)
+                    Task {
+                        await self.logger.log(
+                            level: .error,
+                            phase: .relay,
+                            category: .relayUDP,
+                            component: "Socks5TCPForwardUDPRelay",
+                            event: "read-failed",
+                            errorCode: String(describing: error),
+                            message: "TCP-carried UDP relay read failed"
+                        )
+                    }
+                    return
+                }
+                guard let datagram,
+                      let response = Socks5Codec.buildTCPForwardUDPPacket(
+                        address: key.address,
+                        port: key.port,
+                        payload: datagram
+                      )
+                else {
+                    return
+                }
+                self.sendToClient(response)
+            }
+        }
+
+        return session
+    }
+
+    private func replaceSession(for key: SessionKey, reason: String) {
+        removeSession(for: key)
+        _ = createSession(for: key)
+        Task {
+            await logger.log(
+                level: .notice,
+                phase: .relay,
+                category: .relayUDP,
+                component: "Socks5TCPForwardUDPRelay",
+                event: "session-replaced",
+                result: reason,
+                message: "Replaced TCP-carried UDP session after Network.framework path signal"
+            )
+        }
+    }
+
+    private func removeSession(for key: SessionKey) {
+        guard let session = sessions.removeValue(forKey: key) else {
+            return
+        }
+        session.cancel()
+        sessionOrder.removeAll { $0 == key }
+    }
+
+    private func evictOldestSessionIfNeeded() {
+        while sessions.count >= SessionPolicy.maxSessions, let key = sessionOrder.first {
+            removeSession(for: key)
+        }
+    }
+
+    private func runOnQueue(_ block: @escaping @Sendable () -> Void) {
+        if DispatchQueue.getSpecific(key: queueSpecificKey) != nil {
+            block()
+        } else {
+            queue.async(execute: block)
+        }
+    }
+}
+
 /// Per-client SOCKS connection state machine.
 /// Invariant: transitions are serialized by callbacks running on `queue`.
 final class Socks5Connection: @unchecked Sendable {
@@ -1443,6 +1665,7 @@ final class Socks5Connection: @unchecked Sendable {
         case connectingTCP(Socks5TCPOutbound)
         case tcpProxy(Socks5TCPOutbound)
         case udpProxy(Socks5UDPRelayProtocol)
+        case udpForward(Socks5TCPForwardUDPRelay)
     }
 
     private let logger: StructuredLogger
@@ -1533,6 +1756,8 @@ final class Socks5Connection: @unchecked Sendable {
         case .tcpProxy(let outbound):
             outbound.cancel()
         case .udpProxy(let relay):
+            relay.stop()
+        case .udpForward(let relay):
             relay.stop()
         default:
             break
@@ -1628,6 +1853,21 @@ final class Socks5Connection: @unchecked Sendable {
             forwardToOutbound(payload, outbound: outbound)
         case .udpProxy:
             buffer.removeAll()
+        case .udpForward(let relay):
+            guard relay.handleInboundBuffer(&buffer) else {
+                Task {
+                    await logger.log(
+                        level: .error,
+                        phase: .relay,
+                        category: .relayUDP,
+                        component: "Socks5Connection",
+                        event: "udp-forward-parse-failed",
+                        message: "Closing SOCKS5 TCP-carried UDP stream after invalid frame"
+                    )
+                }
+                stop()
+                return
+            }
         }
     }
 
@@ -1661,6 +1901,8 @@ final class Socks5Connection: @unchecked Sendable {
             startTCPProxy(request)
         case .udpAssociate:
             startUDPRelay()
+        case .udpForward:
+            startTCPForwardUDPRelay()
         case .bind:
             sendFailure(replyCode: 0x07)
         }
@@ -1900,6 +2142,50 @@ final class Socks5Connection: @unchecked Sendable {
             }
             sendFailure()
         }
+    }
+
+    private func startTCPForwardUDPRelay() {
+        let relay = Socks5TCPForwardUDPRelay(
+            provider: provider,
+            queue: queue,
+            logger: logger,
+            sendToClient: { [weak self] data in
+                guard let self else { return }
+                self.runOnQueue {
+                    guard !self.isClosed else { return }
+                    self.connection.send(content: data, completion: .contentProcessed { [weak self] error in
+                        guard let self, let error else { return }
+                        self.runOnQueue {
+                            guard !self.isClosed else { return }
+                            self.logInboundWriteFailure(
+                                error,
+                                event: "udp-forward-write-failed",
+                                message: "SOCKS5 TCP-carried UDP response write failed"
+                            )
+                            self.stop()
+                        }
+                    })
+                }
+            }
+        )
+
+        state = .udpForward(relay)
+        connection.send(
+            content: Socks5Codec.buildReply(code: 0x00, bindAddress: .ipv4("0.0.0.0"), bindPort: 0),
+            completion: .contentProcessed { [weak self] error in
+                guard let self, let error else { return }
+                self.runOnQueue {
+                    guard !self.isClosed else { return }
+                    self.logInboundWriteFailure(
+                        error,
+                        event: "udp-forward-reply-write-failed",
+                        message: "SOCKS5 TCP-carried UDP success reply write failed"
+                    )
+                    self.stop()
+                }
+            }
+        )
+        processBuffer()
     }
 
     private func sendFailure(replyCode: UInt8 = 0x01) {

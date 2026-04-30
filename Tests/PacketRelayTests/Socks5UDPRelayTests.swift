@@ -399,7 +399,7 @@ final class Socks5UDPRelayTests: XCTestCase {
         XCTAssertEqual(relay.activeSessionCount, 1)
     }
 
-    func testUDPRelayRestartsWaitingSession() throws {
+    func testUDPRelayReplacesWaitingSession() throws {
         let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.udp.waiting")
         let provider = FakeUDPProvider()
         let relay = try Socks5UDPRelay(
@@ -418,9 +418,12 @@ final class Socks5UDPRelayTests: XCTestCase {
         defer { close(clientSocket) }
 
         let firstCreated = expectation(description: "first udp session created")
+        let secondCreated = expectation(description: "second udp session created")
         provider.onCreate = { _ in
             if provider.sessions.count == 1 {
                 firstCreated.fulfill()
+            } else if provider.sessions.count == 2 {
+                secondCreated.fulfill()
             }
         }
 
@@ -436,8 +439,10 @@ final class Socks5UDPRelayTests: XCTestCase {
         queue.sync {
             session.eventHandler?(.waiting)
         }
+        wait(for: [secondCreated], timeout: 1.0)
 
-        XCTAssertEqual(session.restartCount, 1)
+        XCTAssertEqual(session.restartCount, 0)
+        XCTAssertTrue(session.cancelled)
         XCTAssertEqual(relay.activeSessionCount, 1)
 
         try sendClientDatagram(
@@ -447,8 +452,7 @@ final class Socks5UDPRelayTests: XCTestCase {
             destinationPort: 53
         )
         queue.sync {}
-        XCTAssertFalse(session.cancelled)
-        XCTAssertEqual(provider.sessions.count, 1)
+        XCTAssertEqual(provider.sessions.count, 2)
         XCTAssertEqual(relay.activeSessionCount, 1)
     }
 

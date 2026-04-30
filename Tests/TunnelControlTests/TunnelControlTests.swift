@@ -93,6 +93,46 @@ final class TunnelControlTests: XCTestCase {
         }
     }
 
+    func testRuntimeProfileValidationAcceptsDefaultDNSMatchDomain() throws {
+        var configuration = makeRuntimeProviderConfiguration()
+        configuration["dnsStrategy"] = [
+            "type": "https",
+            "servers": ["8.8.8.8", "8.8.4.4"],
+            "serverURL": "https://dns.google/dns-query",
+            "matchDomains": [""]
+        ]
+
+        let profile = try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)
+        XCTAssertEqual(
+            profile.dnsStrategy,
+            .https(
+                servers: ["8.8.8.8", "8.8.4.4"],
+                serverURL: "https://dns.google/dns-query",
+                matchDomains: [""]
+            )
+        )
+    }
+
+    func testRuntimeProfileValidationRejectsWhitespaceDNSMatchDomain() {
+        var configuration = makeRuntimeProviderConfiguration()
+        configuration["dnsStrategy"] = [
+            "type": "https",
+            "servers": ["8.8.8.8", "8.8.4.4"],
+            "serverURL": "https://dns.google/dns-query",
+            "matchDomains": [" "]
+        ]
+
+        XCTAssertThrowsError(try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)) { error in
+            XCTAssertEqual(
+                error as? TunnelProfileValidationError,
+                .invalidValue(
+                    key: "dnsStrategy.matchDomains",
+                    reason: "must contain domain names without whitespace; use an empty string only for the default domain"
+                )
+            )
+        }
+    }
+
     func testRuntimeProfileValidationAcceptsCompleteProviderConfiguration() throws {
         let profile = try TunnelProfile.validatedRuntimeProfile(providerConfiguration: makeRuntimeProviderConfiguration())
         XCTAssertEqual(profile.appGroupID, "group.example")
@@ -339,12 +379,27 @@ final class TunnelControlTests: XCTestCase {
         XCTAssertEqual(dnsHTTPS.serverURL?.absoluteString, "https://dns.example/dns-query")
     }
 
+    func testDataplaneConfigHonorsRelayUDPTransportMode() {
+        let tcpCarriedUDPConfig = PacketTunnelProviderShell.makeDataplaneConfig(
+            profile: makeProfile(relayUseUDP: false),
+            socksPort: 1080
+        )
+        XCTAssertFalse(tcpCarriedUDPConfig.contains("  udp: 'udp'"))
+
+        let udpOverUDPConfig = PacketTunnelProviderShell.makeDataplaneConfig(
+            profile: makeProfile(relayUseUDP: true),
+            socksPort: 1080
+        )
+        XCTAssertTrue(udpOverUDPConfig.contains("  udp: 'udp'"))
+    }
+
     private func makeProfile(
         appGroupID: String = "group.example",
         mtu: Int = 1_280,
         mtuStrategy: TunnelMTUStrategy? = nil,
         dnsStrategy: TunnelDNSStrategy? = nil,
-        tcpMultipathHandoverEnabled: Bool = false
+        tcpMultipathHandoverEnabled: Bool = false,
+        relayUseUDP: Bool = false
     ) -> TunnelProfile {
         TunnelProfile(
             appGroupID: appGroupID,
@@ -367,7 +422,7 @@ final class TunnelControlTests: XCTestCase {
             liveTapIncludeFlowSlices: false,
             liveTapMaxBytes: 5_000_000,
             signatureFileName: "app_signatures.json",
-            relayEndpoint: RelayEndpoint(host: "127.0.0.1", port: 1080, useUDP: false),
+            relayEndpoint: RelayEndpoint(host: "127.0.0.1", port: 1080, useUDP: relayUseUDP),
             dataplaneConfigJSON: "{}"
         )
     }

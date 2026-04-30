@@ -418,10 +418,15 @@ public struct TunnelProfile: Sendable, Equatable {
         guard let matchDomains else {
             return
         }
-        if matchDomains.contains(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || containsWhitespace($0) }) {
+        if matchDomains.contains(where: { domain in
+            if domain.isEmpty {
+                return false
+            }
+            return domain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || containsWhitespace(domain)
+        }) {
             throw TunnelProfileValidationError.invalidValue(
                 key: "\(TunnelProviderConfigurationKey.dnsStrategy).matchDomains",
-                reason: "must contain non-empty domain names without whitespace"
+                reason: "must contain domain names without whitespace; use an empty string only for the default domain"
             )
         }
     }

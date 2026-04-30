@@ -16,12 +16,14 @@ It is designed so the tunnel can stay alive and keep detecting while the contain
   - encrypted DNS configuration no longer silently downgrades to cleartext when `serverName` or `serverURL` is missing
   - SOCKS5 request parsing now rejects invalid reserved bytes and returns command/address-specific failure codes for unsupported requests
   - UDP ASSOCIATE now pins relay traffic to the original localhost client endpoint for the association
+  - HEV `FWD_UDP` is now supported so TCP-carried UDP works when a profile disables UDP-over-UDP
   - dataplane bridge lifecycle fields and stats updates are protected by one synchronization boundary
   - lwIP random source ports and TCP initial sequence numbers now use the first-party secure randomness hooks
   - `Scripts/quality-gate.sh` now validates `Config/PerfBaseline.json` and can compare metrics through `VPN_BRIDGE_PERF_RESULTS`
 - transport recovery hardening
   - outbound TCP now uses bounded connect attempts with retry for stalled `NWConnection.State.preparing`
-  - outbound UDP sessions now restart or rotate on `waiting`, `failed`, write-side failure, and better-path replacement signals
+  - outbound UDP sessions now rotate on `waiting`, `failed`, write-side failure, and better-path replacement signals
+  - synthesized HEV configs now omit `udp: 'udp'` when `relayEndpoint.useUDP == false`, allowing UDP payloads to ride the existing SOCKS TCP stream instead of requiring UDP-over-UDP
   - outbound TCP better-path handling is now explicit during connect attempts instead of log-only
   - isolated UDP oversize / PMTU drops no longer tear down the whole relay immediately
   - `engineSocksPort = 0` now round-trips correctly through provider configuration so the local SOCKS listener can stay ephemeral
@@ -372,7 +374,8 @@ Transport recovery improvements do not require host-app changes.
 If you upgrade the package, you automatically get:
 
 - bounded TCP connect timeout and retry
-- UDP session restart and replacement on bad-path signals
+- UDP session replacement on bad-path signals
+- TCP-carried UDP fallback when `relayEndpoint.useUDP == false`
 - better-path-aware outbound TCP connect policy
 - isolated UDP PMTU / oversize drops no longer kill the whole UDP relay path
 - correct preservation of `engineSocksPort = 0` when decoding `providerConfiguration`
@@ -388,6 +391,7 @@ Migration rules:
 5. If your product needs better continuity across Wi-Fi <-> cellular transitions, enable `tcpMultipathHandoverEnabled = true`. Leave it off only if you intentionally want to avoid Multipath TCP handover.
 6. If you run multiple local profiles, test harnesses, or extension builds on the same device, prefer `engineSocksPort = 0` so the tunnel binds an ephemeral local SOCKS port instead of relying on the legacy fixed `1080` port.
 7. If you configure encrypted DNS, provide complete resolver IPs plus the required DoT `serverName` or DoH `serverURL`; incomplete encrypted DNS now fails startup validation instead of falling back to cleartext.
+8. If your profile sets `relayEndpoint.useUDP = false`, the synthesized HEV config now uses TCP-carried UDP; set `useUDP = true` only when the network path is known to tolerate UDP-over-UDP reliably.
 
 Recommended migration profiles:
 
@@ -411,6 +415,7 @@ Operational note:
 
 - the package now exposes the DNS/MTU choices as policy, but the right DNS choice is still network-dependent
 - on handoff-sensitive UDP paths, the relay now keeps sessions alive on isolated `maximumDatagramSize` drops and schedules controlled replacement only after repeated oversize failures
+- on restrictive Wi-Fi, school, enterprise, or apartment networks, prefer `relayEndpoint.useUDP = false` so QUIC/DNS-style UDP payloads do not depend on a second outbound UDP association
 - if your product depends on consistent resolver behavior, encode that policy explicitly in the host app instead of treating defaults as contract
 
 ## Production Best Practices
@@ -456,6 +461,7 @@ UDP and QUIC guidance:
 
 - actively replace UDP sessions on better-path signals and persistent `waiting`
 - keep isolated datagram-too-large failures from tearing down the whole UDP relay
+- prefer TCP-carried UDP for consumer profiles unless you have operational proof that UDP-over-UDP is consistently accepted on the target networks
 - treat each SOCKS UDP ASSOCIATE as owned by its original localhost client endpoint; packets from a different source endpoint are dropped for association safety
 - monitor QUIC separately from TCP because QUIC can look healthy at the TCP layer while being pinned to a stale NAT/path
 - expect UDP session replacement notices during Wi-Fi/cellular handoff; they are healthy when followed by successful probes and zero sustained drops

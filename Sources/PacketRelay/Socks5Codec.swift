@@ -1,11 +1,13 @@
 import Darwin
 import Foundation
 
-/// SOCKS5 command byte values from RFC 1928.
+/// SOCKS5 command byte values.
 public enum Socks5Command: UInt8, Sendable {
     case connect = 0x01
     case bind = 0x02
     case udpAssociate = 0x03
+    /// HEV extension: carries SOCKS UDP frames over the existing TCP control stream.
+    case udpForward = 0x05
 }
 
 /// SOCKS5 target address representation.
@@ -47,6 +49,13 @@ public struct Socks5UDPPacket: Hashable, Sendable {
         self.port = port
         self.payload = payload
     }
+}
+
+/// Result of parsing HEV's TCP-carried UDP frame format from a stream buffer.
+public enum Socks5TCPForwardUDPParseResult: Hashable, Sendable {
+    case packet(Socks5UDPPacket, consumedBytes: Int)
+    case needsMoreData
+    case invalid
 }
 
 /// Stateless encoder/decoder for SOCKS5 handshake/request/UDP formats.
@@ -123,6 +132,60 @@ public enum Socks5Codec {
         return Socks5UDPPacket(address: address, port: port, payload: payload)
     }
 
+    /// Parses HEV's TCP-carried UDP frame format.
+    ///
+    /// Frame layout:
+    /// - 2 bytes: payload length, network byte order
+    /// - 1 byte: header length, including the first 3 bytes
+    /// - N bytes: SOCKS address and port
+    /// - M bytes: UDP payload
+    public static func parseTCPForwardUDPPacket(_ buffer: Data) -> Socks5TCPForwardUDPParseResult {
+        guard buffer.count >= 3 else {
+            return .needsMoreData
+        }
+
+        let start = buffer.startIndex
+        let payloadLength = Int(UInt16(buffer[start]) << 8 | UInt16(buffer[start + 1]))
+        let headerLength = Int(buffer[start + 2])
+        guard headerLength >= 7 else {
+            return .invalid
+        }
+
+        let totalLength = headerLength + payloadLength
+        guard totalLength >= headerLength else {
+            return .invalid
+        }
+        guard buffer.count >= totalLength else {
+            return .needsMoreData
+        }
+
+        let addressStart = start + 3
+        let payloadStart = start + headerLength
+        guard addressStart < payloadStart else {
+            return .invalid
+        }
+
+        let addressBytes = Data(buffer[addressStart ..< payloadStart])
+        var index = addressBytes.startIndex
+        guard index < addressBytes.endIndex else {
+            return .invalid
+        }
+        let atyp = addressBytes[index]
+        index += 1
+        guard let address = parseAddress(from: addressBytes, atyp: atyp, index: &index),
+              addressBytes.count == index + 2
+        else {
+            return .invalid
+        }
+
+        let port = UInt16(addressBytes[index]) << 8 | UInt16(addressBytes[index + 1])
+        let payload = Data(buffer[payloadStart ..< start + totalLength])
+        return .packet(
+            Socks5UDPPacket(address: address, port: port, payload: payload),
+            consumedBytes: totalLength
+        )
+    }
+
     /// Builds server method selection reply.
     /// - Parameter method: Chosen auth method byte.
     public static func buildMethodSelection(method: UInt8) -> Data {
@@ -154,6 +217,30 @@ public enum Socks5Codec {
         data.append(UInt8(port & 0xFF))
         data.append(payload)
         return data
+    }
+
+    /// Builds HEV's TCP-carried UDP frame format.
+    public static func buildTCPForwardUDPPacket(address: Socks5Address, port: UInt16, payload: Data) -> Data? {
+        guard payload.count <= Int(UInt16.max) else {
+            return nil
+        }
+        let addressAndPort = addressPortBytes(address, port: port)
+        let headerLength = 3 + addressAndPort.count
+        guard headerLength <= Int(UInt8.max) else {
+            return nil
+        }
+
+        var data = Data()
+        data.append(UInt8((payload.count >> 8) & 0xFF))
+        data.append(UInt8(payload.count & 0xFF))
+        data.append(UInt8(headerLength))
+        data.append(contentsOf: addressAndPort)
+        data.append(payload)
+        return data
+    }
+
+    private static func addressPortBytes(_ address: Socks5Address, port: UInt16) -> [UInt8] {
+        addressBytes(address) + [UInt8((port >> 8) & 0xFF), UInt8(port & 0xFF)]
     }
 
     private static func parseAddress(from data: Data, atyp: UInt8, index: inout Int) -> Socks5Address? {

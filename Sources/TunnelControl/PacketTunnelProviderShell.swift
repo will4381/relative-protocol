@@ -153,6 +153,7 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
             return
         }
         let settings = TunnelNetworkSettingsFactory.makeSettings(profile: profile)
+        let supersededComponents = takeCleanupSnapshot(markStopping: false)
         let startupID = beginStartup()
 
         let startupTask = Task {
@@ -162,6 +163,7 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
             var startupSocksServer: Socks5Server?
             var startupBridge: TunSocketBridge?
             do {
+                await self.cleanupSupersededComponents(supersededComponents)
                 try self.checkStartupCurrent(startupID)
                 let runtime = TunnelRuntime(
                     clock: SystemClock(),
@@ -205,7 +207,7 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                     self?.handleInboundPackets(packets, families: families)
                 }
 
-                let dataplaneConfig = makeDataplaneConfig(profile: profile, socksPort: socksPort)
+                let dataplaneConfig = Self.makeDataplaneConfig(profile: profile, socksPort: socksPort)
                 try await runtime.start(configJSON: dataplaneConfig, tunFD: bridge.engineFD)
                 try self.checkStartupCurrent(startupID)
 
@@ -751,7 +753,7 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
     /// - Parameters:
     ///   - profile: Active tunnel profile.
     ///   - socksPort: Bound local SOCKS5 port.
-    private func makeDataplaneConfig(profile: TunnelProfile, socksPort: UInt16) -> String {
+    static func makeDataplaneConfig(profile: TunnelProfile, socksPort: UInt16) -> String {
         let configured = profile.dataplaneConfigJSON.trimmingCharacters(in: .whitespacesAndNewlines)
         if !configured.isEmpty, configured != "{}" {
             return configured
@@ -774,7 +776,9 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
         lines.append("socks5:")
         lines.append("  port: \(socksPort)")
         lines.append("  address: 127.0.0.1")
-        lines.append("  udp: 'udp'")
+        if profile.relayEndpoint.useUDP {
+            lines.append("  udp: 'udp'")
+        }
         lines.append("")
         lines.append("misc:")
         lines.append("  log-file: stderr")
@@ -790,7 +794,7 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
 
     /// Maps user-provided log level hints into HEV supported levels.
     /// - Parameter value: Profile-provided log level string.
-    private func normalizedEngineLogLevel(_ value: String) -> String {
+    private static func normalizedEngineLogLevel(_ value: String) -> String {
         let lower = value.lowercased()
         if lower.contains("debug") {
             return "debug"
@@ -1436,6 +1440,52 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                 }
             }
         }
+    }
+
+    /// Tears down runtime objects left behind when NetworkExtension starts the provider again without a prior stop.
+    /// Decision: a fresh `startTunnel` owns a fresh SOCKS listener, bridge, and runtime; the old objects must not
+    /// continue to compete for packet flow or egress callbacks.
+    private func cleanupSupersededComponents(_ snapshot: CleanupSnapshot) async {
+        let hasWork = snapshot.runtime != nil ||
+            snapshot.tunBridge != nil ||
+            snapshot.socksServer != nil ||
+            snapshot.telemetryWorker != nil ||
+            snapshot.startupTask != nil ||
+            snapshot.startupRuntime != nil ||
+            snapshot.startupTunBridge != nil ||
+            snapshot.startupSocksServer != nil ||
+            snapshot.startupTelemetryWorker != nil
+
+        guard hasWork else {
+            return
+        }
+
+        snapshot.startupTask?.cancel()
+        if let telemetryWorker = snapshot.telemetryWorker {
+            await telemetryWorker.stopAndWait()
+        }
+        if let telemetryWorker = snapshot.startupTelemetryWorker {
+            await telemetryWorker.stopAndWait()
+        }
+        if let runtime = snapshot.runtime {
+            try? await runtime.stop()
+        }
+        if let runtime = snapshot.startupRuntime {
+            try? await runtime.stop()
+        }
+        snapshot.tunBridge?.stop()
+        snapshot.startupTunBridge?.stop()
+        snapshot.socksServer?.stop()
+        snapshot.startupSocksServer?.stop()
+
+        await snapshot.logger.log(
+            level: .notice,
+            phase: .lifecycle,
+            category: .control,
+            component: "PacketTunnelProviderShell",
+            event: "superseded-start-cleanup",
+            message: "Cleaned up existing tunnel runtime before processing a replacement startTunnel call"
+        )
     }
 
     /// Best-effort cleanup path used when startup fails after partial initialization.
