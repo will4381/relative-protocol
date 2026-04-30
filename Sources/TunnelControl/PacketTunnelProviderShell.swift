@@ -207,7 +207,7 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                     self?.handleInboundPackets(packets, families: families)
                 }
 
-                let dataplaneConfig = makeDataplaneConfig(profile: profile, socksPort: socksPort)
+                let dataplaneConfig = Self.makeDataplaneConfig(profile: profile, socksPort: socksPort)
                 try await runtime.start(configJSON: dataplaneConfig, tunFD: bridge.engineFD)
                 try self.checkStartupCurrent(startupID)
 
@@ -753,7 +753,7 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
     /// - Parameters:
     ///   - profile: Active tunnel profile.
     ///   - socksPort: Bound local SOCKS5 port.
-    private func makeDataplaneConfig(profile: TunnelProfile, socksPort: UInt16) -> String {
+    static func makeDataplaneConfig(profile: TunnelProfile, socksPort: UInt16) -> String {
         let configured = profile.dataplaneConfigJSON.trimmingCharacters(in: .whitespacesAndNewlines)
         if !configured.isEmpty, configured != "{}" {
             return configured
@@ -776,7 +776,9 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
         lines.append("socks5:")
         lines.append("  port: \(socksPort)")
         lines.append("  address: 127.0.0.1")
-        lines.append("  udp: 'udp'")
+        if profile.relayEndpoint.useUDP {
+            lines.append("  udp: 'udp'")
+        }
         lines.append("")
         lines.append("misc:")
         lines.append("  log-file: stderr")
@@ -792,7 +794,7 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
 
     /// Maps user-provided log level hints into HEV supported levels.
     /// - Parameter value: Profile-provided log level string.
-    private func normalizedEngineLogLevel(_ value: String) -> String {
+    private static func normalizedEngineLogLevel(_ value: String) -> String {
         let lower = value.lowercased()
         if lower.contains("debug") {
             return "debug"
