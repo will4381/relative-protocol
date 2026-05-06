@@ -599,6 +599,64 @@ final class Socks5ServerTests: XCTestCase {
         XCTAssertTrue(snapshot.first?.cancelled == true)
     }
 
+    func testNWConnectionTCPAdapterSnapshotsPathMetadataForAsyncCallbacks() async throws {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.tcp-path-snapshot")
+        let sink = InMemoryLogSink()
+        let connection = NWConnection(host: "127.0.0.1", port: 9, using: .tcp)
+        let adapter = NWConnectionTCPAdapter(
+            connection,
+            queue: queue,
+            logger: StructuredLogger(sink: sink)
+        )
+
+        adapter.waitUntilReady { _ in }
+        let path = try await eventuallyFetchCurrentPath(from: connection)
+        connection.pathUpdateHandler?(path)
+        connection.viabilityUpdateHandler?(false)
+        connection.betterPathUpdateHandler?(true)
+
+        let records = try await eventuallyFetchRecords(from: sink) { records in
+            records.contains { $0.component == "NWConnectionTCPAdapter" && $0.event == "path-update" } &&
+                records.contains { $0.component == "NWConnectionTCPAdapter" && $0.event == "viability-update" } &&
+                records.contains { $0.component == "NWConnectionTCPAdapter" && $0.event == "better-path-available" }
+        }
+
+        let adapterRecords = records.filter { $0.component == "NWConnectionTCPAdapter" }
+        XCTAssertTrue(adapterRecords.allSatisfy { $0.metadata["path"]?.contains("status=") == true })
+        XCTAssertTrue(adapter.pathSnapshot.contains("status="))
+        adapter.cancel()
+        withExtendedLifetime(adapter) {}
+    }
+
+    func testNWConnectionUDPSessionAdapterSnapshotsPathMetadataForAsyncCallbacks() async throws {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.udp-path-snapshot")
+        let sink = InMemoryLogSink()
+        let connection = NWConnection(host: "127.0.0.1", port: 9, using: .udp)
+        let adapter = NWConnectionUDPSessionAdapter(
+            connection,
+            queue: queue,
+            logger: StructuredLogger(sink: sink)
+        )
+
+        connection.stateUpdateHandler?(.waiting(.posix(.ENETDOWN)))
+        let path = try await eventuallyFetchCurrentPath(from: connection)
+        connection.pathUpdateHandler?(path)
+        connection.viabilityUpdateHandler?(false)
+        connection.betterPathUpdateHandler?(true)
+
+        let records = try await eventuallyFetchRecords(from: sink) { records in
+            records.contains { $0.component == "NWConnectionUDPSessionAdapter" && $0.event == "waiting" } &&
+                records.contains { $0.component == "NWConnectionUDPSessionAdapter" && $0.event == "path-update" } &&
+                records.contains { $0.component == "NWConnectionUDPSessionAdapter" && $0.event == "viability-update" } &&
+                records.contains { $0.component == "NWConnectionUDPSessionAdapter" && $0.event == "better-path-available" }
+        }
+
+        let adapterRecords = records.filter { $0.component == "NWConnectionUDPSessionAdapter" }
+        XCTAssertTrue(adapterRecords.allSatisfy { $0.metadata["path"]?.contains("status=") == true })
+        adapter.cancel()
+        withExtendedLifetime(adapter) {}
+    }
+
     func testInboundReadFailureIsLoggedBeforeClose() async throws {
         let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.inbound-read-failure")
         let sink = InMemoryLogSink()
@@ -930,4 +988,18 @@ private func eventuallyFetchRecords(
         try await Task.sleep(for: .milliseconds(25))
     }
     return await sink.snapshot()
+}
+
+private func eventuallyFetchCurrentPath(from connection: NWConnection) async throws -> Network.NWPath {
+    for _ in 0..<20 {
+        if let path = connection.currentPath {
+            return path
+        }
+        try await Task.sleep(for: .milliseconds(25))
+    }
+    throw TestPathError.unavailable
+}
+
+private enum TestPathError: Error {
+    case unavailable
 }

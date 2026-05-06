@@ -229,6 +229,7 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
     private var readyHandlers: [(@Sendable (Result<Void, Error>) -> Void)] = []
     private var readyResult: Result<Void, Error>?
     private var didStart = false
+    private let pathLock = NSLock()
     private var lastKnownPathSummary = "status=unknown uses=unknown"
     var eventHandler: ((TCPOutboundEvent) -> Void)?
 
@@ -255,7 +256,7 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
     }
 
     var pathSnapshot: String {
-        lastKnownPathSummary
+        currentPathSummary()
     }
 
     func waitUntilReady(completionHandler: @escaping @Sendable (Result<Void, Error>) -> Void) {
@@ -305,6 +306,7 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
     private func handleState(_ state: NWConnection.State) {
         switch state {
         case .ready:
+            let path = currentPathSummary()
             finishReadyHandlers(with: .success(()))
             Task {
                 await logger.log(
@@ -314,27 +316,30 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
                     component: "NWConnectionTCPAdapter",
                     event: "ready",
                     message: "Outbound TCP ready",
-                    metadata: ["path": lastKnownPathSummary]
+                    metadata: ["path": path]
                 )
             }
         case .waiting(let error):
+            let path = currentPathSummary()
+            let errorDescription = error.localizedDescription
             eventHandler?(.waiting)
             Task {
-                let path = lastKnownPathSummary
                 await logger.logRateLimited(
-                    key: "NWConnectionTCPAdapter.waiting.\(error.localizedDescription).\(path)",
+                    key: "NWConnectionTCPAdapter.waiting.\(errorDescription).\(path)",
                     minimumInterval: Self.waitingLogMinimumInterval,
                     level: .warning,
                     phase: .relay,
                     category: .relayTCP,
                     component: "NWConnectionTCPAdapter",
                     event: "waiting",
-                    errorCode: error.localizedDescription,
+                    errorCode: errorDescription,
                     message: "Outbound TCP waiting",
                     metadata: ["path": path]
                 )
             }
         case .failed(let error):
+            let path = currentPathSummary()
+            let errorDescription = error.localizedDescription
             finishReadyHandlers(with: .failure(error))
             Task {
                 await logger.log(
@@ -343,9 +348,9 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
                     category: .relayTCP,
                     component: "NWConnectionTCPAdapter",
                     event: "failed",
-                    errorCode: error.localizedDescription,
+                    errorCode: errorDescription,
                     message: "Outbound TCP failed",
-                    metadata: ["path": lastKnownPathSummary]
+                    metadata: ["path": path]
                 )
             }
         case .cancelled:
@@ -356,7 +361,9 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
     }
 
     private func handlePathUpdate(_ path: Network.NWPath) {
-        lastKnownPathSummary = pathSummary(path)
+        let summary = pathSummary(path)
+        let status = pathStatusName(path.status)
+        updatePathSummary(summary)
         Task {
             await logger.log(
                 level: .debug,
@@ -364,14 +371,15 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
                 category: .relayTCP,
                 component: "NWConnectionTCPAdapter",
                 event: "path-update",
-                result: pathStatusName(path.status),
+                result: status,
                 message: "Outbound TCP path updated",
-                metadata: ["path": lastKnownPathSummary]
+                metadata: ["path": summary]
             )
         }
     }
 
     private func handleViabilityUpdate(_ isViable: Bool) {
+        let path = currentPathSummary()
         Task {
             await logger.log(
                 level: .debug,
@@ -381,7 +389,7 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
                 event: "viability-update",
                 result: isViable ? "viable" : "not-viable",
                 message: "Outbound TCP viability changed",
-                metadata: ["path": lastKnownPathSummary]
+                metadata: ["path": path]
             )
         }
     }
@@ -390,6 +398,7 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
         guard betterPathAvailable else {
             return
         }
+        let path = currentPathSummary()
         eventHandler?(.betterPathAvailable)
         Task {
             await logger.log(
@@ -400,9 +409,21 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
                 event: "better-path-available",
                 result: "preferred-path",
                 message: "Outbound TCP has a better path available",
-                metadata: ["path": lastKnownPathSummary]
+                metadata: ["path": path]
             )
         }
+    }
+
+    private func currentPathSummary() -> String {
+        pathLock.lock()
+        defer { pathLock.unlock() }
+        return lastKnownPathSummary
+    }
+
+    private func updatePathSummary(_ summary: String) {
+        pathLock.lock()
+        lastKnownPathSummary = summary
+        pathLock.unlock()
     }
 
     private func finishReadyHandlers(with result: Result<Void, Error>) {
@@ -890,23 +911,26 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
         case .ready:
             eventHandler?(.ready)
         case .waiting(let error):
+            let path = pathSummary(connection.currentPath)
+            let errorDescription = error.localizedDescription
             eventHandler?(.waiting)
             Task {
-                let path = pathSummary(connection.currentPath)
                 await logger.logRateLimited(
-                    key: "NWConnectionUDPSessionAdapter.waiting.\(error.localizedDescription).\(path)",
+                    key: "NWConnectionUDPSessionAdapter.waiting.\(errorDescription).\(path)",
                     minimumInterval: Self.waitingLogMinimumInterval,
                     level: .warning,
                     phase: .relay,
                     category: .relayUDP,
                     component: "NWConnectionUDPSessionAdapter",
                     event: "waiting",
-                    errorCode: error.localizedDescription,
+                    errorCode: errorDescription,
                     message: "Outbound UDP waiting",
                     metadata: ["path": path]
                 )
             }
         case .failed(let error):
+            let path = pathSummary(connection.currentPath)
+            let errorDescription = error.localizedDescription
             eventHandler?(.failed)
             Task {
                 await logger.log(
@@ -915,9 +939,9 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
                     category: .relayUDP,
                     component: "NWConnectionUDPSessionAdapter",
                     event: "failed",
-                    errorCode: error.localizedDescription,
+                    errorCode: errorDescription,
                     message: "Outbound UDP failed",
-                    metadata: ["path": pathSummary(connection.currentPath)]
+                    metadata: ["path": path]
                 )
             }
         default:
@@ -926,6 +950,8 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
     }
 
     private func handlePathUpdate(_ path: Network.NWPath) {
+        let summary = pathSummary(path)
+        let status = pathStatusName(path.status)
         Task {
             await logger.log(
                 level: .debug,
@@ -933,14 +959,15 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
                 category: .relayUDP,
                 component: "NWConnectionUDPSessionAdapter",
                 event: "path-update",
-                result: pathStatusName(path.status),
+                result: status,
                 message: "Outbound UDP path updated",
-                metadata: ["path": pathSummary(path)]
+                metadata: ["path": summary]
             )
         }
     }
 
     private func handleViabilityUpdate(_ isViable: Bool) {
+        let path = pathSummary(connection.currentPath)
         eventHandler?(.viabilityChanged(isViable))
         Task {
             await logger.log(
@@ -951,7 +978,7 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
                 event: "viability-update",
                 result: isViable ? "viable" : "not-viable",
                 message: "Outbound UDP viability changed",
-                metadata: ["path": pathSummary(connection.currentPath)]
+                metadata: ["path": path]
             )
         }
     }
@@ -960,6 +987,7 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
         guard betterPathAvailable else {
             return
         }
+        let path = pathSummary(connection.currentPath)
         eventHandler?(.betterPathAvailable)
         Task {
             await logger.log(
@@ -970,7 +998,7 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
                 event: "better-path-available",
                 result: "preferred-path",
                 message: "Outbound UDP has a better path available",
-                metadata: ["path": pathSummary(connection.currentPath)]
+                metadata: ["path": path]
             )
         }
     }
