@@ -1502,6 +1502,7 @@ final class Socks5TCPForwardUDPRelay: @unchecked Sendable {
 
     private var sessions: [SessionKey: Socks5UDPSession] = [:]
     private var sessionOrder: [SessionKey] = []
+    private var sessionsNeedingReplacement: Set<SessionKey> = []
     private var isStopped = false
 
     init(
@@ -1538,6 +1539,7 @@ final class Socks5TCPForwardUDPRelay: @unchecked Sendable {
         sessions.values.forEach { $0.cancel() }
         sessions.removeAll(keepingCapacity: false)
         sessionOrder.removeAll(keepingCapacity: false)
+        sessionsNeedingReplacement.removeAll(keepingCapacity: false)
     }
 
     private func forward(_ packet: Socks5UDPPacket) {
@@ -1565,8 +1567,13 @@ final class Socks5TCPForwardUDPRelay: @unchecked Sendable {
     }
 
     private func session(for key: SessionKey) -> Socks5UDPSession {
-        if let session = sessions[key] {
+        if let session = sessions[key],
+           !sessionsNeedingReplacement.contains(key) {
             return session
+        }
+
+        if sessions[key] != nil {
+            removeSession(for: key)
         }
 
         evictOldestSessionIfNeeded()
@@ -1591,17 +1598,19 @@ final class Socks5TCPForwardUDPRelay: @unchecked Sendable {
                 guard !self.isStopped, self.sessions[key] === session else { return }
                 switch event {
                 case .ready:
-                    break
+                    self.sessionsNeedingReplacement.remove(key)
                 case .waiting:
-                    self.replaceSession(for: key, reason: "waiting")
+                    break
                 case .failed:
-                    self.replaceSession(for: key, reason: "failed")
+                    self.removeSession(for: key)
                 case .viabilityChanged(let isViable):
-                    if !isViable {
-                        self.replaceSession(for: key, reason: "not-viable")
+                    if isViable {
+                        self.sessionsNeedingReplacement.remove(key)
+                    } else {
+                        self.scheduleSessionReplacement(for: key, reason: "not-viable")
                     }
                 case .betterPathAvailable:
-                    self.replaceSession(for: key, reason: "better-path")
+                    self.scheduleSessionReplacement(for: key, reason: "better-path")
                 }
             }
         }
@@ -1641,18 +1650,22 @@ final class Socks5TCPForwardUDPRelay: @unchecked Sendable {
         return session
     }
 
-    private func replaceSession(for key: SessionKey, reason: String) {
-        removeSession(for: key)
-        _ = createSession(for: key)
+    private func scheduleSessionReplacement(for key: SessionKey, reason: String) {
+        guard sessions[key] != nil,
+              !sessionsNeedingReplacement.contains(key)
+        else {
+            return
+        }
+        sessionsNeedingReplacement.insert(key)
         Task {
             await logger.log(
                 level: .notice,
                 phase: .relay,
                 category: .relayUDP,
                 component: "Socks5TCPForwardUDPRelay",
-                event: "session-replaced",
+                event: "session-replacement-scheduled",
                 result: reason,
-                message: "Replaced TCP-carried UDP session after Network.framework path signal"
+                message: "Scheduled TCP-carried UDP session replacement after Network.framework path signal"
             )
         }
     }
@@ -1662,6 +1675,7 @@ final class Socks5TCPForwardUDPRelay: @unchecked Sendable {
             return
         }
         session.cancel()
+        sessionsNeedingReplacement.remove(key)
         sessionOrder.removeAll { $0 == key }
     }
 

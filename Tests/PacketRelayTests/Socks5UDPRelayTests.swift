@@ -353,7 +353,7 @@ final class Socks5UDPRelayTests: XCTestCase {
         XCTAssertEqual(record.metadata["minimum_observed_maximum_datagram_size"], "1382")
     }
 
-    func testUDPRelayReplacesBetterPathSessionImmediately() throws {
+    func testUDPRelaySchedulesBetterPathReplacementUntilNextDatagram() throws {
         let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.udp.better-path")
         let provider = FakeUDPProvider()
         let relay = try Socks5UDPRelay(
@@ -372,7 +372,7 @@ final class Socks5UDPRelayTests: XCTestCase {
         defer { close(clientSocket) }
 
         let firstCreated = expectation(description: "first udp session created")
-        let secondCreated = expectation(description: "second udp session created after path change")
+        let secondCreated = expectation(description: "second udp session created on next datagram")
         provider.onCreate = { _ in
             if provider.sessions.count == 1 {
                 firstCreated.fulfill()
@@ -392,15 +392,90 @@ final class Socks5UDPRelayTests: XCTestCase {
         let firstSession = try XCTUnwrap(provider.sessions.first)
         queue.sync {
             firstSession.eventHandler?(.betterPathAvailable)
+            firstSession.eventHandler?(.betterPathAvailable)
         }
+
+        XCTAssertFalse(firstSession.cancelled)
+        XCTAssertEqual(provider.sessions.count, 1)
+        XCTAssertEqual(relay.activeSessionCount, 1)
+
+        try sendClientDatagram(
+            socketFD: clientSocket,
+            relayPort: relay.port,
+            destinationAddress: .ipv4("1.1.1.1"),
+            destinationPort: 53
+        )
         wait(for: [secondCreated], timeout: 1.0)
 
         XCTAssertTrue(firstSession.cancelled)
         XCTAssertEqual(relay.activeSessionCount, 1)
     }
 
-    func testUDPRelayReplacesWaitingSession() throws {
+    func testUDPRelayRetainsWaitingSession() throws {
         let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.udp.waiting")
+        let provider = FakeUDPProvider()
+        let relay = try Socks5UDPRelay(
+            provider: provider,
+            queue: queue,
+            mtu: 1_500,
+            logger: StructuredLogger(sink: InMemoryLogSink())
+        )
+        relay.start()
+        defer {
+            relay.stop()
+        }
+
+        let clientSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        XCTAssertGreaterThanOrEqual(clientSocket, 0)
+        defer { close(clientSocket) }
+
+        let firstCreated = expectation(description: "first udp session created")
+        provider.onCreate = { _ in
+            if provider.sessions.count == 1 {
+                firstCreated.fulfill()
+            }
+        }
+
+        try sendClientDatagram(
+            socketFD: clientSocket,
+            relayPort: relay.port,
+            destinationAddress: .ipv4("1.1.1.1"),
+            destinationPort: 53
+        )
+        wait(for: [firstCreated], timeout: 1.0)
+
+        let session = try XCTUnwrap(provider.sessions.first)
+        queue.sync {
+            session.eventHandler?(.waiting)
+            session.eventHandler?(.waiting)
+            session.eventHandler?(.waiting)
+        }
+
+        XCTAssertEqual(session.restartCount, 0)
+        XCTAssertFalse(session.cancelled)
+        XCTAssertEqual(relay.activeSessionCount, 1)
+        XCTAssertEqual(provider.sessions.count, 1)
+
+        let secondWrite = expectation(description: "waiting session receives second datagram")
+        session.onWrite = { _ in
+            if session.writtenDatagrams.count == 2 {
+                secondWrite.fulfill()
+            }
+        }
+        try sendClientDatagram(
+            socketFD: clientSocket,
+            relayPort: relay.port,
+            destinationAddress: .ipv4("1.1.1.1"),
+            destinationPort: 53
+        )
+        wait(for: [secondWrite], timeout: 1.0)
+        XCTAssertEqual(provider.sessions.count, 1)
+        XCTAssertEqual(relay.activeSessionCount, 1)
+        XCTAssertEqual(session.writtenDatagrams.count, 2)
+    }
+
+    func testUDPRelayRemovesFailedSessionAndRecreatesOnNextDatagram() throws {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.udp.failed")
         let provider = FakeUDPProvider()
         let relay = try Socks5UDPRelay(
             provider: provider,
@@ -435,15 +510,14 @@ final class Socks5UDPRelayTests: XCTestCase {
         )
         wait(for: [firstCreated], timeout: 1.0)
 
-        let session = try XCTUnwrap(provider.sessions.first)
+        let firstSession = try XCTUnwrap(provider.sessions.first)
         queue.sync {
-            session.eventHandler?(.waiting)
+            firstSession.eventHandler?(.failed)
         }
-        wait(for: [secondCreated], timeout: 1.0)
 
-        XCTAssertEqual(session.restartCount, 0)
-        XCTAssertTrue(session.cancelled)
-        XCTAssertEqual(relay.activeSessionCount, 1)
+        XCTAssertTrue(firstSession.cancelled)
+        XCTAssertEqual(relay.activeSessionCount, 0)
+        XCTAssertEqual(provider.sessions.count, 1)
 
         try sendClientDatagram(
             socketFD: clientSocket,
@@ -451,9 +525,69 @@ final class Socks5UDPRelayTests: XCTestCase {
             destinationAddress: .ipv4("1.1.1.1"),
             destinationPort: 53
         )
-        queue.sync {}
+        wait(for: [secondCreated], timeout: 1.0)
+
         XCTAssertEqual(provider.sessions.count, 2)
         XCTAssertEqual(relay.activeSessionCount, 1)
+    }
+
+    func testUDPRelayClearsScheduledReplacementWhenSessionRecovers() throws {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.udp.viability-recovers")
+        let provider = FakeUDPProvider()
+        let relay = try Socks5UDPRelay(
+            provider: provider,
+            queue: queue,
+            mtu: 1_500,
+            logger: StructuredLogger(sink: InMemoryLogSink())
+        )
+        relay.start()
+        defer {
+            relay.stop()
+        }
+
+        let clientSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        XCTAssertGreaterThanOrEqual(clientSocket, 0)
+        defer { close(clientSocket) }
+
+        let firstCreated = expectation(description: "first udp session created")
+        provider.onCreate = { _ in
+            if provider.sessions.count == 1 {
+                firstCreated.fulfill()
+            }
+        }
+
+        try sendClientDatagram(
+            socketFD: clientSocket,
+            relayPort: relay.port,
+            destinationAddress: .ipv4("1.1.1.1"),
+            destinationPort: 53
+        )
+        wait(for: [firstCreated], timeout: 1.0)
+
+        let session = try XCTUnwrap(provider.sessions.first)
+        queue.sync {
+            session.eventHandler?(.viabilityChanged(false))
+            session.eventHandler?(.viabilityChanged(true))
+        }
+
+        let secondWrite = expectation(description: "recovered session receives second datagram")
+        session.onWrite = { _ in
+            if session.writtenDatagrams.count == 2 {
+                secondWrite.fulfill()
+            }
+        }
+        try sendClientDatagram(
+            socketFD: clientSocket,
+            relayPort: relay.port,
+            destinationAddress: .ipv4("1.1.1.1"),
+            destinationPort: 53
+        )
+        wait(for: [secondWrite], timeout: 1.0)
+
+        XCTAssertFalse(session.cancelled)
+        XCTAssertEqual(provider.sessions.count, 1)
+        XCTAssertEqual(relay.activeSessionCount, 1)
+        XCTAssertEqual(session.writtenDatagrams.count, 2)
     }
 
     func testUDPRelayKeepsLargeSocksDatagramPayloadIntact() throws {
@@ -610,6 +744,7 @@ private final class FakeUDPSession: Socks5UDPSession, @unchecked Sendable {
     private(set) var writtenDatagrams: [Data] = []
     var nextWriteError: Error?
     var writeErrors: [Error] = []
+    var onWrite: ((Data) -> Void)?
     var eventHandler: ((Socks5UDPSessionEvent) -> Void)?
 
     func setReadHandler(_ handler: @escaping (Data?, Error?) -> Void) {
@@ -618,6 +753,7 @@ private final class FakeUDPSession: Socks5UDPSession, @unchecked Sendable {
 
     func writeDatagram(_ datagram: Data, completionHandler: @escaping (Error?) -> Void) {
         writtenDatagrams.append(datagram)
+        onWrite?(datagram)
         if !writeErrors.isEmpty {
             completionHandler(writeErrors.removeFirst())
             return

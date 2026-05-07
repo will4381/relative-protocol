@@ -219,7 +219,7 @@ final class Socks5ServerTests: XCTestCase {
         XCTAssertEqual(inbound.sentPayloads.last, responseFrame)
     }
 
-    func testTCPForwardUDPReplacesWaitingSession() throws {
+    func testTCPForwardUDPRetainsWaitingSession() throws {
         let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.forward-udp-waiting")
         let inbound = FakeInboundConnection()
         let outbound = ControlledTCPOutbound()
@@ -250,16 +250,112 @@ final class Socks5ServerTests: XCTestCase {
         let firstSession = try XCTUnwrap(provider.udpSessions.first)
         queue.sync {
             firstSession.eventHandler?(.waiting)
+            firstSession.eventHandler?(.waiting)
+            firstSession.eventHandler?(.waiting)
+        }
+
+        XCTAssertFalse(firstSession.cancelled)
+        XCTAssertEqual(provider.udpSessions.count, 1)
+
+        queue.sync {
+            inbound.push(frame)
+        }
+
+        XCTAssertEqual(firstSession.writtenDatagrams, [Data([0x01]), Data([0x01])])
+        XCTAssertEqual(provider.udpSessions.count, 1)
+    }
+
+    func testTCPForwardUDPRemovesFailedSessionAndRecreatesOnNextDatagram() throws {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.forward-udp-failed")
+        let inbound = FakeInboundConnection()
+        let outbound = ControlledTCPOutbound()
+        let provider = FakeProvider(outbound: outbound)
+        let connection = Socks5Connection(
+            connection: inbound,
+            provider: provider,
+            queue: queue,
+            mtu: 1500,
+            logger: StructuredLogger(sink: InMemoryLogSink())
+        )
+
+        let frame = try XCTUnwrap(
+            Socks5Codec.buildTCPForwardUDPPacket(
+                address: .ipv4("1.1.1.1"),
+                port: 53,
+                payload: Data([0x01])
+            )
+        )
+
+        queue.sync {
+            connection.start()
+            inbound.push(Self.greeting)
+            inbound.push(Self.request(command: 0x05, host: "0.0.0.0", port: 0))
+            inbound.push(frame)
+        }
+
+        let firstSession = try XCTUnwrap(provider.udpSessions.first)
+        queue.sync {
+            firstSession.eventHandler?(.failed)
         }
 
         XCTAssertTrue(firstSession.cancelled)
-        XCTAssertEqual(provider.udpSessions.count, 2)
+        XCTAssertEqual(provider.udpSessions.count, 1)
 
         queue.sync {
             inbound.push(frame)
         }
 
         let secondSession = try XCTUnwrap(provider.udpSessions.last)
+        XCTAssertFalse(secondSession === firstSession)
+        XCTAssertEqual(provider.udpSessions.count, 2)
+        XCTAssertEqual(secondSession.writtenDatagrams, [Data([0x01])])
+    }
+
+    func testTCPForwardUDPSchedulesBetterPathReplacementUntilNextDatagram() throws {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.forward-udp-better-path")
+        let inbound = FakeInboundConnection()
+        let outbound = ControlledTCPOutbound()
+        let provider = FakeProvider(outbound: outbound)
+        let connection = Socks5Connection(
+            connection: inbound,
+            provider: provider,
+            queue: queue,
+            mtu: 1500,
+            logger: StructuredLogger(sink: InMemoryLogSink())
+        )
+
+        let frame = try XCTUnwrap(
+            Socks5Codec.buildTCPForwardUDPPacket(
+                address: .ipv4("1.1.1.1"),
+                port: 53,
+                payload: Data([0x01])
+            )
+        )
+
+        queue.sync {
+            connection.start()
+            inbound.push(Self.greeting)
+            inbound.push(Self.request(command: 0x05, host: "0.0.0.0", port: 0))
+            inbound.push(frame)
+        }
+
+        let firstSession = try XCTUnwrap(provider.udpSessions.first)
+        queue.sync {
+            firstSession.eventHandler?(.betterPathAvailable)
+            firstSession.eventHandler?(.betterPathAvailable)
+        }
+
+        XCTAssertFalse(firstSession.cancelled)
+        XCTAssertEqual(provider.udpSessions.count, 1)
+
+        queue.sync {
+            inbound.push(frame)
+        }
+
+        let secondSession = try XCTUnwrap(provider.udpSessions.last)
+        XCTAssertTrue(firstSession.cancelled)
+        XCTAssertFalse(secondSession === firstSession)
+        XCTAssertEqual(provider.udpSessions.count, 2)
         XCTAssertEqual(secondSession.writtenDatagrams, [Data([0x01])])
     }
 

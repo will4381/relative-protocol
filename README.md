@@ -22,7 +22,7 @@ It is designed so the tunnel can stay alive and keep detecting while the contain
   - `Scripts/quality-gate.sh` now validates `Config/PerfBaseline.json` and can compare metrics through `VPN_BRIDGE_PERF_RESULTS`
 - transport recovery hardening
   - outbound TCP now uses bounded connect attempts with retry for stalled `NWConnection.State.preparing`
-  - outbound UDP sessions now rotate on `waiting`, `failed`, write-side failure, and better-path replacement signals
+  - outbound UDP sessions now preserve recoverable `waiting` sessions, remove failed sessions, and lazily rotate after better-path or not-viable signals
   - synthesized HEV configs now omit `udp: 'udp'` when `relayEndpoint.useUDP == false`, allowing UDP payloads to ride the existing SOCKS TCP stream instead of requiring UDP-over-UDP
   - outbound TCP better-path handling is now explicit during connect attempts instead of log-only
   - isolated UDP oversize / PMTU drops no longer tear down the whole relay immediately
@@ -459,17 +459,18 @@ Lifecycle guidance:
 
 UDP and QUIC guidance:
 
-- actively replace UDP sessions on better-path signals and persistent `waiting`
+- do not replace UDP sessions just because Network.framework reports `waiting`; it is recoverable and may resolve on the existing connection
+- schedule UDP session replacement on better-path or not-viable signals, then rotate on the next datagram instead of creating replacement storms
 - keep isolated datagram-too-large failures from tearing down the whole UDP relay
 - prefer TCP-carried UDP for consumer profiles unless you have operational proof that UDP-over-UDP is consistently accepted on the target networks
 - treat each SOCKS UDP ASSOCIATE as owned by its original localhost client endpoint; packets from a different source endpoint are dropped for association safety
 - monitor QUIC separately from TCP because QUIC can look healthy at the TCP layer while being pinned to a stale NAT/path
-- expect UDP session replacement notices during Wi-Fi/cellular handoff; they are healthy when followed by successful probes and zero sustained drops
+- expect occasional UDP session replacement-scheduled notices during Wi-Fi/cellular handoff; they are healthy when followed by successful probes and zero sustained drops
 
 Telemetry and logging guidance:
 
 - use structured event names as the operational contract, not raw console text
-- watch `start-success`, `stop`, `health-sample`, `connect-timeout`, `connect-overall-timeout`, `outbound-connect-failed`, `outbound-read-failed`, `session-replaced`, and telemetry shedding events
+- watch `start-success`, `stop`, `health-sample`, `connect-timeout`, `connect-overall-timeout`, `outbound-connect-failed`, `outbound-read-failed`, `session-replacement-scheduled`, and telemetry shedding events
 - alert on sustained `packet_batches_dropped`, nonzero `pending_outbound_packets`, bridge backpressure, repeated TCP overall timeouts, and unexpected stop reasons
 - treat one-off normal stream closes as lower priority when retries recover and health samples remain clean
 - preserve bounded App Group logs in support builds; do not add unbounded packet logging to debug production issues
@@ -1339,7 +1340,7 @@ What a healthy run looks like:
 - `bridge_backpressured = false`
 - no sustained `connect-overall-timeout`
 - no repeated `outbound-connect-failed`
-- UDP `session-replaced` events appear during path changes and are followed by successful UDP/QUIC probes
+- UDP `session-replacement-scheduled` events may appear during path changes and are followed by successful UDP/QUIC probes
 
 How to interpret blocked rows:
 

@@ -313,17 +313,17 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
                 case .ready:
                     self.clearReplacementNeed(for: key)
                 case .waiting:
-                    self.replaceSession(for: key, reason: "waiting")
+                    break
                 case .failed:
                     self.removeSession(for: key)
                 case .viabilityChanged(let isViable):
                     if isViable {
                         self.clearReplacementNeed(for: key)
                     } else {
-                        self.replaceSession(for: key, reason: "not-viable")
+                        self.scheduleSessionReplacement(for: key, reason: "not-viable")
                     }
                 case .betterPathAvailable:
-                    self.replaceSession(for: key, reason: "better-path")
+                    self.scheduleSessionReplacement(for: key, reason: "better-path")
                 }
             }
         }
@@ -414,21 +414,23 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
         entry.session.cancel()
     }
 
-    private func replaceSession(for key: SessionKey, reason: String) {
-        guard sessions[key] != nil else {
+    private func scheduleSessionReplacement(for key: SessionKey, reason: String) {
+        guard var entry = sessions[key],
+              !entry.needsReplacement
+        else {
             return
         }
-        removeSession(for: key)
-        _ = createSession(for: key, now: nowProvider())
+        entry.needsReplacement = true
+        sessions[key] = entry
         Task {
             await logger.log(
                 level: .notice,
                 phase: .relay,
                 category: .relayUDP,
                 component: "Socks5UDPRelay",
-                event: "session-replaced",
+                event: "session-replacement-scheduled",
                 result: reason,
-                message: "Replaced UDP session after Network.framework path signal"
+                message: "Scheduled UDP session replacement after Network.framework path signal"
             )
         }
     }
