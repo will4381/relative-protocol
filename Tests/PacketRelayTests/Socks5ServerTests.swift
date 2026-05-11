@@ -620,7 +620,41 @@ final class Socks5ServerTests: XCTestCase {
         XCTAssertTrue(firstAttempt?.cancelled == true)
     }
 
-    func testRetryingTCPOutboundRestartsWaitingAttempt() {
+    func testRetryingTCPOutboundLeavesWaitingAttemptAloneByDefault() {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.retry-waiting-default")
+        let attempt = ControlledTCPOutbound()
+        let ready = expectation(description: "waiting attempt eventually connects")
+
+        let outbound = RetryingTCPOutbound(
+            queue: queue,
+            logger: StructuredLogger(sink: InMemoryLogSink()),
+            policy: .init(attemptPreparingTimeout: 1.0, retryBackoff: 0.01, maxAttempts: 2, overallTimeout: 2.0)
+        ) { _ in
+            attempt
+        }
+
+        outbound.waitUntilReady { result in
+            switch result {
+            case .success:
+                ready.fulfill()
+            case .failure(let error):
+                XCTFail("Expected waiting attempt to recover, got \(error)")
+            }
+        }
+
+        queue.sync {
+            for _ in 0..<5 {
+                attempt.emit(.waiting)
+            }
+        }
+        queue.sync {}
+
+        XCTAssertEqual(attempt.restartCount, 0)
+        attempt.succeedConnect()
+        wait(for: [ready], timeout: 1.0)
+    }
+
+    func testRetryingTCPOutboundRestartsWaitingAttemptWhenExplicitlyEnabled() {
         let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.retry-waiting")
         let attempt = ControlledTCPOutbound()
         let restarted = expectation(description: "waiting attempt restarted")
@@ -633,7 +667,14 @@ final class Socks5ServerTests: XCTestCase {
             queue: queue,
             logger: StructuredLogger(sink: InMemoryLogSink()),
             policy: .init(attemptPreparingTimeout: 1.0, retryBackoff: 0.01, maxAttempts: 2, overallTimeout: 2.0),
-            pathSettings: .init(retryOnBetterPathDuringConnect: true, betterPathRetryMinimumElapsed: 0.0, multipathServiceType: nil)
+            pathSettings: .init(
+                retryOnBetterPathDuringConnect: true,
+                restartWaitingConnectionsDuringConnect: true,
+                maximumWaitingRestartsPerAttempt: 1,
+                waitingRestartMinimumInterval: 0.0,
+                betterPathRetryMinimumElapsed: 0.0,
+                multipathServiceType: nil
+            )
         ) { _ in
             attempt
         }
@@ -655,6 +696,107 @@ final class Socks5ServerTests: XCTestCase {
         XCTAssertEqual(attempt.restartCount, 1)
         attempt.succeedConnect()
         wait(for: [ready], timeout: 1.0)
+    }
+
+    func testRetryingTCPOutboundLimitsWaitingRestartStormWhenEnabled() {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.retry-waiting-storm")
+        let attempt = ControlledTCPOutbound()
+        let ready = expectation(description: "bounded waiting attempt eventually connects")
+
+        let outbound = RetryingTCPOutbound(
+            queue: queue,
+            logger: StructuredLogger(sink: InMemoryLogSink()),
+            policy: .init(attemptPreparingTimeout: 1.0, retryBackoff: 0.01, maxAttempts: 2, overallTimeout: 2.0),
+            pathSettings: .init(
+                retryOnBetterPathDuringConnect: true,
+                restartWaitingConnectionsDuringConnect: true,
+                maximumWaitingRestartsPerAttempt: 1,
+                waitingRestartMinimumInterval: 0.0,
+                betterPathRetryMinimumElapsed: 0.0,
+                multipathServiceType: nil
+            )
+        ) { _ in
+            attempt
+        }
+
+        outbound.waitUntilReady { result in
+            switch result {
+            case .success:
+                ready.fulfill()
+            case .failure(let error):
+                XCTFail("Expected bounded waiting attempt to recover, got \(error)")
+            }
+        }
+
+        queue.sync {
+            for _ in 0..<20 {
+                attempt.emit(.waiting)
+            }
+        }
+        queue.sync {}
+
+        XCTAssertEqual(attempt.restartCount, 1)
+        attempt.succeedConnect()
+        wait(for: [ready], timeout: 1.0)
+    }
+
+    func testRetryingTCPOutboundWaitingAttemptTimesOutAndRetriesByDefault() {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.retry-waiting-timeout")
+        let lock = NSLock()
+        var attempts: [ControlledTCPOutbound] = []
+        var firstAttempt: ControlledTCPOutbound?
+        var secondAttempt: ControlledTCPOutbound?
+        let firstAttemptCreated = expectation(description: "first attempt created")
+        let secondAttemptCreated = expectation(description: "second attempt created")
+        let ready = expectation(description: "waiting timeout retry eventually connects")
+
+        let outbound = RetryingTCPOutbound(
+            queue: queue,
+            logger: StructuredLogger(sink: InMemoryLogSink()),
+            policy: .init(attemptPreparingTimeout: 0.08, retryBackoff: 0.01, maxAttempts: 2, overallTimeout: 0.4)
+        ) { attemptIndex in
+            let attempt = ControlledTCPOutbound()
+            lock.lock()
+            attempts.append(attempt)
+            if attemptIndex == 1 {
+                firstAttempt = attempt
+            } else if attemptIndex == 2 {
+                secondAttempt = attempt
+            }
+            lock.unlock()
+            if attemptIndex == 1 {
+                firstAttemptCreated.fulfill()
+            } else if attemptIndex == 2 {
+                secondAttemptCreated.fulfill()
+            }
+            return attempt
+        }
+
+        outbound.waitUntilReady { result in
+            switch result {
+            case .success:
+                ready.fulfill()
+            case .failure(let error):
+                XCTFail("Expected retry after waiting timeout to succeed, got \(error)")
+            }
+        }
+
+        wait(for: [firstAttemptCreated], timeout: 1.0)
+        queue.sync {
+            firstAttempt?.emit(.waiting)
+        }
+
+        wait(for: [secondAttemptCreated], timeout: 1.0)
+        secondAttempt?.succeedConnect()
+        wait(for: [ready], timeout: 1.0)
+
+        lock.lock()
+        let snapshot = attempts
+        lock.unlock()
+
+        XCTAssertEqual(snapshot.count, 2)
+        XCTAssertEqual(snapshot.first?.restartCount, 0)
+        XCTAssertTrue(snapshot.first?.cancelled == true)
     }
 
     func testRetryingTCPOutboundHonorsOverallTimeoutBudget() {

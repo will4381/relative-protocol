@@ -142,17 +142,26 @@ struct TCPConnectRetryPolicy: Sendable {
 public struct Socks5TCPPathSettings: Sendable {
     public let retryOnBetterPathDuringConnect: Bool
     public let restartWaitingConnectionsDuringConnect: Bool
+    public let maximumWaitingRestartsPerAttempt: Int
+    public let waitingRestartMinimumInterval: TimeInterval
+    public let waitingObservationLogMinimumInterval: TimeInterval
     public let betterPathRetryMinimumElapsed: TimeInterval
     public let multipathServiceType: NWParameters.MultipathServiceType?
 
     public init(
         retryOnBetterPathDuringConnect: Bool = true,
-        restartWaitingConnectionsDuringConnect: Bool = true,
+        restartWaitingConnectionsDuringConnect: Bool = false,
+        maximumWaitingRestartsPerAttempt: Int = 1,
+        waitingRestartMinimumInterval: TimeInterval = 2.0,
+        waitingObservationLogMinimumInterval: TimeInterval = 10.0,
         betterPathRetryMinimumElapsed: TimeInterval = 0.75,
         multipathServiceType: NWParameters.MultipathServiceType? = nil
     ) {
         self.retryOnBetterPathDuringConnect = retryOnBetterPathDuringConnect
         self.restartWaitingConnectionsDuringConnect = restartWaitingConnectionsDuringConnect
+        self.maximumWaitingRestartsPerAttempt = max(0, maximumWaitingRestartsPerAttempt)
+        self.waitingRestartMinimumInterval = max(0, waitingRestartMinimumInterval)
+        self.waitingObservationLogMinimumInterval = max(0, waitingObservationLogMinimumInterval)
         self.betterPathRetryMinimumElapsed = betterPathRetryMinimumElapsed
         self.multipathServiceType = multipathServiceType
     }
@@ -453,6 +462,8 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
     private var currentAttemptIndex = 0
     private var startedAt: Date?
     private var currentAttemptStartedAt: Date?
+    private var currentAttemptWaitingRestartCount = 0
+    private var lastWaitingRestartAt: Date?
     private var attemptTimeoutWorkItem: DispatchWorkItem?
     private var overallTimeoutWorkItem: DispatchWorkItem?
     private var retryWorkItem: DispatchWorkItem?
@@ -546,6 +557,8 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
         }
         currentAttempt = outbound
         currentAttemptStartedAt = Date()
+        currentAttemptWaitingRestartCount = 0
+        lastWaitingRestartAt = nil
         log(
                 level: .debug,
                 event: "connect-attempt-started",
@@ -584,20 +597,7 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
 
         switch event {
         case .waiting:
-            guard pathSettings.restartWaitingConnectionsDuringConnect else {
-                return
-            }
-            log(
-                level: .notice,
-                event: "connect-waiting-restart",
-                result: "attempt-\(attemptIndex)",
-                message: "Restarting outbound TCP connect attempt because Network.framework is waiting for a usable path",
-                extraMetadata: [
-                    "attempt_index": String(attemptIndex),
-                    "path": outbound.pathSnapshot
-                ]
-            )
-            outbound.restart()
+            handleWaitingAttemptEvent(attemptIndex: attemptIndex, outbound: outbound)
         case .betterPathAvailable:
             guard pathSettings.retryOnBetterPathDuringConnect else {
                 return
@@ -639,6 +639,123 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
                 reason: "better-path"
             )
         }
+    }
+
+    private func handleWaitingAttemptEvent(
+        attemptIndex: Int,
+        outbound: Socks5PathAwareTCPOutbound
+    ) {
+        let now = Date()
+        let metadata = waitingAttemptMetadata(attemptIndex: attemptIndex, outbound: outbound, now: now)
+        logRateLimited(
+            key: "RetryingTCPOutbound.waiting.observed.attempt-\(attemptIndex).\(outbound.pathSnapshot)",
+            minimumInterval: pathSettings.waitingObservationLogMinimumInterval,
+            now: now,
+            level: .notice,
+            event: "connect-waiting-observed",
+            result: "attempt-\(attemptIndex)",
+            message: "Outbound TCP connect attempt is waiting for Network.framework path recovery",
+            extraMetadata: metadata
+        )
+
+        guard pathSettings.restartWaitingConnectionsDuringConnect else {
+            logWaitingRestartSuppressed(
+                attemptIndex: attemptIndex,
+                outbound: outbound,
+                now: now,
+                reason: "disabled",
+                message: "Leaving outbound TCP connect attempt waiting for Network.framework automatic recovery"
+            )
+            return
+        }
+
+        guard currentAttemptWaitingRestartCount < pathSettings.maximumWaitingRestartsPerAttempt else {
+            logWaitingRestartSuppressed(
+                attemptIndex: attemptIndex,
+                outbound: outbound,
+                now: now,
+                reason: "restart-budget-exhausted",
+                message: "Suppressing outbound TCP waiting restart because the per-attempt restart budget is exhausted"
+            )
+            return
+        }
+
+        if let lastWaitingRestartAt,
+           now.timeIntervalSince(lastWaitingRestartAt) < pathSettings.waitingRestartMinimumInterval {
+            logWaitingRestartSuppressed(
+                attemptIndex: attemptIndex,
+                outbound: outbound,
+                now: now,
+                reason: "restart-cooldown",
+                message: "Suppressing outbound TCP waiting restart because the restart cooldown is active"
+            )
+            return
+        }
+
+        if let overallElapsedMs = elapsedMilliseconds(since: startedAt, now: now) {
+            let overallTimeoutMs = durationMilliseconds(policy.overallTimeout)
+            let minimumRemainingMs = max(durationMilliseconds(pathSettings.waitingRestartMinimumInterval), 500)
+            guard overallTimeoutMs - overallElapsedMs > minimumRemainingMs else {
+                logWaitingRestartSuppressed(
+                    attemptIndex: attemptIndex,
+                    outbound: outbound,
+                    now: now,
+                    reason: "overall-timeout-near",
+                    message: "Suppressing outbound TCP waiting restart because the overall connect timeout is near"
+                )
+                return
+            }
+        }
+
+        currentAttemptWaitingRestartCount += 1
+        lastWaitingRestartAt = now
+        log(
+            level: .notice,
+            event: "connect-waiting-restart",
+            result: "attempt-\(attemptIndex)",
+            message: "Restarting outbound TCP connect attempt after bounded Network.framework waiting recovery",
+            extraMetadata: waitingAttemptMetadata(attemptIndex: attemptIndex, outbound: outbound, now: now)
+        )
+        outbound.restart()
+    }
+
+    private func waitingAttemptMetadata(
+        attemptIndex: Int,
+        outbound: Socks5PathAwareTCPOutbound,
+        now: Date
+    ) -> [String: String] {
+        var metadata = [
+            "attempt_index": String(attemptIndex),
+            "path": outbound.pathSnapshot,
+            "waiting_restart_count": String(currentAttemptWaitingRestartCount),
+            "waiting_restart_max": String(pathSettings.maximumWaitingRestartsPerAttempt),
+            "waiting_restart_minimum_interval_ms": String(durationMilliseconds(pathSettings.waitingRestartMinimumInterval))
+        ]
+        if let lastWaitingRestartAt {
+            metadata["last_waiting_restart_elapsed_ms"] = String(durationMilliseconds(now.timeIntervalSince(lastWaitingRestartAt)))
+        }
+        return metadata
+    }
+
+    private func logWaitingRestartSuppressed(
+        attemptIndex: Int,
+        outbound: Socks5PathAwareTCPOutbound,
+        now: Date,
+        reason: String,
+        message: String
+    ) {
+        var metadata = waitingAttemptMetadata(attemptIndex: attemptIndex, outbound: outbound, now: now)
+        metadata["suppress_reason"] = reason
+        logRateLimited(
+            key: "RetryingTCPOutbound.waiting.suppressed.\(reason).attempt-\(attemptIndex).\(outbound.pathSnapshot)",
+            minimumInterval: pathSettings.waitingObservationLogMinimumInterval,
+            now: now,
+            level: .debug,
+            event: "connect-waiting-restart-suppressed",
+            result: reason,
+            message: message,
+            extraMetadata: metadata
+        )
     }
 
     private func armAttemptTimeout(attemptIndex: Int, outbound: Socks5PathAwareTCPOutbound) {
@@ -829,6 +946,42 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
         }
         Task {
             await logger.log(
+                level: level,
+                phase: .relay,
+                category: .relayTCP,
+                component: "RetryingTCPOutbound",
+                event: event,
+                result: result,
+                errorCode: errorCode,
+                message: message,
+                metadata: metadata
+            )
+        }
+    }
+
+    private func logRateLimited(
+        key: String,
+        minimumInterval: TimeInterval,
+        now: Date,
+        level: LogLevel,
+        event: String,
+        result: String? = nil,
+        errorCode: String? = nil,
+        message: String,
+        extraMetadata: [String: String]
+    ) {
+        var metadata = extraMetadata
+        if let attemptElapsed = elapsedMilliseconds(since: currentAttemptStartedAt, now: now) {
+            metadata["attempt_elapsed_ms"] = String(attemptElapsed)
+        }
+        if let overallElapsed = elapsedMilliseconds(since: startedAt, now: now) {
+            metadata["overall_elapsed_ms"] = String(overallElapsed)
+        }
+        Task {
+            await logger.logRateLimited(
+                key: key,
+                minimumInterval: minimumInterval,
+                now: now,
                 level: level,
                 phase: .relay,
                 category: .relayTCP,
