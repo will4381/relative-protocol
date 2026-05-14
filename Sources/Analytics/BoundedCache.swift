@@ -35,7 +35,8 @@ final class BoundedCache<Key: Hashable, Value>: @unchecked Sendable {
         }
 
         // Periodically compact the logical ring so eviction stays O(1)-ish without unbounded array growth.
-        if nextEvictionIndex >= 512, nextEvictionIndex * 2 >= insertionOrder.count {
+        let compactThreshold = (insertionOrder.count / 2) + (insertionOrder.count % 2)
+        if nextEvictionIndex >= 512, nextEvictionIndex >= compactThreshold {
             insertionOrder.removeFirst(nextEvictionIndex)
             nextEvictionIndex = 0
         }

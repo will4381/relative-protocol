@@ -13,6 +13,7 @@ public enum TunnelThermalState: String, Codable, Sendable, Equatable {
     case critical
     case unknown
 
+#if !os(Linux)
     public init(thermalState: ProcessInfo.ThermalState?) {
         guard let thermalState else {
             self = .unknown
@@ -31,6 +32,25 @@ public enum TunnelThermalState: String, Codable, Sendable, Equatable {
         @unknown default:
             self = .unknown
         }
+    }
+#endif
+}
+
+extension ProcessInfo {
+    var tunnelThermalState: TunnelThermalState {
+#if os(Linux)
+        return .unknown
+#else
+        return TunnelThermalState(thermalState: thermalState)
+#endif
+    }
+
+    var tunnelLowPowerModeEnabled: Bool {
+#if os(Linux)
+        return false
+#else
+        return isLowPowerModeEnabled
+#endif
     }
 }
 

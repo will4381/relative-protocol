@@ -101,7 +101,7 @@ private final class ExampleCDNDomainDetector: TrafficDetector {
             let confidence = Self.confidence(for: record, evidenceMatches: evidenceMatches)
             events.append(
                 DetectionEvent(
-                    id: "\(identifier)-\(primaryEvidence.target)-\(Int(record.timestamp.timeIntervalSince1970 * 1000))",
+                    id: "\(identifier)-\(primaryEvidence.target)-\(Self.timestampMilliseconds(for: record.timestamp))-\(Self.stableIDSuffix(for: flowID))",
                     detectorIdentifier: identifier,
                     signal: "cdn-domain-match",
                     target: primaryEvidence.target,
@@ -125,6 +125,20 @@ private final class ExampleCDNDomainDetector: TrafficDetector {
         }
 
         return events
+    }
+
+    private static func timestampMilliseconds(for date: Date) -> Int {
+        let milliseconds = (date.timeIntervalSince1970 * 1_000).rounded()
+        guard milliseconds.isFinite else {
+            return 0
+        }
+        if milliseconds >= Double(Int.max) {
+            return Int.max
+        }
+        if milliseconds <= Double(Int.min) {
+            return Int.min
+        }
+        return Int(milliseconds)
     }
 
     func reset() {
@@ -323,5 +337,16 @@ private final class ExampleCDNDomainDetector: TrafficDetector {
             String(record.sourcePort ?? 0),
             String(record.destinationPort ?? 0)
         ].joined(separator: ":")
+    }
+
+    private static func stableIDSuffix(for flowID: String) -> String {
+        let sanitized = flowID.map { character -> Character in
+            if character.isLetter || character.isNumber {
+                return character
+            }
+            return "-"
+        }
+        let suffix = String(sanitized).suffix(24)
+        return suffix.isEmpty ? "flow" : String(suffix)
     }
 }

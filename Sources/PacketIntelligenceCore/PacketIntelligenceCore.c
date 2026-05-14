@@ -116,11 +116,11 @@ static void rbpi_fill_quic_metadata(const uint8_t *payload, size_t payload_lengt
     uint8_t scid_length;
     size_t index;
 
-    summary->flags |= RBPI_FLAG_MAYBE_QUIC;
-
     if (payload_length == 0) {
         return;
     }
+
+    summary->flags |= RBPI_FLAG_MAYBE_QUIC;
 
     first_byte = payload[0];
     if ((first_byte & 0x80u) == 0u) {
@@ -190,6 +190,7 @@ static void rbpi_fill_tcp_metadata(const uint8_t *segment, size_t segment_length
 
     payload_offset = data_offset;
     summary->transport_payload_offset = payload_offset;
+    summary->transport_payload_length = (uint16_t)(segment_length - payload_offset);
 
     if ((summary->source_port == 443u || summary->destination_port == 443u) &&
         segment_length > payload_offset && segment[payload_offset] == 22u) {
@@ -201,6 +202,7 @@ static void rbpi_fill_udp_metadata(const uint8_t *segment, size_t segment_length
 {
     const uint8_t *payload;
     size_t payload_length;
+    uint16_t udp_length;
 
     if (segment_length < RBPI_UDP_HEADER_BYTES) {
         return;
@@ -209,9 +211,17 @@ static void rbpi_fill_udp_metadata(const uint8_t *segment, size_t segment_length
     summary->source_port = rbpi_load_u16(segment);
     summary->destination_port = rbpi_load_u16(segment + 2);
     summary->flags |= RBPI_FLAG_HAS_PORTS;
-    summary->transport_payload_offset = RBPI_UDP_HEADER_BYTES;
 
-    if (summary->source_port == 53u || summary->destination_port == 53u) {
+    udp_length = rbpi_load_u16(segment + 4);
+    if (udp_length < RBPI_UDP_HEADER_BYTES || (size_t)udp_length > segment_length) {
+        return;
+    }
+
+    summary->transport_payload_offset = RBPI_UDP_HEADER_BYTES;
+    summary->transport_payload_length = (uint16_t)((size_t)udp_length - RBPI_UDP_HEADER_BYTES);
+
+    if (summary->transport_payload_length > 0u &&
+        (summary->source_port == 53u || summary->destination_port == 53u)) {
         summary->flags |= RBPI_FLAG_MAYBE_DNS;
     }
 
@@ -221,7 +231,7 @@ static void rbpi_fill_udp_metadata(const uint8_t *segment, size_t segment_length
     }
 
     payload = segment + RBPI_UDP_HEADER_BYTES;
-    payload_length = segment_length - RBPI_UDP_HEADER_BYTES;
+    payload_length = (size_t)udp_length - RBPI_UDP_HEADER_BYTES;
     rbpi_fill_quic_metadata(payload, payload_length, summary);
 }
 
@@ -229,6 +239,8 @@ static bool rbpi_parse_ipv4(const uint8_t *bytes, size_t length, rbpi_fast_packe
 {
     uint8_t version_and_ihl;
     size_t header_length;
+    uint16_t total_length;
+    size_t packet_length;
     uint16_t fragment_field;
     const uint8_t *transport;
     size_t transport_length;
@@ -246,6 +258,12 @@ static bool rbpi_parse_ipv4(const uint8_t *bytes, size_t length, rbpi_fast_packe
     if (header_length < RBPI_IPV4_MIN_HEADER_BYTES || length < header_length) {
         return false;
     }
+    total_length = rbpi_load_u16(bytes + 2);
+    if (total_length < header_length || (size_t)total_length > length) {
+        return false;
+    }
+    packet_length = (size_t)total_length;
+    summary->packet_length = (uint32_t)packet_length;
 
     summary->ip_version = 4u;
     summary->transport_protocol = bytes[9];
@@ -267,7 +285,7 @@ static bool rbpi_parse_ipv4(const uint8_t *bytes, size_t length, rbpi_fast_packe
     }
 
     transport = bytes + header_length;
-    transport_length = length - header_length;
+    transport_length = packet_length - header_length;
 
     if (summary->transport_protocol == 6u) {
         rbpi_fill_tcp_metadata(transport, transport_length, summary);
@@ -286,6 +304,8 @@ static bool rbpi_parse_ipv6(const uint8_t *bytes, size_t length, rbpi_fast_packe
 {
     uint8_t next_header;
     size_t offset;
+    uint16_t payload_length_field;
+    size_t packet_length;
     uint8_t extensions_seen;
     const uint8_t *transport;
     size_t transport_length;
@@ -293,8 +313,16 @@ static bool rbpi_parse_ipv6(const uint8_t *bytes, size_t length, rbpi_fast_packe
     if (length < RBPI_IPV6_HEADER_BYTES || (bytes[0] >> 4) != 6u) {
         return false;
     }
+    payload_length_field = rbpi_load_u16(bytes + 4);
+    packet_length = payload_length_field == 0u
+        ? length
+        : RBPI_IPV6_HEADER_BYTES + (size_t)payload_length_field;
+    if (packet_length < RBPI_IPV6_HEADER_BYTES || packet_length > length) {
+        return false;
+    }
 
     summary->ip_version = 6u;
+    summary->packet_length = (uint32_t)packet_length;
     summary->source_address_length = 16u;
     summary->destination_address_length = 16u;
     rbpi_pack_address(bytes + 8, 16u, &summary->source_address_high, &summary->source_address_low);
@@ -310,7 +338,7 @@ static bool rbpi_parse_ipv6(const uint8_t *bytes, size_t length, rbpi_fast_packe
         uint8_t length_field;
         size_t header_length;
 
-        if (length < offset + 2) {
+        if (packet_length < offset + 2) {
             return false;
         }
 
@@ -320,8 +348,15 @@ static bool rbpi_parse_ipv6(const uint8_t *bytes, size_t length, rbpi_fast_packe
 
         switch (current_header) {
         case 44u:
+            if (packet_length < offset + 8u) {
+                return false;
+            }
             header_length = 8u;
             summary->flags |= RBPI_FLAG_IS_FRAGMENT;
+            if ((rbpi_load_u16(bytes + offset + 2u) & 0xfff8u) != 0u) {
+                summary->transport_protocol = next_header;
+                return true;
+            }
             break;
         case 51u:
             header_length = (size_t)(length_field + 2u) * 4u;
@@ -334,7 +369,7 @@ static bool rbpi_parse_ipv6(const uint8_t *bytes, size_t length, rbpi_fast_packe
             break;
         }
 
-        if (length < offset + header_length) {
+        if (packet_length < offset + header_length) {
             return false;
         }
 
@@ -343,12 +378,12 @@ static bool rbpi_parse_ipv6(const uint8_t *bytes, size_t length, rbpi_fast_packe
     }
 
     summary->transport_protocol = next_header;
-    if (length < offset) {
+    if (packet_length < offset) {
         return false;
     }
 
     transport = bytes + offset;
-    transport_length = length - offset;
+    transport_length = packet_length - offset;
 
     if (summary->transport_protocol == 6u) {
         rbpi_fill_tcp_metadata(transport, transport_length, summary);
@@ -390,7 +425,7 @@ bool rbpi_parse_packet(const uint8_t *bytes, size_t length, int32_t family_hint,
         if (!rbpi_parse_ipv4(bytes, length, out_summary)) {
             return false;
         }
-    } else if (family_hint == 30) {
+    } else if (family_hint == 30 || family_hint == 10) {
         if (!rbpi_parse_ipv6(bytes, length, out_summary)) {
             return false;
         }

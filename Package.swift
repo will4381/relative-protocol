@@ -10,6 +10,66 @@ let strictCSettings: [CSetting] = [
     .unsafeFlags(["-Wall", "-Wextra", "-Werror", "-Wpedantic"])
 ]
 
+let appleOnlyProducts: [Product] = {
+#if os(Linux)
+    return []
+#else
+    return [
+        .library(name: "PacketRelay", targets: ["PacketRelay"]),
+        .library(name: "TunnelControl", targets: ["TunnelControl"]),
+        .library(name: "HostClient", targets: ["HostClient"])
+    ]
+#endif
+}()
+
+let appleOnlyTargets: [Target] = {
+#if os(Linux)
+    return []
+#else
+    return [
+        .target(
+            name: "PacketRelay",
+            dependencies: ["Observability", "TunnelRuntime"],
+            path: "Sources/PacketRelay",
+            swiftSettings: strictSwiftSettings
+        ),
+        .target(
+            name: "HostClient",
+            dependencies: ["Analytics"],
+            path: "Sources/HostClient",
+            swiftSettings: strictSwiftSettings
+        ),
+        .target(
+            name: "TunnelControl",
+            dependencies: ["Analytics", "Observability", "PacketRelay", "TunnelRuntime"],
+            path: "Sources/TunnelControl",
+            swiftSettings: strictSwiftSettings
+        )
+    ]
+#endif
+}()
+
+let appleOnlyTestTargets: [Target] = {
+#if os(Linux)
+    return []
+#else
+    return [
+        .testTarget(
+            name: "PacketRelayTests",
+            dependencies: ["PacketRelay", "Observability"],
+            path: "Tests/PacketRelayTests",
+            swiftSettings: strictSwiftSettings
+        ),
+        .testTarget(
+            name: "TunnelControlTests",
+            dependencies: ["TunnelControl", "PacketRelay"],
+            path: "Tests/TunnelControlTests",
+            swiftSettings: strictSwiftSettings
+        )
+    ]
+#endif
+}()
+
 let package = Package(
     name: "relative-protocol",
     platforms: [
@@ -19,13 +79,10 @@ let package = Package(
     products: [
         .library(name: "DataplaneFFI", targets: ["DataplaneFFI"]),
         .library(name: "TunnelRuntime", targets: ["TunnelRuntime"]),
-        .library(name: "PacketRelay", targets: ["PacketRelay"]),
         .library(name: "Analytics", targets: ["Analytics"]),
         .library(name: "Observability", targets: ["Observability"]),
-        .library(name: "TunnelControl", targets: ["TunnelControl"]),
-        .library(name: "HostClient", targets: ["HostClient"]),
         .executable(name: "HarnessLocal", targets: ["HarnessLocal"])
-    ],
+    ] + appleOnlyProducts,
     targets: [
         .target(
             name: "HevSocks5Tunnel",
@@ -94,32 +151,20 @@ let package = Package(
             swiftSettings: strictSwiftSettings
         ),
         .target(
-            name: "PacketRelay",
-            dependencies: ["Observability", "TunnelRuntime"],
-            path: "Sources/PacketRelay",
-            swiftSettings: strictSwiftSettings
-        ),
-        .target(
             name: "Analytics",
             dependencies: ["Observability", "PacketIntelligenceCore", "TunnelRuntime"],
             path: "Sources/Analytics",
             swiftSettings: strictSwiftSettings
         ),
         .target(
-            name: "HostClient",
-            dependencies: ["Analytics"],
-            path: "Sources/HostClient",
-            swiftSettings: strictSwiftSettings
-        ),
-        .target(
-            name: "TunnelControl",
-            dependencies: ["Analytics", "Observability", "PacketRelay", "TunnelRuntime"],
-            path: "Sources/TunnelControl",
-            swiftSettings: strictSwiftSettings
+            name: "HarnessTunSupport",
+            path: "Sources/HarnessTunSupport",
+            publicHeadersPath: "include",
+            cSettings: strictCSettings
         ),
         .executableTarget(
             name: "HarnessLocal",
-            dependencies: ["Analytics", "Observability", "PacketRelay", "TunnelRuntime"],
+            dependencies: ["Analytics", "HarnessTunSupport", "Observability", "TunnelRuntime"],
             path: "Sources/HarnessLocal",
             swiftSettings: strictSwiftSettings
         ),
@@ -146,19 +191,8 @@ let package = Package(
             dependencies: ["Observability"],
             path: "Tests/ObservabilityTests",
             swiftSettings: strictSwiftSettings
-        ),
-        .testTarget(
-            name: "PacketRelayTests",
-            dependencies: ["PacketRelay", "Observability"],
-            path: "Tests/PacketRelayTests",
-            swiftSettings: strictSwiftSettings
-        ),
-        .testTarget(
-            name: "TunnelControlTests",
-            dependencies: ["TunnelControl", "PacketRelay"],
-            path: "Tests/TunnelControlTests",
-            swiftSettings: strictSwiftSettings
-        ),
+        )
+    ] + appleOnlyTargets + appleOnlyTestTargets + [
         .testTarget(
             name: "HarnessLocalTests",
             dependencies: ["HarnessLocal", "Analytics", "TunnelRuntime"],

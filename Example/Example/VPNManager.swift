@@ -19,7 +19,7 @@ enum ExampleDNSMode: String, CaseIterable, Identifiable, Sendable {
 
     var id: String { rawValue }
 
-    var title: String {
+    nonisolated var title: String {
         switch self {
         case .adaptive:
             return "Adaptive"
@@ -40,13 +40,13 @@ private struct ExampleDNSConfiguration: Equatable, Sendable {
 
 private final class OneShot<T>: @unchecked Sendable {
     private let lock = NSLock()
-    nonisolated(unsafe) private var continuation: CheckedContinuation<T, Never>?
+    private var continuation: CheckedContinuation<T, Never>?
 
-    nonisolated init(_ continuation: CheckedContinuation<T, Never>) {
+    init(_ continuation: CheckedContinuation<T, Never>) {
         self.continuation = continuation
     }
 
-    nonisolated func resume(_ value: T) {
+    func resume(_ value: T) {
         lock.lock()
         let continuation = self.continuation
         self.continuation = nil
@@ -121,6 +121,211 @@ struct VPNStressReport: Equatable, Sendable {
         }
         let blockedSuffix = blockedProbes == 0 ? "" : " · \(blockedProbes) blocked"
         return passed ? "PASS · \(totalProbes) probes\(blockedSuffix)" : "FAIL · \(failedProbes)/\(totalProbes) probes\(blockedSuffix)"
+    }
+}
+
+enum VPNDoctorFailureClass: String, Sendable, Equatable {
+    case healthy
+    case profile
+    case lifecycle
+    case providerMessage
+    case path
+    case packetFlow
+    case dns
+    case tcp
+    case udp
+    case quic
+    case telemetry
+
+    nonisolated var title: String {
+        switch self {
+        case .healthy:
+            return "Healthy"
+        case .profile:
+            return "Profile"
+        case .lifecycle:
+            return "Lifecycle"
+        case .providerMessage:
+            return "Provider message"
+        case .path:
+            return "Path"
+        case .packetFlow:
+            return "Packet flow"
+        case .dns:
+            return "DNS"
+        case .tcp:
+            return "TCP"
+        case .udp:
+            return "UDP"
+        case .quic:
+            return "QUIC"
+        case .telemetry:
+            return "Telemetry"
+        }
+    }
+}
+
+/// One ordered diagnostic step in the Example app's VPN Doctor ladder.
+struct VPNDoctorStepRow: Identifiable, Equatable, Sendable {
+    enum Status: String, Sendable {
+        case pass = "PASS"
+        case warn = "WARN"
+        case fail = "FAIL"
+        case blocked = "BLOCKED"
+    }
+
+    let id: String
+    let name: String
+    let failureClass: VPNDoctorFailureClass
+    let status: Status
+    let durationMs: Int
+    let detail: String
+
+    nonisolated var statusText: String {
+        status.rawValue
+    }
+
+    nonisolated var isFailure: Bool {
+        status == .fail || status == .blocked
+    }
+}
+
+/// Root-cause oriented on-device diagnostic report for validating the real packet tunnel.
+struct VPNDoctorReport: Equatable, Sendable {
+    var isRunning: Bool
+    var startedAt: Date?
+    var completedAt: Date?
+    var activeStep: String?
+    var progressText: String
+    var dnsMode: String
+    var effectiveDNS: String
+    var pathSummary: String
+    var verdictClass: VPNDoctorFailureClass
+    var verdict: String
+    var verdictDetail: String
+    var rows: [VPNDoctorStepRow]
+    var savedReportPath: String?
+
+    static let idle = VPNDoctorReport(
+        isRunning: false,
+        startedAt: nil,
+        completedAt: nil,
+        activeStep: nil,
+        progressText: "Not run",
+        dnsMode: "Unknown",
+        effectiveDNS: "Unknown",
+        pathSummary: "Unknown",
+        verdictClass: .healthy,
+        verdict: "Not run",
+        verdictDetail: "Run VPN Doctor to classify profile, lifecycle, DNS, TCP, UDP, QUIC, and packet-flow health.",
+        rows: [],
+        savedReportPath: nil
+    )
+
+    nonisolated var failedSteps: Int {
+        rows.filter(\.isFailure).count
+    }
+
+    nonisolated var warningSteps: Int {
+        rows.filter { $0.status == .warn }.count
+    }
+
+    nonisolated var passed: Bool {
+        !isRunning && !rows.isEmpty && failedSteps == 0
+    }
+
+    nonisolated var summaryText: String {
+        if isRunning {
+            return progressText
+        }
+        guard !rows.isEmpty else {
+            return progressText
+        }
+        if failedSteps > 0 {
+            return "FAIL · \(verdictClass.title) · \(failedSteps) failed"
+        }
+        if warningSteps > 0 {
+            return "WARN · \(warningSteps) warnings"
+        }
+        return "PASS · \(rows.count) checks"
+    }
+}
+
+/// Local relay fault-injection state shown by the Example app.
+struct VPNFaultInjectionReport: Equatable, Sendable {
+    var isRunning: Bool
+    var startedAt: Date?
+    var completedAt: Date?
+    var rows: [Socks5FaultInjectionRow]
+
+    static let idle = VPNFaultInjectionReport(
+        isRunning: false,
+        startedAt: nil,
+        completedAt: nil,
+        rows: []
+    )
+
+    var passed: Bool {
+        !isRunning && !rows.isEmpty && rows.allSatisfy(\.passed)
+    }
+
+    var failedRows: Int {
+        rows.filter { !$0.passed }.count
+    }
+
+    var summaryText: String {
+        if isRunning {
+            return "Running"
+        }
+        guard !rows.isEmpty else {
+            return "Not run"
+        }
+        return passed ? "PASS · \(rows.count) faults" : "FAIL · \(failedRows)/\(rows.count) faults"
+    }
+}
+
+/// Focused real-network load drill state shown by the Example app.
+struct VPNLoadDrillReport: Equatable, Sendable {
+    var isRunning: Bool
+    var startedAt: Date?
+    var completedAt: Date?
+    var activeScenario: String?
+    var progressText: String
+    var dnsMode: String
+    var effectiveDNS: String
+    var pathSummary: String
+    var rows: [VPNStressScenarioRow]
+    var totalProbes: Int
+    var failedProbes: Int
+    var savedReportPath: String?
+
+    static let idle = VPNLoadDrillReport(
+        isRunning: false,
+        startedAt: nil,
+        completedAt: nil,
+        activeScenario: nil,
+        progressText: "Not run",
+        dnsMode: "Unknown",
+        effectiveDNS: "Unknown",
+        pathSummary: "Unknown",
+        rows: [],
+        totalProbes: 0,
+        failedProbes: 0,
+        savedReportPath: nil
+    )
+
+    var passed: Bool {
+        !isRunning && !rows.isEmpty && failedProbes == 0 && rows.allSatisfy(\.passed)
+    }
+
+    var summaryText: String {
+        if isRunning {
+            return progressText
+        }
+        guard !rows.isEmpty else {
+            return progressText
+        }
+        return passed ? "PASS · \(totalProbes) probes" : "FAIL · \(failedProbes)/\(totalProbes) probes"
     }
 }
 
@@ -275,13 +480,16 @@ final class VPNManager: ObservableObject {
     @Published private(set) var profileDiagnostics = ProfileDiagnostics.unconfigured
     @Published private(set) var packetRows: [PacketRow] = []
     @Published private(set) var detectionRows: [DetectionRow] = []
+    @Published private(set) var doctorReport = VPNDoctorReport.idle
     @Published private(set) var stressReport = VPNStressReport.idle
+    @Published private(set) var faultInjectionReport = VPNFaultInjectionReport.idle
+    @Published private(set) var loadDrillReport = VPNLoadDrillReport.idle
     @Published var dnsMode: ExampleDNSMode = .adaptive {
         didSet {
             guard oldValue != dnsMode else { return }
             adaptiveDNSFallbackForced = false
             refreshProfileDiagnosticsForCurrentManager()
-            resetStressDNSContext()
+            resetIdleDiagnosticDNSContext()
         }
     }
     @Published private(set) var currentPathSummary = "Unknown"
@@ -295,13 +503,17 @@ final class VPNManager: ObservableObject {
     private let telemetryClient: TunnelTelemetryClient
     private let stopStore: TunnelStopStore
     private let detectionStore: TunnelDetectionStore
+    private let exampleLogger: StructuredLogger
     private let pathMonitor = Network.NWPathMonitor()
     private let pathMonitorQueue = DispatchQueue(label: "relative.example.default-path", qos: .utility)
 
     private var manager: NETunnelProviderManager?
     private var statusObserver: NSObjectProtocol?
     private var pendingUserDisconnectRequest = false
+    private var doctorTask: Task<Void, Never>?
     private var stressTask: Task<Void, Never>?
+    private var faultInjectionTask: Task<Void, Never>?
+    private var loadDrillTask: Task<Void, Never>?
     private var currentPathSupportsDNS: Bool?
     private var adaptiveDNSFallbackForced = false
 
@@ -309,6 +521,7 @@ final class VPNManager: ObservableObject {
         self.telemetryClient = TunnelTelemetryClient()
         self.stopStore = TunnelStopStore(appGroupID: appGroupID)
         self.detectionStore = TunnelDetectionStore(appGroupID: appGroupID)
+        self.exampleLogger = Self.makeExampleLogger(appGroupID: appGroupID)
         updateProfileDiagnostics(managers: [], selectedManager: nil)
         startPathMonitor()
         Task { await refreshStatus() }
@@ -319,6 +532,22 @@ final class VPNManager: ObservableObject {
             NotificationCenter.default.removeObserver(statusObserver)
         }
         pathMonitor.cancel()
+        doctorTask?.cancel()
+        stressTask?.cancel()
+        faultInjectionTask?.cancel()
+        loadDrillTask?.cancel()
+    }
+
+    private static func makeExampleLogger(appGroupID: String) -> StructuredLogger {
+        let jsonSink = JSONLLogSink(
+            rootProvider: AppGroupLogRootPathProvider(appGroupID: appGroupID),
+            policy: JSONLRotationPolicy(maxBytesPerFile: 1_048_576, maxFiles: 8, maxTotalBytes: 8_388_608),
+            eventQueueLabel: "example",
+            filePrefix: "events.example"
+        )
+        return StructuredLogger(
+            sink: MinimumLevelLogSink(minimumLevel: .info, sink: jsonSink)
+        )
     }
 
     var isConnected: Bool {
@@ -342,6 +571,10 @@ final class VPNManager: ObservableObject {
         return "\(summary) · \(timestamp.formatted(.dateTime.hour().minute().second()))"
     }
 
+    var lastStopLabelText: String {
+        isLastStopSupersededByTunnelActivity ? "Previous recorded stop" : "Last recorded stop"
+    }
+
     var dnsModeDisplayText: String {
         dnsMode.title
     }
@@ -351,7 +584,22 @@ final class VPNManager: ObservableObject {
     }
 
     var canEditDNSMode: Bool {
-        !isBusy && !isConnected && !stressReport.isRunning
+        !isBusy &&
+            !isConnected &&
+            !doctorReport.isRunning &&
+            !stressReport.isRunning &&
+            !faultInjectionReport.isRunning &&
+            !loadDrillReport.isRunning
+    }
+
+    private var isLastStopSupersededByTunnelActivity: Bool {
+        guard
+            let lastStopTimestamp = trafficSummary.lastStopTimestamp,
+            let latestTunnelActivity = trafficSummary.updatedAt
+        else {
+            return false
+        }
+        return latestTunnelActivity > lastStopTimestamp.addingTimeInterval(1)
     }
 
     /// Loads the current tunnel profile from system preferences and refreshes live tunnel diagnostics.
@@ -363,6 +611,13 @@ final class VPNManager: ObservableObject {
                 applyManager(existing)
                 updateProfileDiagnostics(managers: managers, selectedManager: existing)
             } else {
+                await logHostLifecycle(
+                    event: "profile-missing",
+                    result: "missing",
+                    status: .invalid,
+                    message: "No saved NETunnelProviderManager matched the provider bundle identifier",
+                    metadata: ["loaded_manager_count": String(managers.count)]
+                )
                 clearLoadedManager()
             }
             await refreshTraffic()
@@ -378,6 +633,12 @@ final class VPNManager: ObservableObject {
         defer { isBusy = false }
 
         do {
+            await logHostLifecycle(
+                event: "connect-requested",
+                result: "starting",
+                status: status,
+                message: "Preparing and starting the packet tunnel"
+            )
             let preparedManager = try await prepareManager()
             let managers = try await loadAllManagers()
             updateProfileDiagnostics(managers: managers, selectedManager: preparedManager)
@@ -386,8 +647,20 @@ final class VPNManager: ObservableObject {
             pendingUserDisconnectRequest = false
             status = preparedManager.connection.status
             hasProfile = true
+            await logHostLifecycle(
+                event: "connect-started",
+                result: Self.statusDescription(status),
+                status: status,
+                message: "startVPNTunnel returned without throwing"
+            )
             await refreshTraffic()
         } catch {
+            await logHostLifecycle(
+                event: "connect-failed",
+                result: "failed",
+                status: status,
+                message: error.localizedDescription
+            )
             lastError = error.localizedDescription
         }
     }
@@ -397,11 +670,19 @@ final class VPNManager: ObservableObject {
         // Docs: https://developer.apple.com/documentation/networkextension/nevpnconnection/stopvpntunnel()
         pendingUserDisconnectRequest = true
         manager?.connection.stopVPNTunnel()
+        Task {
+            await self.logHostLifecycle(
+                event: "disconnect-requested",
+                result: "requested",
+                status: self.status,
+                message: "Host app requested stopVPNTunnel"
+            )
+        }
     }
 
     /// Starts the real-device network stress matrix against the active Example tunnel.
     func startStressMatrix() {
-        guard stressTask == nil else { return }
+        guard stressTask == nil, doctorTask == nil, loadDrillTask == nil, faultInjectionTask == nil else { return }
         stressTask = Task { [weak self] in
             await self?.runStressMatrix()
         }
@@ -410,6 +691,244 @@ final class VPNManager: ObservableObject {
     /// Cancels the currently running stress matrix.
     func cancelStressMatrix() {
         stressTask?.cancel()
+    }
+
+    /// Starts the root-cause diagnostic ladder against the active Example tunnel.
+    func startDoctor() {
+        guard doctorTask == nil, stressTask == nil, loadDrillTask == nil, faultInjectionTask == nil else { return }
+        doctorTask = Task { [weak self] in
+            await self?.runDoctor()
+        }
+    }
+
+    /// Cancels the currently running VPN Doctor report.
+    func cancelDoctor() {
+        doctorTask?.cancel()
+    }
+
+    /// Starts a focused real-network load drill through the active Example tunnel.
+    func startLoadDrill() {
+        guard loadDrillTask == nil, doctorTask == nil, stressTask == nil, faultInjectionTask == nil else { return }
+        loadDrillTask = Task { [weak self] in
+            await self?.runLoadDrill()
+        }
+    }
+
+    /// Cancels the currently running real-network load drill.
+    func cancelLoadDrill() {
+        loadDrillTask?.cancel()
+    }
+
+    /// Runs deterministic relay faults locally, without depending on the physical network to reproduce them.
+    func startFaultInjection() {
+        guard faultInjectionTask == nil, doctorTask == nil, stressTask == nil, loadDrillTask == nil else { return }
+        faultInjectionTask = Task { [weak self] in
+            await self?.runFaultInjection()
+        }
+    }
+
+    private func runDoctor() async {
+        doctorReport = VPNDoctorReport(
+            isRunning: true,
+            startedAt: Date(),
+            completedAt: nil,
+            activeStep: "Profile",
+            progressText: "Checking installed profile",
+            dnsMode: dnsModeDisplayText,
+            effectiveDNS: effectiveDNSDisplayText,
+            pathSummary: currentPathSummary,
+            verdictClass: .healthy,
+            verdict: "Running",
+            verdictDetail: "Checking profile, lifecycle, provider message, packet flow, and transport canaries.",
+            rows: [],
+            savedReportPath: nil
+        )
+        defer {
+            doctorTask = nil
+        }
+
+        do {
+            await logDoctorLifecycle(event: "doctor-started", result: "started", report: doctorReport)
+            await refreshStatus()
+            appendDoctorRow(makeProfileDoctorRow(stage: "Saved profile", failOnMismatch: false))
+
+            if !isConnected {
+                updateDoctorProgress(activeStep: "Lifecycle", progressText: "Starting tunnel")
+                let startedAt = Date()
+                await connect()
+                try await waitForConnectedTunnel(timeoutSeconds: 25)
+                appendDoctorRow(
+                    VPNDoctorStepRow(
+                        id: "lifecycle-start",
+                        name: "Tunnel lifecycle",
+                        failureClass: .lifecycle,
+                        status: .pass,
+                        durationMs: elapsedMs(since: startedAt),
+                        detail: "startVPNTunnel reached Connected"
+                    )
+                )
+            } else {
+                appendDoctorRow(
+                    VPNDoctorStepRow(
+                        id: "lifecycle-start",
+                        name: "Tunnel lifecycle",
+                        failureClass: .lifecycle,
+                        status: .pass,
+                        durationMs: 0,
+                        detail: "Already connected"
+                    )
+                )
+            }
+
+            try await ensureAdaptiveDNSReadyForDoctor()
+            await refreshStatus()
+            appendDoctorRow(makeProfileDoctorRow(stage: "Active profile", failOnMismatch: true))
+
+            guard let connection = manager?.connection else {
+                throw VPNStressError.missingTunnelConnection
+            }
+
+            let activeProfile = manager.flatMap(Self.decodedProfile(from:))
+            let activeDNSDescription = activeProfile.map { Self.dnsStrategySummary($0.dnsStrategy) } ?? effectiveDNSDisplayText
+            var startingReport = doctorReport
+            startingReport.dnsMode = dnsModeDisplayText
+            startingReport.effectiveDNS = activeDNSDescription
+            startingReport.pathSummary = currentPathSummary
+
+            let runner = VPNStressRunner(
+                telemetryClient: telemetryClient,
+                appGroupID: appGroupID
+            )
+            let report = try await runner.runDoctor(
+                connection: connection,
+                startingReport: startingReport
+            ) { [weak self] update in
+                await self?.applyDoctorUpdate(update)
+            }
+            doctorReport = report
+            await logDoctorLifecycle(event: "doctor-completed", result: report.passed ? "passed" : "failed", report: report)
+            await refreshTraffic()
+        } catch is CancellationError {
+            var cancelled = doctorReport
+            cancelled.isRunning = false
+            cancelled.completedAt = Date()
+            cancelled.activeStep = nil
+            cancelled.progressText = "Cancelled"
+            cancelled.verdictClass = .lifecycle
+            cancelled.verdict = "Cancelled"
+            cancelled.verdictDetail = "The diagnostic run was cancelled before it finished."
+            doctorReport = cancelled
+            await logDoctorLifecycle(event: "doctor-cancelled", result: "cancelled", report: cancelled)
+        } catch {
+            var failed = doctorReport
+            failed.isRunning = false
+            failed.completedAt = Date()
+            failed.activeStep = nil
+            failed.progressText = "Failed · \(error.localizedDescription)"
+            failed.verdictClass = .lifecycle
+            failed.verdict = "Lifecycle failed"
+            failed.verdictDetail = error.localizedDescription
+            failed.rows.append(
+                VPNDoctorStepRow(
+                    id: "doctor-terminal-error",
+                    name: "Doctor terminal error",
+                    failureClass: .lifecycle,
+                    status: .fail,
+                    durationMs: 0,
+                    detail: error.localizedDescription
+                )
+            )
+            doctorReport = failed
+            lastError = error.localizedDescription
+            await logDoctorLifecycle(event: "doctor-failed", result: "failed", report: failed)
+        }
+    }
+
+    private func runFaultInjection() async {
+        faultInjectionReport = VPNFaultInjectionReport(
+            isRunning: true,
+            startedAt: Date(),
+            completedAt: nil,
+            rows: []
+        )
+        defer {
+            faultInjectionTask = nil
+        }
+
+        let report = await Task.detached(priority: .userInitiated) {
+            Socks5FaultInjectionRunner().run()
+        }.value
+
+        faultInjectionReport = VPNFaultInjectionReport(
+            isRunning: false,
+            startedAt: report.startedAt,
+            completedAt: report.completedAt,
+            rows: report.rows
+        )
+    }
+
+    private func runLoadDrill() async {
+        loadDrillReport = VPNLoadDrillReport(
+            isRunning: true,
+            startedAt: Date(),
+            completedAt: nil,
+            activeScenario: "Preparing",
+            progressText: "Preparing tunnel",
+            dnsMode: dnsModeDisplayText,
+            effectiveDNS: effectiveDNSDisplayText,
+            pathSummary: currentPathSummary,
+            rows: [],
+            totalProbes: 0,
+            failedProbes: 0,
+            savedReportPath: nil
+        )
+        defer {
+            loadDrillTask = nil
+        }
+
+        do {
+            if !isConnected {
+                await connect()
+                try await waitForConnectedTunnel(timeoutSeconds: 25)
+            }
+            try await ensureAdaptiveDNSReadyForLoadDrill()
+            guard let connection = manager?.connection else {
+                throw VPNStressError.missingTunnelConnection
+            }
+            let activeProfile = manager.flatMap(Self.decodedProfile(from:))
+            let activeDNSDescription = activeProfile.map { Self.dnsStrategySummary($0.dnsStrategy) } ?? effectiveDNSDisplayText
+
+            let runner = VPNStressRunner(
+                telemetryClient: telemetryClient,
+                appGroupID: appGroupID
+            )
+            let report = try await runner.runLoadDrill(
+                connection: connection,
+                dnsMode: dnsModeDisplayText,
+                effectiveDNS: activeDNSDescription,
+                pathSummary: currentPathSummary
+            ) { [weak self] update in
+                await self?.applyLoadDrillUpdate(update)
+            }
+            loadDrillReport = report
+            await refreshTraffic()
+        } catch is CancellationError {
+            var cancelled = loadDrillReport
+            cancelled.isRunning = false
+            cancelled.completedAt = Date()
+            cancelled.activeScenario = nil
+            cancelled.progressText = "Cancelled"
+            loadDrillReport = cancelled
+        } catch {
+            var failed = loadDrillReport
+            failed.isRunning = false
+            failed.completedAt = Date()
+            failed.activeScenario = nil
+            failed.progressText = "Failed · \(error.localizedDescription)"
+            failed.failedProbes = max(1, failed.failedProbes)
+            loadDrillReport = failed
+            lastError = error.localizedDescription
+        }
     }
 
     private func runStressMatrix() async {
@@ -509,7 +1028,8 @@ final class VPNManager: ObservableObject {
         guard dnsMode == .adaptive else { return }
         await refreshCurrentPath()
         guard currentPathSupportsDNS == false else { return }
-        guard manager.flatMap(Self.decodedProfile(from:))?.dnsStrategy == .noOverride else { return }
+        let installedProfile = manager.flatMap(Self.decodedProfile(from:))
+        guard installedProfile?.dnsStrategy == .noOverride else { return }
 
         var update = stressReport
         update.activeScenario = "Reconfiguring DNS"
@@ -517,6 +1037,7 @@ final class VPNManager: ObservableObject {
         stressReport = update
 
         adaptiveDNSFallbackForced = true
+        await logAdaptiveDNSFallbackRestart(source: "stress-matrix", installedProfile: installedProfile)
         disconnect()
         try await waitForDisconnectedTunnel(timeoutSeconds: 12)
         await connect()
@@ -524,8 +1045,176 @@ final class VPNManager: ObservableObject {
         await refreshCurrentPath()
     }
 
+    private func ensureAdaptiveDNSReadyForDoctor() async throws {
+        guard dnsMode == .adaptive else { return }
+        await refreshCurrentPath()
+        guard currentPathSupportsDNS == false else { return }
+        let installedProfile = manager.flatMap(Self.decodedProfile(from:))
+        guard installedProfile?.dnsStrategy == .noOverride else { return }
+
+        updateDoctorProgress(activeStep: "DNS policy", progressText: "Adaptive DNS fallback")
+        adaptiveDNSFallbackForced = true
+        await logAdaptiveDNSFallbackRestart(source: "doctor", installedProfile: installedProfile)
+        disconnect()
+        try await waitForDisconnectedTunnel(timeoutSeconds: 12)
+        await connect()
+        try await waitForConnectedTunnel(timeoutSeconds: 25)
+        await refreshCurrentPath()
+        appendDoctorRow(
+            VPNDoctorStepRow(
+                id: "dns-policy-fallback",
+                name: "Adaptive DNS fallback",
+                failureClass: .dns,
+                status: .warn,
+                durationMs: 0,
+                detail: "Restarted with explicit DNS because the current path reported no system DNS support."
+            )
+        )
+    }
+
     private func applyStressUpdate(_ update: VPNStressReport) {
         stressReport = update
+    }
+
+    private func ensureAdaptiveDNSReadyForLoadDrill() async throws {
+        guard dnsMode == .adaptive else { return }
+        await refreshCurrentPath()
+        guard currentPathSupportsDNS == false else { return }
+        let installedProfile = manager.flatMap(Self.decodedProfile(from:))
+        guard installedProfile?.dnsStrategy == .noOverride else { return }
+
+        var update = loadDrillReport
+        update.activeScenario = "Reconfiguring DNS"
+        update.progressText = "Adaptive DNS fallback"
+        loadDrillReport = update
+
+        adaptiveDNSFallbackForced = true
+        await logAdaptiveDNSFallbackRestart(source: "load-drill", installedProfile: installedProfile)
+        disconnect()
+        try await waitForDisconnectedTunnel(timeoutSeconds: 12)
+        await connect()
+        try await waitForConnectedTunnel(timeoutSeconds: 25)
+        await refreshCurrentPath()
+    }
+
+    private func logAdaptiveDNSFallbackRestart(source: String, installedProfile: TunnelProfile?) async {
+        await exampleLogger.log(
+            level: .notice,
+            phase: .path,
+            category: .control,
+            component: "ExampleVPNManager",
+            event: "adaptive-dns-fallback-restart",
+            result: source,
+            message: "Restarting tunnel with explicit DNS because adaptive mode found the current path DNS unavailable",
+            metadata: [
+                "source": source,
+                "status": Self.statusDescription(status),
+                "path": currentPathSummary,
+                "path_supports_dns": currentPathSupportsDNS.map(String.init) ?? "unknown",
+                "installed_dns_strategy": installedProfile.map { Self.dnsStrategySummary($0.dnsStrategy) } ?? "unknown",
+                "target_dns_strategy": Self.dnsStrategySummary(profile.dnsStrategy)
+            ]
+        )
+    }
+
+    private func appendDoctorRow(_ row: VPNDoctorStepRow) {
+        var update = doctorReport
+        update.rows.append(row)
+        update.progressText = "\(update.rows.count) checks complete"
+        doctorReport = update
+    }
+
+    private func updateDoctorProgress(activeStep: String, progressText: String) {
+        var update = doctorReport
+        update.activeStep = activeStep
+        update.progressText = progressText
+        update.pathSummary = currentPathSummary
+        update.dnsMode = dnsModeDisplayText
+        update.effectiveDNS = effectiveDNSDisplayText
+        doctorReport = update
+    }
+
+    private func applyDoctorUpdate(_ update: VPNDoctorReport) {
+        doctorReport = update
+    }
+
+    private func makeProfileDoctorRow(stage: String, failOnMismatch: Bool) -> VPNDoctorStepRow {
+        let startedAt = Date()
+        let diagnostics = profileDiagnostics
+        let status: VPNDoctorStepRow.Status
+        switch diagnostics.matchState {
+        case .exactMatch:
+            status = .pass
+        case .missing:
+            status = failOnMismatch ? .fail : .warn
+        case .mismatch, .duplicateExactMatch:
+            status = failOnMismatch ? .fail : .warn
+        }
+
+        let noteSuffix = diagnostics.note.map { " · \($0)" } ?? ""
+        let detail = "\(diagnostics.statusText) · \(diagnostics.managerCountText) · desired: \(diagnostics.desiredSummary) · installed: \(diagnostics.installedSummary)\(noteSuffix)"
+        return VPNDoctorStepRow(
+            id: failOnMismatch ? "profile-active" : "profile-saved",
+            name: stage,
+            failureClass: .profile,
+            status: status,
+            durationMs: elapsedMs(since: startedAt),
+            detail: detail
+        )
+    }
+
+    private func logHostLifecycle(
+        event: String,
+        result: String,
+        status: NEVPNStatus,
+        message: String,
+        metadata: [String: String] = [:]
+    ) async {
+        var fields = metadata
+        fields["status"] = Self.statusDescription(status)
+        fields["has_profile"] = String(hasProfile)
+        fields["is_enabled"] = String(isEnabled)
+        fields["profile_match"] = profileDiagnostics.statusText
+        fields["manager_count"] = String(profileDiagnostics.totalManagerCount)
+        fields["exact_manager_count"] = String(profileDiagnostics.exactMatchCount)
+        fields["path"] = currentPathSummary
+        fields["path_supports_dns"] = currentPathSupportsDNS.map(String.init) ?? "unknown"
+
+        await exampleLogger.log(
+            level: .notice,
+            phase: .lifecycle,
+            category: .control,
+            component: "ExampleVPNManager",
+            event: event,
+            result: result,
+            message: message,
+            metadata: fields
+        )
+    }
+
+    private func logDoctorLifecycle(event: String, result: String, report: VPNDoctorReport) async {
+        await exampleLogger.log(
+            level: .notice,
+            phase: .lifecycle,
+            category: .control,
+            component: "ExampleVPNDoctor",
+            event: event,
+            result: result,
+            message: report.verdict,
+            metadata: [
+                "verdict_class": report.verdictClass.rawValue,
+                "failed_steps": String(report.failedSteps),
+                "warning_steps": String(report.warningSteps),
+                "row_count": String(report.rows.count),
+                "dns_mode": report.dnsMode,
+                "effective_dns": report.effectiveDNS,
+                "path": report.pathSummary
+            ]
+        )
+    }
+
+    private func applyLoadDrillUpdate(_ update: VPNLoadDrillReport) {
+        loadDrillReport = update
     }
 
     /// Clears the live rolling tap and the persisted last-stop breadcrumb, then reloads the main screen.
@@ -679,15 +1368,11 @@ final class VPNManager: ObservableObject {
     ) -> ExampleDNSConfiguration {
         switch mode {
         case .adaptive:
-            if forceAdaptiveFallback || (allowPreconnectFallback && pathSupportsDNS == false) {
-                return publicDNSConfiguration(
-                    name: "Adaptive -> Cloudflare",
-                    servers: TunnelDNSStrategy.defaultPublicResolvers
-                )
-            }
-            return ExampleDNSConfiguration(
-                strategy: .noOverride,
-                summary: pathSupportsDNS == nil ? "Adaptive -> System DNS (path unknown)" : "Adaptive -> System DNS"
+            return publicDNSConfiguration(
+                name: forceAdaptiveFallback || (allowPreconnectFallback && pathSupportsDNS == false)
+                    ? "Adaptive -> Cloudflare"
+                    : "Adaptive -> Cloudflare full tunnel",
+                servers: TunnelDNSStrategy.defaultPublicResolvers
             )
         case .system:
             return ExampleDNSConfiguration(strategy: .noOverride, summary: "System DNS")
@@ -700,8 +1385,13 @@ final class VPNManager: ObservableObject {
 
     private static func publicDNSConfiguration(name: String, servers: [String]) -> ExampleDNSConfiguration {
         ExampleDNSConfiguration(
-            strategy: .cleartext(servers: servers, allowFailover: true),
-            summary: "\(name) cleartext (\(servers.count), failover on)"
+            strategy: .cleartext(
+                servers: servers,
+                matchDomains: [""],
+                matchDomainsNoSearch: true,
+                allowFailover: false
+            ),
+            summary: "\(name) cleartext (\(servers.count), full tunnel)"
         )
     }
 
@@ -778,11 +1468,20 @@ final class VPNManager: ObservableObject {
         ) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                self.status = connection.status
-                if connection.status == .connected {
+                let newStatus = connection.status
+                self.status = newStatus
+                if newStatus == .connected {
                     self.pendingUserDisconnectRequest = false
                 }
-                Task { await self.refreshTraffic() }
+                Task {
+                    await self.logHostLifecycle(
+                        event: "vpn-status-changed",
+                        result: Self.statusDescription(newStatus),
+                        status: newStatus,
+                        message: "NEVPNStatusDidChange notification received"
+                    )
+                    await self.refreshTraffic()
+                }
             }
         }
     }
@@ -806,7 +1505,7 @@ final class VPNManager: ObservableObject {
         currentPathSupportsDNSText = path.supportsDNS ? "Yes" : "No"
         currentPathSummary = Self.pathSummary(path)
         refreshProfileDiagnosticsForCurrentManager()
-        resetStressDNSContext()
+        resetIdleDiagnosticDNSContext()
     }
 
     private func refreshProfileDiagnosticsForCurrentManager() {
@@ -817,13 +1516,30 @@ final class VPNManager: ObservableObject {
         }
     }
 
-    private func resetStressDNSContext() {
-        guard !stressReport.isRunning, stressReport.rows.isEmpty else { return }
-        var report = stressReport
-        report.dnsMode = dnsModeDisplayText
-        report.effectiveDNS = effectiveDNSDisplayText
-        report.pathSummary = currentPathSummary
-        stressReport = report
+    private func resetIdleDiagnosticDNSContext() {
+        if !doctorReport.isRunning, doctorReport.rows.isEmpty {
+            var report = doctorReport
+            report.dnsMode = dnsModeDisplayText
+            report.effectiveDNS = effectiveDNSDisplayText
+            report.pathSummary = currentPathSummary
+            doctorReport = report
+        }
+
+        if !stressReport.isRunning, stressReport.rows.isEmpty {
+            var report = stressReport
+            report.dnsMode = dnsModeDisplayText
+            report.effectiveDNS = effectiveDNSDisplayText
+            report.pathSummary = currentPathSummary
+            stressReport = report
+        }
+
+        if !loadDrillReport.isRunning, loadDrillReport.rows.isEmpty {
+            var report = loadDrillReport
+            report.dnsMode = dnsModeDisplayText
+            report.effectiveDNS = effectiveDNSDisplayText
+            report.pathSummary = currentPathSummary
+            loadDrillReport = report
+        }
     }
 
     nonisolated private static func sampleCurrentPath(timeoutSeconds: TimeInterval) async -> Network.NWPath {
@@ -993,6 +1709,25 @@ final class VPNManager: ObservableObject {
             return "DNS HTTPS (\(servers.count))"
         case .noOverride:
             return "DNS system"
+        }
+    }
+
+    private static func statusDescription(_ status: NEVPNStatus) -> String {
+        switch status {
+        case .invalid:
+            return "invalid"
+        case .disconnected:
+            return "disconnected"
+        case .connecting:
+            return "connecting"
+        case .connected:
+            return "connected"
+        case .reasserting:
+            return "reasserting"
+        case .disconnecting:
+            return "disconnecting"
+        @unknown default:
+            return "unknown"
         }
     }
 
@@ -1170,10 +1905,10 @@ final class VPNManager: ObservableObject {
     }()
 
     private static let googlePublicResolvers = [
-        "8.8.8.8",
-        "8.8.4.4",
         "2001:4860:4860::8888",
-        "2001:4860:4860::8844"
+        "2001:4860:4860::8844",
+        "8.8.8.8",
+        "8.8.4.4"
     ]
 
     private static func kindDisplayName(_ kind: PacketSampleKind) -> String {
@@ -1603,6 +2338,26 @@ private struct VPNStressRunner {
         let detail: String
     }
 
+    private struct LoadScenario: Sendable {
+        enum Kind: Sendable {
+            case udpDNS
+            case quic
+            case http
+            case largeHTTP
+            case tcp
+            case mixed
+        }
+
+        let id: String
+        let name: String
+        let condition: String
+        let kind: Kind
+        let rounds: Int
+        let concurrency: Int
+        let timeoutSeconds: TimeInterval
+        let interRoundDelayMs: UInt64
+    }
+
     private let telemetryClient: TunnelTelemetryClient
     private let appGroupID: String
 
@@ -1674,6 +2429,215 @@ private struct VPNStressRunner {
         return report
     }
 
+    nonisolated func runDoctor(
+        connection: NEVPNConnection,
+        startingReport: VPNDoctorReport,
+        progress: @escaping @Sendable (VPNDoctorReport) async -> Void
+    ) async throws -> VPNDoctorReport {
+        var report = startingReport
+        report.isRunning = true
+        report.activeStep = "Provider message"
+        report.progressText = "Checking provider message channel"
+        await progress(report)
+
+        let providerResult = await providerMessageProbe(connection: connection, timeoutSeconds: 4)
+        report.rows.append(providerResult.row)
+        await progress(report)
+
+        try Task.checkCancellation()
+        report.activeStep = "Path"
+        report.progressText = "Sampling current path"
+        await progress(report)
+        report.rows.append(await doctorPathProbe(timeoutSeconds: 2))
+        await progress(report)
+
+        let canaries: [(id: String, name: String, failureClass: VPNDoctorFailureClass, probe: @Sendable () async -> ProbeResult)] = [
+            (
+                id: "doctor-tcp",
+                name: "TCP canary",
+                failureClass: .tcp,
+                probe: {
+                    await tcpProbe(
+                        name: "doctor-tcp-443",
+                        host: Self.tcpHosts[0],
+                        port: 443,
+                        timeoutSeconds: 8,
+                        failFastOnWaiting: true
+                    )
+                }
+            ),
+            (
+                id: "doctor-https-dns",
+                name: "HTTPS DNS canary",
+                failureClass: .dns,
+                probe: {
+                    await httpProbe(
+                        name: "doctor-https-dns",
+                        urlString: Self.httpsTargets[0],
+                        timeoutSeconds: 8,
+                        expectedBodyFragment: nil
+                    )
+                }
+            ),
+            (
+                id: "doctor-udp-dns",
+                name: "UDP DNS canary",
+                failureClass: .udp,
+                probe: {
+                    await udpDNSRoundTripProbe(
+                        name: "doctor-udp-dns",
+                        resolverIndex: 0,
+                        queryIndex: 0,
+                        timeoutSeconds: 8,
+                        failFastOnWaiting: true
+                    )
+                }
+            ),
+            (
+                id: "doctor-quic",
+                name: "QUIC canary",
+                failureClass: .quic,
+                probe: {
+                    await quicProbe(
+                        name: "doctor-quic",
+                        hostIndex: 0,
+                        timeoutSeconds: 8,
+                        failFastOnWaiting: true
+                    )
+                }
+            )
+        ]
+
+        for canary in canaries {
+            try Task.checkCancellation()
+            report.activeStep = canary.name
+            report.progressText = canary.name
+            await progress(report)
+
+            let result = await canary.probe()
+            report.rows.append(
+                VPNDoctorStepRow(
+                    id: canary.id,
+                    name: canary.name,
+                    failureClass: canary.failureClass,
+                    status: result.passed ? .pass : .fail,
+                    durationMs: result.durationMs,
+                    detail: result.detail
+                )
+            )
+            await progress(report)
+        }
+
+        try Task.checkCancellation()
+        report.activeStep = "Packet flow"
+        report.progressText = "Checking packet movement"
+        await progress(report)
+        report.rows.append(
+            await packetFlowDoctorProbe(
+                connection: connection,
+                baseline: providerResult.snapshot,
+                timeoutSeconds: 6
+            )
+        )
+        await progress(report)
+
+        try Task.checkCancellation()
+        report.activeStep = "Telemetry"
+        report.progressText = "Checking telemetry health"
+        await progress(report)
+        report.rows.append(
+            await telemetryDoctorProbe(
+                connection: connection,
+                baseline: providerResult.snapshot,
+                timeoutSeconds: 6
+            )
+        )
+
+        report.isRunning = false
+        report.activeStep = nil
+        report.completedAt = Date()
+        report = finalizedDoctorReport(report)
+        let savedReportPath = Self.doctorReportFileName(for: report.completedAt ?? Date())
+        report.savedReportPath = savedReportPath
+        do {
+            try persist(report, fileName: savedReportPath)
+        } catch {
+            report.savedReportPath = nil
+        }
+        await progress(report)
+        return report
+    }
+
+    nonisolated func runLoadDrill(
+        connection: NEVPNConnection,
+        dnsMode: String,
+        effectiveDNS: String,
+        pathSummary: String,
+        progress: @escaping @Sendable (VPNLoadDrillReport) async -> Void
+    ) async throws -> VPNLoadDrillReport {
+        let startedAt = Date()
+        var report = VPNLoadDrillReport(
+            isRunning: true,
+            startedAt: startedAt,
+            completedAt: nil,
+            activeScenario: nil,
+            progressText: "Starting",
+            dnsMode: dnsMode,
+            effectiveDNS: effectiveDNS,
+            pathSummary: pathSummary,
+            rows: [],
+            totalProbes: 0,
+            failedProbes: 0,
+            savedReportPath: nil
+        )
+        let baselineTelemetry = try? await telemetrySnapshot(connection: connection, timeoutSeconds: 1)
+
+        for (index, scenario) in Self.loadScenarios.enumerated() {
+            try Task.checkCancellation()
+            report.activeScenario = scenario.name
+            report.progressText = "\(index + 1)/\(Self.loadScenarios.count) · \(scenario.name)"
+            await progress(report)
+
+            let row = try await runLoadScenario(scenario)
+            report.rows.append(row)
+            report.totalProbes += row.probeCount
+            report.failedProbes += row.failureCount
+            await progress(report)
+        }
+
+        let telemetryResult = await telemetryProbe(connection: connection, baseline: baselineTelemetry, timeoutSeconds: 6)
+        let telemetryRow = VPNStressScenarioRow(
+            id: "load-telemetry",
+            name: "Telemetry after load",
+            condition: "Tunnel telemetry remains readable and not heavily shed",
+            passed: telemetryResult.passed,
+            blocked: false,
+            probeCount: 1,
+            failureCount: telemetryResult.passed ? 0 : 1,
+            durationMs: telemetryResult.durationMs,
+            detail: telemetryResult.detail
+        )
+        report.rows.append(telemetryRow)
+        report.totalProbes += telemetryRow.probeCount
+        report.failedProbes += telemetryRow.failureCount
+
+        report.isRunning = false
+        report.activeScenario = nil
+        report.completedAt = Date()
+        report.progressText = report.failedProbes == 0
+            ? "PASS · \(report.totalProbes) probes"
+            : "FAIL · \(report.failedProbes)/\(report.totalProbes) probes"
+        let savedReportPath = Self.loadReportFileName(for: report.completedAt ?? Date())
+        report.savedReportPath = savedReportPath
+        do {
+            try persist(report, fileName: savedReportPath)
+        } catch {
+            report.savedReportPath = nil
+        }
+        await progress(report)
+        return report
+    }
+
     nonisolated private func runScenario(
         _ scenario: Scenario,
         connection: NEVPNConnection,
@@ -1682,7 +2646,7 @@ private struct VPNStressRunner {
         let startedAt = Date()
         let baselineTelemetry = try? await telemetrySnapshot(connection: connection, timeoutSeconds: min(1, scenario.timeoutSeconds))
         var results: [ProbeResult] = []
-        results.reserveCapacity(scenario.rounds * max(1, scenario.concurrency))
+        results.reserveCapacity(Self.probeCapacity(rounds: scenario.rounds, concurrency: scenario.concurrency))
         let environmentResult = await environmentProbe(
             for: scenario,
             dnsPolicyProvidesResolver: dnsPolicyProvidesResolver
@@ -1860,7 +2824,14 @@ private struct VPNStressRunner {
 
     nonisolated private func captivePortalCoverageProbe(timeoutSeconds: TimeInterval) async -> ProbeResult {
         let startedAt = Date()
-        let url = URL(string: "http://captive.apple.com/hotspot-detect.html")!
+        guard let url = Self.probeURL("http://captive.apple.com/hotspot-detect.html") else {
+            return ProbeResult(
+                name: "environment-captive-portal",
+                passed: false,
+                durationMs: elapsedMs(since: startedAt),
+                detail: "Invalid captive portal probe URL"
+            )
+        }
         do {
             var request = URLRequest(url: url)
             request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
@@ -1895,6 +2866,296 @@ private struct VPNStressRunner {
         }
     }
 
+    nonisolated private func providerMessageProbe(
+        connection: NEVPNConnection,
+        timeoutSeconds: TimeInterval
+    ) async -> (row: VPNDoctorStepRow, snapshot: TunnelTelemetrySnapshot?) {
+        let startedAt = Date()
+        do {
+            let snapshot = try await telemetrySnapshot(connection: connection, timeoutSeconds: timeoutSeconds)
+            let detail = "Provider responded; retained \(snapshot.retainedSampleCount), accepted \(snapshot.acceptedBatches), dropped \(snapshot.droppedBatches), skipped \(snapshot.skippedBatches)"
+            return (
+                VPNDoctorStepRow(
+                    id: "provider-message",
+                    name: "Provider message",
+                    failureClass: .providerMessage,
+                    status: .pass,
+                    durationMs: elapsedMs(since: startedAt),
+                    detail: detail
+                ),
+                snapshot
+            )
+        } catch {
+            return (
+                VPNDoctorStepRow(
+                    id: "provider-message",
+                    name: "Provider message",
+                    failureClass: .providerMessage,
+                    status: .fail,
+                    durationMs: elapsedMs(since: startedAt),
+                    detail: error.localizedDescription
+                ),
+                nil
+            )
+        }
+    }
+
+    nonisolated private func doctorPathProbe(timeoutSeconds: TimeInterval) async -> VPNDoctorStepRow {
+        let startedAt = Date()
+        let path = await sampleCurrentPath(timeoutSeconds: timeoutSeconds)
+        let status: VPNDoctorStepRow.Status
+        if path.status == .satisfied {
+            status = path.supportsDNS ? .pass : .warn
+        } else {
+            status = .fail
+        }
+        return VPNDoctorStepRow(
+            id: "path-sample",
+            name: "Current path",
+            failureClass: .path,
+            status: status,
+            durationMs: elapsedMs(since: startedAt),
+            detail: environmentDetail(path: path)
+        )
+    }
+
+    nonisolated private func packetFlowDoctorProbe(
+        connection: NEVPNConnection,
+        baseline: TunnelTelemetrySnapshot?,
+        timeoutSeconds: TimeInterval
+    ) async -> VPNDoctorStepRow {
+        let startedAt = Date()
+        guard let baseline else {
+            return VPNDoctorStepRow(
+                id: "packet-flow",
+                name: "Packet flow",
+                failureClass: .packetFlow,
+                status: .blocked,
+                durationMs: elapsedMs(since: startedAt),
+                detail: "Provider message failed, so packet-flow counters could not be compared."
+            )
+        }
+
+        do {
+            try await telemetryFlush(connection: connection, timeoutSeconds: min(3, timeoutSeconds))
+            let snapshot = try await telemetrySnapshot(connection: connection, timeoutSeconds: timeoutSeconds)
+            let acceptedDelta = max(0, snapshot.acceptedBatches - baseline.acceptedBatches)
+            let droppedDelta = max(0, snapshot.droppedBatches - baseline.droppedBatches)
+            let skippedDelta = max(0, snapshot.skippedBatches - baseline.skippedBatches)
+            let retainedDelta = max(0, snapshot.retainedSampleCount - baseline.retainedSampleCount)
+            let latestAdvanced: Bool
+            if let before = baseline.latestSampleAt, let after = snapshot.latestSampleAt {
+                latestAdvanced = after > before
+            } else {
+                latestAdvanced = baseline.latestSampleAt == nil && snapshot.latestSampleAt != nil
+            }
+            let moved = acceptedDelta > 0 || retainedDelta > 0 || latestAdvanced
+            let detail = "delta accepted \(acceptedDelta), retained \(retainedDelta), dropped \(droppedDelta), skipped \(skippedDelta), latest advanced \(latestAdvanced)"
+            return VPNDoctorStepRow(
+                id: "packet-flow",
+                name: "Packet flow",
+                failureClass: .packetFlow,
+                status: moved ? .pass : .fail,
+                durationMs: elapsedMs(since: startedAt),
+                detail: moved ? detail : "No packet telemetry moved after forced canaries; \(detail)"
+            )
+        } catch {
+            return VPNDoctorStepRow(
+                id: "packet-flow",
+                name: "Packet flow",
+                failureClass: .packetFlow,
+                status: .fail,
+                durationMs: elapsedMs(since: startedAt),
+                detail: error.localizedDescription
+            )
+        }
+    }
+
+    nonisolated private func telemetryDoctorProbe(
+        connection: NEVPNConnection,
+        baseline: TunnelTelemetrySnapshot?,
+        timeoutSeconds: TimeInterval
+    ) async -> VPNDoctorStepRow {
+        let startedAt = Date()
+        guard let baseline else {
+            return VPNDoctorStepRow(
+                id: "telemetry-health",
+                name: "Telemetry health",
+                failureClass: .telemetry,
+                status: .blocked,
+                durationMs: elapsedMs(since: startedAt),
+                detail: "Provider message failed, so telemetry health could not be measured."
+            )
+        }
+
+        let result = await telemetryProbe(
+            connection: connection,
+            baseline: baseline,
+            timeoutSeconds: timeoutSeconds
+        )
+        return VPNDoctorStepRow(
+            id: "telemetry-health",
+            name: "Telemetry health",
+            failureClass: .telemetry,
+            status: result.passed ? .pass : .fail,
+            durationMs: result.durationMs,
+            detail: result.detail
+        )
+    }
+
+    nonisolated private func finalizedDoctorReport(_ source: VPNDoctorReport) -> VPNDoctorReport {
+        var report = source
+        if let failed = report.rows.first(where: \.isFailure) {
+            report.verdictClass = failed.failureClass
+            report.verdict = "\(failed.failureClass.title) failed"
+            report.verdictDetail = "\(failed.name): \(failed.detail)"
+        } else if let warning = report.rows.first(where: { $0.status == .warn }) {
+            report.verdictClass = .healthy
+            report.verdict = "Healthy with warnings"
+            report.verdictDetail = "\(warning.name): \(warning.detail)"
+        } else {
+            report.verdictClass = .healthy
+            report.verdict = "Healthy"
+            report.verdictDetail = "Profile, lifecycle, provider message, path, TCP, HTTPS/DNS, UDP, QUIC, packet flow, and telemetry checks passed."
+        }
+        report.progressText = report.summaryText
+        return report
+    }
+
+    nonisolated private func runLoadScenario(_ scenario: LoadScenario) async throws -> VPNStressScenarioRow {
+        let startedAt = Date()
+        var results: [ProbeResult] = []
+        results.reserveCapacity(Self.probeCapacity(rounds: scenario.rounds, concurrency: scenario.concurrency))
+
+        for round in 0..<scenario.rounds {
+            try Task.checkCancellation()
+            let roundResults = await withTaskGroup(of: ProbeResult.self) { group in
+                for lane in 0..<scenario.concurrency {
+                    group.addTask {
+                        await runLoadProbe(for: scenario, round: round, lane: lane)
+                    }
+                }
+
+                var values: [ProbeResult] = []
+                for await value in group {
+                    values.append(value)
+                }
+                return values
+            }
+            results.append(contentsOf: roundResults)
+
+            if scenario.interRoundDelayMs > 0 {
+                try await Task.sleep(for: .milliseconds(scenario.interRoundDelayMs))
+            }
+        }
+
+        let failures = results.filter { !$0.passed }
+        let durations = results.map(\.durationMs).sorted()
+        let p50 = percentile(durations: durations, percentile: 0.50)
+        let p95 = percentile(durations: durations, percentile: 0.95)
+        let slowest = results.max { $0.durationMs < $1.durationMs }
+        let firstFailures = failures.prefix(8).map { "\($0.name): \($0.detail)" }
+        let detail: String
+        if firstFailures.isEmpty {
+            detail = "p50 \(p50)ms · p95 \(p95)ms · slowest \(slowest?.durationMs ?? 0)ms · \(slowest?.name ?? "none")"
+        } else {
+            detail = "p50 \(p50)ms · p95 \(p95)ms · " + firstFailures.joined(separator: " · ")
+        }
+
+        return VPNStressScenarioRow(
+            id: scenario.id,
+            name: scenario.name,
+            condition: scenario.condition,
+            passed: failures.isEmpty,
+            blocked: false,
+            probeCount: results.count,
+            failureCount: failures.count,
+            durationMs: elapsedMs(since: startedAt),
+            detail: detail
+        )
+    }
+
+    nonisolated private func runLoadProbe(for scenario: LoadScenario, round: Int, lane: Int) async -> ProbeResult {
+        let hostIndex = round * scenario.concurrency + lane
+        switch scenario.kind {
+        case .udpDNS:
+            return await udpDNSRoundTripProbe(
+                name: "load-dns-\(round)-\(lane)",
+                resolverIndex: hostIndex,
+                queryIndex: hostIndex,
+                timeoutSeconds: scenario.timeoutSeconds
+            )
+        case .quic:
+            return await quicProbe(
+                name: "load-quic-\(round)-\(lane)",
+                hostIndex: hostIndex,
+                timeoutSeconds: scenario.timeoutSeconds
+            )
+        case .http:
+            return await httpProbe(
+                name: "load-http-\(round)-\(lane)",
+                urlString: Self.httpsTargets[Self.wrappedIndex(hostIndex, count: Self.httpsTargets.count)],
+                timeoutSeconds: scenario.timeoutSeconds,
+                expectedBodyFragment: nil
+            )
+        case .largeHTTP:
+            return await largeHTTPProbe(
+                name: "load-large-http-\(round)-\(lane)",
+                timeoutSeconds: scenario.timeoutSeconds
+            )
+        case .tcp:
+            return await tcpProbe(
+                name: "load-tcp-\(round)-\(lane)",
+                host: Self.tcpHosts[Self.wrappedIndex(hostIndex, count: Self.tcpHosts.count)],
+                port: 443,
+                timeoutSeconds: scenario.timeoutSeconds
+            )
+        case .mixed:
+            if lane % 6 == 0 {
+                return await udpDNSRoundTripProbe(
+                    name: "load-mixed-dns-\(round)-\(lane)",
+                    resolverIndex: hostIndex,
+                    queryIndex: hostIndex,
+                    timeoutSeconds: scenario.timeoutSeconds
+                )
+            }
+            if lane % 6 == 1 {
+                return await quicProbe(
+                    name: "load-mixed-quic-\(round)-\(lane)",
+                    hostIndex: hostIndex,
+                    timeoutSeconds: scenario.timeoutSeconds
+                )
+            }
+            if lane % 6 == 2 {
+                return await largeHTTPProbe(
+                    name: "load-mixed-large-http-\(round)-\(lane)",
+                    timeoutSeconds: scenario.timeoutSeconds
+                )
+            }
+            if lane % 6 == 3 {
+                return await tcpProbe(
+                    name: "load-mixed-tcp-\(round)-\(lane)",
+                    host: Self.tcpHosts[Self.wrappedIndex(hostIndex, count: Self.tcpHosts.count)],
+                    port: 443,
+                    timeoutSeconds: scenario.timeoutSeconds
+                )
+            }
+            return await httpProbe(
+                name: "load-mixed-http-\(round)-\(lane)",
+                urlString: Self.httpsTargets[Self.wrappedIndex(hostIndex, count: Self.httpsTargets.count)],
+                timeoutSeconds: scenario.timeoutSeconds,
+                expectedBodyFragment: nil
+            )
+        }
+    }
+
+    nonisolated private func percentile(durations: [Int], percentile: Double) -> Int {
+        guard !durations.isEmpty else { return 0 }
+        let clamped = min(max(percentile, 0), 1)
+        let index = min(durations.count - 1, Int((Double(durations.count - 1) * clamped).rounded()))
+        return durations[index]
+    }
+
     nonisolated private static func pathSummary(_ path: Network.NWPath) -> String {
         var interfaces: [String] = []
         if path.usesInterfaceType(.wifi) { interfaces.append("wifi") }
@@ -1919,20 +3180,35 @@ private struct VPNStressRunner {
         return "path \(status), interfaces \(interfaceSummary), expensive \(path.isExpensive), constrained \(path.isConstrained), dns \(path.supportsDNS)"
     }
 
+    nonisolated private static func pathSummary(_ path: Network.NWPath?) -> String {
+        guard let path else {
+            return "path unknown"
+        }
+        return pathSummary(path)
+    }
+
+    nonisolated private static func connectionErrorDetail(
+        prefix: String,
+        error: NWError,
+        connection: NWConnection
+    ) -> String {
+        "\(prefix): \(String(describing: error)); \(pathSummary(connection.currentPath))"
+    }
+
     nonisolated private func runProbe(for scenario: Scenario, round: Int, lane: Int) async -> ProbeResult {
         switch scenario.kind {
         case .captivePortal:
             if lane % 2 == 0 {
                 return await httpProbe(
                     name: "captive-apple-\(round)-\(lane)",
-                    url: URL(string: "http://captive.apple.com/hotspot-detect.html")!,
+                    urlString: "http://captive.apple.com/hotspot-detect.html",
                     timeoutSeconds: scenario.timeoutSeconds,
                     expectedBodyFragment: "Success"
                 )
             }
             return await httpProbe(
                 name: "captive-https-control-\(round)-\(lane)",
-                url: URL(string: "https://www.apple.com/library/test/success.html")!,
+                urlString: "https://www.apple.com/library/test/success.html",
                 timeoutSeconds: scenario.timeoutSeconds,
                 expectedBodyFragment: nil
             )
@@ -2016,7 +3292,7 @@ private struct VPNStressRunner {
             }
             return await tcpProbe(
                 name: "tcp-churn-\(round)-\(lane)",
-                host: Self.tcpHosts[abs(round + lane) % Self.tcpHosts.count],
+                host: Self.tcpHosts[Self.wrappedIndex(round + lane, count: Self.tcpHosts.count)],
                 port: 443,
                 timeoutSeconds: scenario.timeoutSeconds
             )
@@ -2065,7 +3341,7 @@ private struct VPNStressRunner {
         if hostIndex % 4 == 1 {
             return await tcpProbe(
                 name: "\(name)-tcp-443",
-                host: Self.tcpHosts[abs(hostIndex) % Self.tcpHosts.count],
+                host: Self.tcpHosts[Self.wrappedIndex(hostIndex, count: Self.tcpHosts.count)],
                 port: 443,
                 timeoutSeconds: timeoutSeconds
             )
@@ -2073,9 +3349,32 @@ private struct VPNStressRunner {
 
         return await httpProbe(
             name: "\(name)-https",
-            url: URL(string: Self.httpsTargets[abs(hostIndex) % Self.httpsTargets.count])!,
+            urlString: Self.httpsTargets[Self.wrappedIndex(hostIndex, count: Self.httpsTargets.count)],
             timeoutSeconds: timeoutSeconds,
             expectedBodyFragment: nil
+        )
+    }
+
+    nonisolated private func httpProbe(
+        name: String,
+        urlString: String,
+        timeoutSeconds: TimeInterval,
+        expectedBodyFragment: String?
+    ) async -> ProbeResult {
+        let startedAt = Date()
+        guard let url = Self.probeURL(urlString) else {
+            return ProbeResult(
+                name: name,
+                passed: false,
+                durationMs: elapsedMs(since: startedAt),
+                detail: "Invalid HTTP probe URL: \(urlString)"
+            )
+        }
+        return await httpProbe(
+            name: name,
+            url: url,
+            timeoutSeconds: timeoutSeconds,
+            expectedBodyFragment: expectedBodyFragment
         )
     }
 
@@ -2152,16 +3451,23 @@ private struct VPNStressRunner {
                 detail: "HTTP \(statusCode) \(url.host ?? url.absoluteString)"
             )
         } catch {
+            let path = await sampleCurrentPath(timeoutSeconds: min(1.0, timeoutSeconds))
             return ProbeResult(
                 name: name,
                 passed: false,
                 durationMs: elapsedMs(since: startedAt),
-                detail: error.localizedDescription
+                detail: "\(error.localizedDescription); \(Self.pathSummary(path))"
             )
         }
     }
 
-    nonisolated private func tcpProbe(name: String, host: String, port: UInt16, timeoutSeconds: TimeInterval) async -> ProbeResult {
+    nonisolated private func tcpProbe(
+        name: String,
+        host: String,
+        port: UInt16,
+        timeoutSeconds: TimeInterval,
+        failFastOnWaiting: Bool = false
+    ) async -> ProbeResult {
         let startedAt = Date()
         return await withCheckedContinuation { continuation in
             let gate = OneShot<ProbeResult>(continuation)
@@ -2172,18 +3478,34 @@ private struct VPNStressRunner {
 
             let connection = NWConnection(host: NWEndpoint.Host(host), port: endpointPort, using: .tcp)
             let queue = DispatchQueue(label: "relative.example.stress.tcp.\(UUID().uuidString)", qos: .utility)
+            func finish(_ result: ProbeResult) {
+                connection.stateUpdateHandler = nil
+                connection.cancel()
+                gate.resume(result)
+            }
             connection.stateUpdateHandler = { state in
                 switch state {
                 case .ready:
-                    connection.cancel()
-                    gate.resume(ProbeResult(name: name, passed: true, durationMs: elapsedMs(since: startedAt), detail: "TCP ready \(host):\(port)"))
+                    finish(ProbeResult(name: name, passed: true, durationMs: elapsedMs(since: startedAt), detail: "TCP ready \(host):\(port)"))
                 case .failed(let error):
-                    connection.cancel()
-                    gate.resume(ProbeResult(name: name, passed: false, durationMs: elapsedMs(since: startedAt), detail: error.localizedDescription))
+                    finish(
+                        ProbeResult(
+                            name: name,
+                            passed: false,
+                            durationMs: elapsedMs(since: startedAt),
+                            detail: Self.connectionErrorDetail(prefix: "TCP failed", error: error, connection: connection)
+                        )
+                    )
                 case .waiting(let error):
-                    if elapsedMs(since: startedAt) > Int(timeoutSeconds * 1000) {
-                        connection.cancel()
-                        gate.resume(ProbeResult(name: name, passed: false, durationMs: elapsedMs(since: startedAt), detail: "waiting \(error.localizedDescription)"))
+                    if failFastOnWaiting || Self.timeoutExceeded(since: startedAt, timeoutSeconds: timeoutSeconds) {
+                        finish(
+                            ProbeResult(
+                                name: name,
+                                passed: false,
+                                durationMs: elapsedMs(since: startedAt),
+                                detail: Self.connectionErrorDetail(prefix: "TCP waiting", error: error, connection: connection)
+                            )
+                        )
                     }
                 case .cancelled:
                     break
@@ -2193,8 +3515,14 @@ private struct VPNStressRunner {
             }
             connection.start(queue: queue)
             queue.asyncAfter(deadline: .now() + timeoutSeconds) {
-                connection.cancel()
-                gate.resume(ProbeResult(name: name, passed: false, durationMs: elapsedMs(since: startedAt), detail: "timeout"))
+                finish(
+                    ProbeResult(
+                        name: name,
+                        passed: false,
+                        durationMs: elapsedMs(since: startedAt),
+                        detail: "TCP timeout \(host):\(port); \(Self.pathSummary(connection.currentPath))"
+                    )
+                )
             }
         }
     }
@@ -2203,7 +3531,8 @@ private struct VPNStressRunner {
         name: String,
         resolverIndex: Int,
         queryIndex: Int,
-        timeoutSeconds: TimeInterval
+        timeoutSeconds: TimeInterval,
+        failFastOnWaiting: Bool = false
     ) async -> ProbeResult {
         let attempts = 3
         var last = ProbeResult(name: name, passed: false, durationMs: 0, detail: "not started")
@@ -2214,7 +3543,8 @@ private struct VPNStressRunner {
                 name: "\(name)-attempt-\(attempt)",
                 resolverIndex: resolverIndex + attempt - 1,
                 queryIndex: queryIndex + attempt - 1,
-                timeoutSeconds: timeoutSeconds
+                timeoutSeconds: timeoutSeconds,
+                failFastOnWaiting: failFastOnWaiting
             )
             totalDuration += result.durationMs
             if result.passed {
@@ -2248,33 +3578,61 @@ private struct VPNStressRunner {
         name: String,
         resolverIndex: Int,
         queryIndex: Int,
-        timeoutSeconds: TimeInterval
+        timeoutSeconds: TimeInterval,
+        failFastOnWaiting: Bool
     ) async -> ProbeResult {
         let startedAt = Date()
         return await withCheckedContinuation { continuation in
             let gate = OneShot<ProbeResult>(continuation)
-            let resolver = Self.udpResolvers[abs(resolverIndex) % Self.udpResolvers.count]
-            let query = Self.dnsQueries[abs(queryIndex) % Self.dnsQueries.count]
-            let transactionID = UInt16(truncatingIfNeeded: 0x4000 + abs(queryIndex))
-            let payload = Self.dnsQueryPayload(transactionID: transactionID, labels: query.split(separator: ".").map(String.init))
+            let resolver = Self.udpResolvers[Self.wrappedIndex(resolverIndex, count: Self.udpResolvers.count)]
+            let query = Self.dnsQueries[Self.wrappedIndex(queryIndex, count: Self.dnsQueries.count)]
+            let transactionID = Self.dnsTransactionID(for: queryIndex)
+            guard let payload = Self.dnsQueryPayload(transactionID: transactionID, labels: query.split(separator: ".").map(String.init)) else {
+                gate.resume(
+                    ProbeResult(
+                        name: name,
+                        passed: false,
+                        durationMs: elapsedMs(since: startedAt),
+                        detail: "UDP DNS query name was not encodable: \(query)"
+                    )
+                )
+                return
+            }
             let connection = NWConnection(host: NWEndpoint.Host(resolver), port: 53, using: .udp)
             let queue = DispatchQueue(label: "relative.example.stress.udp.\(UUID().uuidString)", qos: .utility)
+            func finish(_ result: ProbeResult) {
+                connection.stateUpdateHandler = nil
+                connection.cancel()
+                gate.resume(result)
+            }
             connection.stateUpdateHandler = { state in
                 switch state {
                 case .ready:
                     connection.send(content: payload, completion: .contentProcessed { error in
                         if let error {
-                            connection.cancel()
-                            gate.resume(ProbeResult(name: name, passed: false, durationMs: elapsedMs(since: startedAt), detail: error.localizedDescription))
+                            finish(
+                                ProbeResult(
+                                    name: name,
+                                    passed: false,
+                                    durationMs: elapsedMs(since: startedAt),
+                                    detail: "UDP DNS send failed \(resolver) \(query); \(error.localizedDescription); \(Self.pathSummary(connection.currentPath))"
+                                )
+                            )
                         } else {
                             connection.receiveMessage { data, _, _, receiveError in
-                                connection.cancel()
                                 if let receiveError {
-                                    gate.resume(ProbeResult(name: name, passed: false, durationMs: elapsedMs(since: startedAt), detail: receiveError.localizedDescription))
+                                    finish(
+                                        ProbeResult(
+                                            name: name,
+                                            passed: false,
+                                            durationMs: elapsedMs(since: startedAt),
+                                            detail: "UDP DNS receive failed \(resolver) \(query); \(receiveError.localizedDescription); \(Self.pathSummary(connection.currentPath))"
+                                        )
+                                    )
                                     return
                                 }
                                 guard let data, data.count >= 12 else {
-                                    gate.resume(ProbeResult(name: name, passed: false, durationMs: elapsedMs(since: startedAt), detail: "DNS response missing"))
+                                    finish(ProbeResult(name: name, passed: false, durationMs: elapsedMs(since: startedAt), detail: "DNS response missing"))
                                     return
                                 }
                                 let responseID = (UInt16(data[0]) << 8) | UInt16(data[1])
@@ -2282,45 +3640,88 @@ private struct VPNStressRunner {
                                 let rcode = data[3] & 0x0F
                                 let passed = responseID == transactionID && isResponse && rcode == 0
                                 let detail = "UDP DNS \(data.count)b \(resolver) \(query) rcode=\(rcode)"
-                                gate.resume(ProbeResult(name: name, passed: passed, durationMs: elapsedMs(since: startedAt), detail: detail))
+                                finish(ProbeResult(name: name, passed: passed, durationMs: elapsedMs(since: startedAt), detail: detail))
                             }
                         }
                     })
                 case .failed(let error):
-                    connection.cancel()
-                    gate.resume(ProbeResult(name: name, passed: false, durationMs: elapsedMs(since: startedAt), detail: error.localizedDescription))
+                    finish(
+                        ProbeResult(
+                            name: name,
+                            passed: false,
+                            durationMs: elapsedMs(since: startedAt),
+                            detail: Self.connectionErrorDetail(prefix: "UDP DNS failed", error: error, connection: connection)
+                        )
+                    )
+                case .waiting(let error):
+                    guard failFastOnWaiting else { break }
+                    finish(
+                        ProbeResult(
+                            name: name,
+                            passed: false,
+                            durationMs: elapsedMs(since: startedAt),
+                            detail: Self.connectionErrorDetail(prefix: "UDP DNS waiting", error: error, connection: connection)
+                        )
+                    )
                 default:
                     break
                 }
             }
             connection.start(queue: queue)
             queue.asyncAfter(deadline: .now() + timeoutSeconds) {
-                connection.cancel()
-                gate.resume(ProbeResult(name: name, passed: false, durationMs: elapsedMs(since: startedAt), detail: "timeout"))
+                finish(
+                    ProbeResult(
+                        name: name,
+                        passed: false,
+                        durationMs: elapsedMs(since: startedAt),
+                        detail: "UDP DNS timeout \(resolver) \(query); \(Self.pathSummary(connection.currentPath))"
+                    )
+                )
             }
         }
     }
 
-    nonisolated private func quicProbe(name: String, hostIndex: Int, timeoutSeconds: TimeInterval) async -> ProbeResult {
+    nonisolated private func quicProbe(
+        name: String,
+        hostIndex: Int,
+        timeoutSeconds: TimeInterval,
+        failFastOnWaiting: Bool = false
+    ) async -> ProbeResult {
         let startedAt = Date()
-        let host = Self.quicHosts[abs(hostIndex) % Self.quicHosts.count]
+        let host = Self.quicHosts[Self.wrappedIndex(hostIndex, count: Self.quicHosts.count)]
         return await withCheckedContinuation { continuation in
             let gate = OneShot<ProbeResult>(continuation)
             let parameters = NWParameters.quic(alpn: ["h3"])
             let connection = NWConnection(host: NWEndpoint.Host(host), port: 443, using: parameters)
             let queue = DispatchQueue(label: "relative.example.stress.quic.\(UUID().uuidString)", qos: .utility)
+            func finish(_ result: ProbeResult) {
+                connection.stateUpdateHandler = nil
+                connection.cancel()
+                gate.resume(result)
+            }
             connection.stateUpdateHandler = { state in
                 switch state {
                 case .ready:
-                    connection.cancel()
-                    gate.resume(ProbeResult(name: name, passed: true, durationMs: elapsedMs(since: startedAt), detail: "QUIC ready \(host):443 h3"))
+                    finish(ProbeResult(name: name, passed: true, durationMs: elapsedMs(since: startedAt), detail: "QUIC ready \(host):443 h3"))
                 case .failed(let error):
-                    connection.cancel()
-                    gate.resume(ProbeResult(name: name, passed: false, durationMs: elapsedMs(since: startedAt), detail: error.localizedDescription))
+                    finish(
+                        ProbeResult(
+                            name: name,
+                            passed: false,
+                            durationMs: elapsedMs(since: startedAt),
+                            detail: Self.connectionErrorDetail(prefix: "QUIC failed", error: error, connection: connection)
+                        )
+                    )
                 case .waiting(let error):
-                    if elapsedMs(since: startedAt) > Int(timeoutSeconds * 1000) {
-                        connection.cancel()
-                        gate.resume(ProbeResult(name: name, passed: false, durationMs: elapsedMs(since: startedAt), detail: "waiting \(error.localizedDescription)"))
+                    if failFastOnWaiting || Self.timeoutExceeded(since: startedAt, timeoutSeconds: timeoutSeconds) {
+                        finish(
+                            ProbeResult(
+                                name: name,
+                                passed: false,
+                                durationMs: elapsedMs(since: startedAt),
+                                detail: Self.connectionErrorDetail(prefix: "QUIC waiting", error: error, connection: connection)
+                            )
+                        )
                     }
                 case .cancelled:
                     break
@@ -2330,15 +3731,28 @@ private struct VPNStressRunner {
             }
             connection.start(queue: queue)
             queue.asyncAfter(deadline: .now() + timeoutSeconds) {
-                connection.cancel()
-                gate.resume(ProbeResult(name: name, passed: false, durationMs: elapsedMs(since: startedAt), detail: "QUIC timeout \(host):443"))
+                finish(
+                    ProbeResult(
+                        name: name,
+                        passed: false,
+                        durationMs: elapsedMs(since: startedAt),
+                        detail: "QUIC timeout \(host):443; \(Self.pathSummary(connection.currentPath))"
+                    )
+                )
             }
         }
     }
 
     nonisolated private func largeHTTPProbe(name: String, timeoutSeconds: TimeInterval) async -> ProbeResult {
         let startedAt = Date()
-        let url = URL(string: "https://speed.cloudflare.com/__down?bytes=262144")!
+        guard let url = Self.probeURL("https://speed.cloudflare.com/__down?bytes=262144") else {
+            return ProbeResult(
+                name: name,
+                passed: false,
+                durationMs: elapsedMs(since: startedAt),
+                detail: "Invalid large HTTP probe URL"
+            )
+        }
         do {
             var request = URLRequest(url: url)
             request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
@@ -2390,7 +3804,7 @@ private struct VPNStressRunner {
 
         async let recoveryHTTP = httpProbe(
             name: "\(name)-recovery-https",
-            url: URL(string: Self.httpsTargets[abs(hostIndex) % Self.httpsTargets.count])!,
+            urlString: Self.httpsTargets[Self.wrappedIndex(hostIndex, count: Self.httpsTargets.count)],
             timeoutSeconds: timeoutSeconds,
             expectedBodyFragment: nil
         )
@@ -2416,7 +3830,14 @@ private struct VPNStressRunner {
 
     nonisolated private func expectedFailureProbe(name: String, timeoutSeconds: TimeInterval) async -> ProbeResult {
         let startedAt = Date()
-        let target = URL(string: "http://203.0.113.1:81/")!
+        guard let target = Self.probeURL("http://expected-failure.invalid/") else {
+            return ProbeResult(
+                name: name,
+                passed: false,
+                durationMs: elapsedMs(since: startedAt),
+                detail: "Invalid expected-failure probe URL"
+            )
+        }
         do {
             var request = URLRequest(url: target)
             request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
@@ -2491,7 +3912,7 @@ private struct VPNStressRunner {
                 try await telemetryClient.flushTelemetry(from: connection)
             }
             group.addTask {
-                try await Task.sleep(for: .milliseconds(UInt64(timeoutSeconds * 1000)))
+                try await Task.sleep(for: .milliseconds(Self.timeoutMilliseconds(timeoutSeconds)))
                 throw CancellationError()
             }
             try await group.next()
@@ -2508,7 +3929,7 @@ private struct VPNStressRunner {
                 try await telemetryClient.snapshot(from: connection, packetLimit: 96)
             }
             group.addTask {
-                try await Task.sleep(for: .milliseconds(UInt64(timeoutSeconds * 1000)))
+                try await Task.sleep(for: .milliseconds(Self.timeoutMilliseconds(timeoutSeconds)))
                 throw CancellationError()
             }
             let first = try await group.next()
@@ -2524,11 +3945,49 @@ private struct VPNStressRunner {
         return "stress-\(stamp).json"
     }
 
+    nonisolated private static func loadReportFileName(for date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        let stamp = formatter.string(from: date)
+            .replacingOccurrences(of: ":", with: "-")
+        return "load-\(stamp).json"
+    }
+
+    nonisolated private static func doctorReportFileName(for date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        let stamp = formatter.string(from: date)
+            .replacingOccurrences(of: ":", with: "-")
+        return "doctor-\(stamp).json"
+    }
+
     nonisolated private func persist(_ report: VPNStressReport, fileName: String) throws {
         guard let root = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupID) else {
             throw VPNStressError.missingTunnelConnection
         }
         let directory = root.appendingPathComponent("StressReports", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent(fileName, isDirectory: false)
+        let payload = Self.jsonObject(from: report)
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: url, options: [.atomic])
+    }
+
+    nonisolated private func persist(_ report: VPNDoctorReport, fileName: String) throws {
+        guard let root = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupID) else {
+            throw VPNStressError.missingTunnelConnection
+        }
+        let directory = root.appendingPathComponent("DoctorReports", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent(fileName, isDirectory: false)
+        let payload = Self.jsonObject(from: report)
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: url, options: [.atomic])
+    }
+
+    nonisolated private func persist(_ report: VPNLoadDrillReport, fileName: String) throws {
+        guard let root = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupID) else {
+            throw VPNStressError.missingTunnelConnection
+        }
+        let directory = root.appendingPathComponent("LoadReports", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let url = directory.appendingPathComponent(fileName, isDirectory: false)
         let payload = Self.jsonObject(from: report)
@@ -2569,6 +4028,56 @@ private struct VPNStressRunner {
         ]
     }
 
+    nonisolated private static func jsonObject(from report: VPNDoctorReport) -> [String: Any] {
+        let formatter = ISO8601DateFormatter()
+        return [
+            "isRunning": report.isRunning,
+            "startedAt": report.startedAt.map { formatter.string(from: $0) } as Any,
+            "completedAt": report.completedAt.map { formatter.string(from: $0) } as Any,
+            "activeStep": report.activeStep as Any,
+            "progressText": report.progressText,
+            "dnsMode": report.dnsMode,
+            "effectiveDNS": report.effectiveDNS,
+            "pathSummary": report.pathSummary,
+            "verdictClass": report.verdictClass.rawValue,
+            "verdict": report.verdict,
+            "verdictDetail": report.verdictDetail,
+            "rows": report.rows.map(jsonObject(from:)),
+            "failedSteps": report.failedSteps,
+            "warningSteps": report.warningSteps,
+            "savedReportPath": report.savedReportPath as Any
+        ]
+    }
+
+    nonisolated private static func jsonObject(from row: VPNDoctorStepRow) -> [String: Any] {
+        [
+            "id": row.id,
+            "name": row.name,
+            "failureClass": row.failureClass.rawValue,
+            "status": row.status.rawValue,
+            "durationMs": row.durationMs,
+            "detail": row.detail
+        ]
+    }
+
+    nonisolated private static func jsonObject(from report: VPNLoadDrillReport) -> [String: Any] {
+        let formatter = ISO8601DateFormatter()
+        return [
+            "isRunning": report.isRunning,
+            "startedAt": report.startedAt.map { formatter.string(from: $0) } as Any,
+            "completedAt": report.completedAt.map { formatter.string(from: $0) } as Any,
+            "activeScenario": report.activeScenario as Any,
+            "progressText": report.progressText,
+            "dnsMode": report.dnsMode,
+            "effectiveDNS": report.effectiveDNS,
+            "pathSummary": report.pathSummary,
+            "rows": report.rows.map(jsonObject(from:)),
+            "totalProbes": report.totalProbes,
+            "failedProbes": report.failedProbes,
+            "savedReportPath": report.savedReportPath as Any
+        ]
+    }
+
     nonisolated private static let httpsTargets = [
         "https://www.apple.com/library/test/success.html",
         "https://www.cloudflare.com/cdn-cgi/trace",
@@ -2584,9 +4093,13 @@ private struct VPNStressRunner {
     ]
 
     nonisolated private static let udpResolvers = [
+        "2606:4700:4700::1111",
         "1.1.1.1",
+        "2606:4700:4700::1001",
         "1.0.0.1",
+        "2001:4860:4860::8888",
         "8.8.8.8",
+        "2620:fe::fe",
         "9.9.9.9"
     ]
 
@@ -2603,6 +4116,69 @@ private struct VPNStressRunner {
         "cloudflare.com",
         "www.google.com",
         "www.gstatic.com"
+    ]
+
+    nonisolated private static let loadScenarios: [LoadScenario] = [
+        LoadScenario(
+            id: "load-udp-dns",
+            name: "UDP DNS load",
+            condition: "Concurrent public resolver DNS round trips over UDP",
+            kind: .udpDNS,
+            rounds: 6,
+            concurrency: 12,
+            timeoutSeconds: 8,
+            interRoundDelayMs: 75
+        ),
+        LoadScenario(
+            id: "load-quic",
+            name: "QUIC h3 load",
+            condition: "Concurrent HTTP/3 ALPN QUIC handshakes on UDP 443",
+            kind: .quic,
+            rounds: 5,
+            concurrency: 10,
+            timeoutSeconds: 8,
+            interRoundDelayMs: 75
+        ),
+        LoadScenario(
+            id: "load-https",
+            name: "HTTPS load",
+            condition: "Concurrent HTTPS requests through URLSession",
+            kind: .http,
+            rounds: 5,
+            concurrency: 12,
+            timeoutSeconds: 8,
+            interRoundDelayMs: 75
+        ),
+        LoadScenario(
+            id: "load-large-https",
+            name: "Large HTTPS load",
+            condition: "Concurrent larger HTTPS downloads",
+            kind: .largeHTTP,
+            rounds: 4,
+            concurrency: 5,
+            timeoutSeconds: 12,
+            interRoundDelayMs: 150
+        ),
+        LoadScenario(
+            id: "load-tcp-churn",
+            name: "TCP churn load",
+            condition: "Concurrent raw TCP 443 connection opens",
+            kind: .tcp,
+            rounds: 5,
+            concurrency: 16,
+            timeoutSeconds: 8,
+            interRoundDelayMs: 50
+        ),
+        LoadScenario(
+            id: "load-mixed-real",
+            name: "Mixed real load",
+            condition: "Concurrent UDP DNS, QUIC, HTTPS, large HTTPS, and TCP probes",
+            kind: .mixed,
+            rounds: 6,
+            concurrency: 18,
+            timeoutSeconds: 12,
+            interRoundDelayMs: 100
+        )
     ]
 
     nonisolated private static let scenarios: [Scenario] = [
@@ -2740,13 +4316,58 @@ private struct VPNStressRunner {
         )
     ]
 
-    nonisolated private static func dnsQueryPayload(transactionID: UInt16, labels: [String]) -> Data {
+    nonisolated private static func probeURL(_ value: String) -> URL? {
+        URL(string: value)
+    }
+
+    nonisolated private static func timeoutMilliseconds(_ seconds: TimeInterval) -> UInt64 {
+        guard seconds.isFinite, seconds > 0 else {
+            return 0
+        }
+        return UInt64(min(seconds * 1_000, Double(UInt64.max)))
+    }
+
+    nonisolated private static func timeoutExceeded(since startedAt: Date, timeoutSeconds: TimeInterval) -> Bool {
+        let timeout = min(timeoutMilliseconds(timeoutSeconds), UInt64(Int.max))
+        return elapsedMs(since: startedAt) > Int(timeout)
+    }
+
+    nonisolated private static func wrappedIndex(_ value: Int, count: Int) -> Int {
+        guard count > 0 else { return 0 }
+        let remainder = value % count
+        return remainder >= 0 ? remainder : remainder + count
+    }
+
+    nonisolated private static func probeCapacity(rounds: Int, concurrency: Int) -> Int {
+        let safeRounds = max(0, rounds)
+        let safeConcurrency = max(1, concurrency)
+        let product = safeRounds.multipliedReportingOverflow(by: safeConcurrency)
+        return product.overflow ? Int.max : product.partialValue
+    }
+
+    nonisolated private static func dnsTransactionID(for value: Int) -> UInt16 {
+        UInt16(truncatingIfNeeded: 0x4000 &+ wrappedIndex(value, count: Int(UInt16.max) + 1))
+    }
+
+    nonisolated private static func dnsQueryPayload(transactionID: UInt16, labels: [String]) -> Data? {
+        guard !labels.isEmpty else {
+            return nil
+        }
         var bytes: [UInt8] = [
             UInt8(transactionID >> 8), UInt8(transactionID & 0x00FF), 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00
         ]
+        var qnameWireLength = 1
         for label in labels {
-            bytes.append(UInt8(label.count))
+            let labelLength = label.utf8.count
+            guard !label.isEmpty, labelLength <= 63 else {
+                return nil
+            }
+            qnameWireLength += 1 + labelLength
+            guard qnameWireLength <= 255 else {
+                return nil
+            }
+            bytes.append(UInt8(labelLength))
             bytes.append(contentsOf: label.utf8)
         }
         bytes.append(0x00)
@@ -2759,10 +4380,25 @@ private struct VPNStressRunner {
     }
 
     nonisolated private static func elapsedMs(since startedAt: Date) -> Int {
-        max(0, Int(Date().timeIntervalSince(startedAt) * 1000))
+        millisecondsSince(startedAt)
     }
 }
 
 nonisolated private func elapsedMs(since startedAt: Date) -> Int {
-    max(0, Int(Date().timeIntervalSince(startedAt) * 1000))
+    millisecondsSince(startedAt)
+}
+
+nonisolated private func millisecondsSince(_ startedAt: Date) -> Int {
+    let elapsed = Date().timeIntervalSince(startedAt)
+    guard elapsed.isFinite, elapsed > 0 else {
+        return 0
+    }
+    let milliseconds = (elapsed * 1_000).rounded()
+    guard milliseconds.isFinite else {
+        return Int.max
+    }
+    if milliseconds >= Double(Int.max) {
+        return Int.max
+    }
+    return Int(milliseconds)
 }

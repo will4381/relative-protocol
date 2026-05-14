@@ -136,14 +136,52 @@ final class Socks5UDPRelayTests: XCTestCase {
         wait(for: [sessionCreated], timeout: 1.0)
     }
 
-    func testUDPRelayEvictsSessionAfterWriteFailure() throws {
-        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.udp.write-failure")
+    func testUDPRelayMarshalsSynchronousReadCallbackThroughQueue() throws {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.udp.sync-read")
         let provider = FakeUDPProvider()
         let relay = try Socks5UDPRelay(
             provider: provider,
             queue: queue,
             mtu: 1_500,
             logger: StructuredLogger(sink: InMemoryLogSink())
+        )
+        relay.start()
+        defer { relay.stop() }
+
+        let clientSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        XCTAssertGreaterThanOrEqual(clientSocket, 0)
+        defer { close(clientSocket) }
+
+        let sessionCreated = expectation(description: "udp session created")
+        provider.onCreate = { session in
+            session.onSetReadHandler = { handler in
+                handler(Data([0x01, 0x02, 0x03]), nil)
+            }
+            sessionCreated.fulfill()
+        }
+
+        try sendClientDatagram(
+            socketFD: clientSocket,
+            relayPort: relay.port,
+            destinationAddress: .ipv4("1.1.1.1"),
+            destinationPort: 53
+        )
+
+        wait(for: [sessionCreated], timeout: 1.0)
+        queue.sync {}
+        XCTAssertEqual(relay.activeSessionCount, 1)
+        XCTAssertFalse(try XCTUnwrap(provider.sessions.first).cancelled)
+    }
+
+    func testUDPRelayEvictsSessionAfterWriteFailure() async throws {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.udp.write-failure")
+        let sink = InMemoryLogSink()
+        let provider = FakeUDPProvider()
+        let relay = try Socks5UDPRelay(
+            provider: provider,
+            queue: queue,
+            mtu: 1_500,
+            logger: StructuredLogger(sink: sink)
         )
         relay.start()
         defer {
@@ -172,11 +210,21 @@ final class Socks5UDPRelayTests: XCTestCase {
             destinationPort: 53
         )
 
-        wait(for: [firstCreated], timeout: 1.0)
+        await fulfillment(of: [firstCreated], timeout: 1.0)
         queue.sync {}
         XCTAssertEqual(relay.activeSessionCount, 0)
         let firstSession = try XCTUnwrap(provider.sessions.first)
         XCTAssertTrue(firstSession.cancelled)
+        let records = try await eventuallyFetchRecords(from: sink) { records in
+            records.contains { $0.component == "Socks5UDPRelay" && $0.event == "write-failed" }
+        }
+        let record = try XCTUnwrap(
+            records.first { $0.component == "Socks5UDPRelay" && $0.event == "write-failed" }
+        )
+        XCTAssertEqual(record.metadata["destination_host"], "<redacted>")
+        XCTAssertEqual(record.metadata["destination_port"], "53")
+        XCTAssertEqual(record.metadata["destination_host_kind"], "ipv4")
+        XCTAssertEqual(record.metadata["destination_transport"], "udp")
 
         try sendClientDatagram(
             socketFD: clientSocket,
@@ -185,7 +233,7 @@ final class Socks5UDPRelayTests: XCTestCase {
             destinationPort: 53
         )
 
-        wait(for: [secondCreated], timeout: 1.0)
+        await fulfillment(of: [secondCreated], timeout: 1.0)
         XCTAssertEqual(relay.activeSessionCount, 1)
     }
 
@@ -256,6 +304,10 @@ final class Socks5UDPRelayTests: XCTestCase {
         XCTAssertEqual(record.metadata["datagram_size"], "1400")
         XCTAssertEqual(record.metadata["maximum_datagram_size"], "1382")
         XCTAssertEqual(record.metadata["session_retained"], "true")
+        XCTAssertEqual(record.metadata["destination_host"], "<redacted>")
+        XCTAssertEqual(record.metadata["destination_port"], "53")
+        XCTAssertEqual(record.metadata["destination_host_kind"], "ipv4")
+        XCTAssertEqual(record.metadata["destination_transport"], "udp")
     }
 
     func testUDPRelaySchedulesReplacementAfterRepeatedDatagramTooLargeFailures() async throws {
@@ -351,16 +403,21 @@ final class Socks5UDPRelayTests: XCTestCase {
         let record = try XCTUnwrap(records.last(where: { $0.metadata["replacement_scheduled"] == "true" }))
         XCTAssertEqual(record.metadata["oversized_drop_count"], "3")
         XCTAssertEqual(record.metadata["minimum_observed_maximum_datagram_size"], "1382")
+        XCTAssertEqual(record.metadata["destination_host"], "<redacted>")
+        XCTAssertEqual(record.metadata["destination_port"], "53")
+        XCTAssertEqual(record.metadata["destination_host_kind"], "ipv4")
+        XCTAssertEqual(record.metadata["destination_transport"], "udp")
     }
 
-    func testUDPRelaySchedulesBetterPathReplacementUntilNextDatagram() throws {
+    func testUDPRelaySchedulesBetterPathReplacementUntilNextDatagram() async throws {
         let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.udp.better-path")
+        let sink = InMemoryLogSink()
         let provider = FakeUDPProvider()
         let relay = try Socks5UDPRelay(
             provider: provider,
             queue: queue,
             mtu: 1_500,
-            logger: StructuredLogger(sink: InMemoryLogSink())
+            logger: StructuredLogger(sink: sink)
         )
         relay.start()
         defer {
@@ -387,7 +444,7 @@ final class Socks5UDPRelayTests: XCTestCase {
             destinationAddress: .ipv4("1.1.1.1"),
             destinationPort: 53
         )
-        wait(for: [firstCreated], timeout: 1.0)
+        await fulfillment(of: [firstCreated], timeout: 1.0)
 
         let firstSession = try XCTUnwrap(provider.sessions.first)
         queue.sync {
@@ -398,6 +455,16 @@ final class Socks5UDPRelayTests: XCTestCase {
         XCTAssertFalse(firstSession.cancelled)
         XCTAssertEqual(provider.sessions.count, 1)
         XCTAssertEqual(relay.activeSessionCount, 1)
+        let records = try await eventuallyFetchRecords(from: sink) { records in
+            records.contains { $0.component == "Socks5UDPRelay" && $0.event == "session-replacement-scheduled" }
+        }
+        let record = try XCTUnwrap(
+            records.first { $0.component == "Socks5UDPRelay" && $0.event == "session-replacement-scheduled" }
+        )
+        XCTAssertEqual(record.metadata["destination_host"], "<redacted>")
+        XCTAssertEqual(record.metadata["destination_port"], "53")
+        XCTAssertEqual(record.metadata["destination_host_kind"], "ipv4")
+        XCTAssertEqual(record.metadata["destination_transport"], "udp")
 
         try sendClientDatagram(
             socketFD: clientSocket,
@@ -405,7 +472,7 @@ final class Socks5UDPRelayTests: XCTestCase {
             destinationAddress: .ipv4("1.1.1.1"),
             destinationPort: 53
         )
-        wait(for: [secondCreated], timeout: 1.0)
+        await fulfillment(of: [secondCreated], timeout: 1.0)
 
         XCTAssertTrue(firstSession.cancelled)
         XCTAssertEqual(relay.activeSessionCount, 1)
@@ -726,52 +793,185 @@ private final class TestClock: @unchecked Sendable {
 }
 
 private final class FakeUDPProvider: Socks5ConnectionProvider, @unchecked Sendable {
-    private(set) var sessions: [FakeUDPSession] = []
-    var onCreate: ((FakeUDPSession) -> Void)?
+    private let lock = NSLock()
+    private var storedSessions: [FakeUDPSession] = []
+    private var storedOnCreate: ((FakeUDPSession) -> Void)?
+
+    var onCreate: ((FakeUDPSession) -> Void)? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return storedOnCreate
+        }
+        set {
+            lock.lock()
+            storedOnCreate = newValue
+            lock.unlock()
+        }
+    }
+
+    var sessions: [FakeUDPSession] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedSessions
+    }
 
     func makeUDPSession(to _: NWHostEndpoint) -> Socks5UDPSession {
         let session = FakeUDPSession()
-        sessions.append(session)
+        let onCreate: ((FakeUDPSession) -> Void)?
+        lock.lock()
+        storedSessions.append(session)
+        onCreate = storedOnCreate
+        lock.unlock()
         onCreate?(session)
         return session
     }
 }
 
 private final class FakeUDPSession: Socks5UDPSession, @unchecked Sendable {
+    private let lock = NSLock()
     private var readHandler: ((Data?, Error?) -> Void)?
-    private(set) var cancelled = false
-    private(set) var restartCount = 0
-    private(set) var writtenDatagrams: [Data] = []
-    var nextWriteError: Error?
-    var writeErrors: [Error] = []
-    var onWrite: ((Data) -> Void)?
-    var eventHandler: ((Socks5UDPSessionEvent) -> Void)?
+    private var storedCancelled = false
+    private var storedRestartCount = 0
+    private var storedWrittenDatagrams: [Data] = []
+    private var storedNextWriteError: Error?
+    private var storedWriteErrors: [Error] = []
+    private var storedOnWrite: ((Data) -> Void)?
+    private var storedOnSetReadHandler: (((Data?, Error?) -> Void) -> Void)?
+    private var storedEventHandler: ((Socks5UDPSessionEvent) -> Void)?
+
+    var cancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedCancelled
+    }
+
+    var restartCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedRestartCount
+    }
+
+    var writtenDatagrams: [Data] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedWrittenDatagrams
+    }
+
+    var nextWriteError: Error? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return storedNextWriteError
+        }
+        set {
+            lock.lock()
+            storedNextWriteError = newValue
+            lock.unlock()
+        }
+    }
+
+    var writeErrors: [Error] {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return storedWriteErrors
+        }
+        set {
+            lock.lock()
+            storedWriteErrors = newValue
+            lock.unlock()
+        }
+    }
+
+    var onWrite: ((Data) -> Void)? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return storedOnWrite
+        }
+        set {
+            lock.lock()
+            storedOnWrite = newValue
+            lock.unlock()
+        }
+    }
+
+    var onSetReadHandler: (((Data?, Error?) -> Void) -> Void)? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return storedOnSetReadHandler
+        }
+        set {
+            lock.lock()
+            storedOnSetReadHandler = newValue
+            lock.unlock()
+        }
+    }
+
+    var eventHandler: ((Socks5UDPSessionEvent) -> Void)? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return storedEventHandler
+        }
+        set {
+            lock.lock()
+            storedEventHandler = newValue
+            lock.unlock()
+        }
+    }
 
     func setReadHandler(_ handler: @escaping (Data?, Error?) -> Void) {
+        lock.lock()
         readHandler = handler
+        let onSetReadHandler = storedOnSetReadHandler
+        lock.unlock()
+        onSetReadHandler?(handler)
     }
 
     func writeDatagram(_ datagram: Data, completionHandler: @escaping (Error?) -> Void) {
-        writtenDatagrams.append(datagram)
-        onWrite?(datagram)
-        if !writeErrors.isEmpty {
-            completionHandler(writeErrors.removeFirst())
-            return
+        let onWrite: ((Data) -> Void)?
+        let error: Error?
+        lock.lock()
+        storedWrittenDatagrams.append(datagram)
+        onWrite = storedOnWrite
+        if !storedWriteErrors.isEmpty {
+            error = storedWriteErrors.removeFirst()
+        } else if let nextWriteError = storedNextWriteError {
+            storedNextWriteError = nil
+            error = nextWriteError
+        } else {
+            error = nil
         }
-        if let nextWriteError {
-            self.nextWriteError = nil
-            completionHandler(nextWriteError)
+        lock.unlock()
+
+        onWrite?(datagram)
+        if let error {
+            completionHandler(error)
             return
         }
         completionHandler(nil)
     }
 
     func restart() {
-        restartCount += 1
+        lock.lock()
+        storedRestartCount += 1
+        lock.unlock()
     }
 
     func cancel() {
-        cancelled = true
+        lock.lock()
+        storedCancelled = true
+        lock.unlock()
+    }
+
+    func deliverRead(datagram: Data?, error: Error? = nil) {
+        lock.lock()
+        let handler = readHandler
+        lock.unlock()
+        handler?(datagram, error)
     }
 }
 

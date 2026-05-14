@@ -21,6 +21,7 @@ struct FastPacketSummary: Sendable {
     let sourcePort: UInt16
     let destinationPort: UInt16
     let transportPayloadOffset: UInt16
+    let transportPayloadLengthRaw: UInt16
     let packetLength: Int
     let quicVersion: UInt32?
     let flowHash: UInt64
@@ -63,6 +64,7 @@ struct FastPacketSummary: Sendable {
         self.sourcePort = raw.source_port
         self.destinationPort = raw.destination_port
         self.transportPayloadOffset = raw.transport_payload_offset
+        self.transportPayloadLengthRaw = raw.transport_payload_length
         self.packetLength = Int(raw.packet_length)
         self.quicVersion = raw.quic_version == 0 ? nil : raw.quic_version
         self.flowHash = raw.flow_hash
@@ -83,11 +85,10 @@ struct FastPacketSummary: Sendable {
     /// The fast-path detector uses this to ignore pure TCP ACK traffic that otherwise creates a lot of heat
     /// without adding useful transition or burst signal.
     var transportPayloadLength: Int {
-        let offset = Int(transportPayloadOffset)
-        guard offset > 0, packetLength >= offset else {
+        guard transportPayloadOffset > 0 else {
             return 0
         }
-        return packetLength - offset
+        return Int(transportPayloadLengthRaw)
     }
 
     var hasPorts: Bool {

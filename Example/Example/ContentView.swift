@@ -2,6 +2,7 @@
 // See LICENSE for terms.
 
 import SwiftUI
+import PacketRelay
 @preconcurrency import NetworkExtension
 
 struct ContentView: View {
@@ -14,7 +15,10 @@ struct ContentView: View {
                 headerSection
                 actionSection
                 dnsSection
+                doctorSection
                 stressSection
+                faultInjectionSection
+                loadDrillSection
                 summarySection
                 detectionsSection
                 packetStreamSection
@@ -81,19 +85,19 @@ struct ContentView: View {
                 }
             }
             .buttonStyle(FlatFillButtonStyle(fill: primaryButtonColor, foreground: .white))
-            .disabled(vpnManager.isBusy)
+            .disabled(anyDiagnosticRunning)
 
             Button("Refresh") {
                 Task { await vpnManager.refreshStatus() }
             }
             .buttonStyle(FlatFillButtonStyle(fill: Color(.secondarySystemBackground), foreground: .primary))
-            .disabled(vpnManager.isBusy)
+            .disabled(anyDiagnosticRunning)
 
             Button("Clear Local Data") {
                 Task { await vpnManager.clearLocalData() }
             }
             .buttonStyle(FlatFillButtonStyle(fill: Color(.secondarySystemBackground), foreground: .primary))
-            .disabled(vpnManager.isBusy)
+            .disabled(anyDiagnosticRunning)
         }
     }
 
@@ -126,7 +130,13 @@ struct ContentView: View {
                 vpnManager.startStressMatrix()
             }
             .buttonStyle(FlatFillButtonStyle(fill: .purple, foreground: .white))
-            .disabled(vpnManager.isBusy || vpnManager.stressReport.isRunning)
+            .disabled(
+                vpnManager.isBusy ||
+                vpnManager.doctorReport.isRunning ||
+                vpnManager.stressReport.isRunning ||
+                vpnManager.faultInjectionReport.isRunning ||
+                vpnManager.loadDrillReport.isRunning
+            )
 
             if vpnManager.stressReport.isRunning {
                 Button("Cancel Stress Matrix") {
@@ -179,6 +189,184 @@ struct ContentView: View {
         }
     }
 
+    private var doctorSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("VPN Doctor")
+                .font(.headline)
+
+            Button(vpnManager.doctorReport.isRunning ? "Running VPN Doctor" : "Run VPN Doctor") {
+                vpnManager.startDoctor()
+            }
+            .buttonStyle(FlatFillButtonStyle(fill: .blue, foreground: .white))
+            .disabled(
+                vpnManager.isBusy ||
+                vpnManager.doctorReport.isRunning ||
+                vpnManager.stressReport.isRunning ||
+                vpnManager.faultInjectionReport.isRunning ||
+                vpnManager.loadDrillReport.isRunning
+            )
+
+            if vpnManager.doctorReport.isRunning {
+                Button("Cancel VPN Doctor") {
+                    vpnManager.cancelDoctor()
+                }
+                .buttonStyle(FlatFillButtonStyle(fill: Color(.secondarySystemBackground), foreground: .primary))
+            }
+
+            SummaryRow(label: "Doctor", value: vpnManager.doctorReport.summaryText)
+            SummaryRow(label: "Verdict", value: vpnManager.doctorReport.verdict)
+            SummaryRow(label: "Class", value: vpnManager.doctorReport.verdictClass.title)
+            SummaryRow(label: "Detail", value: vpnManager.doctorReport.verdictDetail)
+            SummaryRow(label: "DNS mode", value: vpnManager.doctorReport.dnsMode)
+            SummaryRow(label: "Effective DNS", value: vpnManager.doctorReport.effectiveDNS)
+            SummaryRow(label: "Start path", value: vpnManager.doctorReport.pathSummary)
+            if let activeStep = vpnManager.doctorReport.activeStep {
+                SummaryRow(label: "Active", value: activeStep)
+            }
+            if let savedReportPath = vpnManager.doctorReport.savedReportPath {
+                SummaryRow(label: "Report", value: savedReportPath)
+            }
+
+            ForEach(vpnManager.doctorReport.rows) { row in
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(row.name)
+                            .font(.body.weight(.medium))
+                        Spacer(minLength: 8)
+                        Text(row.statusText)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(doctorStatusColor(row.status))
+                    }
+
+                    Text("\(row.failureClass.title) · \(row.durationMs)ms")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+
+                    Text(row.detail)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+                Divider()
+            }
+        }
+    }
+
+    private var faultInjectionSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Fault Injection")
+                .font(.headline)
+
+            Button(vpnManager.faultInjectionReport.isRunning ? "Running Fault Injection" : "Run Fault Injection") {
+                vpnManager.startFaultInjection()
+            }
+            .buttonStyle(FlatFillButtonStyle(fill: .indigo, foreground: .white))
+            .disabled(
+                vpnManager.isBusy ||
+                vpnManager.doctorReport.isRunning ||
+                vpnManager.stressReport.isRunning ||
+                vpnManager.faultInjectionReport.isRunning ||
+                vpnManager.loadDrillReport.isRunning
+            )
+
+            SummaryRow(label: "Faults", value: vpnManager.faultInjectionReport.summaryText)
+            SummaryRow(label: "Cases", value: "\(vpnManager.faultInjectionReport.rows.count)")
+            if let completedAt = vpnManager.faultInjectionReport.completedAt {
+                SummaryRow(label: "Completed", value: completedAt.formatted(.dateTime.hour().minute().second()))
+            }
+
+            ForEach(vpnManager.faultInjectionReport.rows) { row in
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(row.name)
+                            .font(.body.weight(.medium))
+                        Spacer(minLength: 8)
+                        Text(row.statusText)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(row.passed ? .green : .red)
+                    }
+
+                    Text("\(row.fault) · \(row.durationMs)ms")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+
+                    Text(row.detail)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+                Divider()
+            }
+        }
+    }
+
+    private var loadDrillSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Real Load Drill")
+                .font(.headline)
+
+            Button(vpnManager.loadDrillReport.isRunning ? "Running Load Drill" : "Run Load Drill") {
+                vpnManager.startLoadDrill()
+            }
+            .buttonStyle(FlatFillButtonStyle(fill: .teal, foreground: .white))
+            .disabled(
+                vpnManager.isBusy ||
+                vpnManager.doctorReport.isRunning ||
+                vpnManager.stressReport.isRunning ||
+                vpnManager.faultInjectionReport.isRunning ||
+                vpnManager.loadDrillReport.isRunning
+            )
+
+            if vpnManager.loadDrillReport.isRunning {
+                Button("Cancel Load Drill") {
+                    vpnManager.cancelLoadDrill()
+                }
+                .buttonStyle(FlatFillButtonStyle(fill: Color(.secondarySystemBackground), foreground: .primary))
+            }
+
+            SummaryRow(label: "Load", value: vpnManager.loadDrillReport.summaryText)
+            SummaryRow(label: "DNS mode", value: vpnManager.loadDrillReport.dnsMode)
+            SummaryRow(label: "Effective DNS", value: vpnManager.loadDrillReport.effectiveDNS)
+            SummaryRow(label: "Start path", value: vpnManager.loadDrillReport.pathSummary)
+            if let activeScenario = vpnManager.loadDrillReport.activeScenario {
+                SummaryRow(label: "Active", value: activeScenario)
+            }
+            SummaryRow(label: "Probes", value: "\(vpnManager.loadDrillReport.totalProbes)")
+            SummaryRow(label: "Failures", value: "\(vpnManager.loadDrillReport.failedProbes)")
+            if let savedReportPath = vpnManager.loadDrillReport.savedReportPath {
+                SummaryRow(label: "Report", value: savedReportPath)
+            }
+
+            ForEach(vpnManager.loadDrillReport.rows) { row in
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(row.name)
+                            .font(.body.weight(.medium))
+                        Spacer(minLength: 8)
+                        Text(row.statusText)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(row.passed ? .green : .red)
+                    }
+
+                    Text("\(row.condition) · \(row.probeCount) probes · \(row.durationMs)ms")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+
+                    if !row.detail.isEmpty {
+                        Text(row.detail)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                }
+                Divider()
+            }
+        }
+    }
+
     private var summarySection: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Overview")
@@ -192,7 +380,7 @@ struct ContentView: View {
             if let note = vpnManager.profileDiagnostics.note {
                 SummaryRow(label: "Profile note", value: note)
             }
-            SummaryRow(label: "Last stop", value: vpnManager.lastStopDisplayText)
+            SummaryRow(label: vpnManager.lastStopLabelText, value: vpnManager.lastStopDisplayText)
             SummaryRow(label: "Recent events", value: "\(vpnManager.trafficSummary.recentEventCount)")
             SummaryRow(label: "Inspected events", value: "\(vpnManager.trafficSummary.inspectedEventCount)")
             SummaryRow(label: "Events shown", value: "\(vpnManager.packetRows.count)")
@@ -345,12 +533,33 @@ struct ContentView: View {
         }
     }
 
+    private func doctorStatusColor(_ status: VPNDoctorStepRow.Status) -> Color {
+        switch status {
+        case .pass:
+            return .green
+        case .warn:
+            return .orange
+        case .fail:
+            return .red
+        case .blocked:
+            return .orange
+        }
+    }
+
     private var primaryActionTitle: String {
         vpnManager.isConnected ? "Disconnect" : "Connect"
     }
 
     private var primaryButtonColor: Color {
         vpnManager.isConnected ? .red : .blue
+    }
+
+    private var anyDiagnosticRunning: Bool {
+        vpnManager.isBusy ||
+            vpnManager.doctorReport.isRunning ||
+            vpnManager.stressReport.isRunning ||
+            vpnManager.faultInjectionReport.isRunning ||
+            vpnManager.loadDrillReport.isRunning
     }
 
 }

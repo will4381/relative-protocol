@@ -33,7 +33,9 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
 
         var remainingBytes: Int {
             guard nextIndex < packets.count else { return 0 }
-            return packets[nextIndex...].reduce(0) { $0 + $1.count }
+            return packets[nextIndex...].reduce(0) { total, packet in
+                PacketTunnelProviderShell.saturatingAdd(total, packet.count)
+            }
         }
     }
 
@@ -421,10 +423,10 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
         }
 
         let packetCount = packets.count
-        let byteCount = packets.reduce(0) { $0 + $1.count }
+        let byteCount = Self.saturatingByteCount(packets)
         withState { state in
-            state.cumulativeOutboundPackets += packetCount
-            state.cumulativeOutboundBytes += byteCount
+            state.cumulativeOutboundPackets = Self.saturatingAdd(state.cumulativeOutboundPackets, packetCount)
+            state.cumulativeOutboundBytes = Self.saturatingAdd(state.cumulativeOutboundBytes, byteCount)
         }
 
         let batch = PendingOutboundBatch(packets: packets, families: families, nextIndex: 0)
@@ -507,10 +509,10 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
         }
 
         let packetCount = packets.count
-        let byteCount = packets.reduce(0) { $0 + $1.count }
+        let byteCount = Self.saturatingByteCount(packets)
         withState { state in
-            state.cumulativeInboundPackets += packetCount
-            state.cumulativeInboundBytes += byteCount
+            state.cumulativeInboundPackets = Self.saturatingAdd(state.cumulativeInboundPackets, packetCount)
+            state.cumulativeInboundBytes = Self.saturatingAdd(state.cumulativeInboundBytes, byteCount)
         }
 
         // Docs: https://developer.apple.com/documentation/networkextension/nepackettunnelflow/writepackets(_:withprotocols:)
@@ -1001,6 +1003,17 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
         }
     }
 
+    private static func saturatingByteCount(_ packets: [Data]) -> Int {
+        packets.reduce(0) { total, packet in
+            saturatingAdd(total, packet.count)
+        }
+    }
+
+    private static func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
+        let (value, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? Int.max : value
+    }
+
     /// Performs a synchronous mutation/read against provider state shared across tasks and callback queues.
     /// The lock scope must stay short and never cross async or blocking work.
     private func withState<T>(_ body: (inout ProviderState) -> T) -> T {
@@ -1186,7 +1199,7 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
         }
         guard admission.accepted else {
             if admission.shouldLogSheddingStart {
-                let batchBytes = packets.reduce(0) { $0 + $1.count }
+                let batchBytes = Self.saturatingByteCount(packets)
                 Task {
                     await logger.log(
                         level: .warning,
@@ -1223,8 +1236,12 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
             }
 
             state.lastHealthSampleAt = now
-            let pendingPackets = state.pendingOutbound.reduce(0) { $0 + $1.remainingPackets }
-            let pendingBytes = state.pendingOutbound.reduce(0) { $0 + $1.remainingBytes }
+            let pendingPackets = state.pendingOutbound.reduce(0) { total, batch in
+                Self.saturatingAdd(total, batch.remainingPackets)
+            }
+            let pendingBytes = state.pendingOutbound.reduce(0) { total, batch in
+                Self.saturatingAdd(total, batch.remainingBytes)
+            }
             let bridgeBackpressured = state.tunBridge?.isBackpressured() ?? false
             let telemetrySnapshot = state.telemetryWorker?.snapshot()
 
@@ -1246,7 +1263,7 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                     "packet_batches_dropped": String(telemetrySnapshot?.droppedBatches ?? 0),
                     "packet_batches_skipped": String(telemetrySnapshot?.skippedBatches ?? 0),
                     "packet_records_buffered": String(telemetrySnapshot?.bufferedRecords ?? 0),
-                    "thermal_state": TunnelThermalState(thermalState: telemetrySnapshot?.thermalState).rawValue,
+                    "thermal_state": telemetrySnapshot?.thermalState.rawValue ?? TunnelThermalState.unknown.rawValue,
                     "low_power_mode_enabled": String(telemetrySnapshot?.lowPowerModeEnabled ?? false)
                 ]
             )

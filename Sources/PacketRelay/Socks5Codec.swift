@@ -1,5 +1,9 @@
-import Darwin
 import Foundation
+#if os(Linux)
+import Glibc
+#else
+import Darwin
+#endif
 
 /// SOCKS5 command byte values.
 public enum Socks5Command: UInt8, Sendable {
@@ -224,7 +228,9 @@ public enum Socks5Codec {
         guard payload.count <= Int(UInt16.max) else {
             return nil
         }
-        let addressAndPort = addressPortBytes(address, port: port)
+        guard let addressAndPort = validatedAddressPortBytes(address, port: port) else {
+            return nil
+        }
         let headerLength = 3 + addressAndPort.count
         guard headerLength <= Int(UInt8.max) else {
             return nil
@@ -241,6 +247,27 @@ public enum Socks5Codec {
 
     private static func addressPortBytes(_ address: Socks5Address, port: UInt16) -> [UInt8] {
         addressBytes(address) + [UInt8((port >> 8) & 0xFF), UInt8(port & 0xFF)]
+    }
+
+    private static func validatedAddressPortBytes(_ address: Socks5Address, port: UInt16) -> [UInt8]? {
+        switch address {
+        case .ipv4(let value):
+            var bytes = [UInt8](repeating: 0, count: 4)
+            let ok = bytes.withUnsafeMutableBufferPointer { buffer in
+                value.withCString { inet_pton(AF_INET, $0, buffer.baseAddress) }
+            }
+            guard ok == 1 else { return nil }
+            return [0x01] + bytes + [UInt8((port >> 8) & 0xFF), UInt8(port & 0xFF)]
+        case .ipv6(let value):
+            var addr = in6_addr()
+            let ok = value.withCString { inet_pton(AF_INET6, $0, &addr) }
+            guard ok == 1 else { return nil }
+            return [0x04] + withUnsafeBytes(of: &addr, { Array($0) }) + [UInt8((port >> 8) & 0xFF), UInt8(port & 0xFF)]
+        case .domain(let domain):
+            let utf8 = Array(domain.utf8)
+            guard !utf8.isEmpty, utf8.count <= Int(UInt8.max) else { return nil }
+            return [0x03, UInt8(utf8.count)] + utf8 + [UInt8((port >> 8) & 0xFF), UInt8(port & 0xFF)]
+        }
     }
 
     private static func parseAddress(from data: Data, atyp: UInt8, index: inout Int) -> Socks5Address? {
@@ -260,6 +287,7 @@ public enum Socks5Codec {
             guard data.count > index else { return nil }
             let length = Int(data[index])
             index += 1
+            guard length > 0 else { return nil }
             guard data.count >= index + length else { return nil }
             let domain = String(decoding: data[index ..< index + length], as: UTF8.self)
             index += length
@@ -292,6 +320,7 @@ public enum Socks5Codec {
             guard count > index else { return nil }
             let length = Int(data[index])
             index += 1
+            guard length > 0 else { return nil }
             guard count >= index + length else { return nil }
             let buffer = UnsafeBufferPointer(start: data.baseAddress?.advanced(by: index), count: length)
             index += length
@@ -305,7 +334,9 @@ public enum Socks5Codec {
         switch address {
         case .ipv4(let value):
             var bytes = [UInt8](repeating: 0, count: 4)
-            _ = value.withCString { inet_pton(AF_INET, $0, &bytes) }
+            _ = bytes.withUnsafeMutableBufferPointer { buffer in
+                value.withCString { inet_pton(AF_INET, $0, buffer.baseAddress) }
+            }
             return [0x01] + bytes
         case .ipv6(let value):
             var addr = in6_addr()

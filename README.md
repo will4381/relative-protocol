@@ -27,6 +27,8 @@ It is designed so the tunnel can stay alive and keep detecting while the contain
   - outbound TCP better-path handling is now explicit during connect attempts instead of log-only
   - isolated UDP oversize / PMTU drops no longer tear down the whole relay immediately
   - `engineSocksPort = 0` now round-trips correctly through provider configuration so the local SOCKS listener can stay ephemeral
+  - the Example app now includes deterministic relay fault injection for TCP waiting recovery, direct UDP replacement, and TCP-carried UDP replacement
+  - the Example app now includes a focused real-network load drill for UDP DNS, QUIC, HTTPS, large HTTPS, TCP churn, and mixed traffic
 - relay concurrency cleanup
   - per-connection relay work now runs off dedicated queues instead of funneling all flow callbacks through one shared queue
 - explicit network policy surface
@@ -106,6 +108,8 @@ The containing app is a reader, not the runtime brain.
   - structured logging, JSONL/OSLog sinks, signposts
 - `Sources/HarnessLocal`
   - local harness for replay and package-level testing
+
+See `Docs/LocalTunnelHarness.md` for the local emulation ladder: synthetic replay, PCAP replay, Linux TUN runtime checks, and the physical-iPhone release gate.
 
 ## Public Integration Surface
 
@@ -198,14 +202,16 @@ The package writes small, explicit artifacts under the App Group container:
     detections.json
   last-stop.json
 <AppGroup>/Logs/
-  events.current.jsonl
+  events.current.jsonl                    # tunnel extension stream
   events.<timestamp>.<sequence>.jsonl
+  events.example.current.jsonl            # Example app diagnostic stream
+  events.example.<timestamp>.<sequence>.jsonl
 ```
 
 Persisted App Group artifacts are file-protected and excluded from device/iCloud backup.
 
 The package does not persist the rolling live tap.
-It does persist bounded JSONL tunnel logs by default.
+It does persist bounded JSONL tunnel logs by default. If a containing app also writes JSONL diagnostics into the same App Group, give that app its own `JSONLLogSink` file prefix so both processes never append to one active file.
 
 ## Installation
 
@@ -318,7 +324,7 @@ Existing direct `TunnelProfile(...)` callers stay backward-compatible: if you pa
 When you choose `.automaticTunnelOverhead(...)`, the tunnel interface MTU is no longer fixed explicitly. In that mode, `mtu` remains a local buffer hint for relay/runtime code, while NetworkExtension derives the interface MTU from the active physical path.
 
 `dnsStrategy` controls whether the tunnel installs cleartext DNS, DNS-over-TLS, DNS-over-HTTPS, or no DNS override at all.
-The package default for provider-configuration users is `dnsStrategy = .noOverride`.
+The package default for provider-configuration users is `dnsStrategy = .recommendedDefault`, which installs the package public resolver set for all DNS queries with `matchDomains = [""]`, `matchDomainsNoSearch = true`, and DNS failover disabled.
 
 Existing direct `TunnelProfile(...)` callers stay backward-compatible here too: if you pass only `dnsServers`, the profile uses `.cleartext(servers: dnsServers)`.
 If you want to preserve the system resolver path, set `dnsStrategy = .noOverride` explicitly. Do not rely on `dnsServers: []` with a missing `dnsStrategy`, because the direct `TunnelProfile(...)` initializer treats that as cleartext DNS configuration over the provided `dnsServers` array.
@@ -333,9 +339,10 @@ Recommended host-app policies:
 
 - generic compatibility default: `mtuStrategy = .fixed(1280)`
 - protocol-aware UDP tunnel: `mtuStrategy = .automaticTunnelOverhead(80)` when you know your encapsulation overhead
-- full-tunnel DNS with public resolvers: `dnsStrategy = .cleartext(servers: TunnelDNSStrategy.defaultPublicResolvers)`
-- compatibility-first fallback: `dnsStrategy = .cleartext(..., allowFailover: true)` on iOS 26+
-- preserve system DNS: `dnsStrategy = .noOverride`
+- package full-tunnel DNS default: `dnsStrategy = .recommendedDefault`
+- explicit full-tunnel DNS with public resolvers: `dnsStrategy = .cleartext(servers: TunnelDNSStrategy.defaultPublicResolvers)`
+- resolver failover opt-in: `dnsStrategy = .cleartext(..., allowFailover: true)` on iOS 26+
+- system resolver compatibility opt-out: `dnsStrategy = .noOverride`
 - mobility-sensitive app traffic: `tcpMultipathHandoverEnabled = true`
 - collision-resistant local relay: `engineSocksPort = 0`
 
@@ -385,8 +392,8 @@ Network policy defaults do change if your extension relies on `TunnelProfile.fro
 Migration rules:
 
 1. If your app constructs `TunnelProfile(...)` directly and already passes `mtu` and `dnsServers`, behavior stays backward-compatible.
-2. If your extension decodes sparse `providerConfiguration` and relied on package defaults, be explicit now. The package default policy is `mtuStrategy = .fixed(1280)` and `dnsStrategy = .noOverride`.
-3. If you want the old “always install public cleartext DNS” behavior, set it explicitly with `dnsStrategy = .cleartext(servers: TunnelDNSStrategy.defaultPublicResolvers)` instead of depending on defaults.
+2. If your extension decodes sparse `providerConfiguration` and relied on package defaults, be explicit now. The package default policy is `mtuStrategy = .fixed(1280)` and `dnsStrategy = .recommendedDefault`.
+3. If you want the previous compatibility-first system-resolver behavior, set it explicitly with `dnsStrategy = .noOverride`; sparse provider configuration now installs full-tunnel public resolvers by default.
 4. If you know your tunnel encapsulation overhead, prefer `mtuStrategy = .automaticTunnelOverhead(...)` instead of guessing fixed MTU values.
 5. If your product needs better continuity across Wi-Fi <-> cellular transitions, enable `tcpMultipathHandoverEnabled = true`. Leave it off only if you intentionally want to avoid Multipath TCP handover.
 6. If you run multiple local profiles, test harnesses, or extension builds on the same device, prefer `engineSocksPort = 0` so the tunnel binds an ephemeral local SOCKS port instead of relying on the legacy fixed `1080` port.
@@ -395,7 +402,12 @@ Migration rules:
 
 Recommended migration profiles:
 
-- compatibility-first
+- package full-tunnel default
+  - `mtuStrategy = .fixed(1280)`
+  - `dnsStrategy = .recommendedDefault`
+  - `tcpMultipathHandoverEnabled = true` for mobility-sensitive clients
+  - `engineSocksPort = 0`
+- system-resolver compatibility opt-out
   - `mtuStrategy = .fixed(1280)`
   - `dnsStrategy = .noOverride`
   - `tcpMultipathHandoverEnabled = true` for mobility-sensitive clients
@@ -436,8 +448,9 @@ Recommended baseline:
 
 DNS policy guidance:
 
-- `.noOverride` has the smallest failure surface on captive, enterprise, school, hotel, and carrier-managed networks because it preserves the system resolver path
-- `.cleartext(servers:allowFailover:)` is appropriate when the product needs full-tunnel public resolver behavior and you accept that some networks block or intercept public DNS
+- `.recommendedDefault` installs full-tunnel public resolvers for all DNS queries and avoids relying on an ambient system resolver path for VPN-covered traffic
+- `.noOverride` preserves the system resolver path, but it is an explicit compatibility opt-out because it may not match full-tunnel product expectations
+- `.cleartext(servers:allowFailover:)` is appropriate when the product needs a specific full-tunnel resolver set and you accept that some networks block or intercept public DNS
 - `.tls(...)` and `.https(...)` should only be used with fully specified resolver IPs plus server name or URL
 - do not rely on `dnsServers` alone as a production contract; encode `dnsStrategy`
 - if a host app offers Adaptive DNS, make it observable: show the selected mode, active installed strategy, and current path DNS support
@@ -1357,6 +1370,8 @@ Where to pull artifacts from:
 <AppGroup>/StressReports/stress-<timestamp>.json
 <AppGroup>/Logs/events.current.jsonl
 <AppGroup>/Logs/events.<timestamp>.<sequence>.jsonl
+<AppGroup>/Logs/events.example.current.jsonl
+<AppGroup>/Logs/events.example.<timestamp>.<sequence>.jsonl
 <AppGroup>/Analytics/last-stop.json
 ```
 
@@ -1370,6 +1385,39 @@ Useful device-side checks:
 
 The top-level report path summary is the path sampled at run start.
 For transition runs, use per-row details and JSONL path/UDP replacement logs to confirm when the active path changed.
+
+### Fault injection
+
+The Example app also includes a local fault-injection runner.
+Use it when you need deterministic coverage for relay recovery behavior that may not reproduce on your current Wi-Fi or cellular path.
+
+The runner forces:
+
+- repeated outbound TCP `waiting` events with default no-restart recovery
+- outbound TCP `waiting` timeout and retry
+- opt-in bounded TCP waiting restart budget
+- direct UDP `waiting`, failed-session recreation, and better-path replacement
+- TCP-carried UDP `waiting` and better-path replacement
+
+A healthy run reports `PASS` for every row.
+Fault injection complements the real-device stress matrix; it does not replace Wi-Fi, cellular, transition, or soak testing.
+
+### Real load drill
+
+The Example app includes a focused real-network load drill for quicker checks than the full matrix.
+Use it after fault injection when you specifically want to pressure live internet behavior through the active tunnel.
+
+The drill runs:
+
+- concurrent UDP DNS round trips against public resolvers
+- concurrent HTTP/3 QUIC handshakes on UDP `443`
+- concurrent HTTPS requests
+- concurrent larger HTTPS downloads
+- concurrent TCP `443` opens
+- a mixed row that runs DNS, QUIC, HTTPS, large HTTPS, and TCP together
+
+A healthy run reports `PASS`, `failedProbes = 0`, and latency rows with reasonable p50/p95 values for the current network.
+If this fails while fault injection passes, the relay state machine is probably behaving, but the active network path, resolver policy, QUIC reachability, or load handling needs investigation.
 
 ## Profiling Guidance
 

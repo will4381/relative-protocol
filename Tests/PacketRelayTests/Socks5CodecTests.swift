@@ -3,6 +3,20 @@ import Foundation
 import XCTest
 
 final class Socks5CodecTests: XCTestCase {
+    func testBuildReplyEncodesIPv4AddressBytesPrecisely() {
+        XCTAssertEqual(
+            Socks5Codec.buildReply(code: 0x00, bindAddress: .ipv4("127.0.0.1"), bindPort: 53_000),
+            Data([0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0xCF, 0x08])
+        )
+    }
+
+    func testBuildUDPPacketEncodesIPv4AddressBytesPrecisely() {
+        XCTAssertEqual(
+            Socks5Codec.buildUDPPacket(address: .ipv4("1.2.3.4"), port: 53, payload: Data([0xAA])),
+            Data([0x00, 0x00, 0x00, 0x01, 1, 2, 3, 4, 0x00, 0x35, 0xAA])
+        )
+    }
+
     func testTCPForwardUDPFrameRoundTripsAndReportsConsumedBytes() throws {
         let firstPayload = Data([0x01, 0x02, 0x03])
         let secondPayload = Data([0x04, 0x05])
@@ -75,6 +89,45 @@ final class Socks5CodecTests: XCTestCase {
         XCTAssertEqual(Socks5Codec.parseTCPForwardUDPPacket(invalidAddressType), .invalid)
     }
 
+    func testTCPForwardUDPParserRejectsEmptyDomainAddress() {
+        let emptyDomain = Data([
+            0x00, 0x00, 0x06,
+            0x03, 0x00, 0x01, 0xbb
+        ])
+
+        XCTAssertEqual(Socks5Codec.parseTCPForwardUDPPacket(emptyDomain), .invalid)
+    }
+
+    func testSocksRequestParserRejectsEmptyDomainAddress() {
+        var request = Data([
+            0x05, 0x01, 0x00, 0x03,
+            0x00,
+            0x01, 0xbb
+        ])
+
+        XCTAssertNil(Socks5Codec.parseRequest(&request))
+    }
+
+    func testUDPPacketParserRejectsEmptyDomainAddress() {
+        let packet = Data([
+            0x00, 0x00, 0x00, 0x03,
+            0x00,
+            0x00, 0x35
+        ])
+
+        let parsed = packet.withUnsafeBytes { rawBuffer -> Socks5UDPPacket? in
+            let bytes = rawBuffer.bindMemory(to: UInt8.self)
+            guard let baseAddress = bytes.baseAddress else {
+                return nil
+            }
+            return Socks5Codec.parseUDPPacket(
+                UnsafeBufferPointer(start: baseAddress, count: packet.count),
+                count: packet.count
+            )
+        }
+        XCTAssertNil(parsed)
+    }
+
     func testTCPForwardUDPParserRejectsAddressHeaderWithoutCompletePort() {
         let missingPortByte = Data([
             0x00, 0x00, 0x09,
@@ -99,6 +152,14 @@ final class Socks5CodecTests: XCTestCase {
         XCTAssertNil(
             Socks5Codec.buildTCPForwardUDPPacket(
                 address: .domain(overlongDomain),
+                port: 443,
+                payload: Data()
+            )
+        )
+
+        XCTAssertNil(
+            Socks5Codec.buildTCPForwardUDPPacket(
+                address: .domain(""),
                 port: 443,
                 payload: Data()
             )

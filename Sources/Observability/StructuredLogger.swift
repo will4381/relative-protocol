@@ -125,7 +125,7 @@ public actor StructuredLogger {
         var metadata = metadata
         if let state = rateLimitStates[key], state.suppressedCount > 0 {
             metadata["suppressed_duplicate_count"] = String(state.suppressedCount)
-            metadata["rate_limit_window_ms"] = String(Int(minimumInterval * 1_000))
+            metadata["rate_limit_window_ms"] = String(Self.milliseconds(from: minimumInterval))
         }
         rateLimitStates[key] = RateLimitState(lastEmittedAt: now, suppressedCount: 0)
 
@@ -183,5 +183,19 @@ public actor StructuredLogger {
             metadata: mergedMetadata
         )
         await sink.write(envelope)
+    }
+
+    private static func milliseconds(from interval: TimeInterval) -> Int {
+        guard interval.isFinite, interval > 0 else {
+            return 0
+        }
+        let milliseconds = (interval * 1_000).rounded()
+        guard milliseconds.isFinite else {
+            return Int.max
+        }
+        if milliseconds >= Double(Int.max) {
+            return Int.max
+        }
+        return Int(milliseconds)
     }
 }

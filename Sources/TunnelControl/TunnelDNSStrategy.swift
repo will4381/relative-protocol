@@ -4,36 +4,41 @@ import Foundation
 public enum TunnelDNSStrategy: Sendable, Equatable {
     case cleartext(
         servers: [String],
-        matchDomains: [String]? = nil,
-        matchDomainsNoSearch: Bool = false,
+        matchDomains: [String]? = [""],
+        matchDomainsNoSearch: Bool = true,
         allowFailover: Bool = false
     )
     case tls(
         servers: [String],
         serverName: String,
-        matchDomains: [String]? = nil,
-        matchDomainsNoSearch: Bool = false,
+        matchDomains: [String]? = [""],
+        matchDomainsNoSearch: Bool = true,
         allowFailover: Bool = false
     )
     case https(
         servers: [String],
         serverURL: String,
-        matchDomains: [String]? = nil,
-        matchDomainsNoSearch: Bool = false,
+        matchDomains: [String]? = [""],
+        matchDomainsNoSearch: Bool = true,
         allowFailover: Bool = false
     )
     case noOverride
 
-    /// Dual-stack Cloudflare resolver set with IPv4 primary/secondary and IPv6 counterparts.
+    /// Dual-stack Cloudflare resolver set with IPv6 primary/secondary and IPv4 fallbacks.
     public static let defaultPublicResolvers = [
-        "1.1.1.1",
-        "1.0.0.1",
         "2606:4700:4700::1111",
-        "2606:4700:4700::1001"
+        "2606:4700:4700::1001",
+        "1.1.1.1",
+        "1.0.0.1"
     ]
 
-    /// Compatibility-first default that preserves the system resolver path.
-    public static let recommendedDefault = TunnelDNSStrategy.noOverride
+    /// Full-tunnel default that installs package-owned resolvers for all DNS queries.
+    public static let recommendedDefault = TunnelDNSStrategy.cleartext(
+        servers: defaultPublicResolvers,
+        matchDomains: [""],
+        matchDomainsNoSearch: true,
+        allowFailover: false
+    )
 
     /// Resolver IPs associated with the strategy. `noOverride` returns an empty list.
     public var servers: [String] {

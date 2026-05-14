@@ -47,7 +47,7 @@ typedef struct rbpi_fast_packet_s {
     uint16_t source_port;
     uint16_t destination_port;
     uint16_t transport_payload_offset;
-    uint16_t reserved1;
+    uint16_t transport_payload_length;
     uint32_t packet_length;
     uint32_t quic_version;
     uint64_t flow_hash;

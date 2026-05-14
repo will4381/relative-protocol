@@ -1,5 +1,9 @@
-import Darwin
 import Foundation
+#if os(Linux)
+import Glibc
+#else
+import Darwin
+#endif
 
 /// Stable flow identity used by burst tracking, aggregation, and live-tap grouping.
 /// Decision: production traffic uses the numeric path so packet accounting can stay allocation-light,
@@ -213,8 +217,19 @@ public struct FlowKey: Hashable, Sendable, Codable {
 
         if length == 4 {
             var address = in_addr()
-            _ = bytes.withUnsafeBytes { rawBuffer in
-                memcpy(&address, rawBuffer.baseAddress!.advanced(by: 12), 4)
+            var didCopyAddress = false
+            withUnsafeMutableBytes(of: &address) { addressBuffer in
+                bytes.withUnsafeBytes { rawBuffer in
+                    guard let destination = addressBuffer.baseAddress,
+                          let source = rawBuffer.baseAddress?.advanced(by: 12) else {
+                        return
+                    }
+                    memcpy(destination, source, 4)
+                    didCopyAddress = true
+                }
+            }
+            guard didCopyAddress else {
+                return ""
             }
             var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
             let result = withUnsafePointer(to: &address) {
@@ -224,8 +239,19 @@ public struct FlowKey: Hashable, Sendable, Codable {
         }
 
         var address = in6_addr()
-        _ = bytes.withUnsafeBytes { rawBuffer in
-            memcpy(&address, rawBuffer.baseAddress!, 16)
+        var didCopyAddress = false
+        withUnsafeMutableBytes(of: &address) { addressBuffer in
+            bytes.withUnsafeBytes { rawBuffer in
+                guard let destination = addressBuffer.baseAddress,
+                      let source = rawBuffer.baseAddress else {
+                    return
+                }
+                memcpy(destination, source, 16)
+                didCopyAddress = true
+            }
+        }
+        guard didCopyAddress else {
+            return ""
         }
         var buffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
         let result = withUnsafePointer(to: &address) {
@@ -296,9 +322,9 @@ public final class BurstTracker: @unchecked Sendable {
             return nil
         }
 
-        let deltaMs = Int((now.timeIntervalSince(previous) * 1000).rounded())
+        let deltaMs = millisecondsBetween(previous, and: now)
         if deltaMs <= thresholdMs {
-            burstCounts[flow, default: 1] += 1
+            burstCounts[flow] = saturatingAdd(burstCounts[flow, default: 1], 1)
             return nil
         }
 
@@ -379,4 +405,24 @@ public final class BurstTracker: @unchecked Sendable {
 
         arrivalQueue = ArraySlice(activeQueue)
     }
+}
+
+private func millisecondsBetween(_ earlier: Date, and later: Date) -> Int {
+    let elapsed = later.timeIntervalSince(earlier)
+    guard elapsed.isFinite, elapsed > 0 else {
+        return 0
+    }
+    let milliseconds = (elapsed * 1_000).rounded()
+    guard milliseconds.isFinite else {
+        return Int.max
+    }
+    if milliseconds >= Double(Int.max) {
+        return Int.max
+    }
+    return Int(milliseconds)
+}
+
+private func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
+    let (value, overflow) = lhs.addingReportingOverflow(rhs)
+    return overflow ? Int.max : value
 }

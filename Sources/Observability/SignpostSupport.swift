@@ -1,5 +1,10 @@
 import Foundation
+#if canImport(os)
 import os
+#else
+/// Portable placeholder for Apple signpost interval state on platforms without the `os` module.
+public struct OSSignpostIntervalState: Sendable {}
+#endif
 
 /// Named signpost intervals required for runtime performance inspection.
 public enum SignpostName: String, Sendable, CaseIterable {
@@ -12,15 +17,22 @@ public enum SignpostName: String, Sendable, CaseIterable {
 
 /// Lightweight signpost facade that allows callers to avoid direct OSSignposter usage.
 public final class SignpostSupport: @unchecked Sendable {
+#if canImport(os)
     // Docs: https://developer.apple.com/documentation/os/ossignposter
     private let signposter: OSSignposter
+#endif
 
     /// Creates a signposter scoped to `subsystem` and `category`.
     /// - Parameters:
     ///   - subsystem: Unified logging subsystem identifier.
     ///   - category: Unified logging category used for signposts.
     public init(subsystem: String, category: String) {
+#if canImport(os)
         self.signposter = OSSignposter(subsystem: subsystem, category: category)
+#else
+        _ = subsystem
+        _ = category
+#endif
     }
 
     // Docs: https://developer.apple.com/documentation/os/ossignposter/begininterval(_:id:_:)
@@ -31,10 +43,16 @@ public final class SignpostSupport: @unchecked Sendable {
     /// - Returns: Interval state token used to finish the interval, or `nil` when signposting is disabled.
     @discardableResult
     public func begin(_ name: SignpostName, message: String = "") -> OSSignpostIntervalState? {
+#if canImport(os)
         guard signposter.isEnabled else {
             return nil
         }
         return signposter.beginInterval(name.staticName, "\(message, privacy: .public)")
+#else
+        _ = name
+        _ = message
+        return nil
+#endif
     }
 
     // Docs: https://developer.apple.com/documentation/os/ossignposter/endinterval(_:_:_:)
@@ -44,10 +62,16 @@ public final class SignpostSupport: @unchecked Sendable {
     ///   - state: State token returned by `begin`.
     ///   - message: Optional public message attached to interval end.
     public func end(_ name: SignpostName, state: OSSignpostIntervalState?, message: String = "") {
+#if canImport(os)
         guard let state else {
             return
         }
         signposter.endInterval(name.staticName, state, "\(message, privacy: .public)")
+#else
+        _ = name
+        _ = state
+        _ = message
+#endif
     }
 
     // Docs: https://developer.apple.com/documentation/os/ossignposter/emitevent(_:id:_:)
@@ -56,13 +80,19 @@ public final class SignpostSupport: @unchecked Sendable {
     ///   - name: Stable event name.
     ///   - message: Optional public message attached to the event.
     public func emit(_ name: SignpostName, message: String = "") {
+#if canImport(os)
         guard signposter.isEnabled else {
             return
         }
         signposter.emitEvent(name.staticName, "\(message, privacy: .public)")
+#else
+        _ = name
+        _ = message
+#endif
     }
 }
 
+#if canImport(os)
 private extension SignpostName {
     var staticName: StaticString {
         switch self {
@@ -79,3 +109,4 @@ private extension SignpostName {
         }
     }
 }
+#endif

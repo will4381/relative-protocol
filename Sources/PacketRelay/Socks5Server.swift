@@ -47,15 +47,61 @@ private func pathSummary(_ path: Network.NWPath?) -> String {
     return "status=\(pathStatusName(path.status)) uses=\(uses.joined(separator: ",")) available=\(available) expensive=\(path.isExpensive) constrained=\(path.isConstrained) ipv4=\(path.supportsIPv4) ipv6=\(path.supportsIPv6)"
 }
 
+private func endpointHostKind(_ host: String) -> String {
+    if IPv4Address(host) != nil {
+        return "ipv4"
+    }
+    if IPv6Address(host) != nil {
+        return "ipv6"
+    }
+    return "domain"
+}
+
+private func relayDestinationMetadata(
+    host: String,
+    port: String,
+    transport: String,
+    tls: Bool? = nil
+) -> [String: String] {
+    var metadata = [
+        "destination_host": host,
+        "destination_port": port,
+        "destination_host_kind": endpointHostKind(host),
+        "destination_transport": transport
+    ]
+    if let tls {
+        metadata["destination_tls"] = String(tls)
+    }
+    return metadata
+}
+
 private func durationMilliseconds(_ duration: TimeInterval) -> Int {
-    max(0, Int((duration * 1000).rounded()))
+    guard duration.isFinite, duration > 0 else {
+        return 0
+    }
+    return clampedMilliseconds(duration)
 }
 
 private func elapsedMilliseconds(since startedAt: Date?, now: Date = Date()) -> Int? {
     guard let startedAt else {
         return nil
     }
-    return max(0, Int((now.timeIntervalSince(startedAt) * 1000).rounded()))
+    let elapsed = now.timeIntervalSince(startedAt)
+    guard elapsed.isFinite, elapsed > 0 else {
+        return 0
+    }
+    return clampedMilliseconds(elapsed)
+}
+
+private func clampedMilliseconds(_ interval: TimeInterval) -> Int {
+    let milliseconds = (interval * 1_000).rounded()
+    guard milliseconds.isFinite else {
+        return Int.max
+    }
+    if milliseconds >= Double(Int.max) {
+        return Int.max
+    }
+    return Int(milliseconds)
 }
 
 private extension Result where Success == Void, Failure == Error {
@@ -453,6 +499,7 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
     private let logger: StructuredLogger
     private let policy: TCPConnectRetryPolicy
     private let pathSettings: Socks5TCPPathSettings
+    private let endpointMetadata: [String: String]
     private let makeAttempt: (_ attemptIndex: Int) -> Socks5PathAwareTCPOutbound
 
     private var readyHandlers: [(@Sendable (Result<Void, Error>) -> Void)] = []
@@ -474,12 +521,14 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
         logger: StructuredLogger,
         policy: TCPConnectRetryPolicy = .default,
         pathSettings: Socks5TCPPathSettings = .default,
+        endpointMetadata: [String: String] = [:],
         makeAttempt: @escaping (_ attemptIndex: Int) -> Socks5PathAwareTCPOutbound
     ) {
         self.queue = queue
         self.logger = logger
         self.policy = policy
         self.pathSettings = pathSettings
+        self.endpointMetadata = endpointMetadata
         self.makeAttempt = makeAttempt
     }
 
@@ -937,7 +986,7 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
         message: String,
         extraMetadata: [String: String]
     ) {
-        var metadata = extraMetadata
+        var metadata = endpointMetadata.merging(extraMetadata) { _, new in new }
         if let attemptElapsed = elapsedMilliseconds(since: currentAttemptStartedAt) {
             metadata["attempt_elapsed_ms"] = String(attemptElapsed)
         }
@@ -970,7 +1019,7 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
         message: String,
         extraMetadata: [String: String]
     ) {
-        var metadata = extraMetadata
+        var metadata = endpointMetadata.merging(extraMetadata) { _, new in new }
         if let attemptElapsed = elapsedMilliseconds(since: currentAttemptStartedAt, now: now) {
             metadata["attempt_elapsed_ms"] = String(attemptElapsed)
         }
@@ -1001,6 +1050,7 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
 
     private let connection: NWConnection
     private let logger: StructuredLogger
+    private let endpointMetadata: [String: String]
     private var readHandler: (@Sendable (Data?, Error?) -> Void)?
     private var isCancelled = false
     var eventHandler: ((Socks5UDPSessionEvent) -> Void)?
@@ -1009,9 +1059,16 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
     ///   - connection: Outbound UDP connection.
     ///   - queue: Queue used for callback delivery.
     ///   - logger: Structured logger for state changes.
-    init(_ connection: NWConnection, queue: DispatchQueue, logger: StructuredLogger) {
+    ///   - endpointMetadata: Redactable destination metadata for diagnostics.
+    init(
+        _ connection: NWConnection,
+        queue: DispatchQueue,
+        logger: StructuredLogger,
+        endpointMetadata: [String: String] = [:]
+    ) {
         self.connection = connection
         self.logger = logger
+        self.endpointMetadata = endpointMetadata
         connection.stateUpdateHandler = { [weak self] state in
             self?.handleState(state)
         }
@@ -1067,6 +1124,8 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
             let path = pathSummary(connection.currentPath)
             let errorDescription = error.localizedDescription
             eventHandler?(.waiting)
+            var metadata = endpointMetadata
+            metadata["path"] = path
             Task {
                 await logger.logRateLimited(
                     key: "NWConnectionUDPSessionAdapter.waiting.\(errorDescription).\(path)",
@@ -1078,13 +1137,15 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
                     event: "waiting",
                     errorCode: errorDescription,
                     message: "Outbound UDP waiting",
-                    metadata: ["path": path]
+                    metadata: metadata
                 )
             }
         case .failed(let error):
             let path = pathSummary(connection.currentPath)
             let errorDescription = error.localizedDescription
             eventHandler?(.failed)
+            var metadata = endpointMetadata
+            metadata["path"] = path
             Task {
                 await logger.log(
                     level: .error,
@@ -1094,7 +1155,7 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
                     event: "failed",
                     errorCode: errorDescription,
                     message: "Outbound UDP failed",
-                    metadata: ["path": path]
+                    metadata: metadata
                 )
             }
         default:
@@ -1105,6 +1166,8 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
     private func handlePathUpdate(_ path: Network.NWPath) {
         let summary = pathSummary(path)
         let status = pathStatusName(path.status)
+        var metadata = endpointMetadata
+        metadata["path"] = summary
         Task {
             await logger.log(
                 level: .debug,
@@ -1114,7 +1177,7 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
                 event: "path-update",
                 result: status,
                 message: "Outbound UDP path updated",
-                metadata: ["path": summary]
+                metadata: metadata
             )
         }
     }
@@ -1122,6 +1185,8 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
     private func handleViabilityUpdate(_ isViable: Bool) {
         let path = pathSummary(connection.currentPath)
         eventHandler?(.viabilityChanged(isViable))
+        var metadata = endpointMetadata
+        metadata["path"] = path
         Task {
             await logger.log(
                 level: .debug,
@@ -1131,7 +1196,7 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
                 event: "viability-update",
                 result: isViable ? "viable" : "not-viable",
                 message: "Outbound UDP viability changed",
-                metadata: ["path": path]
+                metadata: metadata
             )
         }
     }
@@ -1142,6 +1207,8 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
         }
         let path = pathSummary(connection.currentPath)
         eventHandler?(.betterPathAvailable)
+        var metadata = endpointMetadata
+        metadata["path"] = path
         Task {
             await logger.log(
                 level: .debug,
@@ -1151,7 +1218,7 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
                 event: "better-path-available",
                 result: "preferred-path",
                 message: "Outbound UDP has a better path available",
-                metadata: ["path": path]
+                metadata: metadata
             )
         }
     }
@@ -1217,7 +1284,17 @@ final class PacketTunnelProviderAdapter: @unchecked Sendable, Socks5FullConnecti
             return InvalidEndpointTCPOutbound(logger: logger, hostname: endpoint.hostname, port: endpoint.port)
         }
 
-        return RetryingTCPOutbound(queue: queue, logger: logger, pathSettings: tcpPathSettings) { _ in
+        return RetryingTCPOutbound(
+            queue: queue,
+            logger: logger,
+            pathSettings: tcpPathSettings,
+            endpointMetadata: relayDestinationMetadata(
+                host: endpoint.hostname,
+                port: endpoint.port,
+                transport: "tcp",
+                tls: enableTLS
+            )
+        ) { _ in
             return self.makeSingleNWConnection(host: endpoint.hostname, port: port, enableTLS: enableTLS)
         }
     }
@@ -1239,7 +1316,16 @@ final class PacketTunnelProviderAdapter: @unchecked Sendable, Socks5FullConnecti
 
         let host = NWEndpoint.Host(endpoint.hostname)
         let connection = NWConnection(host: host, port: port, using: parameters)
-        return NWConnectionUDPSessionAdapter(connection, queue: queue, logger: logger)
+        return NWConnectionUDPSessionAdapter(
+            connection,
+            queue: queue,
+            logger: logger,
+            endpointMetadata: relayDestinationMetadata(
+                host: endpoint.hostname,
+                port: endpoint.port,
+                transport: "udp"
+            )
+        )
     }
 
     private func makeSingleNWConnection(host: String, port: Network.NWEndpoint.Port, enableTLS: Bool) -> Socks5PathAwareTCPOutbound {
@@ -1712,7 +1798,8 @@ final class Socks5TCPForwardUDPRelay: @unchecked Sendable {
                         component: "Socks5TCPForwardUDPRelay",
                         event: "write-failed",
                         errorCode: String(describing: error),
-                        message: "TCP-carried UDP relay write failed"
+                        message: "TCP-carried UDP relay write failed",
+                        metadata: Self.destinationMetadata(for: key)
                     )
                 }
             }
@@ -1782,7 +1869,8 @@ final class Socks5TCPForwardUDPRelay: @unchecked Sendable {
                             component: "Socks5TCPForwardUDPRelay",
                             event: "read-failed",
                             errorCode: String(describing: error),
-                            message: "TCP-carried UDP relay read failed"
+                            message: "TCP-carried UDP relay read failed",
+                            metadata: Self.destinationMetadata(for: key)
                         )
                     }
                     return
@@ -1818,9 +1906,23 @@ final class Socks5TCPForwardUDPRelay: @unchecked Sendable {
                 component: "Socks5TCPForwardUDPRelay",
                 event: "session-replacement-scheduled",
                 result: reason,
-                message: "Scheduled TCP-carried UDP session replacement after Network.framework path signal"
+                message: "Scheduled TCP-carried UDP session replacement after Network.framework path signal",
+                metadata: Self.destinationMetadata(for: key)
             )
         }
+    }
+
+    private static func destinationMetadata(for key: SessionKey) -> [String: String] {
+        let host: String
+        switch key.address {
+        case .ipv4(let value), .ipv6(let value), .domain(let value):
+            host = value
+        }
+        return relayDestinationMetadata(
+            host: host,
+            port: String(key.port),
+            transport: "udp-over-tcp"
+        )
     }
 
     private func removeSession(for key: SessionKey) {
@@ -1878,6 +1980,8 @@ final class Socks5Connection: @unchecked Sendable {
     private var outboundReadArmed = false
     private var outboundWriteInFlight = false
     private var inboundSendInFlight = false
+    private var udpForwardReplyInFlight = false
+    private var activeTCPDestinationMetadata: [String: String] = [:]
 
     var onClose: (() -> Void)?
 
@@ -1967,7 +2071,7 @@ final class Socks5Connection: @unchecked Sendable {
         }
 
         inboundReceiveArmed = true
-        connection.receive(minimumIncompleteLength: 1, maximumLength: max(65_535, mtu + 256)) { [weak self] data, _, isComplete, error in
+        connection.receive(minimumIncompleteLength: 1, maximumLength: inboundReceiveMaximumLength) { [weak self] data, _, isComplete, error in
             guard let self else { return }
             self.runOnQueue {
                 guard !self.isClosed else { return }
@@ -1995,6 +2099,11 @@ final class Socks5Connection: @unchecked Sendable {
         }
     }
 
+    private var inboundReceiveMaximumLength: Int {
+        let clampedMTU = min(max(0, mtu), 65_535)
+        return max(65_535, clampedMTU + 256)
+    }
+
     private var shouldReadInbound: Bool {
         switch state {
         case .connectingTCP:
@@ -2012,18 +2121,22 @@ final class Socks5Connection: @unchecked Sendable {
             guard let methods = Socks5Codec.parseGreeting(&buffer) else { return }
             let method: UInt8 = methods.contains(0x00) ? 0x00 : 0xFF
             connection.send(content: Socks5Codec.buildMethodSelection(method: method), completion: .contentProcessed { [weak self] error in
-                guard let self, let error else { return }
+                guard let self else { return }
                 self.runOnQueue {
                     guard !self.isClosed else { return }
-                    self.logInboundWriteFailure(error, event: "greeting-write-failed", message: "SOCKS5 greeting reply write failed")
-                    self.stop()
+                    if let error {
+                        self.logInboundWriteFailure(error, event: "greeting-write-failed", message: "SOCKS5 greeting reply write failed")
+                        self.stop()
+                        return
+                    }
+                    if method == 0xFF {
+                        self.stop()
+                    }
                 }
             })
             if method == 0x00 {
                 state = .request
                 processBuffer()
-            } else {
-                stop()
             }
         case .request:
             if let failureCode = Socks5Codec.requestFailureReplyCode(buffer) {
@@ -2049,6 +2162,9 @@ final class Socks5Connection: @unchecked Sendable {
         case .udpProxy:
             buffer.removeAll()
         case .udpForward(let relay):
+            guard !udpForwardReplyInFlight else {
+                return
+            }
             guard relay.handleInboundBuffer(&buffer) else {
                 Task {
                     await logger.log(
@@ -2067,7 +2183,8 @@ final class Socks5Connection: @unchecked Sendable {
     }
 
     private func admitInboundBufferBytes(_ byteCount: Int) -> Bool {
-        guard buffer.count + byteCount <= ConnectionPolicy.maxBufferedBytes else {
+        let remainingCapacity = max(0, ConnectionPolicy.maxBufferedBytes - buffer.count)
+        guard byteCount <= remainingCapacity else {
             Task {
                 await logger.log(
                     level: .warning,
@@ -2112,6 +2229,11 @@ final class Socks5Connection: @unchecked Sendable {
 
         let endpoint = NWHostEndpoint(hostname: host, port: String(request.port))
         let outbound = provider.makeTCPConnection(to: endpoint, enableTLS: false, tlsParameters: nil, delegate: nil)
+        activeTCPDestinationMetadata = relayDestinationMetadata(
+            host: host,
+            port: String(request.port),
+            transport: "tcp"
+        )
 
         state = .connectingTCP(outbound)
         outbound.waitUntilReady { [weak self] result in
@@ -2156,7 +2278,13 @@ final class Socks5Connection: @unchecked Sendable {
                             component: "Socks5Connection",
                             event: "outbound-connect-failed",
                             errorCode: error.localizedDescription,
-                            message: "SOCKS5 outbound connect failed"
+                            message: "SOCKS5 outbound connect failed",
+                            metadata: [
+                                "destination_host": host,
+                                "destination_port": String(request.port),
+                                "destination_host_kind": endpointHostKind(host),
+                                "destination_transport": "tcp"
+                            ]
                         )
                     }
                     self.sendFailure(replyCode: 0x05)
@@ -2201,6 +2329,7 @@ final class Socks5Connection: @unchecked Sendable {
 
     private func logOutboundReadError(_ error: any Error) {
         let benignRemoteClose = Self.isBenignOutboundReadClose(error)
+        let metadata = activeTCPDestinationMetadata
         Task {
             await logger.log(
                 level: benignRemoteClose ? .notice : .error,
@@ -2209,17 +2338,26 @@ final class Socks5Connection: @unchecked Sendable {
                 component: "Socks5Connection",
                 event: benignRemoteClose ? "outbound-read-closed" : "outbound-read-failed",
                 errorCode: error.localizedDescription,
-                message: benignRemoteClose ? "SOCKS5 outbound read closed" : "SOCKS5 outbound read failed"
+                message: benignRemoteClose ? "SOCKS5 outbound read closed" : "SOCKS5 outbound read failed",
+                metadata: metadata
             )
         }
     }
 
     private static func isBenignOutboundReadClose(_ error: any Error) -> Bool {
-        guard let nwError = error as? NWError,
-              case .posix(let code) = nwError else {
+        if let nwError = error as? NWError,
+           case .posix(let code) = nwError {
+            return code == .ENOMSG
+        }
+
+        let nsError = error as NSError
+        guard nsError.domain == "Network.NWError" else {
             return false
         }
-        return code == .ENOMSG
+        if nsError.code == Int(POSIXErrorCode.ENOMSG.rawValue) {
+            return true
+        }
+        return nsError.localizedDescription.localizedCaseInsensitiveContains("No message")
     }
 
     private func forwardToOutbound(_ data: Data, outbound: Socks5TCPOutbound) {
@@ -2321,7 +2459,18 @@ final class Socks5Connection: @unchecked Sendable {
             state = .udpProxy(relay)
             connection.send(
                 content: Socks5Codec.buildReply(code: 0x00, bindAddress: .ipv4("127.0.0.1"), bindPort: relay.port),
-                completion: .contentProcessed { _ in }
+                completion: .contentProcessed { [weak self] error in
+                    guard let self, let error else { return }
+                    self.runOnQueue {
+                        guard !self.isClosed else { return }
+                        self.logInboundWriteFailure(
+                            error,
+                            event: "udp-associate-reply-write-failed",
+                            message: "SOCKS5 UDP ASSOCIATE success reply write failed"
+                        )
+                        self.stop()
+                    }
+                }
             )
         } catch {
             Task {
@@ -2365,29 +2514,47 @@ final class Socks5Connection: @unchecked Sendable {
         )
 
         state = .udpForward(relay)
+        udpForwardReplyInFlight = true
         connection.send(
             content: Socks5Codec.buildReply(code: 0x00, bindAddress: .ipv4("0.0.0.0"), bindPort: 0),
             completion: .contentProcessed { [weak self] error in
-                guard let self, let error else { return }
+                guard let self else { return }
                 self.runOnQueue {
                     guard !self.isClosed else { return }
-                    self.logInboundWriteFailure(
-                        error,
-                        event: "udp-forward-reply-write-failed",
-                        message: "SOCKS5 TCP-carried UDP success reply write failed"
-                    )
-                    self.stop()
+                    self.udpForwardReplyInFlight = false
+                    if let error {
+                        self.logInboundWriteFailure(
+                            error,
+                            event: "udp-forward-reply-write-failed",
+                            message: "SOCKS5 TCP-carried UDP success reply write failed"
+                        )
+                        self.stop()
+                        return
+                    }
+                    self.processBuffer()
+                    self.armInboundReceiveIfNeeded()
                 }
             }
         )
-        processBuffer()
     }
 
     private func sendFailure(replyCode: UInt8 = 0x01) {
         connection.send(
             content: Socks5Codec.buildReply(code: replyCode, bindAddress: .ipv4("0.0.0.0"), bindPort: 0),
-            completion: .contentProcessed { _ in }
+            completion: .contentProcessed { [weak self] error in
+                guard let self else { return }
+                self.runOnQueue {
+                    guard !self.isClosed else { return }
+                    if let error {
+                        self.logInboundWriteFailure(
+                            error,
+                            event: "failure-reply-write-failed",
+                            message: "SOCKS5 failure reply write failed"
+                        )
+                    }
+                    self.stop()
+                }
+            }
         )
-        stop()
     }
 }

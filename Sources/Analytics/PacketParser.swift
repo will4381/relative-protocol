@@ -2,9 +2,15 @@
 // See LICENSE for terms.
 // Created by Will Kusch 1/23/26
 
-import CryptoKit
-import Darwin
 import Foundation
+#if canImport(CryptoKit)
+import CryptoKit
+#endif
+#if os(Linux)
+import Glibc
+#else
+import Darwin
+#endif
 
 /// Deep packet parser for IPv4/IPv6, DNS, TLS SNI, and QUIC metadata.
 /// Parser is intentionally allocation-light and returns `nil` for malformed/unsupported frames.
@@ -42,12 +48,26 @@ public enum PacketParser {
         guard version == 4 else { return nil }
         let ihl = Int(versionAndIHL & 0x0F) * 4
         guard ihl >= 20, data.count >= ihl else { return nil }
+        let declaredLength = Int(readUInt16(data, offset: 2))
+        guard declaredLength >= ihl, declaredLength <= data.count else { return nil }
+        let packet = declaredLength == data.count ? data : Data(data.prefix(declaredLength))
 
-        let protocolByte = data[data.startIndex + 9]
+        let protocolByte = packet[packet.startIndex + 9]
         let transport = TransportProtocol(rawValue: protocolByte)
-        guard let srcAddress = readIPAddress(data, offset: 12, length: 4),
-              let dstAddress = readIPAddress(data, offset: 16, length: 4) else {
+        guard let srcAddress = readIPAddress(packet, offset: 12, length: 4),
+              let dstAddress = readIPAddress(packet, offset: 16, length: 4) else {
             return nil
+        }
+        let fragmentField = readUInt16(packet, offset: 6)
+        let fragmentOffset = fragmentField & 0x1FFF
+        if fragmentOffset != 0 {
+            return bareMetadata(
+                ipVersion: .v4,
+                transport: transport,
+                srcAddress: srcAddress,
+                dstAddress: dstAddress,
+                length: packet.count
+            )
         }
 
         var srcPort: UInt16?
@@ -63,15 +83,20 @@ public enum PacketParser {
         var quicSourceConnectionId: String?
 
         if transport == .tcp || transport == .udp {
-            guard data.count >= ihl + 4 else { return nil }
-            srcPort = readUInt16(data, offset: ihl)
-            dstPort = readUInt16(data, offset: ihl + 2)
+            guard packet.count >= ihl + 4 else { return nil }
+            srcPort = readUInt16(packet, offset: ihl)
+            dstPort = readUInt16(packet, offset: ihl + 2)
 
             if transport == .udp {
+                guard packet.count >= ihl + 8 else { return nil }
+                let udpLength = Int(readUInt16(packet, offset: ihl + 4))
+                guard udpLength >= 8, ihl + udpLength <= packet.count else { return nil }
+                let udpPacketEnd = ihl + udpLength
+                let boundedTransportPacket = udpPacketEnd == packet.count ? packet : Data(packet.prefix(udpPacketEnd))
                 if let srcPort, let dstPort, (srcPort == dnsPort || dstPort == dnsPort) {
                     let payloadOffset = ihl + 8
-                    if data.count > payloadOffset {
-                        let dnsInfo = parseDNSInfo(data, payloadOffset: payloadOffset)
+                    if udpPacketEnd > payloadOffset {
+                        let dnsInfo = parseDNSInfo(boundedTransportPacket, payloadOffset: payloadOffset)
                         dnsQuery = dnsInfo.query
                         dnsCname = dnsInfo.cname
                         dnsAnswers = dnsInfo.answers.isEmpty ? nil : dnsInfo.answers
@@ -80,7 +105,7 @@ public enum PacketParser {
 
                 if let srcPort, let dstPort, (srcPort == 443 || dstPort == 443) {
                     let payloadOffset = ihl + 8
-                    if data.count > payloadOffset, let quicInfo = parseQuicHeader(data, payloadOffset: payloadOffset) {
+                    if udpPacketEnd > payloadOffset, let quicInfo = parseQuicHeader(boundedTransportPacket, payloadOffset: payloadOffset) {
                         quicVersion = quicInfo.version
                         quicPacketType = mapQuicPacketType(version: quicInfo.version, packetType: quicInfo.packetType)
                         quicDestinationConnectionId = quicInfo.dcid
@@ -90,7 +115,7 @@ public enum PacketParser {
                            let quicVersion = quicInfo.version,
                            let dcidData = quicInfo.dcidData {
                             tlsServerName = decryptQuicInitialServerName(
-                                data,
+                                boundedTransportPacket,
                                 payloadOffset: payloadOffset,
                                 version: quicVersion,
                                 dcid: dcidData
@@ -99,11 +124,11 @@ public enum PacketParser {
                     }
                 }
             } else if transport == .tcp {
-                if data.count > ihl + 13 {
-                    let dataOffset = Int((data[data.startIndex + ihl + 12] >> 4) * 4)
+                if packet.count > ihl + 13 {
+                    let dataOffset = Int((packet[packet.startIndex + ihl + 12] >> 4) * 4)
                     let payloadOffset = ihl + dataOffset
-                    if dataOffset >= 20, data.count > payloadOffset {
-                        tlsServerName = parseTLSServerName(data, payloadOffset: payloadOffset)
+                    if dataOffset >= 20, packet.count > payloadOffset {
+                        tlsServerName = parseTLSServerName(packet, payloadOffset: payloadOffset)
                     }
                 }
             }
@@ -118,7 +143,7 @@ public enum PacketParser {
             dstAddress: dstAddress,
             srcPort: srcPort,
             dstPort: dstPort,
-            length: data.count,
+            length: packet.count,
             dnsQueryName: dnsQuery,
             dnsCname: dnsCname,
             dnsAnswerAddresses: dnsAnswers,
@@ -135,26 +160,42 @@ public enum PacketParser {
         guard data.count >= 40 else { return nil }
         let version = data[data.startIndex] >> 4
         guard version == 6 else { return nil }
+        let payloadLength = Int(readUInt16(data, offset: 4))
+        let declaredLength = payloadLength == 0 ? data.count : 40 + payloadLength
+        guard declaredLength >= 40, declaredLength <= data.count else { return nil }
+        let packet = declaredLength == data.count ? data : Data(data.prefix(declaredLength))
 
-        var nextHeader = data[data.startIndex + 6]
+        var nextHeader = packet[packet.startIndex + 6]
         var offset = 40
 
-        guard let srcAddress = readIPAddress(data, offset: 8, length: 16),
-              let dstAddress = readIPAddress(data, offset: 24, length: 16) else {
+        guard let srcAddress = readIPAddress(packet, offset: 8, length: 16),
+              let dstAddress = readIPAddress(packet, offset: 24, length: 16) else {
             return nil
         }
 
         var extensionsSeen = 0
         while isIPv6ExtensionHeader(nextHeader) && extensionsSeen < maxIPv6Extensions {
-            guard data.count >= offset + 2 else { return nil }
+            guard packet.count >= offset + 2 else { return nil }
             let currentHeader = nextHeader
-            nextHeader = data[data.startIndex + offset]
-            let lengthField = data[data.startIndex + offset + 1]
+            nextHeader = packet[packet.startIndex + offset]
+            let lengthField = packet[packet.startIndex + offset + 1]
 
             let headerLength: Int
             switch currentHeader {
             case 44: // Fragment
+                guard packet.count >= offset + 8 else { return nil }
+                let fragmentField = readUInt16(packet, offset: offset + 2)
+                let fragmentOffset = fragmentField >> 3
                 headerLength = 8
+                if fragmentOffset != 0 {
+                    return bareMetadata(
+                        ipVersion: .v6,
+                        transport: TransportProtocol(rawValue: nextHeader),
+                        srcAddress: srcAddress,
+                        dstAddress: dstAddress,
+                        length: packet.count
+                    )
+                }
             case 51: // AH
                 headerLength = (Int(lengthField) + 2) * 4
             case 50: // ESP
@@ -165,7 +206,7 @@ public enum PacketParser {
                     dstAddress: dstAddress,
                     srcPort: nil,
                     dstPort: nil,
-                    length: data.count,
+                    length: packet.count,
                     dnsQueryName: nil,
                     dnsCname: nil,
                     dnsAnswerAddresses: nil,
@@ -182,7 +223,7 @@ public enum PacketParser {
 
             offset += headerLength
             extensionsSeen += 1
-            guard data.count >= offset else { return nil }
+            guard packet.count >= offset else { return nil }
         }
 
         let transport = TransportProtocol(rawValue: nextHeader)
@@ -199,15 +240,20 @@ public enum PacketParser {
         var quicSourceConnectionId: String?
 
         if transport == .tcp || transport == .udp {
-            guard data.count >= offset + 4 else { return nil }
-            srcPort = readUInt16(data, offset: offset)
-            dstPort = readUInt16(data, offset: offset + 2)
+            guard packet.count >= offset + 4 else { return nil }
+            srcPort = readUInt16(packet, offset: offset)
+            dstPort = readUInt16(packet, offset: offset + 2)
 
             if transport == .udp {
+                guard packet.count >= offset + 8 else { return nil }
+                let udpLength = Int(readUInt16(packet, offset: offset + 4))
+                guard udpLength >= 8, offset + udpLength <= packet.count else { return nil }
+                let udpPacketEnd = offset + udpLength
+                let boundedTransportPacket = udpPacketEnd == packet.count ? packet : Data(packet.prefix(udpPacketEnd))
                 if let srcPort, let dstPort, (srcPort == dnsPort || dstPort == dnsPort) {
                     let payloadOffset = offset + 8
-                    if data.count > payloadOffset {
-                        let dnsInfo = parseDNSInfo(data, payloadOffset: payloadOffset)
+                    if udpPacketEnd > payloadOffset {
+                        let dnsInfo = parseDNSInfo(boundedTransportPacket, payloadOffset: payloadOffset)
                         dnsQuery = dnsInfo.query
                         dnsCname = dnsInfo.cname
                         dnsAnswers = dnsInfo.answers.isEmpty ? nil : dnsInfo.answers
@@ -216,7 +262,7 @@ public enum PacketParser {
 
                 if let srcPort, let dstPort, (srcPort == 443 || dstPort == 443) {
                     let payloadOffset = offset + 8
-                    if data.count > payloadOffset, let quicInfo = parseQuicHeader(data, payloadOffset: payloadOffset) {
+                    if udpPacketEnd > payloadOffset, let quicInfo = parseQuicHeader(boundedTransportPacket, payloadOffset: payloadOffset) {
                         quicVersion = quicInfo.version
                         quicPacketType = mapQuicPacketType(version: quicInfo.version, packetType: quicInfo.packetType)
                         quicDestinationConnectionId = quicInfo.dcid
@@ -226,7 +272,7 @@ public enum PacketParser {
                            let quicVersion = quicInfo.version,
                            let dcidData = quicInfo.dcidData {
                             tlsServerName = decryptQuicInitialServerName(
-                                data,
+                                boundedTransportPacket,
                                 payloadOffset: payloadOffset,
                                 version: quicVersion,
                                 dcid: dcidData
@@ -235,11 +281,11 @@ public enum PacketParser {
                     }
                 }
             } else if transport == .tcp {
-                if data.count > offset + 13 {
-                    let dataOffset = Int((data[data.startIndex + offset + 12] >> 4) * 4)
+                if packet.count > offset + 13 {
+                    let dataOffset = Int((packet[packet.startIndex + offset + 12] >> 4) * 4)
                     let payloadOffset = offset + dataOffset
-                    if dataOffset >= 20, data.count > payloadOffset {
-                        tlsServerName = parseTLSServerName(data, payloadOffset: payloadOffset)
+                    if dataOffset >= 20, packet.count > payloadOffset {
+                        tlsServerName = parseTLSServerName(packet, payloadOffset: payloadOffset)
                     }
                 }
             }
@@ -254,7 +300,7 @@ public enum PacketParser {
             dstAddress: dstAddress,
             srcPort: srcPort,
             dstPort: dstPort,
-            length: data.count,
+            length: packet.count,
             dnsQueryName: dnsQuery,
             dnsCname: dnsCname,
             dnsAnswerAddresses: dnsAnswers,
@@ -264,6 +310,33 @@ public enum PacketParser {
             quicPacketType: quicPacketType,
             quicDestinationConnectionId: quicDestinationConnectionId,
             quicSourceConnectionId: quicSourceConnectionId
+        )
+    }
+
+    private static func bareMetadata(
+        ipVersion: IPVersion,
+        transport: TransportProtocol,
+        srcAddress: IPAddress,
+        dstAddress: IPAddress,
+        length: Int
+    ) -> PacketMetadata {
+        PacketMetadata(
+            ipVersion: ipVersion,
+            transport: transport,
+            srcAddress: srcAddress,
+            dstAddress: dstAddress,
+            srcPort: nil,
+            dstPort: nil,
+            length: length,
+            dnsQueryName: nil,
+            dnsCname: nil,
+            dnsAnswerAddresses: nil,
+            registrableDomain: nil,
+            tlsServerName: nil,
+            quicVersion: nil,
+            quicPacketType: nil,
+            quicDestinationConnectionId: nil,
+            quicSourceConnectionId: nil
         )
     }
 
@@ -511,6 +584,7 @@ public enum PacketParser {
     private static let quicV1Version: UInt32 = 0x00000001
     private static let quicV2Version: UInt32 = 0x6b3343cf
 
+#if canImport(CryptoKit)
     private static let quicV1InitialSalt: [UInt8] = [
         0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17,
         0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a
@@ -913,6 +987,20 @@ public enum PacketParser {
         }
         return nil
     }
+#else
+    private static func decryptQuicInitialServerName(
+        _ data: Data,
+        payloadOffset: Int,
+        version: UInt32,
+        dcid: Data
+    ) -> String? {
+        _ = data
+        _ = payloadOffset
+        _ = version
+        _ = dcid
+        return nil
+    }
+#endif
 
     private static func hexString(_ data: Data) -> String? {
         guard !data.isEmpty else { return nil }
@@ -1022,6 +1110,7 @@ public enum PacketParser {
                 return nil
             }
 
+            guard length <= 63 else { return nil }
             index += 1
             guard index + length <= data.count else { return nil }
             guard let label = decodeASCII(data, start: index, length: length) else { return nil }

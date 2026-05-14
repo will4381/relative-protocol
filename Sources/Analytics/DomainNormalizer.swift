@@ -1,5 +1,9 @@
-import Darwin
 import Foundation
+#if os(Linux)
+import Glibc
+#else
+import Darwin
+#endif
 
 /// Normalizes hostnames into registrable domains for stable analytics classification keys.
 public enum DomainNormalizer {

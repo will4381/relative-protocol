@@ -7,11 +7,14 @@ import Observability
 public enum AnalyticsStoragePaths {
     public enum Error: LocalizedError {
         case containerUnavailable(String)
+        case invalidFileName(String)
 
         public var errorDescription: String? {
             switch self {
             case .containerUnavailable(let appGroupID):
                 return "Shared container is unavailable for App Group '\(appGroupID)'."
+            case .invalidFileName(let fileName):
+                return "Invalid analytics file name '\(fileName)'."
             }
         }
     }
@@ -42,8 +45,26 @@ public enum AnalyticsStoragePaths {
     }
 
     public static func signatureURL(appGroupID: String, fileName: String) throws -> URL {
-        try signaturesRoot(appGroupID: appGroupID)
+        guard isSafeFileName(fileName) else {
+            throw Error.invalidFileName(fileName)
+        }
+        return try signaturesRoot(appGroupID: appGroupID)
             .appendingPathComponent(fileName, isDirectory: false)
+    }
+
+    private static func isSafeFileName(_ value: String) -> Bool {
+        guard !value.isEmpty,
+              value != ".",
+              value != "..",
+              value.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
+              value.range(of: "\0") == nil,
+              value == (value as NSString).lastPathComponent,
+              !value.contains("/"),
+              !value.contains("\\")
+        else {
+            return false
+        }
+        return true
     }
 }
 

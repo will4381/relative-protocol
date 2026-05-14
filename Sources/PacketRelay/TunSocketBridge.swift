@@ -43,7 +43,7 @@ public final class TunSocketBridge: @unchecked Sendable {
     ///   - logger: Structured logger for bridge errors and backpressure events.
     public init(mtu: Int, queue: DispatchQueue, logger: StructuredLogger) throws {
         self.logger = logger
-        self.mtu = max(256, mtu)
+        self.mtu = min(max(256, mtu), 65_535)
         self.queue = queue
         queue.setSpecific(key: queueSpecificKey, value: queueSpecificValue)
         self.maxPendingBytes = max(4_194_304, self.mtu * 1024)
@@ -62,8 +62,14 @@ public final class TunSocketBridge: @unchecked Sendable {
         setSocketBuffer(fd: engineFD)
         setSocketBuffer(fd: appFD)
 
-        try setNonBlocking(fd: engineFD)
-        try setNonBlocking(fd: appFD)
+        do {
+            try setNonBlocking(fd: engineFD)
+            try setNonBlocking(fd: appFD)
+        } catch {
+            close(engineFD)
+            close(appFD)
+            throw error
+        }
 
         let writeSource = DispatchSource.makeWriteSource(fileDescriptor: appFD, queue: queue)
         writeSource.setEventHandler { [weak self] in
@@ -79,15 +85,24 @@ public final class TunSocketBridge: @unchecked Sendable {
     /// Starts consuming packets written by the dataplane and forwards decoded frames to `handler`.
     /// - Parameter handler: Called with a packet batch and per-packet address family values.
     public func startReadLoop(handler: @escaping @Sendable ([Data], [Int32]) -> Void) {
-        let source = DispatchSource.makeReadSource(fileDescriptor: appFD, queue: queue)
-        source.setEventHandler { [weak self] in
-            self?.drainReadable(handler: handler)
+        performOnQueue {
+            lifecycleLock.lock()
+            guard !isStopped, readSource == nil else {
+                lifecycleLock.unlock()
+                return
+            }
+
+            let source = DispatchSource.makeReadSource(fileDescriptor: appFD, queue: queue)
+            source.setEventHandler { [weak self] in
+                self?.drainReadable(handler: handler)
+            }
+            source.setCancelHandler { [appFD] in
+                close(appFD)
+            }
+            readSource = source
+            lifecycleLock.unlock()
+            source.resume()
         }
-        source.setCancelHandler { [appFD] in
-            close(appFD)
-        }
-        source.resume()
-        readSource = source
     }
 
     @discardableResult
@@ -97,13 +112,26 @@ public final class TunSocketBridge: @unchecked Sendable {
     ///   - ipVersionHint: Optional family hint (`AF_INET` or `AF_INET6`).
     /// - Returns: Bridge acceptance, saturation, or terminal failure status.
     public func writePacket(_ packet: Data, ipVersionHint: Int32) -> BridgeWriteResult {
+        if DispatchQueue.getSpecific(key: queueSpecificKey) != queueSpecificValue {
+            var result = BridgeWriteResult.backpressured
+            performOnQueue {
+                result = writePacketOnQueue(packet, ipVersionHint: ipVersionHint)
+            }
+            return result
+        }
+        return writePacketOnQueue(packet, ipVersionHint: ipVersionHint)
+    }
+
+    private func writePacketOnQueue(_ packet: Data, ipVersionHint: Int32) -> BridgeWriteResult {
         var family: Int32 = ipVersionHint
         if family != AF_INET && family != AF_INET6 {
             family = packet.first.map { (($0 >> 4) & 0x0F) == 6 ? AF_INET6 : AF_INET } ?? AF_INET
         }
 
         if pendingWrites.isEmpty {
-            let expectedLength = MemoryLayout<UInt32>.size + packet.count
+            guard let expectedLength = frameLength(for: packet) else {
+                return .failed(errorCode: EINVAL)
+            }
             let result = writePacketImmediate(packet, family: family)
             if result == expectedLength {
                 return .accepted
@@ -131,7 +159,11 @@ public final class TunSocketBridge: @unchecked Sendable {
 
     /// Returns whether queued bytes have crossed the backpressure threshold.
     public func isBackpressured() -> Bool {
-        pendingBytes >= backpressureThreshold
+        var result = false
+        performOnQueue {
+            result = pendingBytes >= backpressureThreshold
+        }
+        return result
     }
 
     /// Stops read/write sources and closes owned descriptors.
@@ -239,7 +271,8 @@ public final class TunSocketBridge: @unchecked Sendable {
     }
 
     private func enqueueWrite(_ data: Data) -> BridgeWriteResult {
-        if pendingBytes + data.count > maxPendingBytes {
+        let remainingCapacity = max(0, maxPendingBytes - pendingBytes)
+        if data.count > remainingCapacity {
             backpressureSignals &+= 1
             if backpressureSignals == 1 || backpressureSignals % 100 == 0 {
                 Task {
@@ -367,12 +400,17 @@ public final class TunSocketBridge: @unchecked Sendable {
 
     private func framedPacket(_ packet: Data, family: Int32) -> Data {
         var header = UInt32(family).bigEndian
-        var buffer = Data(capacity: MemoryLayout<UInt32>.size + packet.count)
+        var buffer = Data(capacity: frameLength(for: packet) ?? packet.count)
         withUnsafeBytes(of: &header) { headerPtr in
             buffer.append(headerPtr.bindMemory(to: UInt8.self))
         }
         buffer.append(packet)
         return buffer
+    }
+
+    private func frameLength(for packet: Data) -> Int? {
+        let (length, overflow) = MemoryLayout<UInt32>.size.addingReportingOverflow(packet.count)
+        return overflow ? nil : length
     }
 
     private func writePacketImmediate(_ packet: Data, family: Int32) -> Int {
