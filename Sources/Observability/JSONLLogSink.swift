@@ -9,8 +9,8 @@ public struct JSONLRotationPolicy: Sendable, Equatable {
 
     /// - Parameters:
     ///   - maxBytesPerFile: Rotation threshold for active file size.
-    ///   - maxFiles: Maximum number of retained `events*` files.
-    ///   - maxTotalBytes: Maximum retained bytes across all `events*` files.
+    ///   - maxFiles: Maximum number of retained active/rotated files for one stream.
+    ///   - maxTotalBytes: Maximum retained bytes across active/rotated files for one stream.
     ///   - maxQueueDepth: In-memory pending envelope limit before queue drops.
     public init(
         maxBytesPerFile: Int,
@@ -18,10 +18,10 @@ public struct JSONLRotationPolicy: Sendable, Equatable {
         maxTotalBytes: Int,
         maxQueueDepth: Int = 2048
     ) {
-        self.maxBytesPerFile = maxBytesPerFile
-        self.maxFiles = maxFiles
-        self.maxTotalBytes = maxTotalBytes
-        self.maxQueueDepth = maxQueueDepth
+        self.maxBytesPerFile = max(1, maxBytesPerFile)
+        self.maxFiles = max(1, maxFiles)
+        self.maxTotalBytes = max(self.maxBytesPerFile, maxTotalBytes)
+        self.maxQueueDepth = max(1, maxQueueDepth)
     }
 }
 
@@ -43,7 +43,24 @@ public struct JSONLDropCounters: Sendable, Equatable {
 
     /// Total number of drops across all drop categories.
     public var total: Int {
-        droppedQueueFull + droppedIOError + droppedSizePolicy
+        Self.saturatingAdd(Self.saturatingAdd(droppedQueueFull, droppedIOError), droppedSizePolicy)
+    }
+
+    mutating func incrementQueueFull() {
+        droppedQueueFull = Self.saturatingAdd(droppedQueueFull, 1)
+    }
+
+    mutating func incrementIOError() {
+        droppedIOError = Self.saturatingAdd(droppedIOError, 1)
+    }
+
+    mutating func incrementSizePolicy() {
+        droppedSizePolicy = Self.saturatingAdd(droppedSizePolicy, 1)
+    }
+
+    private static func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
+        let (value, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? Int.max : value
     }
 }
 
@@ -72,6 +89,7 @@ public actor JSONLLogSink: LogSink {
     private let policy: JSONLRotationPolicy
     private let rootProvider: any LogRootPathProvider
     private let eventQueueLabel: String
+    private let filePrefix: String
 
     private var initialized = false
     private var rootURL: URL = URL(fileURLWithPath: "/")
@@ -88,10 +106,17 @@ public actor JSONLLogSink: LogSink {
     ///   - rootProvider: Root path provider used to resolve log directory.
     ///   - policy: Rotation, retention, and queue limits.
     ///   - eventQueueLabel: Component label used by sink-generated events.
-    public init(rootProvider: any LogRootPathProvider, policy: JSONLRotationPolicy, eventQueueLabel: String = "jsonl") {
+    ///   - filePrefix: File prefix for the active and rotated stream. Use one prefix per process.
+    public init(
+        rootProvider: any LogRootPathProvider,
+        policy: JSONLRotationPolicy,
+        eventQueueLabel: String = "jsonl",
+        filePrefix: String = "events"
+    ) {
         self.rootProvider = rootProvider
         self.policy = policy
         self.eventQueueLabel = eventQueueLabel
+        self.filePrefix = Self.normalizedFilePrefix(filePrefix)
         self.encoder = JSONEncoder()
         self.encoder.dateEncodingStrategy = .iso8601
         self.encoder.outputFormatting = [.sortedKeys]
@@ -104,12 +129,12 @@ public actor JSONLLogSink: LogSink {
             try ensureInitialized()
             let payload = try serialize(envelope)
             guard payload.count <= policy.maxBytesPerFile else {
-                drops.droppedSizePolicy += 1
+                drops.incrementSizePolicy()
                 await emitDropSummaryIfNeeded(trigger: "size-policy")
                 return
             }
             guard pending.count < policy.maxQueueDepth else {
-                drops.droppedQueueFull += 1
+                drops.incrementQueueFull()
                 await emitDropSummaryIfNeeded(trigger: "queue-full")
                 return
             }
@@ -119,7 +144,7 @@ public actor JSONLLogSink: LogSink {
                 await drainQueue()
             }
         } catch {
-            drops.droppedIOError += 1
+            drops.incrementIOError()
             await emitDropSummaryIfNeeded(trigger: "io-error")
         }
     }
@@ -140,7 +165,7 @@ public actor JSONLLogSink: LogSink {
             options: [.skipsHiddenFiles]
         )
         return files
-            .filter { $0.lastPathComponent.hasPrefix("events") }
+            .filter { isOwnedLogFileName($0.lastPathComponent) }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 
@@ -157,7 +182,7 @@ public actor JSONLLogSink: LogSink {
                 try rotateIfNeeded(for: next.count)
                 try append(next)
             } catch {
-                drops.droppedIOError += 1
+                drops.incrementIOError()
             }
         }
         pending = []
@@ -171,7 +196,7 @@ public actor JSONLLogSink: LogSink {
         }
 
         rootURL = try rootProvider.resolveRootPath()
-        activeURL = rootURL.appendingPathComponent("events.current.jsonl", isDirectory: false)
+        activeURL = rootURL.appendingPathComponent(activeFileName, isDirectory: false)
         try FileManager.default.createDirectory(
             atPath: rootURL.path,
             withIntermediateDirectories: true,
@@ -179,11 +204,14 @@ public actor JSONLLogSink: LogSink {
         )
         try Self.excludeFromBackupIfNeeded(rootURL)
         if !FileManager.default.fileExists(atPath: activeURL.path) {
-            FileManager.default.createFile(
+            let created = FileManager.default.createFile(
                 atPath: activeURL.path,
                 contents: nil,
                 attributes: Self.protectionAttributes
             )
+            guard created else {
+                throw CocoaError(.fileWriteUnknown)
+            }
         } else if !Self.protectionAttributes.isEmpty {
             try FileManager.default.setAttributes(Self.protectionAttributes, ofItemAtPath: activeURL.path)
         }
@@ -206,20 +234,23 @@ public actor JSONLLogSink: LogSink {
         try handle.synchronize()
         try handle.close()
 
-        let timestampMillis = Int(Date().timeIntervalSince1970 * 1000)
-        let rotatedName = "events.\(timestampMillis).\(rotationSequence).jsonl"
-        rotationSequence += 1
+        let timestampMillis = Self.timestampMilliseconds(Date())
+        let rotatedName = "\(filePrefix).\(timestampMillis).\(rotationSequence).jsonl"
+        rotationSequence &+= 1
         let rotatedURL = rootURL.appendingPathComponent(rotatedName, isDirectory: false)
         try FileManager.default.moveItem(at: activeURL, to: rotatedURL)
         if !Self.protectionAttributes.isEmpty {
             try FileManager.default.setAttributes(Self.protectionAttributes, ofItemAtPath: rotatedURL.path)
         }
         try Self.excludeFromBackupIfNeeded(rotatedURL)
-        FileManager.default.createFile(
+        let created = FileManager.default.createFile(
             atPath: activeURL.path,
             contents: nil,
             attributes: Self.protectionAttributes
         )
+        guard created else {
+            throw CocoaError(.fileWriteUnknown)
+        }
         try Self.excludeFromBackupIfNeeded(activeURL)
         self.handle = try FileHandle(forWritingTo: activeURL)
         activeSize = 0
@@ -240,6 +271,20 @@ public actor JSONLLogSink: LogSink {
         )
         let payload = try serialize(rotationEvent)
         try append(payload)
+    }
+
+    private static func timestampMilliseconds(_ date: Date) -> Int {
+        let milliseconds = (date.timeIntervalSince1970 * 1_000).rounded()
+        guard milliseconds.isFinite else {
+            return 0
+        }
+        if milliseconds >= Double(Int.max) {
+            return Int.max
+        }
+        if milliseconds <= Double(Int.min) {
+            return Int.min
+        }
+        return Int(milliseconds)
     }
 
     private func enforceRetention() throws {
@@ -272,7 +317,7 @@ public actor JSONLLogSink: LogSink {
             options: [.skipsHiddenFiles]
         )
         return try files
-            .filter { $0.lastPathComponent.hasPrefix("events") }
+            .filter { isOwnedLogFileName($0.lastPathComponent) }
             .map { url in
                 let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
                 let created = attrs[.creationDate] as? Date ?? .distantPast
@@ -293,7 +338,48 @@ public actor JSONLLogSink: LogSink {
             throw CocoaError(.fileNoSuchFile)
         }
         try handle.write(contentsOf: data)
-        activeSize += data.count
+        activeSize = Self.saturatingAdd(activeSize, data.count)
+    }
+
+    private static func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
+        let (value, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? Int.max : value
+    }
+
+    private var activeFileName: String {
+        "\(filePrefix).current.jsonl"
+    }
+
+    private func isOwnedLogFileName(_ name: String) -> Bool {
+        if name == activeFileName {
+            return true
+        }
+
+        let rotatedPrefix = "\(filePrefix)."
+        guard name.hasPrefix(rotatedPrefix), name.hasSuffix(".jsonl") else {
+            return false
+        }
+
+        let suffix = name.dropFirst(rotatedPrefix.count)
+        return suffix.first?.isNumber == true
+    }
+
+    private static func normalizedFilePrefix(_ prefix: String) -> String {
+        let trimmed = prefix.trimmingCharacters(in: .whitespacesAndNewlines)
+        var normalized = ""
+        normalized.reserveCapacity(trimmed.count)
+
+        for scalar in trimmed.unicodeScalars {
+            switch scalar.value {
+            case 48...57, 65...90, 97...122, 45, 46, 95:
+                normalized.unicodeScalars.append(scalar)
+            default:
+                normalized.append("_")
+            }
+        }
+
+        normalized = normalized.trimmingCharacters(in: CharacterSet(charactersIn: "._-"))
+        return normalized.isEmpty ? "events" : normalized
     }
 
     private func emitDropSummaryIfNeeded(trigger: String) async {

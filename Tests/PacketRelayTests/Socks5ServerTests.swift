@@ -77,6 +77,136 @@ final class Socks5ServerTests: XCTestCase {
         }
     }
 
+    func testConnectFailureClosesAfterFailureReplyFlushes() {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.failure-flush")
+        let inbound = FakeInboundConnection()
+        inbound.completeSendsAutomatically = false
+        let outbound = ControlledTCPOutbound()
+        let provider = FakeProvider(outbound: outbound)
+        let connection = Socks5Connection(
+            connection: inbound,
+            provider: provider,
+            queue: queue,
+            mtu: 1500,
+            logger: StructuredLogger(sink: InMemoryLogSink())
+        )
+
+        queue.sync {
+            connection.start()
+            inbound.push(Self.greeting)
+            inbound.completeNextSend()
+            inbound.push(Self.connectRequest(host: "denied.example", port: 80))
+            outbound.failConnect(TestConnectError.refused)
+
+            XCTAssertEqual(
+                inbound.sentPayloads,
+                [
+                    Socks5Codec.buildMethodSelection(method: 0x00),
+                    Socks5Codec.buildReply(code: 0x05, bindAddress: .ipv4("0.0.0.0"), bindPort: 0)
+                ]
+            )
+            XCTAssertFalse(inbound.cancelled)
+            inbound.completeNextSend()
+            XCTAssertTrue(inbound.cancelled)
+        }
+    }
+
+    func testUnsupportedGreetingClosesAfterMethodSelectionFlushes() {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.greeting-flush")
+        let inbound = FakeInboundConnection()
+        inbound.completeSendsAutomatically = false
+        let provider = FakeProvider(outbound: ControlledTCPOutbound())
+        let connection = Socks5Connection(
+            connection: inbound,
+            provider: provider,
+            queue: queue,
+            mtu: 1500,
+            logger: StructuredLogger(sink: InMemoryLogSink())
+        )
+
+        queue.sync {
+            connection.start()
+            inbound.push(Data([0x05, 0x01, 0x02]))
+
+            XCTAssertEqual(inbound.sentPayloads, [Socks5Codec.buildMethodSelection(method: 0xFF)])
+            XCTAssertFalse(inbound.cancelled)
+            inbound.completeNextSend()
+            XCTAssertTrue(inbound.cancelled)
+        }
+    }
+
+    func testUDPAssociateReplyFailureStopsRelayAndConnection() {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.udp-associate-reply-failure")
+        let inbound = FakeInboundConnection()
+        inbound.completeSendsAutomatically = false
+        let provider = FakeProvider(outbound: ControlledTCPOutbound())
+        let relay = ControlledUDPAssociateRelay(port: 53_000)
+        let connection = Socks5Connection(
+            connection: inbound,
+            provider: provider,
+            queue: queue,
+            mtu: 1500,
+            logger: StructuredLogger(sink: InMemoryLogSink()),
+            udpRelayFactory: { _, _, _, _ in relay }
+        )
+
+        queue.sync {
+            connection.start()
+            inbound.push(Self.greeting)
+            inbound.completeNextSend()
+            inbound.push(Self.request(command: 0x03, host: "0.0.0.0", port: 0))
+
+            XCTAssertTrue(relay.started)
+            XCTAssertEqual(
+                inbound.sentPayloads,
+                [
+                    Socks5Codec.buildMethodSelection(method: 0x00),
+                    Socks5Codec.buildReply(code: 0x00, bindAddress: .ipv4("127.0.0.1"), bindPort: relay.port)
+                ]
+            )
+            XCTAssertFalse(relay.stopped)
+            XCTAssertFalse(inbound.cancelled)
+
+            inbound.completeNextSend(error: NWError.posix(.ECONNRESET))
+
+            XCTAssertTrue(relay.stopped)
+            XCTAssertTrue(inbound.cancelled)
+        }
+    }
+
+    func testConnectFailureLogsDestinationMetadata() async throws {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.failure-metadata")
+        let sink = InMemoryLogSink()
+        let inbound = FakeInboundConnection()
+        let outbound = ControlledTCPOutbound()
+        let provider = FakeProvider(outbound: outbound)
+        let connection = Socks5Connection(
+            connection: inbound,
+            provider: provider,
+            queue: queue,
+            mtu: 1500,
+            logger: StructuredLogger(sink: sink)
+        )
+
+        queue.sync {
+            connection.start()
+            inbound.push(Self.greeting)
+            inbound.push(Self.connectRequest(host: "denied.example", port: 8443))
+            outbound.failConnect(TestConnectError.refused)
+        }
+
+        let records = try await eventuallyFetchRecords(from: sink) { records in
+            records.contains { $0.component == "Socks5Connection" && $0.event == "outbound-connect-failed" }
+        }
+        let record = try XCTUnwrap(
+            records.first { $0.component == "Socks5Connection" && $0.event == "outbound-connect-failed" }
+        )
+        XCTAssertEqual(record.metadata["destination_host"], "<redacted>")
+        XCTAssertEqual(record.metadata["destination_port"], "8443")
+        XCTAssertEqual(record.metadata["destination_host_kind"], "domain")
+        XCTAssertEqual(record.metadata["destination_transport"], "tcp")
+    }
+
     func testMalformedRequestReservedByteSendsGeneralFailure() {
         let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.invalid-rsv")
         let inbound = FakeInboundConnection()
@@ -217,6 +347,43 @@ final class Socks5ServerTests: XCTestCase {
             )
         )
         XCTAssertEqual(inbound.sentPayloads.last, responseFrame)
+    }
+
+    func testTCPForwardUDPWaitsForSuccessReplyBeforeProcessingPipelinedFrames() throws {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.forward-udp-reply-order")
+        let inbound = FakeInboundConnection()
+        let outbound = ControlledTCPOutbound()
+        let provider = FakeProvider(outbound: outbound)
+        let connection = Socks5Connection(
+            connection: inbound,
+            provider: provider,
+            queue: queue,
+            mtu: 1500,
+            logger: StructuredLogger(sink: InMemoryLogSink())
+        )
+
+        let payload = Data([0x09, 0x08, 0x07])
+        let frame = try XCTUnwrap(
+            Socks5Codec.buildTCPForwardUDPPacket(
+                address: .ipv4("1.1.1.1"),
+                port: 53,
+                payload: payload
+            )
+        )
+
+        queue.sync {
+            connection.start()
+            inbound.push(Self.greeting)
+            inbound.completeSendsAutomatically = false
+            inbound.push(Self.request(command: 0x05, host: "0.0.0.0", port: 0))
+            inbound.push(frame)
+
+            XCTAssertTrue(provider.udpSessions.isEmpty)
+            inbound.completeNextSend()
+        }
+
+        let session = try XCTUnwrap(provider.udpSessions.first)
+        XCTAssertEqual(session.writtenDatagrams, [payload])
     }
 
     func testTCPForwardUDPRetainsWaitingSession() throws {
@@ -566,6 +733,47 @@ final class Socks5ServerTests: XCTestCase {
         XCTAssertTrue(snapshot.allSatisfy(\.cancelled))
     }
 
+    func testRetryingTCPOutboundLogsDestinationMetadataOnTimeout() async throws {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.retry-timeout-metadata")
+        let sink = InMemoryLogSink()
+        let failed = expectation(description: "connect fails after timeout")
+
+        let outbound = RetryingTCPOutbound(
+            queue: queue,
+            logger: StructuredLogger(sink: sink),
+            policy: .init(attemptPreparingTimeout: 0.03, retryBackoff: 0.01, maxAttempts: 1, overallTimeout: 0.1),
+            endpointMetadata: [
+                "destination_host": "api.example.com",
+                "destination_port": "443",
+                "destination_host_kind": "domain",
+                "destination_transport": "tcp"
+            ]
+        ) { _ in
+            ControlledTCPOutbound()
+        }
+
+        outbound.waitUntilReady { result in
+            switch result {
+            case .success:
+                XCTFail("Expected timeout after exhausting retries")
+            case .failure:
+                failed.fulfill()
+            }
+        }
+
+        await fulfillment(of: [failed], timeout: 1.0)
+        let records = try await eventuallyFetchRecords(from: sink) { records in
+            records.contains { $0.component == "RetryingTCPOutbound" && $0.event == "connect-timeout" }
+        }
+        let record = try XCTUnwrap(
+            records.first { $0.component == "RetryingTCPOutbound" && $0.event == "connect-timeout" }
+        )
+        XCTAssertEqual(record.metadata["destination_host"], "<redacted>")
+        XCTAssertEqual(record.metadata["destination_port"], "443")
+        XCTAssertEqual(record.metadata["destination_host_kind"], "domain")
+        XCTAssertEqual(record.metadata["destination_transport"], "tcp")
+    }
+
     func testRetryingTCPOutboundRetriesWhenBetterPathBecomesAvailable() {
         let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.retry-better-path")
         let lock = NSLock()
@@ -873,7 +1081,13 @@ final class Socks5ServerTests: XCTestCase {
         let adapter = NWConnectionUDPSessionAdapter(
             connection,
             queue: queue,
-            logger: StructuredLogger(sink: sink)
+            logger: StructuredLogger(sink: sink),
+            endpointMetadata: [
+                "destination_host": "8.8.8.8",
+                "destination_port": "53",
+                "destination_host_kind": "ipv4",
+                "destination_transport": "udp"
+            ]
         )
 
         connection.stateUpdateHandler?(.waiting(.posix(.ENETDOWN)))
@@ -891,6 +1105,10 @@ final class Socks5ServerTests: XCTestCase {
 
         let adapterRecords = records.filter { $0.component == "NWConnectionUDPSessionAdapter" }
         XCTAssertTrue(adapterRecords.allSatisfy { $0.metadata["path"]?.contains("status=") == true })
+        XCTAssertTrue(adapterRecords.allSatisfy { $0.metadata["destination_host"] == "<redacted>" })
+        XCTAssertTrue(adapterRecords.allSatisfy { $0.metadata["destination_port"] == "53" })
+        XCTAssertTrue(adapterRecords.allSatisfy { $0.metadata["destination_host_kind"] == "ipv4" })
+        XCTAssertTrue(adapterRecords.allSatisfy { $0.metadata["destination_transport"] == "udp" })
         adapter.cancel()
         withExtendedLifetime(adapter) {}
     }
@@ -946,7 +1164,13 @@ final class Socks5ServerTests: XCTestCase {
         let records = try await eventuallyFetchRecords(from: sink) { records in
             records.contains { $0.component == "Socks5Connection" && $0.event == "outbound-read-failed" }
         }
-        XCTAssertTrue(records.contains { $0.component == "Socks5Connection" && $0.event == "outbound-read-failed" })
+        let record = try XCTUnwrap(
+            records.first { $0.component == "Socks5Connection" && $0.event == "outbound-read-failed" }
+        )
+        XCTAssertEqual(record.metadata["destination_host"], "<redacted>")
+        XCTAssertEqual(record.metadata["destination_port"], "443")
+        XCTAssertEqual(record.metadata["destination_host_kind"], "domain")
+        XCTAssertEqual(record.metadata["destination_transport"], "tcp")
         XCTAssertTrue(inbound.cancelled)
     }
 
@@ -975,7 +1199,54 @@ final class Socks5ServerTests: XCTestCase {
         let records = try await eventuallyFetchRecords(from: sink) { records in
             records.contains { $0.component == "Socks5Connection" && $0.event == "outbound-read-closed" }
         }
-        XCTAssertTrue(records.contains { $0.component == "Socks5Connection" && $0.event == "outbound-read-closed" && $0.level == .notice })
+        let record = try XCTUnwrap(
+            records.first { $0.component == "Socks5Connection" && $0.event == "outbound-read-closed" && $0.level == .notice }
+        )
+        XCTAssertEqual(record.metadata["destination_host"], "<redacted>")
+        XCTAssertEqual(record.metadata["destination_port"], "443")
+        XCTAssertEqual(record.metadata["destination_host_kind"], "domain")
+        XCTAssertEqual(record.metadata["destination_transport"], "tcp")
+        XCTAssertFalse(records.contains { $0.component == "Socks5Connection" && $0.event == "outbound-read-failed" })
+        XCTAssertTrue(inbound.cancelled)
+    }
+
+    func testOutboundReadBridgedENOMSGIsLoggedAsNormalClose() async throws {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.outbound-read-bridged-close")
+        let sink = InMemoryLogSink()
+        let inbound = FakeInboundConnection()
+        let outbound = ControlledTCPOutbound()
+        let provider = FakeProvider(outbound: outbound)
+        let connection = Socks5Connection(
+            connection: inbound,
+            provider: provider,
+            queue: queue,
+            mtu: 1500,
+            logger: StructuredLogger(sink: sink)
+        )
+        let bridgedError = NSError(
+            domain: "Network.NWError",
+            code: Int(POSIXErrorCode.ENOMSG.rawValue),
+            userInfo: [NSLocalizedDescriptionKey: "The operation couldn’t be completed. (Network.NWError error 96 - No message available on STREAM)"]
+        )
+
+        queue.sync {
+            connection.start()
+            inbound.push(Self.greeting)
+            inbound.push(Self.connectRequest(host: "example.com", port: 443))
+            outbound.succeedConnect()
+            outbound.queueRead(nil, error: bridgedError)
+        }
+
+        let records = try await eventuallyFetchRecords(from: sink) { records in
+            records.contains { $0.component == "Socks5Connection" && $0.event == "outbound-read-closed" }
+        }
+        let record = try XCTUnwrap(
+            records.first { $0.component == "Socks5Connection" && $0.event == "outbound-read-closed" && $0.level == .notice }
+        )
+        XCTAssertEqual(record.metadata["destination_host"], "<redacted>")
+        XCTAssertEqual(record.metadata["destination_port"], "443")
+        XCTAssertEqual(record.metadata["destination_host_kind"], "domain")
+        XCTAssertEqual(record.metadata["destination_transport"], "tcp")
         XCTAssertFalse(records.contains { $0.component == "Socks5Connection" && $0.event == "outbound-read-failed" })
         XCTAssertTrue(inbound.cancelled)
     }
@@ -1066,92 +1337,220 @@ private final class FakeInboundConnection: Socks5InboundConnection {
 }
 
 private final class ControlledTCPOutbound: @unchecked Sendable, Socks5PathAwareTCPOutbound {
+    private let lock = NSLock()
     private var readyHandlers: [(@Sendable (Result<Void, Error>) -> Void)] = []
     private var readyResult: Result<Void, Error>?
     private var pendingReadHandlers: [(@Sendable (Data?, Error?) -> Void)] = []
     private var pendingWriteHandlers: [(@Sendable (Error?) -> Void)] = []
     private var queuedReads: [(Data?, Error?)] = []
-    private(set) var writes: [Data] = []
-    private(set) var cancelled = false
-    private(set) var readRequests = 0
-    private(set) var restartCount = 0
-    var autoCompleteWrites = true
-    var onRestart: (() -> Void)?
-    var eventHandler: ((TCPOutboundEvent) -> Void)?
-    var pathSnapshot = "status=unknown uses=unknown"
+    private var storedWrites: [Data] = []
+    private var storedCancelled = false
+    private var storedReadRequests = 0
+    private var storedRestartCount = 0
+    private var storedAutoCompleteWrites = true
+    private var storedOnRestart: (() -> Void)?
+    private var storedEventHandler: ((TCPOutboundEvent) -> Void)?
+    private var storedPathSnapshot = "status=unknown uses=unknown"
+
+    var writes: [Data] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedWrites
+    }
+
+    var cancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedCancelled
+    }
+
+    var readRequests: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedReadRequests
+    }
+
+    var restartCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedRestartCount
+    }
+
+    var autoCompleteWrites: Bool {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return storedAutoCompleteWrites
+        }
+        set {
+            lock.lock()
+            storedAutoCompleteWrites = newValue
+            lock.unlock()
+        }
+    }
+
+    var onRestart: (() -> Void)? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return storedOnRestart
+        }
+        set {
+            lock.lock()
+            storedOnRestart = newValue
+            lock.unlock()
+        }
+    }
+
+    var eventHandler: ((TCPOutboundEvent) -> Void)? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return storedEventHandler
+        }
+        set {
+            lock.lock()
+            storedEventHandler = newValue
+            lock.unlock()
+        }
+    }
+
+    var pathSnapshot: String {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return storedPathSnapshot
+        }
+        set {
+            lock.lock()
+            storedPathSnapshot = newValue
+            lock.unlock()
+        }
+    }
 
     func waitUntilReady(completionHandler: @escaping @Sendable (Result<Void, Error>) -> Void) {
+        lock.lock()
         if let readyResult {
+            lock.unlock()
             completionHandler(readyResult)
             return
         }
         readyHandlers.append(completionHandler)
+        lock.unlock()
     }
 
     func readMinimumLength(_: Int, maximumLength _: Int, completionHandler: @escaping @Sendable (Data?, (any Error)?) -> Void) {
-        readRequests += 1
+        let queuedRead: (Data?, Error?)?
+        lock.lock()
+        storedReadRequests += 1
         if !queuedReads.isEmpty {
-            let next = queuedReads.removeFirst()
-            completionHandler(next.0, next.1)
-            return
+            queuedRead = queuedReads.removeFirst()
+        } else {
+            queuedRead = nil
+            pendingReadHandlers.append(completionHandler)
         }
-        pendingReadHandlers.append(completionHandler)
+        lock.unlock()
+
+        if let queuedRead {
+            completionHandler(queuedRead.0, queuedRead.1)
+        }
     }
 
     func write(_ data: Data, completionHandler: @escaping @Sendable ((any Error)?) -> Void) {
-        writes.append(data)
-        if autoCompleteWrites {
-            completionHandler(nil)
-        } else {
+        let shouldComplete: Bool
+        lock.lock()
+        storedWrites.append(data)
+        shouldComplete = storedAutoCompleteWrites
+        if !shouldComplete {
             pendingWriteHandlers.append(completionHandler)
+        }
+        lock.unlock()
+
+        if shouldComplete {
+            completionHandler(nil)
         }
     }
 
     func cancel() {
-        cancelled = true
+        lock.lock()
+        storedCancelled = true
+        lock.unlock()
     }
 
     func restart() {
-        restartCount += 1
+        let onRestart: (() -> Void)?
+        lock.lock()
+        storedRestartCount += 1
+        onRestart = storedOnRestart
+        lock.unlock()
         onRestart?()
     }
 
     func succeedConnect() {
-        guard readyResult == nil else { return }
+        let handlers: [(@Sendable (Result<Void, Error>) -> Void)]
+        lock.lock()
+        guard readyResult == nil else {
+            lock.unlock()
+            return
+        }
         readyResult = .success(())
-        let handlers = readyHandlers
+        handlers = readyHandlers
         readyHandlers.removeAll(keepingCapacity: false)
+        lock.unlock()
         for handler in handlers {
             handler(.success(()))
         }
     }
 
     func failConnect(_ error: Error) {
-        guard readyResult == nil else { return }
+        let handlers: [(@Sendable (Result<Void, Error>) -> Void)]
+        lock.lock()
+        guard readyResult == nil else {
+            lock.unlock()
+            return
+        }
         readyResult = .failure(error)
-        let handlers = readyHandlers
+        handlers = readyHandlers
         readyHandlers.removeAll(keepingCapacity: false)
+        lock.unlock()
         for handler in handlers {
             handler(.failure(error))
         }
     }
 
     func emit(_ event: TCPOutboundEvent) {
-        eventHandler?(event)
+        lock.lock()
+        let handler = storedEventHandler
+        lock.unlock()
+        handler?(event)
     }
 
     func queueRead(_ data: Data?, error: Error? = nil) {
+        let handler: (@Sendable (Data?, Error?) -> Void)?
+        lock.lock()
         if !pendingReadHandlers.isEmpty {
-            let handler = pendingReadHandlers.removeFirst()
-            handler(data, error)
-            return
+            handler = pendingReadHandlers.removeFirst()
+        } else {
+            handler = nil
+            queuedReads.append((data, error))
         }
-        queuedReads.append((data, error))
+        lock.unlock()
+        handler?(data, error)
     }
 
     func completeNextWrite(error: Error? = nil) {
-        XCTAssertFalse(pendingWriteHandlers.isEmpty)
-        let completion = pendingWriteHandlers.removeFirst()
+        let completion: (@Sendable (Error?) -> Void)?
+        lock.lock()
+        if pendingWriteHandlers.isEmpty {
+            completion = nil
+        } else {
+            completion = pendingWriteHandlers.removeFirst()
+        }
+        lock.unlock()
+        guard let completion else {
+            XCTFail("Expected a pending write completion")
+            return
+        }
         completion(error)
     }
 }
@@ -1187,6 +1586,24 @@ private final class ControlledUDPSession: @unchecked Sendable, Socks5UDPSession 
 
     func emitRead(_ data: Data?, error: Error? = nil) {
         readHandler?(data, error)
+    }
+}
+
+private final class ControlledUDPAssociateRelay: Socks5UDPRelayProtocol {
+    let port: UInt16
+    private(set) var started = false
+    private(set) var stopped = false
+
+    init(port: UInt16) {
+        self.port = port
+    }
+
+    func start() {
+        started = true
+    }
+
+    func stop() {
+        stopped = true
     }
 }
 

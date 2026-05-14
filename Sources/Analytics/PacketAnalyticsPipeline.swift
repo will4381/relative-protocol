@@ -95,6 +95,11 @@ public actor PacketAnalyticsPipeline {
         let destinationAddressLow: UInt64
     }
 
+    private static func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
+        let (value, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? Int.max : value
+    }
+
     private struct CounterSet: Sendable {
         var bytes = 0
         var packetCount = 0
@@ -112,34 +117,39 @@ public actor PacketAnalyticsPipeline {
         }
 
         mutating func record(summary: FastPacketSummary) {
-            bytes += summary.packetLength
-            packetCount += 1
+            bytes = Self.saturatingAdd(bytes, summary.packetLength)
+            packetCount = Self.saturatingAdd(packetCount, 1)
             if summary.isLargePacketForDetectorStats {
-                largePacketCount += 1
+                largePacketCount = Self.saturatingAdd(largePacketCount, 1)
             }
             if summary.isSmallPacketForDetectorStats {
-                smallPacketCount += 1
+                smallPacketCount = Self.saturatingAdd(smallPacketCount, 1)
             }
             switch summary.transport {
             case .udp:
-                udpPacketCount += 1
+                udpPacketCount = Self.saturatingAdd(udpPacketCount, 1)
             case .tcp:
-                tcpPacketCount += 1
+                tcpPacketCount = Self.saturatingAdd(tcpPacketCount, 1)
             default:
                 break
             }
             if summary.isQUICInitialCandidate {
-                quicInitialCount += 1
+                quicInitialCount = Self.saturatingAdd(quicInitialCount, 1)
             }
             if summary.hasTCPSYN {
-                tcpSynCount += 1
+                tcpSynCount = Self.saturatingAdd(tcpSynCount, 1)
             }
             if summary.hasTCPFIN {
-                tcpFinCount += 1
+                tcpFinCount = Self.saturatingAdd(tcpFinCount, 1)
             }
             if summary.hasTCPRST {
-                tcpRstCount += 1
+                tcpRstCount = Self.saturatingAdd(tcpRstCount, 1)
             }
+        }
+
+        private static func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
+            let (value, overflow) = lhs.addingReportingOverflow(rhs)
+            return overflow ? Int.max : value
         }
 
         mutating func reset() {
@@ -199,12 +209,12 @@ public actor PacketAnalyticsPipeline {
 
             let elapsed = now.timeIntervalSince(startedAt)
             if elapsed <= 0.2 {
-                leadingBytes200ms += summary.packetLength
-                leadingPackets200ms += 1
+                leadingBytes200ms = PacketAnalyticsPipeline.saturatingAdd(leadingBytes200ms, summary.packetLength)
+                leadingPackets200ms = PacketAnalyticsPipeline.saturatingAdd(leadingPackets200ms, 1)
             }
             if elapsed <= 0.6 {
-                leadingBytes600ms += summary.packetLength
-                leadingPackets600ms += 1
+                leadingBytes600ms = PacketAnalyticsPipeline.saturatingAdd(leadingBytes600ms, summary.packetLength)
+                leadingPackets600ms = PacketAnalyticsPipeline.saturatingAdd(leadingPackets600ms, 1)
             }
         }
 
@@ -304,7 +314,7 @@ public actor PacketAnalyticsPipeline {
 
         let now = await clock.now()
         var records: [PacketSampleStream.PacketStreamRecord] = []
-        records.reserveCapacity(min(packets.count * 2, 128))
+        records.reserveCapacity(min(packets.count, 64) * 2)
         records.append(contentsOf: maybeEvictExpiredFlowContexts(now: now, policy: policy))
 
         var metadataProbesRemaining = policy.maxMetadataProbesPerBatch
@@ -351,8 +361,8 @@ public actor PacketAnalyticsPipeline {
                 context.currentBurst.reset()
             }
 
-            context.totalPacketCount += 1
-            context.totalByteCount += summary.packetLength
+            context.totalPacketCount = Self.saturatingAdd(context.totalPacketCount, 1)
+            context.totalByteCount = Self.saturatingAdd(context.totalByteCount, summary.packetLength)
             context.activityCounters.record(summary: summary)
             context.slice.record(summary: summary, now: now)
             context.currentBurst.record(summary: summary, now: now)

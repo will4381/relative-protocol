@@ -1,5 +1,9 @@
-import Darwin
 import Foundation
+#if os(Linux)
+import Glibc
+#else
+import Darwin
+#endif
 
 /// IP protocol version discriminator.
 public enum IPVersion: UInt8, Codable, Sendable {

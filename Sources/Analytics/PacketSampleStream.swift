@@ -1,7 +1,11 @@
-import Darwin
 import Foundation
 import Observability
 import TunnelRuntime
+#if os(Linux)
+import Glibc
+#else
+import Darwin
+#endif
 
 /// Event kind used by the app-facing rolling packet tap.
 /// Decision: the tunnel writes fewer, more meaningful events (`flowOpen`, `flowSlice`, `flowClose`, `metadata`,
@@ -446,14 +450,14 @@ public actor PacketSampleStream {
 
         func add(_ value: String?) {
             guard let value else { return }
-            size += value.utf8.count
+            size = saturatingAdd(size, value.utf8.count)
         }
 
         func add(_ values: [String]?) {
             guard let values else { return }
-            size += 16
+            size = saturatingAdd(size, 16)
             for value in values {
-                size += value.utf8.count
+                size = saturatingAdd(size, value.utf8.count)
             }
         }
 
@@ -481,14 +485,14 @@ public actor PacketSampleStream {
 
         func add(_ value: String?) {
             guard let value else { return }
-            size += value.utf8.count
+            size = saturatingAdd(size, value.utf8.count)
         }
 
         func add(_ values: [String]?) {
             guard let values else { return }
-            size += 16
+            size = saturatingAdd(size, 16)
             for value in values {
-                size += value.utf8.count
+                size = saturatingAdd(size, value.utf8.count)
             }
         }
 
@@ -496,7 +500,7 @@ public actor PacketSampleStream {
         if let textFlowId = record.textFlowId, !textFlowId.isEmpty {
             add(textFlowId)
         } else if record.flowHash != nil {
-            size += 16
+            size = saturatingAdd(size, 16)
         }
         add(record.protocolHint)
         add(record.textSourceAddress)
@@ -513,6 +517,11 @@ public actor PacketSampleStream {
         add(record.associatedDomain)
         add(record.serviceFamily)
         return size
+    }
+
+    private static func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
+        let (value, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? Int.max : value
     }
 
     private func store(_ sample: PacketSample, retainedAt: Date) async throws {
@@ -542,7 +551,7 @@ public actor PacketSampleStream {
                 estimatedBytes: estimatedBytes
             )
         )
-        retainedBytes += estimatedBytes
+        retainedBytes = Self.saturatingAdd(retainedBytes, estimatedBytes)
         evictToFitBudget()
     }
 
@@ -573,7 +582,7 @@ public actor PacketSampleStream {
                 estimatedBytes: estimatedBytes
             )
         )
-        retainedBytes += estimatedBytes
+        retainedBytes = Self.saturatingAdd(retainedBytes, estimatedBytes)
         evictToFitBudget()
     }
 
@@ -725,8 +734,19 @@ public actor PacketSampleStream {
         switch length {
         case 4:
             var address = in_addr()
-            _ = bytes.withUnsafeBytes { rawBuffer in
-                memcpy(&address, rawBuffer.baseAddress!.advanced(by: 12), 4)
+            var didCopyAddress = false
+            withUnsafeMutableBytes(of: &address) { addressBuffer in
+                bytes.withUnsafeBytes { rawBuffer in
+                    guard let destination = addressBuffer.baseAddress,
+                          let source = rawBuffer.baseAddress?.advanced(by: 12) else {
+                        return
+                    }
+                    memcpy(destination, source, 4)
+                    didCopyAddress = true
+                }
+            }
+            guard didCopyAddress else {
+                return fallback
             }
             var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
             guard inet_ntop(AF_INET, &address, &buffer, socklen_t(INET_ADDRSTRLEN)) != nil else {
@@ -735,8 +755,19 @@ public actor PacketSampleStream {
             return String(cString: buffer)
         case 16:
             var address = in6_addr()
-            _ = bytes.withUnsafeBytes { rawBuffer in
-                memcpy(&address, rawBuffer.baseAddress, 16)
+            var didCopyAddress = false
+            withUnsafeMutableBytes(of: &address) { addressBuffer in
+                bytes.withUnsafeBytes { rawBuffer in
+                    guard let destination = addressBuffer.baseAddress,
+                          let source = rawBuffer.baseAddress else {
+                        return
+                    }
+                    memcpy(destination, source, 16)
+                    didCopyAddress = true
+                }
+            }
+            guard didCopyAddress else {
+                return fallback
             }
             var buffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
             guard inet_ntop(AF_INET6, &address, &buffer, socklen_t(INET6_ADDRSTRLEN)) != nil else {

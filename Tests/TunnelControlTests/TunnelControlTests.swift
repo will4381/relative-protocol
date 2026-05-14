@@ -11,7 +11,7 @@ final class TunnelControlTests: XCTestCase {
         XCTAssertEqual(profile.mtu, 1_280)
         XCTAssertEqual(profile.mtuStrategy, .recommendedGeneric)
         XCTAssertEqual(profile.dnsStrategy, .recommendedDefault)
-        XCTAssertEqual(profile.dnsServers, [])
+        XCTAssertEqual(profile.dnsServers, TunnelDNSStrategy.defaultPublicResolvers)
     }
 
     func testRuntimeProfileValidationFailsClosedForEmptyProviderConfiguration() {
@@ -39,6 +39,18 @@ final class TunnelControlTests: XCTestCase {
         }
     }
 
+    func testRuntimeProfileValidationRejectsSignaturePathTraversal() {
+        var configuration = makeRuntimeProviderConfiguration()
+        configuration["signatureFileName"] = "../app_signatures.json"
+
+        XCTAssertThrowsError(try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)) { error in
+            XCTAssertEqual(
+                error as? TunnelProfileValidationError,
+                .invalidValue(key: "signatureFileName", reason: "must be a single file name without path separators")
+            )
+        }
+    }
+
     func testRuntimeProfileValidationRejectsMalformedNetworkAddresses() {
         var configuration = makeRuntimeProviderConfiguration()
         configuration["ipv4Address"] = "10.0.0.999"
@@ -57,6 +69,71 @@ final class TunnelControlTests: XCTestCase {
             XCTAssertEqual(
                 error as? TunnelProfileValidationError,
                 .invalidValue(key: "ipv4SubnetMask", reason: "must be a contiguous IPv4 subnet mask")
+            )
+        }
+    }
+
+    func testRuntimeProfileValidationRejectsOutOfRangePortsBeforeClamping() {
+        var configuration = makeRuntimeProviderConfiguration()
+        configuration["relayPort"] = 70_000
+
+        XCTAssertThrowsError(try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)) { error in
+            XCTAssertEqual(
+                error as? TunnelProfileValidationError,
+                .invalidValue(key: "relayPort", reason: "must be in 1...65535")
+            )
+        }
+
+        configuration = makeRuntimeProviderConfiguration()
+        configuration["engineSocksPort"] = -1
+
+        XCTAssertThrowsError(try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)) { error in
+            XCTAssertEqual(
+                error as? TunnelProfileValidationError,
+                .invalidValue(key: "engineSocksPort", reason: "must be in 0...65535")
+            )
+        }
+
+        configuration = makeRuntimeProviderConfiguration()
+        configuration["relayPort"] = true
+
+        XCTAssertThrowsError(try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)) { error in
+            XCTAssertEqual(
+                error as? TunnelProfileValidationError,
+                .invalidValue(key: "relayPort", reason: "must be in 1...65535")
+            )
+        }
+    }
+
+    func testRuntimeProfileValidationRejectsOutOfRangeMTUBeforeClamping() {
+        var configuration = makeRuntimeProviderConfiguration()
+        configuration["mtu"] = 70_000
+
+        XCTAssertThrowsError(try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)) { error in
+            XCTAssertEqual(
+                error as? TunnelProfileValidationError,
+                .invalidValue(key: "mtu", reason: "must be in 1280...65535")
+            )
+        }
+
+        configuration = makeRuntimeProviderConfiguration()
+        configuration["mtu"] = true
+
+        XCTAssertThrowsError(try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)) { error in
+            XCTAssertEqual(
+                error as? TunnelProfileValidationError,
+                .invalidValue(key: "mtu", reason: "must be in 1280...65535")
+            )
+        }
+
+        configuration = makeRuntimeProviderConfiguration()
+        configuration["mtuStrategy"] = "automaticTunnelOverhead"
+        configuration["tunnelOverheadBytes"] = true
+
+        XCTAssertThrowsError(try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)) { error in
+            XCTAssertEqual(
+                error as? TunnelProfileValidationError,
+                .invalidValue(key: "tunnelOverheadBytes", reason: "must be in 0...65535")
             )
         }
     }
@@ -138,6 +215,7 @@ final class TunnelControlTests: XCTestCase {
         XCTAssertEqual(profile.appGroupID, "group.example")
         XCTAssertEqual(profile.engineSocksPort, 0)
         XCTAssertEqual(profile.dnsStrategy, .recommendedDefault)
+        XCTAssertEqual(profile.dnsServers, TunnelDNSStrategy.defaultPublicResolvers)
     }
 
     func testAutomaticTunnelOverheadUsesSafeInternalMTUBuffer() {
@@ -353,6 +431,23 @@ final class TunnelControlTests: XCTestCase {
         XCTAssertNil(settings.mtu)
         XCTAssertEqual(settings.tunnelOverheadBytes?.intValue, 80)
         XCTAssertNil(settings.dnsSettings)
+    }
+
+    func testSettingsFactoryInstallsDefaultDNSForFullTunnel() throws {
+        let profile = makeProfile(
+            mtu: 1_280,
+            mtuStrategy: .automaticTunnelOverhead(80),
+            dnsStrategy: .recommendedDefault
+        )
+
+        let settings = TunnelNetworkSettingsFactory.makeSettings(profile: profile)
+        let dnsSettings = try XCTUnwrap(settings.dnsSettings)
+        XCTAssertEqual(dnsSettings.servers, TunnelDNSStrategy.defaultPublicResolvers)
+        XCTAssertEqual(dnsSettings.matchDomains, [""])
+        XCTAssertTrue(dnsSettings.matchDomainsNoSearch)
+        if #available(iOS 26.0, macOS 26.0, tvOS 26.0, *) {
+            XCTAssertFalse(dnsSettings.allowFailover)
+        }
     }
 
     func testSettingsFactoryBuildsTLSAndHTTPSDNSSettings() throws {

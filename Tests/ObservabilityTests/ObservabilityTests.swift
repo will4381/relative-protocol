@@ -56,6 +56,57 @@ final class ObservabilityTests: XCTestCase {
         XCTAssertEqual(drops.droppedQueueFull, 0)
     }
 
+    /// Verifies public rotation policy inputs are normalized to operable minimums.
+    func testJSONLRotationPolicyClampsInvalidInputs() {
+        let policy = JSONLRotationPolicy(maxBytesPerFile: 0, maxFiles: 0, maxTotalBytes: 0, maxQueueDepth: 0)
+
+        XCTAssertEqual(policy.maxBytesPerFile, 1)
+        XCTAssertEqual(policy.maxFiles, 1)
+        XCTAssertEqual(policy.maxTotalBytes, 1)
+        XCTAssertEqual(policy.maxQueueDepth, 1)
+    }
+
+    /// Verifies independent writers can share one directory without sharing one active JSONL file.
+    func testJSONLFilePrefixIsolatesIndependentWriters() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let tunnelSink = JSONLLogSink(
+            rootProvider: HarnessLogRootPathProvider(root: root),
+            policy: JSONLRotationPolicy(maxBytesPerFile: 1024, maxFiles: 3, maxTotalBytes: 4096),
+            eventQueueLabel: "tunnel"
+        )
+        let exampleSink = JSONLLogSink(
+            rootProvider: HarnessLogRootPathProvider(root: root),
+            policy: JSONLRotationPolicy(maxBytesPerFile: 1024, maxFiles: 3, maxTotalBytes: 4096),
+            eventQueueLabel: "example",
+            filePrefix: "events.example"
+        )
+
+        await tunnelSink.write(
+            LogEnvelope(level: .info, phase: .lifecycle, component: "tunnel", event: "start", message: "Tunnel started")
+        )
+        await exampleSink.write(
+            LogEnvelope(
+                level: .info,
+                phase: .lifecycle,
+                component: "example",
+                event: "doctor-started",
+                message: "Doctor started"
+            )
+        )
+
+        let tunnelFiles = try await tunnelSink.listLogFiles().map(\.lastPathComponent)
+        let exampleFiles = try await exampleSink.listLogFiles().map(\.lastPathComponent)
+        let allFiles = try FileManager.default.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: nil
+        ).map(\.lastPathComponent)
+
+        XCTAssertEqual(tunnelFiles, ["events.current.jsonl"])
+        XCTAssertEqual(exampleFiles, ["events.example.current.jsonl"])
+        XCTAssertTrue(allFiles.contains("events.current.jsonl"))
+        XCTAssertTrue(allFiles.contains("events.example.current.jsonl"))
+    }
+
     /// Verifies unified-log rendering preserves identifiers and severity mapping for device debugging.
     func testUnifiedLogRenderingIncludesStructuredIdentifiers() {
         let envelope = LogEnvelope(
@@ -75,7 +126,9 @@ final class ObservabilityTests: XCTestCase {
             metadata: ["path": "wifi"]
         )
 
+#if canImport(os)
         XCTAssertEqual(envelope.level.unifiedLogType, .default)
+#endif
         XCTAssertTrue(envelope.renderedForUnifiedLog.contains("runId=run-1"))
         XCTAssertTrue(envelope.renderedForUnifiedLog.contains("sessionId=session-1"))
         XCTAssertTrue(envelope.renderedForUnifiedLog.contains("connId=conn-1"))

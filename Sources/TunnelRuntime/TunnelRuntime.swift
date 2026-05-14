@@ -215,6 +215,17 @@ public actor TunnelRuntime {
             return 0
         }
         let now = await clock.now()
-        return Int((now.timeIntervalSince(setupStartedAt) * 1000).rounded())
+        let elapsed = now.timeIntervalSince(setupStartedAt)
+        guard elapsed.isFinite, elapsed > 0 else {
+            return 0
+        }
+        let milliseconds = (elapsed * 1_000).rounded()
+        guard milliseconds.isFinite else {
+            return Int.max
+        }
+        if milliseconds >= Double(Int.max) {
+            return Int.max
+        }
+        return Int(milliseconds)
     }
 }

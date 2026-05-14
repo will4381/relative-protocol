@@ -1,6 +1,10 @@
 @testable import Analytics
-import Darwin
 import Foundation
+#if os(Linux)
+import Glibc
+#else
+import Darwin
+#endif
 import XCTest
 
 final class FastPacketSummaryTests: XCTestCase {
@@ -67,6 +71,124 @@ final class FastPacketSummaryTests: XCTestCase {
         XCTAssertEqual(summary?.protocolHint, "udp")
     }
 
+    func testNonInitialIPv4FragmentDoesNotExposeTransportMetadata() throws {
+        var packet = makeIPv4TCPPacket(
+            sourceAddress: [10, 0, 0, 2],
+            destinationAddress: [1, 1, 1, 1],
+            sourcePort: 50_000,
+            destinationPort: 443,
+            tcpFlags: 0x02,
+            payload: [22, 3, 3, 0, 5]
+        )
+        packet[6] = 0x00
+        packet[7] = 0x01
+
+        let summary = FastPacketSummary(data: Data(packet), ipVersionHint: nil)
+        XCTAssertNotNil(summary)
+        XCTAssertEqual(summary?.transportProtocolNumber, 6)
+        XCTAssertFalse(summary?.hasPorts == true)
+
+        let metadata = try XCTUnwrap(PacketParser.parse(Data(packet), ipVersionHint: nil))
+        XCTAssertEqual(metadata.transport, .tcp)
+        XCTAssertNil(metadata.srcPort)
+        XCTAssertNil(metadata.dstPort)
+        XCTAssertNil(metadata.tlsServerName)
+    }
+
+    func testNonInitialIPv6FragmentDoesNotExposeTransportMetadata() throws {
+        let packet = makeIPv6FragmentedUDPPacket(
+            sourceAddress: [
+                0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 1
+            ],
+            destinationAddress: [
+                0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 2
+            ],
+            sourcePort: 50_001,
+            destinationPort: 443,
+            payload: [0xc0, 0x00, 0x00, 0x00]
+        )
+
+        let summary = FastPacketSummary(data: Data(packet), ipVersionHint: nil)
+        XCTAssertNotNil(summary)
+        XCTAssertEqual(summary?.ipVersion, 6)
+        XCTAssertEqual(summary?.transportProtocolNumber, 17)
+        XCTAssertFalse(summary?.hasPorts == true)
+        XCTAssertNil(summary?.quicVersion)
+
+        let metadata = try XCTUnwrap(PacketParser.parse(Data(packet), ipVersionHint: nil))
+        XCTAssertEqual(metadata.transport, .udp)
+        XCTAssertNil(metadata.srcPort)
+        XCTAssertNil(metadata.dstPort)
+        XCTAssertNil(metadata.quicVersion)
+    }
+
+    func testIPv4DeclaredLengthsBoundFastAndDeepPayloadParsing() throws {
+        let quicLookingPayload: [UInt8] = [
+            0xc0,
+            0x00, 0x00, 0x00, 0x01,
+            0x08,
+            0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef,
+            0x00
+        ]
+        var packet = makeIPv4UDPPacket(
+            sourceAddress: [10, 0, 0, 2],
+            destinationAddress: [1, 1, 1, 1],
+            sourcePort: 50_001,
+            destinationPort: 443,
+            payload: quicLookingPayload
+        )
+        let declaredLength = 20 + 8
+        packet[2] = UInt8(declaredLength >> 8)
+        packet[3] = UInt8(declaredLength & 0xff)
+        packet[24] = 0
+        packet[25] = 8
+
+        let summary = try XCTUnwrap(FastPacketSummary(data: Data(packet), ipVersionHint: nil))
+        XCTAssertEqual(summary.packetLength, declaredLength)
+        XCTAssertTrue(summary.hasPorts)
+        XCTAssertFalse(summary.hasTransportPayload)
+        XCTAssertFalse(summary.isQUICCandidate)
+        XCTAssertNil(summary.quicVersion)
+
+        let metadata = try XCTUnwrap(PacketParser.parse(Data(packet), ipVersionHint: nil))
+        XCTAssertEqual(metadata.length, declaredLength)
+        XCTAssertNil(metadata.quicVersion)
+        XCTAssertNil(metadata.quicPacketType)
+    }
+
+    func testUDPDeclaredLengthBoundsFastAndDeepPayloadParsing() throws {
+        let trailingBytes: [UInt8] = [
+            0xc0,
+            0x00, 0x00, 0x00, 0x01,
+            0x08,
+            0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef,
+            0x00
+        ]
+        var packet = makeIPv4UDPPacket(
+            sourceAddress: [10, 0, 0, 2],
+            destinationAddress: [1, 1, 1, 1],
+            sourcePort: 50_001,
+            destinationPort: 443,
+            payload: trailingBytes
+        )
+        packet[24] = 0
+        packet[25] = 8
+
+        let summary = try XCTUnwrap(FastPacketSummary(data: Data(packet), ipVersionHint: nil))
+        XCTAssertEqual(summary.packetLength, packet.count)
+        XCTAssertTrue(summary.hasPorts)
+        XCTAssertFalse(summary.hasTransportPayload)
+        XCTAssertFalse(summary.isQUICCandidate)
+        XCTAssertNil(summary.quicVersion)
+
+        let metadata = try XCTUnwrap(PacketParser.parse(Data(packet), ipVersionHint: nil))
+        XCTAssertEqual(metadata.length, packet.count)
+        XCTAssertNil(metadata.quicVersion)
+        XCTAssertNil(metadata.quicPacketType)
+    }
+
     private func makeIPv4TCPPacket(
         sourceAddress: [UInt8],
         destinationAddress: [UInt8],
@@ -92,6 +214,36 @@ final class FastPacketSummaryTests: XCTestCase {
         packet[tcpOffset + 12] = 0x50
         packet[tcpOffset + 13] = tcpFlags
         packet[(tcpOffset + 20)...] = payload[0...]
+        return packet
+    }
+
+    private func makeIPv4UDPPacket(
+        sourceAddress: [UInt8],
+        destinationAddress: [UInt8],
+        sourcePort: UInt16,
+        destinationPort: UInt16,
+        payload: [UInt8]
+    ) -> [UInt8] {
+        var packet = [UInt8](repeating: 0, count: 20 + 8 + payload.count)
+        packet[0] = 0x45
+        packet[2] = UInt8(packet.count >> 8)
+        packet[3] = UInt8(packet.count & 0xff)
+        packet[8] = 64
+        packet[9] = 17
+        packet[12..<16] = sourceAddress[0..<4]
+        packet[16..<20] = destinationAddress[0..<4]
+
+        let udpOffset = 20
+        let udpLength = 8 + payload.count
+        packet[udpOffset] = UInt8(sourcePort >> 8)
+        packet[udpOffset + 1] = UInt8(sourcePort & 0xff)
+        packet[udpOffset + 2] = UInt8(destinationPort >> 8)
+        packet[udpOffset + 3] = UInt8(destinationPort & 0xff)
+        packet[udpOffset + 4] = UInt8(udpLength >> 8)
+        packet[udpOffset + 5] = UInt8(udpLength & 0xff)
+        if !payload.isEmpty {
+            packet[(udpOffset + 8)...] = payload[0...]
+        }
         return packet
     }
 
@@ -123,6 +275,45 @@ final class FastPacketSummaryTests: XCTestCase {
         return packet
     }
 
+    private func makeIPv6FragmentedUDPPacket(
+        sourceAddress: [UInt8],
+        destinationAddress: [UInt8],
+        sourcePort: UInt16,
+        destinationPort: UInt16,
+        payload: [UInt8]
+    ) -> [UInt8] {
+        var packet = [UInt8](repeating: 0, count: 40 + 8 + 8 + payload.count)
+        packet[0] = 0x60
+        let payloadLength = 8 + 8 + payload.count
+        packet[4] = UInt8(payloadLength >> 8)
+        packet[5] = UInt8(payloadLength & 0xff)
+        packet[6] = 44
+        packet[7] = 64
+        packet[8..<24] = sourceAddress[0..<16]
+        packet[24..<40] = destinationAddress[0..<16]
+
+        let fragmentOffset = 40
+        packet[fragmentOffset] = 17
+        packet[fragmentOffset + 1] = 0
+        packet[fragmentOffset + 2] = 0x00
+        packet[fragmentOffset + 3] = 0x08
+        packet[fragmentOffset + 4] = 0xde
+        packet[fragmentOffset + 5] = 0xad
+        packet[fragmentOffset + 6] = 0xbe
+        packet[fragmentOffset + 7] = 0xef
+
+        let udpOffset = fragmentOffset + 8
+        let udpLength = 8 + payload.count
+        packet[udpOffset] = UInt8(sourcePort >> 8)
+        packet[udpOffset + 1] = UInt8(sourcePort & 0xff)
+        packet[udpOffset + 2] = UInt8(destinationPort >> 8)
+        packet[udpOffset + 3] = UInt8(destinationPort & 0xff)
+        packet[udpOffset + 4] = UInt8(udpLength >> 8)
+        packet[udpOffset + 5] = UInt8(udpLength & 0xff)
+        packet[(udpOffset + 8)...] = payload[0...]
+        return packet
+    }
+
     private func addressString(high: UInt64?, low: UInt64?, length: UInt8?) -> String? {
         guard let high, let low, let length, length == 4 || length == 16 else {
             return nil
@@ -136,8 +327,9 @@ final class FastPacketSummaryTests: XCTestCase {
 
         if length == 4 {
             var address = in_addr()
-            _ = bytes.withUnsafeBytes { rawBuffer in
-                memcpy(&address, rawBuffer.baseAddress!.advanced(by: 12), 4)
+            bytes.withUnsafeBytes { rawBuffer in
+                guard let baseAddress = rawBuffer.baseAddress else { return }
+                memcpy(&address, baseAddress.advanced(by: 12), 4)
             }
             var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
             let result = withUnsafePointer(to: &address) {
@@ -147,8 +339,9 @@ final class FastPacketSummaryTests: XCTestCase {
         }
 
         var address = in6_addr()
-        _ = bytes.withUnsafeBytes { rawBuffer in
-            memcpy(&address, rawBuffer.baseAddress!, 16)
+        bytes.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else { return }
+            memcpy(&address, baseAddress, 16)
         }
         var buffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
         let result = withUnsafePointer(to: &address) {

@@ -64,7 +64,7 @@ internal struct DNSAssociationCache {
         guard let entry = entries[key] else {
             return nil
         }
-        let ageMs = max(0, Int(now.timeIntervalSince(entry.storedAt) * 1_000))
+        let ageMs = millisecondsBetween(entry.storedAt, and: now)
         return DNSAssociationSnapshot(
             associatedDomain: entry.associatedDomain,
             source: entry.source,
@@ -152,4 +152,19 @@ internal struct DNSAssociationCache {
         }
         return AddressKey(length: UInt8(bytes.count), high: high, low: low)
     }
+}
+
+private func millisecondsBetween(_ earlier: Date, and later: Date) -> Int {
+    let elapsed = later.timeIntervalSince(earlier)
+    guard elapsed.isFinite, elapsed > 0 else {
+        return 0
+    }
+    let milliseconds = (elapsed * 1_000).rounded()
+    guard milliseconds.isFinite else {
+        return Int.max
+    }
+    if milliseconds >= Double(Int.max) {
+        return Int.max
+    }
+    return Int(milliseconds)
 }

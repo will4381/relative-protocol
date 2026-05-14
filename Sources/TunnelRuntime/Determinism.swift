@@ -25,10 +25,11 @@ public struct SystemClock: Clock {
     /// Sleeps the current task using system monotonic clock.
     /// - Parameter seconds: Duration to sleep. Non-positive values are ignored.
     public func sleep(for seconds: TimeInterval) async throws {
-        guard seconds > 0 else {
+        guard seconds.isFinite, seconds > 0 else {
             return
         }
-        try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+        let nanoseconds = min(seconds * 1_000_000_000, Double(UInt64.max))
+        try await Task.sleep(nanoseconds: UInt64(nanoseconds))
     }
 
     /// No-op for system clock because wall time cannot be manually advanced.
@@ -61,7 +62,7 @@ public actor DeterministicClock: Clock {
     /// Suspends until deterministic time is advanced by at least `seconds`.
     /// - Parameter seconds: Duration relative to current deterministic time.
     public func sleep(for seconds: TimeInterval) async throws {
-        guard seconds > 0 else {
+        guard seconds.isFinite, seconds > 0 else {
             return
         }
         let wakeTime = currentTime.addingTimeInterval(seconds)
@@ -74,7 +75,7 @@ public actor DeterministicClock: Clock {
     /// Advances deterministic time and resumes any now-ready waiters.
     /// - Parameter seconds: Non-negative time delta.
     public func advance(by seconds: TimeInterval) async {
-        guard seconds >= 0 else {
+        guard seconds.isFinite, seconds >= 0 else {
             return
         }
         currentTime = currentTime.addingTimeInterval(seconds)
@@ -110,7 +111,9 @@ public actor DeterministicRunIdGenerator: RunIdGenerator {
 
     /// Returns the next monotonically increasing run ID.
     public func nextRunId() async -> String {
-        counter += 1
+        if counter < UInt64.max {
+            counter += 1
+        }
         return "\(prefix)-\(counter)"
     }
 }

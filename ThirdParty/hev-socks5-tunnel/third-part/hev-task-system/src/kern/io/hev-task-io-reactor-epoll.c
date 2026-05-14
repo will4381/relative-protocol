@@ -1,13 +1,13 @@
 /*
  ============================================================================
- Name        : hev-task-io-reactor-kqueue.c
+ Name        : hev-task-io-reactor-epoll.c
  Author      : Heiher <r@hev.cc>
  Copyright   : Copyright (c) 2018 - 2025 everyone.
- Description : I/O Reactor KQueue
+ Description : I/O Reactor EPoll
  ============================================================================
  */
 
-#if !defined(__linux__) && !defined(__MSYS__)
+#if defined(__linux__)
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -26,7 +26,7 @@ hev_task_io_reactor_new (void)
     if (!self)
         return NULL;
 
-    self->fd = kqueue ();
+    self->fd = epoll_create (128);
     if (self->fd < 0) {
         hev_free (self);
         return NULL;
@@ -60,17 +60,14 @@ int
 hev_task_io_reactor_setup (HevTaskIOReactor *self,
                            HevTaskIOReactorSetupEvent *events, int count)
 {
-    int i, res = -1;
+    int i, res = 0;
 
     for (i = 0; i < count; i++) {
-        if (!(events[i].flags & EV_DELETE)) {
-            res = kevent (self->fd, &events[i], count - i, NULL, 0, NULL);
-            break;
-        }
-        res &= kevent (self->fd, &events[i], 1, NULL, 0, NULL);
+        HevTaskIOReactorSetupEvent *ev = &events[i];
+        res |= epoll_ctl (self->fd, ev->op, ev->fd, &ev->event);
     }
 
     return res;
 }
 
-#endif /* !defined(__linux__) && !defined(__MSYS__) */
+#endif /* defined(__linux__) */

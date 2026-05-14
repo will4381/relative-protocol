@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(Network)
 import Network
+#endif
 
 internal struct PathRegimeSnapshot: Sendable, Equatable {
     let epoch: UInt32
@@ -35,6 +37,7 @@ internal protocol PathRegimeProvider: Sendable {
 /// Docs: https://developer.apple.com/documentation/network/nwpathmonitor
 /// Docs: https://developer.apple.com/documentation/network/nwpath/usesinterfacetype(_:)
 internal final class NWPathRegimeMonitor: PathRegimeProvider, @unchecked Sendable {
+#if canImport(Network)
     private struct Signature: Equatable {
         let interfaceClass: PathInterfaceClass
         let isExpensive: Bool
@@ -129,4 +132,13 @@ internal final class NWPathRegimeMonitor: PathRegimeProvider, @unchecked Sendabl
         }
         return .mixed
     }
+#else
+    init() {}
+
+    var currentSnapshot: PathRegimeSnapshot {
+        .unavailable
+    }
+
+    func stop() {}
+#endif
 }

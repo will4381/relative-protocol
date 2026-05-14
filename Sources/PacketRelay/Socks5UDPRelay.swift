@@ -125,7 +125,11 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
     }
 
     var activeSessionCount: Int {
-        sessions.count
+        var count = 0
+        performOnQueue {
+            count = sessions.count
+        }
+        return count
     }
 
     /// Starts local UDP socket read loop for SOCKS5 UDP ASSOCIATE traffic.
@@ -255,7 +259,8 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
                             component: "Socks5UDPRelay",
                             event: "write-failed",
                             errorCode: String(describing: error),
-                            message: "UDP relay write failed"
+                            message: "UDP relay write failed",
+                            metadata: Self.destinationMetadata(for: key)
                         )
                     }
                 }
@@ -285,7 +290,7 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
 
     private func sessionEntry(for key: SessionKey, now: Date) -> SessionEntry {
         if let entry = sessions[key], !entry.needsReplacement {
-            return markSessionUsed(for: key, at: now)
+            return markSessionUsed(for: key, at: now) ?? entry
         }
 
         if sessions[key] != nil {
@@ -327,30 +332,6 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
                 }
             }
         }
-        session.setReadHandler({ [weak self] datagram, error in
-            guard let self else { return }
-            if let error {
-                self.removeSession(for: key)
-                let logger = self.logger
-                Task {
-                    await logger.log(
-                        level: .error,
-                        phase: .relay,
-                        category: .relayUDP,
-                        component: "Socks5UDPRelay",
-                        event: "read-failed",
-                        errorCode: String(describing: error),
-                        message: "UDP relay read failed"
-                    )
-                }
-                return
-            }
-            guard let datagram else { return }
-            _ = self.markSessionUsed(for: key, at: self.nowProvider())
-            let response = Socks5Codec.buildUDPPacket(address: key.address, port: key.port, payload: datagram)
-            self.sendToClient(response)
-        })
-
         let entry = SessionEntry(
             session: session,
             lastUsedAt: now,
@@ -367,6 +348,37 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
         sessions[key] = entry
         sessionUsageQueue.append(SessionUsageStamp(key: key, sequence: entry.lastUsedSequence))
         pruneUsageQueueIfNeeded()
+
+        session.setReadHandler({ [weak self, weak session] datagram, error in
+            guard let self, let session else { return }
+            self.performAsyncOnQueue {
+                guard self.isCurrentSession(session, for: key) else { return }
+                if let error {
+                    self.removeSession(for: key)
+                    let logger = self.logger
+                    Task {
+                        await logger.log(
+                            level: .error,
+                            phase: .relay,
+                            category: .relayUDP,
+                            component: "Socks5UDPRelay",
+                            event: "read-failed",
+                            errorCode: String(describing: error),
+                            message: "UDP relay read failed",
+                            metadata: Self.destinationMetadata(for: key)
+                        )
+                    }
+                    return
+                }
+                guard let datagram else { return }
+                guard self.markSessionUsed(for: key, at: self.nowProvider()) != nil else {
+                    return
+                }
+                let response = Socks5Codec.buildUDPPacket(address: key.address, port: key.port, payload: datagram)
+                self.sendToClient(response)
+            }
+        })
+
         return entry
     }
 
@@ -395,9 +407,9 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
         }
     }
 
-    private func markSessionUsed(for key: SessionKey, at now: Date) -> SessionEntry {
+    private func markSessionUsed(for key: SessionKey, at now: Date) -> SessionEntry? {
         guard var entry = sessions[key] else {
-            preconditionFailure("Attempted to mark a missing UDP session as used")
+            return nil
         }
         entry.lastUsedAt = now
         entry.lastUsedSequence = nextSessionUsageSequence()
@@ -430,9 +442,32 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
                 component: "Socks5UDPRelay",
                 event: "session-replacement-scheduled",
                 result: reason,
-                message: "Scheduled UDP session replacement after Network.framework path signal"
+                message: "Scheduled UDP session replacement after Network.framework path signal",
+                metadata: Self.destinationMetadata(for: key)
             )
         }
+    }
+
+    private static func destinationMetadata(for key: SessionKey) -> [String: String] {
+        let host: String
+        let hostKind: String
+        switch key.address {
+        case .ipv4(let value):
+            host = value
+            hostKind = "ipv4"
+        case .ipv6(let value):
+            host = value
+            hostKind = "ipv6"
+        case .domain(let value):
+            host = value
+            hostKind = "domain"
+        }
+        return [
+            "destination_host": host,
+            "destination_port": String(key.port),
+            "destination_host_kind": hostKind,
+            "destination_transport": "udp"
+        ]
     }
 
     private func handleDatagramLimitError(
@@ -463,7 +498,7 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
         } else {
             entry.pmtuFeedback.minimumObservedMaximumDatagramSize = maximumDatagramSize
         }
-        entry.pmtuFeedback.oversizedDropCount += 1
+        entry.pmtuFeedback.oversizedDropCount = Self.saturatingAdd(entry.pmtuFeedback.oversizedDropCount, 1)
         entry.pmtuFeedback.lastOversizedDropAt = now
         entry.pmtuFeedback.lastPathSummary = pathSummary
 
@@ -473,7 +508,8 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
         }
         sessions[key] = entry
 
-        return [
+        var metadata = Self.destinationMetadata(for: key)
+        metadata.merge([
             "error_kind": "maximum-datagram-size",
             "datagram_size": String(datagramSize),
             "maximum_datagram_size": String(maximumDatagramSize),
@@ -488,7 +524,8 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
             "replacement_scheduled": replacementScheduled ? "true" : "false",
             "session_retained": "true",
             "path": pathSummary,
-        ]
+        ]) { _, new in new }
+        return metadata
     }
 
     private func clearReplacementNeed(for key: SessionKey) {
@@ -660,5 +697,14 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
         } else {
             queue.sync(execute: work)
         }
+    }
+
+    private func performAsyncOnQueue(_ work: @escaping @Sendable () -> Void) {
+        queue.async(execute: work)
+    }
+
+    private static func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
+        let (value, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? Int.max : value
     }
 }

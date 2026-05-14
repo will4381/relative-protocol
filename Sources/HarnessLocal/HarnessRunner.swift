@@ -1,7 +1,6 @@
 import Analytics
 import Foundation
 import Observability
-import PacketRelay
 import TunnelRuntime
 
 /// Summary produced by one harness scenario execution.

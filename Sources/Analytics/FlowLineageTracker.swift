@@ -64,12 +64,12 @@ internal struct FlowLineageTracker {
         if statesByKey[key] == nil {
             nextLineageID &+= 1
         } else if state.activeFlowCount == 0, let lastClosedAt = state.lastClosedAt {
-            state.generation += 1
-            state.reopenCount += 1
-            state.lastReuseGapMs = max(0, Int(now.timeIntervalSince(lastClosedAt) * 1_000))
+            state.generation = saturatingAdd(state.generation, 1)
+            state.reopenCount = saturatingAdd(state.reopenCount, 1)
+            state.lastReuseGapMs = millisecondsBetween(lastClosedAt, and: now)
         }
         state.lastSeenAt = now
-        state.activeFlowCount += 1
+        state.activeFlowCount = saturatingAdd(state.activeFlowCount, 1)
         statesByKey[key] = state
         flowAssignments[flow] = key
         arrivalQueue.append(key)
@@ -91,7 +91,7 @@ internal struct FlowLineageTracker {
         FlowLineageSnapshot(
             lineageID: state.id,
             generation: state.generation,
-            ageMs: max(0, Int(now.timeIntervalSince(state.firstSeenAt) * 1_000)),
+            ageMs: millisecondsBetween(state.firstSeenAt, and: now),
             reuseGapMs: state.lastReuseGapMs,
             reopenCount: state.reopenCount,
             siblingCount: max(0, state.activeFlowCount - 1)
@@ -185,4 +185,24 @@ internal struct FlowLineageTracker {
         }
         return hash
     }
+}
+
+private func millisecondsBetween(_ earlier: Date, and later: Date) -> Int {
+    let elapsed = later.timeIntervalSince(earlier)
+    guard elapsed.isFinite, elapsed > 0 else {
+        return 0
+    }
+    let milliseconds = (elapsed * 1_000).rounded()
+    guard milliseconds.isFinite else {
+        return Int.max
+    }
+    if milliseconds >= Double(Int.max) {
+        return Int.max
+    }
+    return Int(milliseconds)
+}
+
+private func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
+    let (value, overflow) = lhs.addingReportingOverflow(rhs)
+    return overflow ? Int.max : value
 }

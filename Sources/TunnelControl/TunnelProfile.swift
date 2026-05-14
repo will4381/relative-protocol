@@ -52,8 +52,9 @@ public struct TunnelProfile: Sendable, Equatable {
     ///   - ipv4Router: Default IPv4 router.
     ///   - ipv6Address: Assigned IPv6 address.
     ///   - ipv6PrefixLength: IPv6 prefix length.
-    ///   - dnsServers: DNS servers pushed to the tunnel interface when `dnsStrategy` is not supplied.
-    ///   - dnsStrategy: Controls which DNS settings are installed. Defaults to cleartext DNS over `dnsServers`.
+    ///   - dnsServers: DNS servers used by direct callers when `dnsStrategy` is not supplied.
+    ///   - dnsStrategy: Controls which DNS settings are installed. Direct callers default to cleartext DNS over
+    ///     `dnsServers`; provider-configuration decoding defaults to `TunnelDNSStrategy.recommendedDefault`.
     ///   - engineSocksPort: Local SOCKS server listen port.
     ///   - engineLogLevel: Dataplane log level hint.
     ///   - telemetryEnabled: Enables sparse analytics and detector execution inside the tunnel extension.
@@ -90,15 +91,15 @@ public struct TunnelProfile: Sendable, Equatable {
         relayEndpoint: RelayEndpoint,
         dataplaneConfigJSON: String
     ) {
-        let requestedMTU = max(256, mtu)
-        let resolvedMTUStrategy = mtuStrategy ?? .fixed(requestedMTU)
+        let requestedMTU = TunnelMTUStrategy.clampedInterfaceMTU(mtu, minimum: TunnelMTUStrategy.minimumBufferMTUHint)
+        let resolvedMTUStrategy = (mtuStrategy ?? .fixed(requestedMTU)).normalizedForProvider()
 
         self.appGroupID = appGroupID
         self.tunnelRemoteAddress = tunnelRemoteAddress
         self.mtuStrategy = resolvedMTUStrategy
         switch resolvedMTUStrategy {
         case .fixed(let fixedMTU):
-            self.mtu = max(256, fixedMTU)
+            self.mtu = TunnelMTUStrategy.clampedInterfaceMTU(fixedMTU, minimum: TunnelMTUStrategy.minimumBufferMTUHint)
         case .automaticTunnelOverhead:
             self.mtu = max(requestedMTU, resolvedMTUStrategy.bufferMTUHint)
         }
@@ -202,8 +203,29 @@ public struct TunnelProfile: Sendable, Equatable {
         guard missing.isEmpty else {
             throw TunnelProfileValidationError.missingRequiredKeys(missing.sorted())
         }
-        guard profile.mtu >= 1_280 else {
-            throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.mtu, reason: "must be at least 1280")
+        if let rawMTU = providerConfiguration[TunnelProviderConfigurationKey.mtu],
+           !isExactMTU(rawMTU) {
+            throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.mtu, reason: "must be in 1280...65535")
+        }
+        guard profile.mtu >= TunnelMTUStrategy.minimumRuntimeMTU,
+              profile.mtu <= TunnelMTUStrategy.maximumInterfaceMTU else {
+            throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.mtu, reason: "must be in 1280...65535")
+        }
+        switch profile.mtuStrategy {
+        case .fixed(let mtu):
+            guard mtu >= TunnelMTUStrategy.minimumRuntimeMTU,
+                  mtu <= TunnelMTUStrategy.maximumInterfaceMTU else {
+                throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.mtu, reason: "must be in 1280...65535")
+            }
+        case .automaticTunnelOverhead(let overhead):
+            if let rawOverhead = providerConfiguration[TunnelProviderConfigurationKey.tunnelOverheadBytes],
+               !isExactTunnelOverhead(rawOverhead) {
+                throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.tunnelOverheadBytes, reason: "must be in 0...65535")
+            }
+            guard overhead >= 0,
+                  overhead <= TunnelMTUStrategy.maximumTunnelOverheadBytes else {
+                throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.tunnelOverheadBytes, reason: "must be in 0...65535")
+            }
         }
         guard isValidHostNameOrAddress(profile.tunnelRemoteAddress) else {
             throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.tunnelRemoteAddress, reason: "must be a hostname or IP literal without whitespace")
@@ -226,8 +248,17 @@ public struct TunnelProfile: Sendable, Equatable {
         guard profile.relayEndpoint.port > 0 else {
             throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.relayPort, reason: "must be greater than zero")
         }
+        guard exactUInt16(providerConfiguration[TunnelProviderConfigurationKey.engineSocksPort], allowingZero: true) != nil else {
+            throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.engineSocksPort, reason: "must be in 0...65535")
+        }
+        guard exactUInt16(providerConfiguration[TunnelProviderConfigurationKey.relayPort], allowingZero: false) != nil else {
+            throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.relayPort, reason: "must be in 1...65535")
+        }
         guard isValidHostNameOrAddress(profile.relayEndpoint.host) else {
             throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.relayHost, reason: "must be a hostname or IP literal without whitespace")
+        }
+        guard isSafeFileName(profile.signatureFileName) else {
+            throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.signatureFileName, reason: "must be a single file name without path separators")
         }
         try validateDNSStrategy(profile.dnsStrategy)
         try validateDataplaneConfig(profile.dataplaneConfigJSON)
@@ -243,12 +274,67 @@ public struct TunnelProfile: Sendable, Equatable {
             return value
         }
         if let value = value as? NSNumber {
+            guard !isBooleanNumber(value) else {
+                return defaultValue
+            }
             return value.intValue
         }
         if let value = value as? String, let parsed = Int(value) {
             return parsed
         }
         return defaultValue
+    }
+
+    private static func exactInt(_ value: Any?) -> Int? {
+        if let value = value as? Int {
+            return value
+        }
+        if let value = value as? NSNumber {
+            guard !isBooleanNumber(value) else {
+                return nil
+            }
+            let candidate = value.doubleValue
+            guard candidate.isFinite,
+                  candidate.rounded(.towardZero) == candidate,
+                  candidate >= Double(Int.min),
+                  candidate <= Double(Int.max)
+            else {
+                return nil
+            }
+            return Int(candidate)
+        }
+        if let value = value as? String {
+            return Int(value)
+        }
+        return nil
+    }
+
+    private static func isBooleanNumber(_ value: NSNumber) -> Bool {
+        CFGetTypeID(value) == CFBooleanGetTypeID()
+    }
+
+    private static func exactUInt16(_ value: Any?, allowingZero: Bool) -> UInt16? {
+        guard let parsed = exactInt(value),
+              parsed >= (allowingZero ? 0 : 1),
+              parsed <= Int(UInt16.max)
+        else {
+            return nil
+        }
+        return UInt16(parsed)
+    }
+
+    private static func isExactMTU(_ value: Any?) -> Bool {
+        guard let parsed = exactInt(value) else {
+            return false
+        }
+        return parsed >= TunnelMTUStrategy.minimumRuntimeMTU && parsed <= TunnelMTUStrategy.maximumInterfaceMTU
+    }
+
+    private static func isExactTunnelOverhead(_ value: Any?) -> Bool {
+        guard let parsed = exactInt(value) else {
+            return false
+        }
+        return parsed >= 0 && parsed <= TunnelMTUStrategy.maximumTunnelOverheadBytes
     }
 
     /// Parses a positive `UInt16` from loosely typed input.
@@ -349,8 +435,8 @@ public struct TunnelProfile: Sendable, Equatable {
             return .tls(
                 servers: servers,
                 serverName: serverName,
-                matchDomains: stringArray(rawStrategy["matchDomains"]),
-                matchDomainsNoSearch: bool(rawStrategy["matchDomainsNoSearch"], default: false),
+                matchDomains: dnsMatchDomains(from: rawStrategy),
+                matchDomainsNoSearch: bool(rawStrategy["matchDomainsNoSearch"], default: true),
                 allowFailover: bool(rawStrategy["allowFailover"], default: false)
             )
         case "https":
@@ -359,8 +445,8 @@ public struct TunnelProfile: Sendable, Equatable {
             return .https(
                 servers: servers,
                 serverURL: serverURL,
-                matchDomains: stringArray(rawStrategy["matchDomains"]),
-                matchDomainsNoSearch: bool(rawStrategy["matchDomainsNoSearch"], default: false),
+                matchDomains: dnsMatchDomains(from: rawStrategy),
+                matchDomainsNoSearch: bool(rawStrategy["matchDomainsNoSearch"], default: true),
                 allowFailover: bool(rawStrategy["allowFailover"], default: false)
             )
         case "cleartext":
@@ -368,11 +454,15 @@ public struct TunnelProfile: Sendable, Equatable {
         default:
             return .cleartext(
                 servers: stringArray(rawStrategy["servers"]) ?? legacyServers ?? TunnelDNSStrategy.defaultPublicResolvers,
-                matchDomains: stringArray(rawStrategy["matchDomains"]),
-                matchDomainsNoSearch: bool(rawStrategy["matchDomainsNoSearch"], default: false),
+                matchDomains: dnsMatchDomains(from: rawStrategy),
+                matchDomainsNoSearch: bool(rawStrategy["matchDomainsNoSearch"], default: true),
                 allowFailover: bool(rawStrategy["allowFailover"], default: false)
             )
         }
+    }
+
+    private static func dnsMatchDomains(from rawStrategy: [String: Any]) -> [String]? {
+        stringArray(rawStrategy["matchDomains"]) ?? [""]
     }
 
     private static func validateDNSStrategy(_ strategy: TunnelDNSStrategy) throws {
@@ -461,6 +551,21 @@ public struct TunnelProfile: Sendable, Equatable {
 
     private static func containsWhitespace(_ value: String) -> Bool {
         value.rangeOfCharacter(from: .whitespacesAndNewlines) != nil
+    }
+
+    private static func isSafeFileName(_ value: String) -> Bool {
+        guard !value.isEmpty,
+              value != ".",
+              value != "..",
+              value.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
+              value.range(of: "\0") == nil,
+              value == (value as NSString).lastPathComponent,
+              !value.contains("/"),
+              !value.contains("\\")
+        else {
+            return false
+        }
+        return true
     }
 
     private static func validateDataplaneConfig(_ config: String) throws {

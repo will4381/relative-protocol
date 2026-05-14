@@ -196,7 +196,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         public let droppedBatches: Int
         public let skippedBatches: Int
         public let bufferedRecords: Int
-        public let thermalState: ProcessInfo.ThermalState
+        public let thermalState: TunnelThermalState
         public let lowPowerModeEnabled: Bool
     }
 
@@ -356,7 +356,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
 
             if state.queuedBatches >= QueuePolicy.maxQueuedBatches ||
                 state.queuedBytes >= QueuePolicy.maxQueuedBytes {
-                state.droppedBatches += 1
+                Self.incrementCounter(&state.droppedBatches)
                 let shouldLogSheddingStart = !state.hasEnteredShedMode
                 state.hasEnteredShedMode = true
                 return (
@@ -396,7 +396,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
             }
 
             guard !filtered.packets.isEmpty else {
-                state.skippedBatches += 1
+                Self.incrementCounter(&state.skippedBatches)
                 return SubmitResult(
                     accepted: false,
                     skipped: true,
@@ -407,10 +407,10 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 )
             }
 
-            let nextQueuedBatches = state.queuedBatches + 1
-            let nextQueuedBytes = state.queuedBytes + filtered.byteCount
+            let nextQueuedBatches = Self.saturatingAdd(state.queuedBatches, 1)
+            let nextQueuedBytes = Self.saturatingAdd(state.queuedBytes, filtered.byteCount)
             if nextQueuedBatches > QueuePolicy.maxQueuedBatches || nextQueuedBytes > QueuePolicy.maxQueuedBytes {
-                state.droppedBatches += 1
+                Self.incrementCounter(&state.droppedBatches)
                 let shouldLogSheddingStart = !state.hasEnteredShedMode
                 state.hasEnteredShedMode = true
                 return SubmitResult(
@@ -425,7 +425,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
 
             state.queuedBatches = nextQueuedBatches
             state.queuedBytes = nextQueuedBytes
-            state.acceptedBatches += 1
+            Self.incrementCounter(&state.acceptedBatches)
             state.continuation?.yield(
                 .batch(
                     Batch(
@@ -459,8 +459,8 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 droppedBatches: state.droppedBatches,
                 skippedBatches: state.skippedBatches,
                 bufferedRecords: state.bufferedRecords,
-                thermalState: processInfo.thermalState,
-                lowPowerModeEnabled: processInfo.isLowPowerModeEnabled
+                thermalState: processInfo.tunnelThermalState,
+                lowPowerModeEnabled: processInfo.tunnelLowPowerModeEnabled
             )
         }
     }
@@ -493,7 +493,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
             droppedBatches: state.droppedBatches,
             skippedBatches: state.skippedBatches,
             bufferedRecords: state.bufferedRecords,
-            thermalState: TunnelThermalState(thermalState: state.thermalState),
+            thermalState: state.thermalState,
             lowPowerModeEnabled: state.lowPowerModeEnabled,
             detections: detections
         )
@@ -586,12 +586,15 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
             var updatedAt = state.detectionSnapshot.updatedAt
 
             for event in events {
-                countsByDetector[event.detectorIdentifier, default: 0] += 1
+                countsByDetector[event.detectorIdentifier] = Self.saturatingAdd(
+                    countsByDetector[event.detectorIdentifier, default: 0],
+                    1
+                )
                 if let target = event.target, !target.isEmpty {
-                    countsByTarget[target, default: 0] += 1
+                    countsByTarget[target] = Self.saturatingAdd(countsByTarget[target, default: 0], 1)
                 }
                 recentEvents.append(event)
-                totalDetectionCount += 1
+                totalDetectionCount = Self.saturatingAdd(totalDetectionCount, 1)
                 updatedAt = event.timestamp
             }
 
@@ -750,7 +753,10 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         }
 
         var snapshotRecords: [PacketSampleStream.PacketStreamRecord] = []
-        snapshotRecords.reserveCapacity(records.count + detailRecords.count)
+        let reserveLimit = records.count.addingReportingOverflow(detailRecords.count)
+        if !reserveLimit.overflow {
+            snapshotRecords.reserveCapacity(reserveLimit.partialValue)
+        }
 
         for record in records {
             switch record.kind {
@@ -855,8 +861,8 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         processInfo: ProcessInfo,
         runtimePlan: DetectorRuntimePlan
     ) -> PacketAnalyticsPipeline.EmissionPolicy {
-        let thermalState = processInfo.thermalState
-        let lowPowerModeEnabled = processInfo.isLowPowerModeEnabled
+        let thermalState = processInfo.tunnelThermalState
+        let lowPowerModeEnabled = processInfo.tunnelLowPowerModeEnabled
 
         if lowPowerModeEnabled || thermalState == .critical {
             return PacketAnalyticsPipeline.EmissionPolicy(
@@ -926,28 +932,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 emitBurstEvents: true,
                 emitActivitySamples: false
             )
-        case .serious, .critical:
-            return PacketAnalyticsPipeline.EmissionPolicy(
-                allowDeepMetadata: false,
-                maxMetadataProbesPerBatch: 0,
-                emitFlowSlices: false,
-                flowSliceIntervalMs: runtimePlan.flowSliceIntervalMs,
-                emitFlowCloseEvents: true,
-                emitBurstShapeCounters: runtimePlan.needsBurstShapeCounters || runtimePlan.liveTapFeatureFamilies.contains(.burstShape),
-                emitDNSAssociationFields: false,
-                emitLineageFields: false,
-                emitPathRegimeFields: runtimePlan.needsPathRegime,
-                emitServiceAttributionFields: false,
-                includeHostHints: runtimePlan.liveTapFeatureFamilies.contains(.hostHints),
-                includeDNSAnswerAddresses: runtimePlan.unionFeatureFamilies.contains(.dnsAnswerAddresses),
-                includeQUICIdentity: runtimePlan.needsQUICIdentity || runtimePlan.liveTapFeatureFamilies.contains(.quicIdentity),
-                activitySampleMinimumPackets: 2_048,
-                activitySampleMinimumBytes: 4_194_304,
-                activitySampleMinimumInterval: 30,
-                emitBurstEvents: true,
-                emitActivitySamples: false
-            )
-        @unknown default:
+        case .serious, .critical, .unknown:
             return PacketAnalyticsPipeline.EmissionPolicy(
                 allowDeepMetadata: false,
                 maxMetadataProbesPerBatch: 0,
@@ -998,10 +983,19 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
             filteredPackets.append(packet)
             filteredFamilies.append(familyHint)
             filteredSummaries.append(summary)
-            totalBytes += packet.count
+            totalBytes = Self.saturatingAdd(totalBytes, packet.count)
         }
 
         return (filteredPackets, filteredFamilies, filteredSummaries, totalBytes)
+    }
+
+    private static func incrementCounter(_ value: inout Int) {
+        value = saturatingAdd(value, 1)
+    }
+
+    private static func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
+        let (value, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? Int.max : value
     }
 
     private static func shouldTrack(summary: FastPacketSummary, trackingMode: TrackingMode = .full) -> Bool {
