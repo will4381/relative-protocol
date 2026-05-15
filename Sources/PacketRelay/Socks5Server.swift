@@ -2347,14 +2347,15 @@ final class Socks5Connection: @unchecked Sendable {
     private static func isBenignOutboundReadClose(_ error: any Error) -> Bool {
         if let nwError = error as? NWError,
            case .posix(let code) = nwError {
-            return code == .ENOMSG
+            return code == .ENOMSG || code == .ENODATA
         }
 
         let nsError = error as NSError
         guard nsError.domain == "Network.NWError" else {
             return false
         }
-        if nsError.code == Int(POSIXErrorCode.ENOMSG.rawValue) {
+        if nsError.code == Int(POSIXErrorCode.ENOMSG.rawValue) ||
+            nsError.code == Int(POSIXErrorCode.ENODATA.rawValue) {
             return true
         }
         return nsError.localizedDescription.localizedCaseInsensitiveContains("No message")

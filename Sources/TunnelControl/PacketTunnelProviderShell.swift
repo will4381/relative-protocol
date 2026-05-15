@@ -78,6 +78,10 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
         let startupTelemetryWorker: PacketTelemetryWorker?
     }
 
+    private enum NetworkSettingsPolicy {
+        static let applyTimeoutNanoseconds: UInt64 = 15_000_000_000
+    }
+
     /// One-shot callback wrapper used when framework completion handlers need to cross into `Task`.
     /// Safety invariant: the callback is consumed under `lock`, so callers can safely invoke it from concurrent tasks
     /// without racing a second invocation.
@@ -1449,11 +1453,23 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
     /// - Parameter settings: Tunnel interface settings to apply.
     private func apply(_ settings: NEPacketTunnelNetworkSettings) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let completion = CallbackBox<Result<Void, Error>> { result in
+                switch result {
+                case .success:
+                    continuation.resume()
+                case .failure(let error):
+                    continuation.resume(throwing: error)
+                }
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: Self.NetworkSettingsPolicy.applyTimeoutNanoseconds)
+                completion.call(.failure(TunnelProviderError.networkSettingsApplyTimedOut))
+            }
             setTunnelNetworkSettings(settings) { error in
                 if let error {
-                    continuation.resume(throwing: error)
+                    completion.call(.failure(error))
                 } else {
-                    continuation.resume()
+                    completion.call(.success(()))
                 }
             }
         }
@@ -1596,6 +1612,7 @@ private enum TunnelProviderError: LocalizedError {
     case packetFlowWriteFailed
     case startCancelled
     case defaultPathUnsatisfied(String)
+    case networkSettingsApplyTimedOut
 
     var errorDescription: String? {
         switch self {
@@ -1607,6 +1624,8 @@ private enum TunnelProviderError: LocalizedError {
             return "Tunnel start was cancelled"
         case .defaultPathUnsatisfied(let summary):
             return "Underlying network path is not satisfied: \(summary)"
+        case .networkSettingsApplyTimedOut:
+            return "Timed out applying tunnel network settings"
         }
     }
 }

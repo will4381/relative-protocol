@@ -1174,7 +1174,7 @@ final class Socks5ServerTests: XCTestCase {
         XCTAssertTrue(inbound.cancelled)
     }
 
-    func testOutboundReadENOMSGIsLoggedAsNormalClose() async throws {
+    func testOutboundReadENODATAIsLoggedAsNormalClose() async throws {
         let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.outbound-read-close")
         let sink = InMemoryLogSink()
         let inbound = FakeInboundConnection()
@@ -1193,7 +1193,7 @@ final class Socks5ServerTests: XCTestCase {
             inbound.push(Self.greeting)
             inbound.push(Self.connectRequest(host: "example.com", port: 443))
             outbound.succeedConnect()
-            outbound.queueRead(nil, error: NWError.posix(.ENOMSG))
+            outbound.queueRead(nil, error: NWError.posix(.ENODATA))
         }
 
         let records = try await eventuallyFetchRecords(from: sink) { records in
@@ -1210,7 +1210,7 @@ final class Socks5ServerTests: XCTestCase {
         XCTAssertTrue(inbound.cancelled)
     }
 
-    func testOutboundReadBridgedENOMSGIsLoggedAsNormalClose() async throws {
+    func testOutboundReadBridgedENODATAIsLoggedAsNormalClose() async throws {
         let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.outbound-read-bridged-close")
         let sink = InMemoryLogSink()
         let inbound = FakeInboundConnection()
@@ -1225,7 +1225,7 @@ final class Socks5ServerTests: XCTestCase {
         )
         let bridgedError = NSError(
             domain: "Network.NWError",
-            code: Int(POSIXErrorCode.ENOMSG.rawValue),
+            code: Int(POSIXErrorCode.ENODATA.rawValue),
             userInfo: [NSLocalizedDescriptionKey: "The operation couldn’t be completed. (Network.NWError error 96 - No message available on STREAM)"]
         )
 
