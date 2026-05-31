@@ -67,11 +67,11 @@ public final class Socks5FaultInjectionRunner: @unchecked Sendable {
                 body: tcpWaitingRestartBudget
             ),
             runScenario(
-                id: "udp-waiting-retained",
+                id: "udp-waiting-replaced",
                 name: "UDP waiting",
                 fault: "Direct UDP session reports waiting repeatedly",
-                expectedBehavior: "Retain the session and continue using it",
-                body: directUDPWaitingRetained
+                expectedBehavior: "Schedule replacement and rotate on the next datagram",
+                body: directUDPWaitingReplaced
             ),
             runScenario(
                 id: "udp-failed-recreated",
@@ -88,11 +88,11 @@ public final class Socks5FaultInjectionRunner: @unchecked Sendable {
                 body: directUDPBetterPathReplaced
             ),
             runScenario(
-                id: "tcp-forward-udp-waiting-retained",
+                id: "tcp-forward-udp-waiting-replaced",
                 name: "TCP-carried UDP waiting",
                 fault: "TCP-carried UDP session reports waiting repeatedly",
-                expectedBehavior: "Retain the session and continue using it",
-                body: tcpForwardUDPWaitingRetained
+                expectedBehavior: "Schedule replacement and rotate on the next UDP frame",
+                body: tcpForwardUDPWaitingReplaced
             ),
             runScenario(
                 id: "tcp-forward-udp-better-path-replaced",
@@ -233,7 +233,7 @@ public final class Socks5FaultInjectionRunner: @unchecked Sendable {
         return "Opt-in restart path capped 20 waiting events at 1 manual restart."
     }
 
-    private func directUDPWaitingRetained() throws -> String {
+    private func directUDPWaitingReplaced() throws -> String {
         let context = try DirectUDPContext(label: "com.vpnbridge.fault.udp-waiting")
         defer { context.stop() }
 
@@ -245,11 +245,14 @@ public final class Socks5FaultInjectionRunner: @unchecked Sendable {
             }
         }
         try require(session.restartCount == 0, "UDP waiting restarted the session")
-        try require(!session.cancelled, "UDP waiting cancelled the session")
+        try require(!session.cancelled, "UDP waiting cancelled before replacement datagram")
 
         try context.sendDatagram()
-        try context.waitForWrittenDatagrams(session: session, count: 2)
-        return "Direct UDP retained the waiting session and accepted the next datagram."
+        let replacement = try context.waitForSession(index: 1)
+        try require(session.cancelled, "old UDP waiting session was not cancelled during replacement")
+        try require(session !== replacement, "UDP waiting replacement reused the old session")
+        try context.waitForWrittenDatagrams(session: replacement, count: 1)
+        return "Direct UDP scheduled waiting replacement and rotated on the next datagram."
     }
 
     private func directUDPFailedRecreated() throws -> String {
@@ -290,7 +293,7 @@ public final class Socks5FaultInjectionRunner: @unchecked Sendable {
         return "Direct UDP deferred better-path replacement until the next datagram."
     }
 
-    private func tcpForwardUDPWaitingRetained() throws -> String {
+    private func tcpForwardUDPWaitingReplaced() throws -> String {
         let context = try TCPForwardUDPContext(label: "com.vpnbridge.fault.forward-udp-waiting")
         defer { context.stop() }
 
@@ -300,11 +303,15 @@ public final class Socks5FaultInjectionRunner: @unchecked Sendable {
             for _ in 0..<5 {
                 session.eventHandler?(.waiting)
             }
-            context.inbound.push(context.frame)
         }
-        try require(!session.cancelled, "TCP-carried UDP waiting cancelled the session")
-        try require(session.writtenDatagrams.count == 2, "expected 2 writes on retained session, saw \(session.writtenDatagrams.count)")
-        return "TCP-carried UDP retained the waiting session and accepted the next frame."
+        try require(!session.cancelled, "TCP-carried UDP waiting cancelled before replacement frame")
+
+        try context.sendFrame()
+        let replacement = try context.waitForSession(index: 1)
+        try require(session.cancelled, "old TCP-carried UDP waiting session was not cancelled during replacement")
+        try require(session !== replacement, "TCP-carried UDP waiting replacement reused the old session")
+        try require(replacement.writtenDatagrams.count == 1, "replacement TCP-carried UDP waiting session did not receive the frame")
+        return "TCP-carried UDP scheduled waiting replacement and rotated on the next frame."
     }
 
     private func tcpForwardUDPBetterPathReplaced() throws -> String {

@@ -218,6 +218,23 @@ final class TunnelControlTests: XCTestCase {
         XCTAssertEqual(profile.dnsServers, TunnelDNSStrategy.defaultPublicResolvers)
     }
 
+    func testRuntimeProfileValidationRejectsMalformedIncludedIPv4Routes() {
+        var configuration = makeRuntimeProviderConfiguration()
+        configuration["ipv4IncludedRoutes"] = [
+            [
+                "destinationAddress": "203.0.113.999",
+                "subnetMask": "255.255.255.255"
+            ]
+        ]
+
+        XCTAssertThrowsError(try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)) { error in
+            XCTAssertEqual(
+                error as? TunnelProfileValidationError,
+                .invalidValue(key: "ipv4IncludedRoutes", reason: "destinationAddress must be a valid IPv4 address")
+            )
+        }
+    }
+
     func testAutomaticTunnelOverheadUsesSafeInternalMTUBuffer() {
         let profile = TunnelProfile.from(providerConfiguration: [
             "mtuStrategy": "automaticTunnelOverhead",
@@ -233,6 +250,24 @@ final class TunnelControlTests: XCTestCase {
             "tcpMultipathHandoverEnabled": true
         ])
         XCTAssertTrue(profile.tcpMultipathHandoverEnabled)
+    }
+
+    func testTunnelProfileParsesIncludedIPv4Routes() {
+        let profile = TunnelProfile.from(providerConfiguration: [
+            "ipv4IncludedRoutes": [
+                [
+                    "destinationAddress": "203.0.113.10",
+                    "subnetMask": "255.255.255.255"
+                ]
+            ]
+        ])
+
+        XCTAssertEqual(
+            profile.ipv4RouteStrategy,
+            .includedRoutes([
+                TunnelIPv4Route(destinationAddress: "203.0.113.10", subnetMask: "255.255.255.255")
+            ])
+        )
     }
 
     func testTunnelProfilePreservesEphemeralEngineSocksPort() {
@@ -283,7 +318,10 @@ final class TunnelControlTests: XCTestCase {
                 matchDomainsNoSearch: true,
                 allowFailover: true
             ),
-            tcpMultipathHandoverEnabled: true
+            tcpMultipathHandoverEnabled: true,
+            ipv4RouteStrategy: .includedRoutes([
+                TunnelIPv4Route(destinationAddress: "203.0.113.10", subnetMask: "255.255.255.255")
+            ])
         )
 
         TunnelProfileManager.configure(
@@ -300,6 +338,8 @@ final class TunnelControlTests: XCTestCase {
         XCTAssertEqual(flag, true)
         XCTAssertEqual(configuration["mtuStrategy"] as? String, "automaticTunnelOverhead")
         XCTAssertEqual((configuration["tunnelOverheadBytes"] as? NSNumber)?.intValue, 80)
+        let routes = try XCTUnwrap(configuration["ipv4IncludedRoutes"] as? [[String: String]])
+        XCTAssertEqual(routes, [["destinationAddress": "203.0.113.10", "subnetMask": "255.255.255.255"]])
         XCTAssertEqual(configuration["dnsServers"] as? [String], ["1.1.1.1", "1.0.0.1"])
         let dnsStrategy = try XCTUnwrap(configuration["dnsStrategy"] as? [String: Any])
         XCTAssertEqual(dnsStrategy["type"] as? String, "tls")
@@ -433,6 +473,20 @@ final class TunnelControlTests: XCTestCase {
         XCTAssertNil(settings.dnsSettings)
     }
 
+    func testSettingsFactoryInstallsIncludedIPv4Routes() {
+        let profile = makeProfile(
+            ipv4RouteStrategy: .includedRoutes([
+                TunnelIPv4Route(destinationAddress: "203.0.113.10", subnetMask: "255.255.255.255")
+            ])
+        )
+
+        let settings = TunnelNetworkSettingsFactory.makeSettings(profile: profile)
+        let routes = settings.ipv4Settings?.includedRoutes ?? []
+        XCTAssertEqual(routes.count, 1)
+        XCTAssertEqual(routes.first?.destinationAddress, "203.0.113.10")
+        XCTAssertEqual(routes.first?.destinationSubnetMask, "255.255.255.255")
+    }
+
     func testSettingsFactoryInstallsDefaultDNSForFullTunnel() throws {
         let profile = makeProfile(
             mtu: 1_280,
@@ -494,7 +548,8 @@ final class TunnelControlTests: XCTestCase {
         mtuStrategy: TunnelMTUStrategy? = nil,
         dnsStrategy: TunnelDNSStrategy? = nil,
         tcpMultipathHandoverEnabled: Bool = false,
-        relayUseUDP: Bool = false
+        relayUseUDP: Bool = false,
+        ipv4RouteStrategy: TunnelIPv4RouteStrategy? = nil
     ) -> TunnelProfile {
         TunnelProfile(
             appGroupID: appGroupID,
@@ -506,6 +561,7 @@ final class TunnelControlTests: XCTestCase {
             ipv4Address: "10.0.0.2",
             ipv4SubnetMask: "255.255.255.0",
             ipv4Router: "10.0.0.1",
+            ipv4RouteStrategy: ipv4RouteStrategy,
             ipv6Address: "fd00:1::2",
             ipv6PrefixLength: 64,
             dnsServers: dnsStrategy?.servers ?? TunnelDNSStrategy.defaultPublicResolvers,

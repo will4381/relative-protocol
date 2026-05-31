@@ -34,9 +34,14 @@ public struct SignatureDocument: Codable, Sendable, Equatable {
 
 /// Signature classifier with on-demand reload and in-memory cache.
 public actor SignatureClassifier {
-    private struct CompiledSignature: Sendable, Equatable {
+    private struct SignatureMatch: Sendable, Equatable {
+        let order: Int
         let label: String
-        let domains: [String]
+    }
+
+    private struct SuffixTrieNode: Sendable, Equatable {
+        var children: [Character: Int] = [:]
+        var match: SignatureMatch?
     }
 
     private let logger: StructuredLogger
@@ -45,7 +50,7 @@ public actor SignatureClassifier {
 
     private var cache: SignatureDocument?
     private var cacheURL: URL?
-    private var compiledSignatures: [CompiledSignature] = []
+    private var suffixTrieNodes: [SuffixTrieNode] = [SuffixTrieNode()]
     private var classificationCache: [String: String?] = [:]
 
     /// Creates a classifier with an empty in-memory cache.
@@ -64,11 +69,11 @@ public actor SignatureClassifier {
         let document = try decoder.decode(SignatureDocument.self, from: payload)
         cache = document
         cacheURL = url
-        compiledSignatures = document.signatures.map { signature in
-            CompiledSignature(
-                label: signature.label,
-                domains: signature.domains.map { $0.lowercased() }
-            )
+        suffixTrieNodes = [SuffixTrieNode()]
+        for (order, signature) in document.signatures.enumerated() {
+            for domain in signature.domains {
+                insertSignatureSuffix(domain.lowercased(), label: signature.label, order: order)
+            }
         }
         classificationCache.removeAll(keepingCapacity: false)
         await logger.log(
@@ -97,14 +102,51 @@ public actor SignatureClassifier {
             return cached
         }
 
-        let classification = compiledSignatures.first { signature in
-            signature.domains.contains(where: normalized.hasSuffix)
-        }?.label
+        let classification = indexedClassification(for: normalized)
 
         if classificationCache.count >= maxCachedLookups {
             classificationCache.removeAll(keepingCapacity: true)
         }
         classificationCache[normalized] = classification
         return classification
+    }
+
+    private func indexedClassification(for normalizedHost: String) -> String? {
+        var nodeIndex = 0
+        var bestMatch = suffixTrieNodes[nodeIndex].match
+        for character in normalizedHost.reversed() {
+            guard let nextIndex = suffixTrieNodes[nodeIndex].children[character] else {
+                break
+            }
+            nodeIndex = nextIndex
+            guard let match = suffixTrieNodes[nodeIndex].match else {
+                continue
+            }
+            if bestMatch == nil || match.order < bestMatch!.order {
+                bestMatch = match
+            }
+        }
+        return bestMatch?.label
+    }
+
+    private func insertSignatureSuffix(_ suffix: String, label: String, order: Int) {
+        var nodeIndex = 0
+        for character in suffix.reversed() {
+            if let nextIndex = suffixTrieNodes[nodeIndex].children[character] {
+                nodeIndex = nextIndex
+            } else {
+                let nextIndex = suffixTrieNodes.count
+                suffixTrieNodes.append(SuffixTrieNode())
+                suffixTrieNodes[nodeIndex].children[character] = nextIndex
+                nodeIndex = nextIndex
+            }
+        }
+
+        let match = SignatureMatch(order: order, label: label)
+        if let existingMatch = suffixTrieNodes[nodeIndex].match,
+           existingMatch.order <= order {
+            return
+        }
+        suffixTrieNodes[nodeIndex].match = match
     }
 }

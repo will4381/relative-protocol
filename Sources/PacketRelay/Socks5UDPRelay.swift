@@ -318,7 +318,7 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
                 case .ready:
                     self.clearReplacementNeed(for: key)
                 case .waiting:
-                    break
+                    self.scheduleSessionReplacement(for: key, reason: "waiting")
                 case .failed:
                     self.removeSession(for: key)
                 case .viabilityChanged(let isViable):

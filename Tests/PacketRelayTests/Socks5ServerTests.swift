@@ -386,7 +386,7 @@ final class Socks5ServerTests: XCTestCase {
         XCTAssertEqual(session.writtenDatagrams, [payload])
     }
 
-    func testTCPForwardUDPRetainsWaitingSession() throws {
+    func testTCPForwardUDPSchedulesWaitingReplacementUntilNextDatagram() throws {
         let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.forward-udp-waiting")
         let inbound = FakeInboundConnection()
         let outbound = ControlledTCPOutbound()
@@ -428,8 +428,12 @@ final class Socks5ServerTests: XCTestCase {
             inbound.push(frame)
         }
 
-        XCTAssertEqual(firstSession.writtenDatagrams, [Data([0x01]), Data([0x01])])
-        XCTAssertEqual(provider.udpSessions.count, 1)
+        let secondSession = try XCTUnwrap(provider.udpSessions.last)
+        XCTAssertTrue(firstSession.cancelled)
+        XCTAssertFalse(secondSession === firstSession)
+        XCTAssertEqual(provider.udpSessions.count, 2)
+        XCTAssertEqual(firstSession.writtenDatagrams, [Data([0x01])])
+        XCTAssertEqual(secondSession.writtenDatagrams, [Data([0x01])])
     }
 
     func testTCPForwardUDPRemovesFailedSessionAndRecreatesOnNextDatagram() throws {

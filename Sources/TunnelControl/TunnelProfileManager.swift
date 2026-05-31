@@ -54,6 +54,9 @@ public enum TunnelProfileManager {
         for (key, value) in profile.mtuStrategy.providerConfiguration {
             configuration[key] = value
         }
+        for (key, value) in profile.ipv4RouteStrategy.providerConfiguration {
+            configuration[key] = value
+        }
         configuration[TunnelProviderConfigurationKey.dnsStrategy] = profile.dnsStrategy.providerConfiguration
         proto.providerConfiguration = configuration
         manager.protocolConfiguration = proto

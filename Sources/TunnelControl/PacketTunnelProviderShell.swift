@@ -247,7 +247,12 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                         "socks_port": String(socksPort),
                         "mtu": String(profile.mtu),
                         "mtu_strategy": Self.mtuStrategySummary(profile.mtuStrategy),
-                        "dns_strategy": Self.dnsStrategySummary(profile.dnsStrategy)
+                        "dns_strategy": Self.dnsStrategySummary(profile.dnsStrategy),
+                        "tcp_multipath_handover_enabled": String(profile.tcpMultipathHandoverEnabled),
+                        "tcp_waiting_restart_enabled": "true",
+                        "tcp_waiting_restart_max": "1",
+                        "udp_waiting_replacement_enabled": "true",
+                        "virtual_interface_exclusion": virtualInterfaceExclusionSummary()
                     ]
                 )
                 signposts.end(.startup, state: startupInterval, message: "ok")
@@ -584,6 +589,9 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
     private func startSocksServer(profile: TunnelProfile, logger: StructuredLogger) async throws -> (server: Socks5Server, port: UInt16) {
         let tcpPathSettings = Socks5TCPPathSettings(
             retryOnBetterPathDuringConnect: true,
+            restartWaitingConnectionsDuringConnect: true,
+            maximumWaitingRestartsPerAttempt: 1,
+            waitingRestartMinimumInterval: 1.0,
             betterPathRetryMinimumElapsed: 0.75,
             multipathServiceType: profile.tcpMultipathHandoverEnabled ? .handover : nil
         )
@@ -605,6 +613,13 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                 }
             }
         }
+    }
+
+    private func virtualInterfaceExclusionSummary() -> String {
+        if #available(iOS 18.0, macOS 15.0, *) {
+            return virtualInterface == nil ? "missing" : "available"
+        }
+        return "unsupported-os"
     }
 
     /// Creates the detector-focused telemetry worker used by the provider hot path.

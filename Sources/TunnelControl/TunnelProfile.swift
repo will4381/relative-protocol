@@ -20,6 +20,7 @@ public struct TunnelProfile: Sendable, Equatable {
     public let ipv4Address: String
     public let ipv4SubnetMask: String
     public let ipv4Router: String
+    public let ipv4RouteStrategy: TunnelIPv4RouteStrategy
     public let ipv6Address: String
     public let ipv6PrefixLength: Int
     /// Controls which DNS settings are installed on the tunnel interface.
@@ -50,6 +51,7 @@ public struct TunnelProfile: Sendable, Equatable {
     ///   - ipv4Address: Assigned IPv4 address.
     ///   - ipv4SubnetMask: Assigned IPv4 subnet mask.
     ///   - ipv4Router: Default IPv4 router.
+    ///   - ipv4RouteStrategy: Controls which IPv4 routes are installed on the tunnel interface.
     ///   - ipv6Address: Assigned IPv6 address.
     ///   - ipv6PrefixLength: IPv6 prefix length.
     ///   - dnsServers: DNS servers used by direct callers when `dnsStrategy` is not supplied.
@@ -77,6 +79,7 @@ public struct TunnelProfile: Sendable, Equatable {
         ipv4Address: String,
         ipv4SubnetMask: String,
         ipv4Router: String,
+        ipv4RouteStrategy: TunnelIPv4RouteStrategy? = nil,
         ipv6Address: String,
         ipv6PrefixLength: Int,
         dnsServers: [String],
@@ -108,6 +111,7 @@ public struct TunnelProfile: Sendable, Equatable {
         self.ipv4Address = ipv4Address
         self.ipv4SubnetMask = ipv4SubnetMask
         self.ipv4Router = ipv4Router
+        self.ipv4RouteStrategy = (ipv4RouteStrategy ?? .defaultRoute).normalized()
         self.ipv6Address = ipv6Address
         self.ipv6PrefixLength = ipv6PrefixLength
         self.dnsStrategy = dnsStrategy ?? .cleartext(servers: dnsServers)
@@ -137,6 +141,7 @@ public struct TunnelProfile: Sendable, Equatable {
         )
         let mtuValue = configuredMTU ?? mtuStrategy.bufferMTUHint
         let dnsStrategy = dnsStrategy(from: providerConfiguration)
+        let ipv4RouteStrategy = ipv4RouteStrategy(from: providerConfiguration)
 
         return TunnelProfile(
             appGroupID: providerConfiguration[TunnelProviderConfigurationKey.appGroupID] as? String ?? "",
@@ -148,6 +153,7 @@ public struct TunnelProfile: Sendable, Equatable {
             ipv4Address: providerConfiguration[TunnelProviderConfigurationKey.ipv4Address] as? String ?? "10.0.0.2",
             ipv4SubnetMask: providerConfiguration[TunnelProviderConfigurationKey.ipv4SubnetMask] as? String ?? "255.255.255.0",
             ipv4Router: providerConfiguration[TunnelProviderConfigurationKey.ipv4Router] as? String ?? "10.0.0.1",
+            ipv4RouteStrategy: ipv4RouteStrategy,
             ipv6Address: providerConfiguration[TunnelProviderConfigurationKey.ipv6Address] as? String ?? "fd00:1::2",
             ipv6PrefixLength: int(providerConfiguration[TunnelProviderConfigurationKey.ipv6PrefixLength], default: 64),
             dnsServers: dnsStrategy.servers,
@@ -239,6 +245,7 @@ public struct TunnelProfile: Sendable, Equatable {
         guard isValidIPv4Address(profile.ipv4Router) else {
             throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.ipv4Router, reason: "must be a valid IPv4 address")
         }
+        try validateIPv4RouteStrategy(profile.ipv4RouteStrategy, rawValue: providerConfiguration[TunnelProviderConfigurationKey.ipv4IncludedRoutes])
         guard profile.ipv6PrefixLength > 0, profile.ipv6PrefixLength <= 128 else {
             throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.ipv6PrefixLength, reason: "must be in 1...128")
         }
@@ -459,6 +466,80 @@ public struct TunnelProfile: Sendable, Equatable {
                 allowFailover: bool(rawStrategy["allowFailover"], default: false)
             )
         }
+    }
+
+    private static func ipv4RouteStrategy(from providerConfiguration: [String: Any]) -> TunnelIPv4RouteStrategy {
+        guard let rawRoutes = providerConfiguration[TunnelProviderConfigurationKey.ipv4IncludedRoutes] else {
+            return .defaultRoute
+        }
+        guard let routeDictionaries = ipv4RouteDictionaries(from: rawRoutes) else {
+            return .defaultRoute
+        }
+
+        let routes = routeDictionaries.compactMap { route -> TunnelIPv4Route? in
+            guard let destinationAddress = string(route["destinationAddress"]),
+                  let subnetMask = string(route["subnetMask"]) else {
+                return nil
+            }
+            return TunnelIPv4Route(destinationAddress: destinationAddress, subnetMask: subnetMask)
+        }
+        return routes.isEmpty ? .defaultRoute : .includedRoutes(routes)
+    }
+
+    private static func validateIPv4RouteStrategy(_ strategy: TunnelIPv4RouteStrategy, rawValue: Any?) throws {
+        guard let rawValue else {
+            return
+        }
+        guard let routeDictionaries = ipv4RouteDictionaries(from: rawValue), !routeDictionaries.isEmpty else {
+            throw TunnelProfileValidationError.invalidValue(
+                key: TunnelProviderConfigurationKey.ipv4IncludedRoutes,
+                reason: "must be a non-empty array of IPv4 route dictionaries"
+            )
+        }
+
+        let routes: [TunnelIPv4Route]
+        switch strategy {
+        case .defaultRoute:
+            routes = []
+        case .includedRoutes(let includedRoutes):
+            routes = includedRoutes
+        }
+
+        guard routes.count == routeDictionaries.count else {
+            throw TunnelProfileValidationError.invalidValue(
+                key: TunnelProviderConfigurationKey.ipv4IncludedRoutes,
+                reason: "each route must include destinationAddress and subnetMask strings"
+            )
+        }
+
+        for route in routes {
+            guard isValidIPv4Address(route.destinationAddress) else {
+                throw TunnelProfileValidationError.invalidValue(
+                    key: TunnelProviderConfigurationKey.ipv4IncludedRoutes,
+                    reason: "destinationAddress must be a valid IPv4 address"
+                )
+            }
+            guard isValidIPv4SubnetMask(route.subnetMask) else {
+                throw TunnelProfileValidationError.invalidValue(
+                    key: TunnelProviderConfigurationKey.ipv4IncludedRoutes,
+                    reason: "subnetMask must be a contiguous IPv4 subnet mask"
+                )
+            }
+        }
+    }
+
+    private static func ipv4RouteDictionaries(from value: Any?) -> [[String: Any]]? {
+        if let routes = value as? [[String: Any]] {
+            return routes
+        }
+        if let routes = value as? [[String: String]] {
+            return routes.map { route in
+                route.reduce(into: [String: Any]()) { partialResult, pair in
+                    partialResult[pair.key] = pair.value
+                }
+            }
+        }
+        return nil
     }
 
     private static func dnsMatchDomains(from rawStrategy: [String: Any]) -> [String]? {

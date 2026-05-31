@@ -33,15 +33,17 @@ internal struct FlowLineageTracker {
     private struct Policy {
         static let ttlSeconds: TimeInterval = 180
         static let maxTrackedLineages = 4_096
+        static let minimumSweepIntervalSeconds: TimeInterval = 10
     }
 
     private var statesByKey: [LineageKey: LineageState] = [:]
     private var flowAssignments: [FlowKey: LineageKey] = [:]
     private var arrivalQueue: ArraySlice<LineageKey> = []
     private var nextLineageID: UInt64 = 1
+    private var lastSweepAt: Date?
 
     mutating func snapshot(for flow: FlowKey, summary: FastPacketSummary, direction: PacketDirection, now: Date) -> FlowLineageSnapshot {
-        evictExpired(now: now)
+        evictExpiredIfNeeded(now: now)
 
         if let key = flowAssignments[flow], let state = statesByKey[key] {
             var updated = state
@@ -51,6 +53,12 @@ internal struct FlowLineageTracker {
         }
 
         let key = Self.makeKey(summary: summary, direction: direction)
+        let existingState = statesByKey[key]
+        let existingWasExpired = existingState.map { Self.isExpired($0, now: now) } ?? false
+        if existingWasExpired {
+            statesByKey.removeValue(forKey: key)
+            pruneArrivalQueue()
+        }
         var state = statesByKey[key] ?? LineageState(
             id: nextLineageID,
             firstSeenAt: now,
@@ -61,7 +69,7 @@ internal struct FlowLineageTracker {
             reopenCount: 0,
             activeFlowCount: 0
         )
-        if statesByKey[key] == nil {
+        if existingState == nil || existingWasExpired {
             nextLineageID &+= 1
         } else if state.activeFlowCount == 0, let lastClosedAt = state.lastClosedAt {
             state.generation = saturatingAdd(state.generation, 1)
@@ -98,13 +106,19 @@ internal struct FlowLineageTracker {
         )
     }
 
-    private mutating func evictExpired(now: Date) {
+    private mutating func evictExpiredIfNeeded(now: Date) {
         guard !statesByKey.isEmpty else {
             return
         }
+        if let lastSweepAt,
+           now.timeIntervalSince(lastSweepAt) < Policy.minimumSweepIntervalSeconds,
+           statesByKey.count <= Policy.maxTrackedLineages {
+            return
+        }
 
+        lastSweepAt = now
         let expiredKeys = statesByKey.compactMap { key, state in
-            state.activeFlowCount == 0 && now.timeIntervalSince(state.lastSeenAt) > Policy.ttlSeconds ? key : nil
+            Self.isExpired(state, now: now) ? key : nil
         }
         for key in expiredKeys {
             statesByKey.removeValue(forKey: key)
@@ -145,6 +159,10 @@ internal struct FlowLineageTracker {
             active.append(key)
         }
         arrivalQueue = ArraySlice(active)
+    }
+
+    private static func isExpired(_ state: LineageState, now: Date) -> Bool {
+        state.activeFlowCount == 0 && now.timeIntervalSince(state.lastSeenAt) > Policy.ttlSeconds
     }
 
     private static func makeKey(summary: FastPacketSummary, direction: PacketDirection) -> LineageKey {

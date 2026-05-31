@@ -478,14 +478,15 @@ final class Socks5UDPRelayTests: XCTestCase {
         XCTAssertEqual(relay.activeSessionCount, 1)
     }
 
-    func testUDPRelayRetainsWaitingSession() throws {
+    func testUDPRelaySchedulesWaitingReplacementUntilNextDatagram() async throws {
         let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.udp.waiting")
         let provider = FakeUDPProvider()
+        let sink = InMemoryLogSink()
         let relay = try Socks5UDPRelay(
             provider: provider,
             queue: queue,
             mtu: 1_500,
-            logger: StructuredLogger(sink: InMemoryLogSink())
+            logger: StructuredLogger(sink: sink)
         )
         relay.start()
         defer {
@@ -497,9 +498,12 @@ final class Socks5UDPRelayTests: XCTestCase {
         defer { close(clientSocket) }
 
         let firstCreated = expectation(description: "first udp session created")
+        let secondCreated = expectation(description: "second udp session created on next datagram")
         provider.onCreate = { _ in
             if provider.sessions.count == 1 {
                 firstCreated.fulfill()
+            } else if provider.sessions.count == 2 {
+                secondCreated.fulfill()
             }
         }
 
@@ -509,7 +513,7 @@ final class Socks5UDPRelayTests: XCTestCase {
             destinationAddress: .ipv4("1.1.1.1"),
             destinationPort: 53
         )
-        wait(for: [firstCreated], timeout: 1.0)
+        await fulfillment(of: [firstCreated], timeout: 1.0)
 
         let session = try XCTUnwrap(provider.sessions.first)
         queue.sync {
@@ -523,22 +527,33 @@ final class Socks5UDPRelayTests: XCTestCase {
         XCTAssertEqual(relay.activeSessionCount, 1)
         XCTAssertEqual(provider.sessions.count, 1)
 
-        let secondWrite = expectation(description: "waiting session receives second datagram")
-        session.onWrite = { _ in
-            if session.writtenDatagrams.count == 2 {
-                secondWrite.fulfill()
-            }
-        }
         try sendClientDatagram(
             socketFD: clientSocket,
             relayPort: relay.port,
             destinationAddress: .ipv4("1.1.1.1"),
             destinationPort: 53
         )
-        wait(for: [secondWrite], timeout: 1.0)
-        XCTAssertEqual(provider.sessions.count, 1)
+        await fulfillment(of: [secondCreated], timeout: 1.0)
+
+        let secondSession = try XCTUnwrap(provider.sessions.last)
+        XCTAssertTrue(session.cancelled)
+        XCTAssertFalse(secondSession === session)
+        XCTAssertEqual(provider.sessions.count, 2)
         XCTAssertEqual(relay.activeSessionCount, 1)
-        XCTAssertEqual(session.writtenDatagrams.count, 2)
+        XCTAssertEqual(session.writtenDatagrams.count, 1)
+        XCTAssertEqual(secondSession.writtenDatagrams.count, 1)
+
+        let records = try await eventuallyFetchRecords(from: sink) { records in
+            records.contains {
+                $0.component == "Socks5UDPRelay"
+                    && $0.event == "session-replacement-scheduled"
+                    && $0.result == "waiting"
+            }
+        }
+        let replacementRecord = try XCTUnwrap(
+            records.first { $0.component == "Socks5UDPRelay" && $0.event == "session-replacement-scheduled" }
+        )
+        XCTAssertEqual(replacementRecord.result, "waiting")
     }
 
     func testUDPRelayRemovesFailedSessionAndRecreatesOnNextDatagram() throws {

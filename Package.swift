@@ -3,7 +3,7 @@ import PackageDescription
 
 let strictSwiftSettings: [SwiftSetting] = [
     .unsafeFlags(["-strict-concurrency=complete"]),
-    .unsafeFlags(["-warnings-as-errors"], .when(platforms: [.macOS]))
+    .unsafeFlags(["-Xfrontend", "-warnings-as-errors"], .when(platforms: [.macOS]))
 ]
 
 let strictCSettings: [CSetting] = [

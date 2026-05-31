@@ -13,10 +13,10 @@ final class Socks5FaultInjectionRunnerTests: XCTestCase {
                 "tcp-waiting-default",
                 "tcp-waiting-timeout-retry",
                 "tcp-waiting-bounded-restart",
-                "udp-waiting-retained",
+                "udp-waiting-replaced",
                 "udp-failed-recreated",
                 "udp-better-path-replaced",
-                "tcp-forward-udp-waiting-retained",
+                "tcp-forward-udp-waiting-replaced",
                 "tcp-forward-udp-better-path-replaced"
             ]
         )

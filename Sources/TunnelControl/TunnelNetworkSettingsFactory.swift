@@ -12,7 +12,7 @@ public enum TunnelNetworkSettingsFactory {
 
         // Docs: https://developer.apple.com/documentation/networkextension/neipv4settings
         let ipv4 = NEIPv4Settings(addresses: [profile.ipv4Address], subnetMasks: [profile.ipv4SubnetMask])
-        ipv4.includedRoutes = [NEIPv4Route.default()]
+        ipv4.includedRoutes = profile.ipv4RouteStrategy.includedRoutes
         // Docs: https://developer.apple.com/documentation/networkextension/neipv4settings/router
         // `router` is only available on macOS, so iOS relies on the default included route alone.
         #if os(macOS)

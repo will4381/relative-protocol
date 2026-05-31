@@ -24,10 +24,12 @@ internal struct DNSAssociationCache {
     private enum Policy {
         static let ttlSeconds: TimeInterval = 60
         static let maxEntries = 4_096
+        static let minimumSweepIntervalSeconds: TimeInterval = 10
     }
 
     private var entries: [AddressKey: Entry] = [:]
     private var arrivalQueue: ArraySlice<AddressKey> = []
+    private var lastSweepAt: Date?
 
     mutating func record(metadata: PacketMetadata, classification: String?, now: Date) {
         guard let answers = metadata.dnsAnswerAddresses, !answers.isEmpty else {
@@ -42,7 +44,7 @@ internal struct DNSAssociationCache {
             return
         }
 
-        evictExpired(now: now)
+        evictExpiredIfNeeded(now: now)
 
         for address in answers {
             let key = Self.key(for: address)
@@ -59,9 +61,14 @@ internal struct DNSAssociationCache {
     }
 
     mutating func associate(summary: FastPacketSummary, direction: PacketDirection, now: Date) -> DNSAssociationSnapshot? {
-        evictExpired(now: now)
+        evictExpiredIfNeeded(now: now)
         let key = Self.remoteAddressKey(for: summary, direction: direction)
         guard let entry = entries[key] else {
+            return nil
+        }
+        guard !Self.isExpired(entry, now: now) else {
+            entries.removeValue(forKey: key)
+            pruneArrivalQueue()
             return nil
         }
         let ageMs = millisecondsBetween(entry.storedAt, and: now)
@@ -73,13 +80,19 @@ internal struct DNSAssociationCache {
         )
     }
 
-    private mutating func evictExpired(now: Date) {
+    private mutating func evictExpiredIfNeeded(now: Date) {
         guard !entries.isEmpty else {
             return
         }
+        if let lastSweepAt,
+           now.timeIntervalSince(lastSweepAt) < Policy.minimumSweepIntervalSeconds,
+           entries.count <= Policy.maxEntries {
+            return
+        }
 
+        lastSweepAt = now
         let expiredKeys = entries.compactMap { key, entry in
-            now.timeIntervalSince(entry.storedAt) > Policy.ttlSeconds ? key : nil
+            Self.isExpired(entry, now: now) ? key : nil
         }
         for key in expiredKeys {
             entries.removeValue(forKey: key)
@@ -117,6 +130,10 @@ internal struct DNSAssociationCache {
             active.append(key)
         }
         arrivalQueue = ArraySlice(active)
+    }
+
+    private static func isExpired(_ entry: Entry, now: Date) -> Bool {
+        now.timeIntervalSince(entry.storedAt) > Policy.ttlSeconds
     }
 
     private static func remoteAddressKey(for summary: FastPacketSummary, direction: PacketDirection) -> AddressKey {

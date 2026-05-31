@@ -73,7 +73,7 @@ public struct DetectorRequirements: Sendable, Hashable {
     )
 }
 
-internal struct DetectorRecordProjection: Sendable {
+internal struct DetectorRecordProjection: Sendable, Hashable {
     let recordKinds: Set<PacketSampleKind>
     let featureFamilies: DetectorFeatureFamily
 

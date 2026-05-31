@@ -1840,7 +1840,7 @@ final class Socks5TCPForwardUDPRelay: @unchecked Sendable {
                 case .ready:
                     self.sessionsNeedingReplacement.remove(key)
                 case .waiting:
-                    break
+                    self.scheduleSessionReplacement(for: key, reason: "waiting")
                 case .failed:
                     self.removeSession(for: key)
                 case .viabilityChanged(let isViable):

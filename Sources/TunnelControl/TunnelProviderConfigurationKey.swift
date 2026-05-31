@@ -11,6 +11,7 @@ enum TunnelProviderConfigurationKey {
     static let ipv4Address = "ipv4Address"
     static let ipv4SubnetMask = "ipv4SubnetMask"
     static let ipv4Router = "ipv4Router"
+    static let ipv4IncludedRoutes = "ipv4IncludedRoutes"
     static let ipv6Address = "ipv6Address"
     static let ipv6PrefixLength = "ipv6PrefixLength"
     static let dnsServers = "dnsServers"
@@ -39,6 +40,7 @@ enum TunnelProviderConfigurationKey {
         ipv4Address,
         ipv4SubnetMask,
         ipv4Router,
+        ipv4IncludedRoutes,
         ipv6Address,
         ipv6PrefixLength,
         dnsServers,
