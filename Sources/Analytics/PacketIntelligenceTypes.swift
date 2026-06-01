@@ -27,7 +27,7 @@ public struct TransportProtocol: RawRepresentable, Codable, Hashable, Sendable, 
 }
 
 /// Packet direction relative to the device tunnel interface.
-public enum PacketDirection: String, Codable, Sendable {
+public enum PacketDirection: String, Codable, Sendable, Hashable {
     case outbound
     case inbound
 }

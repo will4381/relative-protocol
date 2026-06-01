@@ -12,7 +12,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         static let payloadOnlyQueuedBytes = 3 * 1024 * 1024
     }
 
-    private enum TrackingMode {
+    private enum TrackingMode: Sendable {
         case full
         case payloadOnlyUnderPressure
     }
@@ -143,9 +143,9 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
     private struct Batch: Sendable {
         let packets: [Data]
         let families: [Int32]
-        let summaries: [FastPacketSummary]
         let direction: PacketDirection
         let byteCount: Int
+        let trackingMode: TrackingMode
     }
 
     private final class SharedState: @unchecked Sendable {
@@ -327,12 +327,25 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
     }
 
     /// Enqueues one raw packet batch for telemetry processing.
-    /// Decision: the worker performs one cheap, synchronous packet-summary pass here so batches that contain only
-    /// uninteresting traffic (for example, pure TCP ACKs) never enter the async telemetry pipeline at all. The worker
-    /// also switches to payload-only tracking under pressure so short TCP lifecycle bursts do not crowd out useful
-    /// packet diagnostics.
-    /// Queue byte admission happens after prefiltering so dropped-batch accounting reflects post-filter telemetry cost.
+    /// Decision: admission remains cheap on the provider queue; packet parsing and payload-only filtering happen on
+    /// the worker task so telemetry cannot add per-packet parsing heat to the tunnel IO path.
     public func submit(packets: [Data], families: [Int32], direction: PacketDirection) -> SubmitResult {
+        guard !packets.isEmpty else {
+            return state.withLock { state in
+                Self.incrementCounter(&state.skippedBatches)
+                return SubmitResult(
+                    accepted: false,
+                    skipped: true,
+                    shouldLogSheddingStart: false,
+                    queuedBatches: state.queuedBatches,
+                    queuedBytes: state.queuedBytes,
+                    droppedBatches: state.droppedBatches
+                )
+            }
+        }
+        let rawByteCount = packets.reduce(0) { partial, packet in
+            Self.saturatingAdd(partial, packet.count)
+        }
         let initialDecision: (SubmitResult?, TrackingMode) = state.withLock { state in
             guard !state.isStopped else {
                 return (
@@ -381,8 +394,6 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
             return initialDecision
         }
 
-        let filtered = Self.prefilter(packets: packets, families: families, trackingMode: initialDecision.1)
-
         return state.withLock { state in
             guard !state.isStopped else {
                 return SubmitResult(
@@ -395,20 +406,8 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 )
             }
 
-            guard !filtered.packets.isEmpty else {
-                Self.incrementCounter(&state.skippedBatches)
-                return SubmitResult(
-                    accepted: false,
-                    skipped: true,
-                    shouldLogSheddingStart: false,
-                    queuedBatches: state.queuedBatches,
-                    queuedBytes: state.queuedBytes,
-                    droppedBatches: state.droppedBatches
-                )
-            }
-
             let nextQueuedBatches = Self.saturatingAdd(state.queuedBatches, 1)
-            let nextQueuedBytes = Self.saturatingAdd(state.queuedBytes, filtered.byteCount)
+            let nextQueuedBytes = Self.saturatingAdd(state.queuedBytes, rawByteCount)
             if nextQueuedBatches > QueuePolicy.maxQueuedBatches || nextQueuedBytes > QueuePolicy.maxQueuedBytes {
                 Self.incrementCounter(&state.droppedBatches)
                 let shouldLogSheddingStart = !state.hasEnteredShedMode
@@ -428,15 +427,15 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
             Self.incrementCounter(&state.acceptedBatches)
             state.continuation?.yield(
                 .batch(
-                    Batch(
-                        packets: filtered.packets,
-                        families: filtered.families,
-                        summaries: filtered.summaries,
-                        direction: direction,
-                        byteCount: filtered.byteCount
+                            Batch(
+                                packets: packets,
+                                families: families,
+                                direction: direction,
+                                byteCount: rawByteCount,
+                                trackingMode: initialDecision.1
+                            )
+                        )
                     )
-                )
-            )
 
             return SubmitResult(
                 accepted: true,
@@ -559,6 +558,12 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         }
     }
 
+    private static func didSkipBatch(state: SharedState) {
+        state.withLock { state in
+            Self.incrementCounter(&state.skippedBatches)
+        }
+    }
+
     private static func setBufferedRecordCount(state: SharedState, _ count: Int) {
         state.withLock { state in
             state.bufferedRecords = count
@@ -599,7 +604,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
             }
 
             if recentEvents.count > DetectionPolicy.maxRecentEvents {
-                recentEvents.removeFirst(recentEvents.count - DetectionPolicy.maxRecentEvents)
+                recentEvents = Array(recentEvents.suffix(DetectionPolicy.maxRecentEvents))
             }
             if countsByTarget.count > DetectionPolicy.maxCountedTargets {
                 let retainedTargets = Set(
@@ -660,14 +665,23 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
             switch command {
             case .batch(let batch):
                 Self.didStartBatch(state: state, byteCount: batch.byteCount)
+                let filtered = Self.prefilter(
+                    packets: batch.packets,
+                    families: batch.families,
+                    trackingMode: batch.trackingMode
+                )
+                guard !filtered.packets.isEmpty else {
+                    Self.didSkipBatch(state: state)
+                    continue
+                }
                 let policy = emissionPolicyOverride ?? Self.currentEmissionPolicy(processInfo: processInfo, runtimePlan: runtimePlan)
                 let runtimeContext = PacketAnalyticsPipeline.RuntimeContext(
                     pathRegime: policy.emitPathRegimeFields ? pathRegimeProvider?.currentSnapshot : nil
                 )
                 let records = await pipeline.ingest(
-                    packets: batch.packets,
-                    families: batch.families,
-                    summaries: batch.summaries,
+                    packets: filtered.packets,
+                    families: filtered.families,
+                    summaries: filtered.summaries,
                     direction: batch.direction,
                     policy: policy,
                     runtimeContext: runtimeContext
@@ -765,18 +779,14 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                     continue
                 }
                 detailRecords.append(record)
-                if detailRecords.count > DetailPolicy.maxBufferedRecords {
-                    detailRecords.removeFirst(detailRecords.count - DetailPolicy.maxBufferedRecords)
-                }
+                trimDetailRecords(&detailRecords)
 
             case .flowSlice:
                 guard liveTapPolicy.includeFlowSlices else {
                     continue
                 }
                 detailRecords.append(record)
-                if detailRecords.count > DetailPolicy.maxBufferedRecords {
-                    detailRecords.removeFirst(detailRecords.count - DetailPolicy.maxBufferedRecords)
-                }
+                trimDetailRecords(&detailRecords)
 
             case .metadata, .burst:
                 snapshotRecords.append(contentsOf: Self.drainDetailWindow(for: record, detailRecords: &detailRecords))
@@ -794,6 +804,13 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         }
 
         return snapshotRecords
+    }
+
+    private static func trimDetailRecords(_ detailRecords: inout [PacketSampleStream.PacketStreamRecord]) {
+        guard detailRecords.count > DetailPolicy.maxBufferedRecords else {
+            return
+        }
+        detailRecords = Array(detailRecords.suffix(DetailPolicy.maxBufferedRecords))
     }
 
     /// Pulls recent activity samples for the same flow into the app-facing snapshot right before a trigger event.

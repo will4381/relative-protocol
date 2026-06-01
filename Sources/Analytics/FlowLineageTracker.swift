@@ -152,13 +152,13 @@ internal struct FlowLineageTracker {
         var seen: Set<LineageKey> = []
         var active: [LineageKey] = []
         active.reserveCapacity(statesByKey.count)
-        for key in arrivalQueue {
+        for key in arrivalQueue.reversed() {
             guard statesByKey[key] != nil, seen.insert(key).inserted else {
                 continue
             }
             active.append(key)
         }
-        arrivalQueue = ArraySlice(active)
+        arrivalQueue = ArraySlice(active.reversed())
     }
 
     private static func isExpired(_ state: LineageState, now: Date) -> Bool {

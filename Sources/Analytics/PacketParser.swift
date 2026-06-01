@@ -594,7 +594,12 @@ public enum PacketParser {
         0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb, 0xf9, 0xbd, 0x2e, 0xd9
     ]
 
-    private struct QuicInitialSecrets {
+    private struct QuicInitialSecretKey: Hashable {
+        let version: UInt32
+        let dcid: Data
+    }
+
+    private struct QuicInitialSecrets: Sendable {
         let clientKey: Data
         let clientIv: Data
         let clientHp: Data
@@ -603,7 +608,13 @@ public enum PacketParser {
         let serverHp: Data
     }
 
+    private static let quicInitialSecretCache = BoundedCache<QuicInitialSecretKey, QuicInitialSecrets>(countLimit: 1_024)
+
     private static func deriveQuicInitialSecrets(version: UInt32, dcid: Data) -> QuicInitialSecrets? {
+        let cacheKey = QuicInitialSecretKey(version: version, dcid: dcid)
+        if let cached = quicInitialSecretCache.value(for: cacheKey) {
+            return cached
+        }
         let salt: Data
         let labelPrefix: String
         if version == quicV1Version {
@@ -627,7 +638,7 @@ public enum PacketParser {
         let serverIv = hkdfExpandLabel(secret: SymmetricKey(data: serverSecret), label: "\(labelPrefix) iv", length: 12)
         let serverHp = hkdfExpandLabel(secret: SymmetricKey(data: serverSecret), label: "\(labelPrefix) hp", length: 16)
 
-        return QuicInitialSecrets(
+        let secrets = QuicInitialSecrets(
             clientKey: clientKey,
             clientIv: clientIv,
             clientHp: clientHp,
@@ -635,6 +646,8 @@ public enum PacketParser {
             serverIv: serverIv,
             serverHp: serverHp
         )
+        quicInitialSecretCache.insert(secrets, for: cacheKey)
+        return secrets
     }
 
     private static func hkdfExtract(salt: Data, ikm: Data) -> SymmetricKey {

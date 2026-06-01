@@ -39,6 +39,28 @@ final class TunnelControlTests: XCTestCase {
         }
     }
 
+    func testRuntimeProfileValidationRejectsSpacedAndQuotedRawDataplaneConfigKeys() {
+        var configuration = makeRuntimeProviderConfiguration()
+        configuration["dataplaneConfigJSON"] = """
+        misc:
+          log-file : /tmp/vpnbridge.log
+        """
+
+        XCTAssertThrowsError(try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)) { error in
+            XCTAssertEqual(error as? TunnelProfileValidationError, .unsafeDataplaneConfig("log-file"))
+        }
+
+        configuration = makeRuntimeProviderConfiguration()
+        configuration["dataplaneConfigJSON"] = """
+        misc:
+          "pid-file": "/tmp/vpnbridge.pid"
+        """
+
+        XCTAssertThrowsError(try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)) { error in
+            XCTAssertEqual(error as? TunnelProfileValidationError, .unsafeDataplaneConfig("pid-file"))
+        }
+    }
+
     func testRuntimeProfileValidationRejectsSignaturePathTraversal() {
         var configuration = makeRuntimeProviderConfiguration()
         configuration["signatureFileName"] = "../app_signatures.json"
@@ -71,20 +93,20 @@ final class TunnelControlTests: XCTestCase {
                 .invalidValue(key: "ipv4SubnetMask", reason: "must be a contiguous IPv4 subnet mask")
             )
         }
-    }
 
-    func testRuntimeProfileValidationRejectsOutOfRangePortsBeforeClamping() {
-        var configuration = makeRuntimeProviderConfiguration()
-        configuration["relayPort"] = 70_000
+        configuration = makeRuntimeProviderConfiguration()
+        configuration["tunnelRemoteAddress"] = "bad/host"
 
         XCTAssertThrowsError(try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)) { error in
             XCTAssertEqual(
                 error as? TunnelProfileValidationError,
-                .invalidValue(key: "relayPort", reason: "must be in 1...65535")
+                .invalidValue(key: "tunnelRemoteAddress", reason: "must be a hostname or IP literal without whitespace")
             )
         }
+    }
 
-        configuration = makeRuntimeProviderConfiguration()
+    func testRuntimeProfileValidationRejectsOutOfRangePortsBeforeClamping() {
+        var configuration = makeRuntimeProviderConfiguration()
         configuration["engineSocksPort"] = -1
 
         XCTAssertThrowsError(try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)) { error in
@@ -93,16 +115,17 @@ final class TunnelControlTests: XCTestCase {
                 .invalidValue(key: "engineSocksPort", reason: "must be in 0...65535")
             )
         }
+    }
 
-        configuration = makeRuntimeProviderConfiguration()
-        configuration["relayPort"] = true
+    func testRuntimeProfileValidationIgnoresLegacyRelayHostAndPort() throws {
+        var configuration = makeRuntimeProviderConfiguration()
+        configuration.removeValue(forKey: "relayHost")
+        configuration.removeValue(forKey: "relayPort")
+        _ = try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)
 
-        XCTAssertThrowsError(try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)) { error in
-            XCTAssertEqual(
-                error as? TunnelProfileValidationError,
-                .invalidValue(key: "relayPort", reason: "must be in 1...65535")
-            )
-        }
+        configuration["relayHost"] = "bad host"
+        configuration["relayPort"] = 70_000
+        _ = try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)
     }
 
     func testRuntimeProfileValidationRejectsOutOfRangeMTUBeforeClamping() {
@@ -166,6 +189,46 @@ final class TunnelControlTests: XCTestCase {
             XCTAssertEqual(
                 error as? TunnelProfileValidationError,
                 .invalidValue(key: "dnsStrategy.serverURL", reason: "must be an HTTPS URL with a host")
+            )
+        }
+    }
+
+    func testRuntimeProfileValidationRejectsMixedProviderStringArrays() {
+        var configuration = makeRuntimeProviderConfiguration()
+        configuration["dnsServers"] = ["1.1.1.1", 123]
+
+        XCTAssertThrowsError(try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)) { error in
+            XCTAssertEqual(
+                error as? TunnelProfileValidationError,
+                .invalidValue(key: "dnsServers", reason: "must be an array of strings")
+            )
+        }
+
+        configuration = makeRuntimeProviderConfiguration()
+        configuration["dnsStrategy"] = [
+            "type": "cleartext",
+            "servers": ["1.1.1.1", 123],
+            "matchDomains": [""]
+        ]
+
+        XCTAssertThrowsError(try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)) { error in
+            XCTAssertEqual(
+                error as? TunnelProfileValidationError,
+                .invalidValue(key: "dnsStrategy.servers", reason: "must be an array of strings")
+            )
+        }
+
+        configuration = makeRuntimeProviderConfiguration()
+        configuration["dnsStrategy"] = [
+            "type": "cleartext",
+            "servers": ["1.1.1.1"],
+            "matchDomains": ["", 123]
+        ]
+
+        XCTAssertThrowsError(try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)) { error in
+            XCTAssertEqual(
+                error as? TunnelProfileValidationError,
+                .invalidValue(key: "dnsStrategy.matchDomains", reason: "must be an array of strings")
             )
         }
     }
@@ -356,6 +419,8 @@ final class TunnelControlTests: XCTestCase {
             "appGroupID": "group.example",
             "mtuStrategy": "automaticTunnelOverhead",
             "tunnelOverheadBytes": 92,
+            "relayHost": "legacy.example",
+            "relayPort": 9_999,
             "vpnConfigVersion": 4,
             "hostOwnedFlag": "keep-me"
         ]
@@ -382,6 +447,8 @@ final class TunnelControlTests: XCTestCase {
         XCTAssertEqual((configuration["mtu"] as? NSNumber)?.intValue, 1_280)
         XCTAssertEqual(configuration["mtuStrategy"] as? String, "fixed")
         XCTAssertNil(configuration["tunnelOverheadBytes"])
+        XCTAssertNil(configuration["relayHost"])
+        XCTAssertNil(configuration["relayPort"])
     }
 
     func testTunnelProfileManagerPreservesHostOwnedKeysAcrossRepeatedReconfigure() throws {
@@ -528,6 +595,24 @@ final class TunnelControlTests: XCTestCase {
         XCTAssertEqual(dnsHTTPS.serverURL?.absoluteString, "https://dns.example/dns-query")
     }
 
+    func testSettingsFactoryDropsInvalidDirectDNSSettings() {
+        let emptyServers = makeProfile(dnsServers: [], dnsStrategy: nil)
+        XCTAssertNil(TunnelNetworkSettingsFactory.makeSettings(profile: emptyServers).dnsSettings)
+
+        let malformedServer = makeProfile(dnsStrategy: .cleartext(servers: ["not an ip"]))
+        XCTAssertNil(TunnelNetworkSettingsFactory.makeSettings(profile: malformedServer).dnsSettings)
+
+        let malformedTLS = makeProfile(
+            dnsStrategy: .tls(servers: ["1.1.1.1"], serverName: "bad/name")
+        )
+        XCTAssertNil(TunnelNetworkSettingsFactory.makeSettings(profile: malformedTLS).dnsSettings)
+
+        let malformedHTTPS = makeProfile(
+            dnsStrategy: .https(servers: ["1.1.1.1"], serverURL: "http://dns.example/dns-query")
+        )
+        XCTAssertNil(TunnelNetworkSettingsFactory.makeSettings(profile: malformedHTTPS).dnsSettings)
+    }
+
     func testDataplaneConfigHonorsRelayUDPTransportMode() {
         let tcpCarriedUDPConfig = PacketTunnelProviderShell.makeDataplaneConfig(
             profile: makeProfile(relayUseUDP: false),
@@ -546,6 +631,7 @@ final class TunnelControlTests: XCTestCase {
         appGroupID: String = "group.example",
         mtu: Int = 1_280,
         mtuStrategy: TunnelMTUStrategy? = nil,
+        dnsServers: [String]? = nil,
         dnsStrategy: TunnelDNSStrategy? = nil,
         tcpMultipathHandoverEnabled: Bool = false,
         relayUseUDP: Bool = false,
@@ -564,7 +650,7 @@ final class TunnelControlTests: XCTestCase {
             ipv4RouteStrategy: ipv4RouteStrategy,
             ipv6Address: "fd00:1::2",
             ipv6PrefixLength: 64,
-            dnsServers: dnsStrategy?.servers ?? TunnelDNSStrategy.defaultPublicResolvers,
+            dnsServers: dnsServers ?? dnsStrategy?.servers ?? TunnelDNSStrategy.defaultPublicResolvers,
             dnsStrategy: dnsStrategy,
             engineSocksPort: 1080,
             engineLogLevel: "warn",

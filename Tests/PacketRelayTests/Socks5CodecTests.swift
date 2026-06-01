@@ -17,6 +17,19 @@ final class Socks5CodecTests: XCTestCase {
         )
     }
 
+    func testBuildersRejectInvalidAddresses() {
+        XCTAssertNil(Socks5Codec.buildReply(code: 0x00, bindAddress: .ipv4("999.0.0.1"), bindPort: 53))
+        XCTAssertNil(Socks5Codec.buildReply(code: 0x00, bindAddress: .ipv6("not-ipv6"), bindPort: 53))
+        XCTAssertNil(Socks5Codec.buildUDPPacket(address: .domain(""), port: 53, payload: Data()))
+        XCTAssertNil(
+            Socks5Codec.buildUDPPacket(
+                address: .domain(String(repeating: "a", count: 256)),
+                port: 53,
+                payload: Data()
+            )
+        )
+    }
+
     func testTCPForwardUDPFrameRoundTripsAndReportsConsumedBytes() throws {
         let firstPayload = Data([0x01, 0x02, 0x03])
         let secondPayload = Data([0x04, 0x05])

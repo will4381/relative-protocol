@@ -17,6 +17,7 @@
 #define RP_DP_STATE_CREATED 0
 #define RP_DP_STATE_RUNNING 1
 #define RP_DP_STATE_STOPPED 2
+#define RP_DP_MAX_CALLBACK_QUEUE_DEPTH 4096
 
 static const char *RP_DP_CREATED_MSG = "dataplane-created";
 static const char *RP_DP_RUNNING_MSG = "dataplane-running";
@@ -57,6 +58,8 @@ struct rp_dp_callback_queue {
     struct rp_dp_handle *handle;
     struct rp_dp_callback_task *head;
     struct rp_dp_callback_task *tail;
+    size_t depth;
+    uint64_t dropped;
     uint8_t running;
     uint8_t stopped;
 };
@@ -123,6 +126,9 @@ static void *rp_dp_callback_queue_main(void *ctx)
         if (queue->head == NULL) {
             queue->tail = NULL;
         }
+        if (queue->depth > 0) {
+            queue->depth--;
+        }
         pthread_mutex_unlock(&queue->lock);
 
         switch (task->kind) {
@@ -183,6 +189,11 @@ static int rp_dp_callback_queue_enqueue(struct rp_dp_handle *handle,
         pthread_mutex_unlock(&queue->lock);
         return -1;
     }
+    if (queue->depth >= RP_DP_MAX_CALLBACK_QUEUE_DEPTH) {
+        queue->dropped++;
+        pthread_mutex_unlock(&queue->lock);
+        return -2;
+    }
     task->next = NULL;
     if (queue->tail != NULL) {
         queue->tail->next = task;
@@ -190,9 +201,17 @@ static int rp_dp_callback_queue_enqueue(struct rp_dp_handle *handle,
         queue->head = task;
     }
     queue->tail = task;
+    queue->depth++;
     pthread_cond_signal(&queue->cond);
     pthread_mutex_unlock(&queue->lock);
     return 0;
+}
+
+static void *rp_dp_destroy_async_main(void *ctx)
+{
+    struct rp_dp_handle *handle = (struct rp_dp_handle *)ctx;
+    (void)rp_dp_destroy(handle);
+    return NULL;
 }
 
 static void rp_dp_callback_queue_stop_and_join(struct rp_dp_handle *handle)
@@ -613,6 +632,15 @@ int32_t rp_dp_start(rp_dp_handle_t *opaque_handle, int32_t tun_fd)
         handle->stopping = 1;
         pthread_mutex_unlock(&rp_dp_global_lock);
         hev_socks5_tunnel_quit();
+        rp_dp_wait_worker_if_needed(handle);
+        pthread_mutex_lock(&rp_dp_global_lock);
+        handle->started = 0;
+        handle->stopping = 0;
+        handle->ready = 0;
+        handle->exited = 1;
+        handle->exit_code = -6;
+        pthread_mutex_unlock(&rp_dp_global_lock);
+        rp_dp_clear_active_handle_if_current(handle);
         rp_dp_dispatch_log(handle, "dataplane-start-timeout");
         return -6;
     }
@@ -675,14 +703,19 @@ int32_t rp_dp_stop(rp_dp_handle_t *opaque_handle)
     return 0;
 }
 
-void rp_dp_destroy(rp_dp_handle_t *opaque_handle)
+int32_t rp_dp_destroy(rp_dp_handle_t *opaque_handle)
 {
     struct rp_dp_handle *handle = (struct rp_dp_handle *)opaque_handle;
     if (handle == NULL) {
-        return;
+        return 0;
     }
     if (rp_dp_reentrant_call_guard() != 0) {
-        return;
+        pthread_t cleanup_thread;
+        if (pthread_create(&cleanup_thread, NULL, rp_dp_destroy_async_main, handle) != 0) {
+            return -2;
+        }
+        pthread_detach(cleanup_thread);
+        return 1;
     }
 
     pthread_mutex_lock(&rp_dp_global_lock);
@@ -704,6 +737,7 @@ void rp_dp_destroy(rp_dp_handle_t *opaque_handle)
     }
 
     free(handle);
+    return 0;
 }
 
 int32_t rp_dp_get_stats(rp_dp_handle_t *opaque_handle, rp_dp_stats_t *out_stats)

@@ -46,8 +46,9 @@ int32_t rp_dp_start(rp_dp_handle_t *handle, int32_t tun_fd);
 /// Stops packet processing for an active dataplane handle.
 int32_t rp_dp_stop(rp_dp_handle_t *handle);
 
-/// Destroys an existing dataplane handle.
-void rp_dp_destroy(rp_dp_handle_t *handle);
+/// Destroys an existing dataplane handle. Returns 0 when destroyed synchronously,
+/// 1 when destruction was scheduled off callback context, or a negative error code.
+int32_t rp_dp_destroy(rp_dp_handle_t *handle);
 
 /// Retrieves dataplane statistics.
 int32_t rp_dp_get_stats(rp_dp_handle_t *handle, rp_dp_stats_t *out_stats);

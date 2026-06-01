@@ -1,4 +1,9 @@
 import Foundation
+#if os(Linux)
+import Glibc
+#else
+import Darwin
+#endif
 import NetworkExtension
 
 /// Converts `TunnelProfile` into NetworkExtension interface settings.
@@ -43,6 +48,9 @@ public enum TunnelNetworkSettingsFactory {
         case .noOverride:
             return nil
         case .cleartext(let servers, let matchDomains, let matchDomainsNoSearch, let allowFailover):
+            guard areValidResolverServers(servers) else {
+                return nil
+            }
             let dnsSettings = NEDNSSettings(servers: servers)
             configureCommonDNSSettings(
                 dnsSettings,
@@ -52,6 +60,9 @@ public enum TunnelNetworkSettingsFactory {
             )
             return dnsSettings
         case .tls(let servers, let serverName, let matchDomains, let matchDomainsNoSearch, let allowFailover):
+            guard areValidResolverServers(servers), isValidHostName(serverName) else {
+                return nil
+            }
             let dnsSettings = NEDNSOverTLSSettings(servers: servers)
             dnsSettings.serverName = serverName
             configureCommonDNSSettings(
@@ -62,8 +73,14 @@ public enum TunnelNetworkSettingsFactory {
             )
             return dnsSettings
         case .https(let servers, let serverURL, let matchDomains, let matchDomainsNoSearch, let allowFailover):
+            guard areValidResolverServers(servers),
+                  let url = URL(string: serverURL),
+                  url.scheme?.lowercased() == "https",
+                  url.host?.isEmpty == false else {
+                return nil
+            }
             let dnsSettings = NEDNSOverHTTPSSettings(servers: servers)
-            dnsSettings.serverURL = URL(string: serverURL)
+            dnsSettings.serverURL = url
             configureCommonDNSSettings(
                 dnsSettings,
                 matchDomains: matchDomains,
@@ -93,6 +110,51 @@ public enum TunnelNetworkSettingsFactory {
             settings.mtu = NSNumber(value: mtu)
         case .automaticTunnelOverhead(let overhead):
             settings.tunnelOverheadBytes = NSNumber(value: overhead)
+        }
+    }
+
+    private static func areValidResolverServers(_ servers: [String]) -> Bool {
+        !servers.isEmpty && servers.allSatisfy { isValidIPv4Address($0) || isValidIPv6Address($0) }
+    }
+
+    private static func isValidIPv4Address(_ value: String) -> Bool {
+        var address = in_addr()
+        return value.withCString { inet_pton(AF_INET, $0, &address) } == 1
+    }
+
+    private static func isValidIPv6Address(_ value: String) -> Bool {
+        var address = in6_addr()
+        return value.withCString { inet_pton(AF_INET6, $0, &address) } == 1
+    }
+
+    private static func isValidHostName(_ value: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              trimmed == value,
+              value.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
+              value.range(of: "\0") == nil,
+              value.rangeOfCharacter(from: .controlCharacters) == nil,
+              !value.contains("/"),
+              !value.contains("\\"),
+              !value.contains("\""),
+              !value.contains("'")
+        else {
+            return false
+        }
+        if isValidIPv4Address(value) || isValidIPv6Address(value) {
+            return true
+        }
+        if value.contains(":") || value.allSatisfy({ $0.isNumber || $0 == "." }) {
+            return false
+        }
+        let normalized = value.hasSuffix(".") ? String(value.dropLast()) : value
+        let labels = normalized.split(separator: ".", omittingEmptySubsequences: false)
+        return !labels.isEmpty && labels.allSatisfy { label in
+            !label.isEmpty &&
+                label.utf8.count <= 63 &&
+                label.first != "-" &&
+                label.last != "-" &&
+                label.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }
         }
     }
 }

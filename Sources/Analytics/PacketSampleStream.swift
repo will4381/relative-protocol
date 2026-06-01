@@ -608,7 +608,7 @@ public actor PacketSampleStream {
             return
         }
         if startIndex >= 128 || startIndex * 2 >= records.count {
-            records.removeFirst(startIndex)
+            records = Array(records[startIndex...])
             startIndex = 0
         }
         if startIndex >= records.count {

@@ -157,6 +157,17 @@ public struct FlowKey: Hashable, Sendable, Codable {
         return String(repeating: "0", count: 16 - hex.count) + hex
     }
 
+    var bidirectionalIdentifierHex: String {
+        if let flowHash, let reverseFlowHash {
+            let low = min(flowHash, reverseFlowHash)
+            let high = max(flowHash, reverseFlowHash)
+            return "\(Self.paddedHex(low)):\(Self.paddedHex(high)):\(ipVersion ?? 0):\(transportProtocolNumber ?? 0)"
+        }
+
+        let orderedEndpoints = [src, dst].sorted()
+        return "\(orderedEndpoints[0])|\(orderedEndpoints[1])|\(proto)"
+    }
+
     public static func == (lhs: FlowKey, rhs: FlowKey) -> Bool {
         if lhs.flowHash != nil || rhs.flowHash != nil {
             return lhs.flowHash == rhs.flowHash &&
@@ -258,6 +269,14 @@ public struct FlowKey: Hashable, Sendable, Codable {
             inet_ntop(AF_INET6, UnsafeRawPointer($0), &buffer, socklen_t(INET6_ADDRSTRLEN))
         }
         return result == nil ? "" : String(cString: buffer)
+    }
+
+    private static func paddedHex(_ value: UInt64) -> String {
+        let hex = String(value, radix: 16, uppercase: false)
+        if hex.count >= 16 {
+            return hex
+        }
+        return String(repeating: "0", count: 16 - hex.count) + hex
     }
 }
 

@@ -37,6 +37,7 @@ public actor SignatureClassifier {
     private struct SignatureMatch: Sendable, Equatable {
         let order: Int
         let label: String
+        let suffixLength: Int
     }
 
     private struct SuffixTrieNode: Sendable, Equatable {
@@ -97,7 +98,12 @@ public actor SignatureClassifier {
         guard cache != nil else {
             return nil
         }
-        let normalized = host.lowercased()
+        let normalized = host
+            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            .lowercased()
+        guard !normalized.isEmpty else {
+            return nil
+        }
         if let cached = classificationCache[normalized] {
             return cached
         }
@@ -122,11 +128,25 @@ public actor SignatureClassifier {
             guard let match = suffixTrieNodes[nodeIndex].match else {
                 continue
             }
+            guard Self.isDomainBoundaryMatch(host: normalizedHost, suffixLength: match.suffixLength) else {
+                continue
+            }
             if bestMatch == nil || match.order < bestMatch!.order {
                 bestMatch = match
             }
         }
         return bestMatch?.label
+    }
+
+    private static func isDomainBoundaryMatch(host: String, suffixLength: Int) -> Bool {
+        guard suffixLength > 0, suffixLength <= host.count else {
+            return false
+        }
+        if suffixLength == host.count {
+            return true
+        }
+        let boundaryIndex = host.index(host.endIndex, offsetBy: -suffixLength - 1)
+        return host[boundaryIndex] == "."
     }
 
     private func insertSignatureSuffix(_ suffix: String, label: String, order: Int) {
@@ -142,7 +162,7 @@ public actor SignatureClassifier {
             }
         }
 
-        let match = SignatureMatch(order: order, label: label)
+        let match = SignatureMatch(order: order, label: label, suffixLength: suffix.count)
         if let existingMatch = suffixTrieNodes[nodeIndex].match,
            existingMatch.order <= order {
             return

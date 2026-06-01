@@ -144,11 +144,15 @@ public enum Socks5Codec {
     /// - N bytes: SOCKS address and port
     /// - M bytes: UDP payload
     public static func parseTCPForwardUDPPacket(_ buffer: Data) -> Socks5TCPForwardUDPParseResult {
-        guard buffer.count >= 3 else {
+        parseTCPForwardUDPPacket(buffer, startIndex: buffer.startIndex)
+    }
+
+    static func parseTCPForwardUDPPacket(_ buffer: Data, startIndex start: Data.Index) -> Socks5TCPForwardUDPParseResult {
+        let availableBytes = buffer.distance(from: start, to: buffer.endIndex)
+        guard availableBytes >= 3 else {
             return .needsMoreData
         }
 
-        let start = buffer.startIndex
         let payloadLength = Int(UInt16(buffer[start]) << 8 | UInt16(buffer[start + 1]))
         let headerLength = Int(buffer[start + 2])
         guard headerLength >= 7 else {
@@ -159,7 +163,7 @@ public enum Socks5Codec {
         guard totalLength >= headerLength else {
             return .invalid
         }
-        guard buffer.count >= totalLength else {
+        guard availableBytes >= totalLength else {
             return .needsMoreData
         }
 
@@ -169,20 +173,19 @@ public enum Socks5Codec {
             return .invalid
         }
 
-        let addressBytes = Data(buffer[addressStart ..< payloadStart])
-        var index = addressBytes.startIndex
-        guard index < addressBytes.endIndex else {
+        var index = addressStart
+        guard index < payloadStart else {
             return .invalid
         }
-        let atyp = addressBytes[index]
+        let atyp = buffer[index]
         index += 1
-        guard let address = parseAddress(from: addressBytes, atyp: atyp, index: &index),
-              addressBytes.count == index + 2
+        guard let address = parseAddress(from: buffer, endIndex: payloadStart, atyp: atyp, index: &index),
+              payloadStart == index + 2
         else {
             return .invalid
         }
 
-        let port = UInt16(addressBytes[index]) << 8 | UInt16(addressBytes[index + 1])
+        let port = UInt16(buffer[index]) << 8 | UInt16(buffer[index + 1])
         let payload = Data(buffer[payloadStart ..< start + totalLength])
         return .packet(
             Socks5UDPPacket(address: address, port: port, payload: payload),
@@ -201,9 +204,12 @@ public enum Socks5Codec {
     ///   - code: Reply status code.
     ///   - bindAddress: Bound address to return.
     ///   - bindPort: Bound port to return.
-    public static func buildReply(code: UInt8, bindAddress: Socks5Address, bindPort: UInt16) -> Data {
+    public static func buildReply(code: UInt8, bindAddress: Socks5Address, bindPort: UInt16) -> Data? {
+        guard let addressBytes = addressBytes(bindAddress) else {
+            return nil
+        }
         var data = Data([0x05, code, 0x00])
-        data.append(contentsOf: addressBytes(bindAddress))
+        data.append(contentsOf: addressBytes)
         data.append(UInt8((bindPort >> 8) & 0xFF))
         data.append(UInt8(bindPort & 0xFF))
         return data
@@ -214,9 +220,12 @@ public enum Socks5Codec {
     ///   - address: Destination/source address.
     ///   - port: Destination/source port.
     ///   - payload: UDP payload bytes.
-    public static func buildUDPPacket(address: Socks5Address, port: UInt16, payload: Data) -> Data {
+    public static func buildUDPPacket(address: Socks5Address, port: UInt16, payload: Data) -> Data? {
+        guard let addressBytes = addressBytes(address) else {
+            return nil
+        }
         var data = Data([0x00, 0x00, 0x00])
-        data.append(contentsOf: addressBytes(address))
+        data.append(contentsOf: addressBytes)
         data.append(UInt8((port >> 8) & 0xFF))
         data.append(UInt8(port & 0xFF))
         data.append(payload)
@@ -245,10 +254,6 @@ public enum Socks5Codec {
         return data
     }
 
-    private static func addressPortBytes(_ address: Socks5Address, port: UInt16) -> [UInt8] {
-        addressBytes(address) + [UInt8((port >> 8) & 0xFF), UInt8(port & 0xFF)]
-    }
-
     private static func validatedAddressPortBytes(_ address: Socks5Address, port: UInt16) -> [UInt8]? {
         switch address {
         case .ipv4(let value):
@@ -271,24 +276,28 @@ public enum Socks5Codec {
     }
 
     private static func parseAddress(from data: Data, atyp: UInt8, index: inout Int) -> Socks5Address? {
+        parseAddress(from: data, endIndex: data.endIndex, atyp: atyp, index: &index)
+    }
+
+    private static func parseAddress(from data: Data, endIndex: Data.Index, atyp: UInt8, index: inout Int) -> Socks5Address? {
         switch atyp {
         case 0x01:
-            guard data.count >= index + 4 else { return nil }
+            guard endIndex >= index + 4 else { return nil }
             let value = [data[index], data[index + 1], data[index + 2], data[index + 3]].map(String.init).joined(separator: ".")
             index += 4
             return .ipv4(value)
         case 0x04:
-            guard data.count >= index + 16 else { return nil }
+            guard endIndex >= index + 16 else { return nil }
             let addressData = Data(data[index ..< index + 16])
             guard let value = ipv6String(from: addressData) else { return nil }
             index += 16
             return .ipv6(value)
         case 0x03:
-            guard data.count > index else { return nil }
+            guard endIndex > index else { return nil }
             let length = Int(data[index])
             index += 1
             guard length > 0 else { return nil }
-            guard data.count >= index + length else { return nil }
+            guard endIndex >= index + length else { return nil }
             let domain = String(decoding: data[index ..< index + length], as: UTF8.self)
             index += length
             return .domain(domain)
@@ -330,23 +339,23 @@ public enum Socks5Codec {
         }
     }
 
-    private static func addressBytes(_ address: Socks5Address) -> [UInt8] {
+    private static func addressBytes(_ address: Socks5Address) -> [UInt8]? {
         switch address {
         case .ipv4(let value):
             var bytes = [UInt8](repeating: 0, count: 4)
-            _ = bytes.withUnsafeMutableBufferPointer { buffer in
+            let ok = bytes.withUnsafeMutableBufferPointer { buffer in
                 value.withCString { inet_pton(AF_INET, $0, buffer.baseAddress) }
             }
+            guard ok == 1 else { return nil }
             return [0x01] + bytes
         case .ipv6(let value):
             var addr = in6_addr()
             let ok = value.withCString { inet_pton(AF_INET6, $0, &addr) }
-            if ok == 1 {
-                return [0x04] + withUnsafeBytes(of: &addr, { Array($0) })
-            }
-            return [0x04] + [UInt8](repeating: 0, count: 16)
+            guard ok == 1 else { return nil }
+            return [0x04] + withUnsafeBytes(of: &addr, { Array($0) })
         case .domain(let domain):
-            let utf8 = Array(domain.utf8.prefix(255))
+            let utf8 = Array(domain.utf8)
+            guard !utf8.isEmpty, utf8.count <= Int(UInt8.max) else { return nil }
             return [0x03, UInt8(utf8.count)] + utf8
         }
     }

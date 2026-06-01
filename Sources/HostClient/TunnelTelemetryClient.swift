@@ -1,4 +1,5 @@
 import Analytics
+import Dispatch
 import Foundation
 @preconcurrency import NetworkExtension
 
@@ -7,6 +8,7 @@ public enum TunnelTelemetryClientError: LocalizedError {
     case providerReturnedNoResponse
     case providerFailure(String)
     case unexpectedResponseKind(String)
+    case providerTimedOut(TimeInterval)
 
     public var errorDescription: String? {
         switch self {
@@ -18,7 +20,34 @@ public enum TunnelTelemetryClientError: LocalizedError {
             return "The tunnel provider reported an error: \(message)"
         case .unexpectedResponseKind(let kind):
             return "The tunnel provider returned an unexpected response kind: \(kind)"
+        case .providerTimedOut(let seconds):
+            return "The tunnel provider did not respond within \(seconds) seconds."
         }
+    }
+}
+
+private final class ProviderMessageContinuationBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Data, Error>?
+
+    init(_ continuation: CheckedContinuation<Data, Error>) {
+        self.continuation = continuation
+    }
+
+    func resume(returning data: Data) {
+        lock.lock()
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(returning: data)
+    }
+
+    func resume(throwing error: Error) {
+        lock.lock()
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(throwing: error)
     }
 }
 
@@ -26,6 +55,8 @@ public enum TunnelTelemetryClientError: LocalizedError {
 /// Decision: poll the provider on demand while the app is active, instead of treating the live tap as another
 /// always-on shared-storage feed.
 public struct TunnelTelemetryClient: Sendable {
+    private static let defaultProviderMessageTimeout: TimeInterval = 3
+
     public init() {}
 
     public func snapshot(from connection: NEVPNConnection, packetLimit: Int? = nil) async throws -> TunnelTelemetrySnapshot {
@@ -114,16 +145,24 @@ public struct TunnelTelemetryClient: Sendable {
     /// Bridges the tunnel provider's message callback into async/await for the foreground app.
     private func sendProviderMessage(_ request: Data, through session: NETunnelProviderSession) async throws -> Data {
         try await withCheckedThrowingContinuation { continuation in
+            let box = ProviderMessageContinuationBox(continuation)
+            let timeoutSeconds = Self.defaultProviderMessageTimeout
+            let timeout = DispatchWorkItem {
+                box.resume(throwing: TunnelTelemetryClientError.providerTimedOut(timeoutSeconds))
+            }
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeoutSeconds, execute: timeout)
             do {
                 try session.sendProviderMessage(request) { response in
+                    timeout.cancel()
                     guard let response else {
-                        continuation.resume(throwing: TunnelTelemetryClientError.providerReturnedNoResponse)
+                        box.resume(throwing: TunnelTelemetryClientError.providerReturnedNoResponse)
                         return
                     }
-                    continuation.resume(returning: response)
+                    box.resume(returning: response)
                 }
             } catch {
-                continuation.resume(throwing: error)
+                timeout.cancel()
+                box.resume(throwing: error)
             }
         }
     }

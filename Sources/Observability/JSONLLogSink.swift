@@ -98,7 +98,7 @@ public actor JSONLLogSink: LogSink {
     private var activeSize = 0
     private var rotationSequence = 0
     private var pending: ArraySlice<Data> = []
-    private var isDraining = false
+    private var drainTask: Task<Void, Never>?
     private var drops = JSONLDropCounters()
 
     /// Creates a JSONL sink with deterministic rotation/retention policies.
@@ -139,10 +139,7 @@ public actor JSONLLogSink: LogSink {
                 return
             }
             pending.append(payload)
-            if !isDraining {
-                isDraining = true
-                await drainQueue()
-            }
+            startDrainTaskIfNeeded()
         } catch {
             drops.incrementIOError()
             await emitDropSummaryIfNeeded(trigger: "io-error")
@@ -176,8 +173,13 @@ public actor JSONLLogSink: LogSink {
     }
 
     private func drainQueue() async {
-        while !pending.isEmpty {
-            let next = pending.removeFirst()
+        while true {
+            guard let next = pending.popFirst() else {
+                pending = []
+                drainTask = nil
+                await emitDropSummaryIfNeeded(trigger: "drain")
+                return
+            }
             do {
                 try rotateIfNeeded(for: next.count)
                 try append(next)
@@ -185,9 +187,15 @@ public actor JSONLLogSink: LogSink {
                 drops.incrementIOError()
             }
         }
-        pending = []
-        isDraining = false
-        await emitDropSummaryIfNeeded(trigger: "drain")
+    }
+
+    private func startDrainTaskIfNeeded() {
+        guard drainTask == nil else {
+            return
+        }
+        drainTask = Task { [weak self] in
+            await self?.drainQueue()
+        }
     }
 
     private func ensureInitialized() throws {

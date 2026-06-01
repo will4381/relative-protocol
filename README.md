@@ -375,6 +375,9 @@ let profile = TunnelProfile(
 )
 ```
 
+`RelayEndpoint.host` and `RelayEndpoint.port` are retained as legacy metadata for source compatibility.
+The active runtime selector is `relayEndpoint.useUDP`; TCP and UDP egress destinations come from SOCKS requests.
+
 ### Migration from earlier releases
 
 Transport recovery improvements do not require host-app changes.

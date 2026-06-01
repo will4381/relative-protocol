@@ -95,6 +95,7 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
     private var clientEndpoint: IPv4ClientEndpoint?
     private var clientAddress = sockaddr_storage()
     private var clientAddressLen: socklen_t = 0
+    private var receiveBuffer = [UInt8](repeating: 0, count: SessionPolicy.maxSocksDatagramBytes)
 
     private(set) var port: UInt16 = 0
 
@@ -183,12 +184,10 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
     }
 
     private func drainReadable() {
-        var buffer = [UInt8](repeating: 0, count: SessionPolicy.maxSocksDatagramBytes)
-
         while true {
             var addr = sockaddr_storage()
             var addrLen = socklen_t(MemoryLayout<sockaddr_storage>.size)
-            let bytes = recvfrom(socketFD, &buffer, buffer.count, 0, withUnsafeMutablePointer(to: &addr) {
+            let bytes = recvfrom(socketFD, &receiveBuffer, receiveBuffer.count, 0, withUnsafeMutablePointer(to: &addr) {
                 UnsafeMutableRawPointer($0).assumingMemoryBound(to: sockaddr.self)
             }, &addrLen)
             if bytes < 0 {
@@ -216,7 +215,7 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
                 continue
             }
 
-            guard let packet = buffer.withUnsafeBufferPointer({ ptr in
+            guard let packet = receiveBuffer.withUnsafeBufferPointer({ ptr in
                 Socks5Codec.parseUDPPacket(ptr, count: bytes)
             }) else {
                 continue
@@ -374,7 +373,9 @@ final class Socks5UDPRelay: @unchecked Sendable, Socks5UDPRelayProtocol {
                 guard self.markSessionUsed(for: key, at: self.nowProvider()) != nil else {
                     return
                 }
-                let response = Socks5Codec.buildUDPPacket(address: key.address, port: key.port, payload: datagram)
+                guard let response = Socks5Codec.buildUDPPacket(address: key.address, port: key.port, payload: datagram) else {
+                    return
+                }
                 self.sendToClient(response)
             }
         })

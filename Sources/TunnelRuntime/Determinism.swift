@@ -47,6 +47,7 @@ public actor DeterministicClock: Clock {
 
     private var currentTime: Date
     private var waiters: [Waiter] = []
+    private var waiterHeadIndex = 0
 
     /// Creates a deterministic clock with explicit start time.
     /// - Parameter startTime: Initial clock time.
@@ -67,8 +68,9 @@ public actor DeterministicClock: Clock {
         }
         let wakeTime = currentTime.addingTimeInterval(seconds)
         try await withCheckedThrowingContinuation { continuation in
-            waiters.append(Waiter(wakeTime: wakeTime, continuation: continuation))
-            waiters.sort { $0.wakeTime < $1.wakeTime }
+            let waiter = Waiter(wakeTime: wakeTime, continuation: continuation)
+            let insertionIndex = insertionIndex(for: wakeTime)
+            waiters.insert(waiter, at: insertionIndex)
         }
     }
 
@@ -80,12 +82,36 @@ public actor DeterministicClock: Clock {
         }
         currentTime = currentTime.addingTimeInterval(seconds)
         var ready: [Waiter] = []
-        while let first = waiters.first, first.wakeTime <= currentTime {
-            ready.append(waiters.removeFirst())
+        while waiterHeadIndex < waiters.count, waiters[waiterHeadIndex].wakeTime <= currentTime {
+            ready.append(waiters[waiterHeadIndex])
+            waiterHeadIndex += 1
         }
+        compactWaitersIfNeeded()
         for waiter in ready {
             waiter.continuation.resume()
         }
+    }
+
+    private func insertionIndex(for wakeTime: Date) -> Int {
+        var low = waiterHeadIndex
+        var high = waiters.count
+        while low < high {
+            let mid = low + (high - low) / 2
+            if waiters[mid].wakeTime <= wakeTime {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+        return low
+    }
+
+    private func compactWaitersIfNeeded() {
+        guard waiterHeadIndex >= 128, waiterHeadIndex * 2 >= waiters.count else {
+            return
+        }
+        waiters.removeFirst(waiterHeadIndex)
+        waiterHeadIndex = 0
     }
 }
 

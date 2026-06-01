@@ -710,7 +710,9 @@ private final class DirectUDPContext {
         port: UInt16 = 53,
         payload: Data = Data([0x01, 0x02, 0x03, 0x04])
     ) throws {
-        let frame = Socks5Codec.buildUDPPacket(address: address, port: port, payload: payload)
+        guard let frame = Socks5Codec.buildUDPPacket(address: address, port: port, payload: payload) else {
+            throw FaultInjectionError("failed to build UDP frame")
+        }
         var destination = sockaddr_in()
         destination.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         destination.sin_family = sa_family_t(AF_INET)
@@ -831,11 +833,12 @@ private final class TCPForwardUDPContext {
 
 private func wait<T>(timeoutSeconds: TimeInterval, pollIntervalSeconds: TimeInterval = 0.01, _ body: () -> T?) throws -> T {
     let deadline = Date().addingTimeInterval(timeoutSeconds)
+    let ticker = DispatchSemaphore(value: 0)
     while Date() < deadline {
         if let value = body() {
             return value
         }
-        Thread.sleep(forTimeInterval: pollIntervalSeconds)
+        _ = ticker.wait(timeout: .now() + pollIntervalSeconds)
     }
     throw FaultInjectionError("timed out waiting for relay fault state")
 }

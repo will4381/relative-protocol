@@ -249,6 +249,8 @@ public actor PacketAnalyticsPipeline {
         var hasEmittedFlowOpen = false
         var lastMetadataFingerprint: UInt64?
         var lastActivityEmissionAt: Date?
+        var sawOutboundFIN = false
+        var sawInboundFIN = false
         var totalPacketCount = 0
         var totalByteCount = 0
         var activityCounters = CounterSet()
@@ -271,9 +273,29 @@ public actor PacketAnalyticsPipeline {
 
     private var flowContexts: [FlowKey: FlowContext] = [:]
     private var flowContextArrivalQueue: ArraySlice<FlowKey> = []
+    private var flowKeysByPair: [String: Set<FlowKey>] = [:]
+    private var tcpFinStatesByPair: [String: TCPFinState] = [:]
     private var lastFlowContextSweepAt: Date?
     private var dnsAssociationCache = DNSAssociationCache()
     private var lineageTracker = FlowLineageTracker()
+
+    private struct TCPFinState: Sendable {
+        var outbound = false
+        var inbound = false
+
+        mutating func record(direction: PacketDirection) {
+            switch direction {
+            case .outbound:
+                outbound = true
+            case .inbound:
+                inbound = true
+            }
+        }
+
+        var isComplete: Bool {
+            outbound && inbound
+        }
+    }
 
     /// - Parameters:
     ///   - clock: Time source used for deterministic timestamps.
@@ -312,14 +334,15 @@ public actor PacketAnalyticsPipeline {
             return []
         }
 
-        let now = await clock.now()
+        let batchNow = await clock.now()
         var records: [PacketSampleStream.PacketStreamRecord] = []
         records.reserveCapacity(min(packets.count, 64) * 2)
-        records.append(contentsOf: maybeEvictExpiredFlowContexts(now: now, policy: policy))
+        records.append(contentsOf: maybeEvictExpiredFlowContexts(now: batchNow, policy: policy))
 
         var metadataProbesRemaining = policy.maxMetadataProbesPerBatch
 
         for (index, packet) in packets.enumerated() {
+            let now = await clock.now()
             let familyHint: Int32? = families.indices.contains(index) ? families[index] : nil
             let summary: FastPacketSummary
             if let summaries, summaries.indices.contains(index) {
@@ -340,6 +363,7 @@ public actor PacketAnalyticsPipeline {
                 metadataProbesRemaining > 0
 
             let flow = summary.flowKey
+            rememberFlow(flow)
             let isNewFlow = flowContexts[flow] == nil
             var context = flowContexts[flow] ?? makeFlowContext(for: summary, now: now, direction: direction, policy: policy)
             context.lastSeen = now
@@ -441,9 +465,9 @@ public actor PacketAnalyticsPipeline {
                 context.lastActivityEmissionAt = now
             }
 
-            if let closeReason = closeReason(for: summary) {
+            if let closeReason = closeReason(for: summary, direction: direction, flow: flow, context: &context) {
                 records.append(
-                    contentsOf: closeFlow(
+                    contentsOf: closeFlows(
                         flow: flow,
                         context: context,
                         timestamp: now,
@@ -462,7 +486,7 @@ public actor PacketAnalyticsPipeline {
             }
         }
 
-        records.append(contentsOf: trimOverflowFlowContextsIfNeeded(policy: policy, now: now))
+        records.append(contentsOf: trimOverflowFlowContextsIfNeeded(policy: policy, now: await clock.now()))
         return records
     }
 
@@ -613,14 +637,40 @@ public actor PacketAnalyticsPipeline {
         return now.timeIntervalSince(startedAt) * 1000 >= Double(policy.flowSliceIntervalMs)
     }
 
-    private func closeReason(for summary: FastPacketSummary) -> FlowCloseReason? {
+    private func closeReason(
+        for summary: FastPacketSummary,
+        direction: PacketDirection,
+        flow: FlowKey,
+        context: inout FlowContext
+    ) -> FlowCloseReason? {
         if summary.hasTCPRST {
+            tcpFinStatesByPair.removeValue(forKey: flow.bidirectionalIdentifierHex)
             return .tcpRst
         }
         if summary.hasTCPFIN {
-            return .tcpFin
+            switch direction {
+            case .outbound:
+                context.sawOutboundFIN = true
+            case .inbound:
+                context.sawInboundFIN = true
+            }
+            let pairID = flow.bidirectionalIdentifierHex
+            var state = tcpFinStatesByPair[pairID] ?? TCPFinState()
+            state.record(direction: direction)
+            tcpFinStatesByPair[pairID] = state
+            if state.isComplete {
+                tcpFinStatesByPair.removeValue(forKey: pairID)
+                return .tcpFin
+            }
         }
         return nil
+    }
+
+    private func rememberFlow(_ flow: FlowKey) {
+        let pairID = flow.bidirectionalIdentifierHex
+        var flows = flowKeysByPair[pairID] ?? []
+        flows.insert(flow)
+        flowKeysByPair[pairID] = flows
     }
 
     private func metadataFingerprint(for flowContext: FlowContext) -> UInt64 {
@@ -829,6 +879,46 @@ public actor PacketAnalyticsPipeline {
         return records
     }
 
+    private func closeFlows(
+        flow: FlowKey,
+        context: FlowContext,
+        timestamp: Date,
+        direction: PacketDirection,
+        reason: FlowCloseReason,
+        policy: EmissionPolicy,
+        closingSummary: FastPacketSummary?
+    ) -> [PacketSampleStream.PacketStreamRecord] {
+        let pairID = flow.bidirectionalIdentifierHex
+        let relatedFlows = Array(flowKeysByPair[pairID] ?? [])
+        var records = closeFlow(
+            flow: flow,
+            context: context,
+            timestamp: timestamp,
+            direction: direction,
+            reason: reason,
+            policy: policy,
+            closingSummary: closingSummary
+        )
+        for relatedFlow in relatedFlows where relatedFlow != flow {
+            guard let relatedContext = flowContexts[relatedFlow] else {
+                continue
+            }
+            records.append(
+                contentsOf: closeFlow(
+                    flow: relatedFlow,
+                    context: relatedContext,
+                    timestamp: timestamp,
+                    direction: relatedContext.lastDirection,
+                    reason: reason,
+                    policy: policy,
+                    closingSummary: nil
+                )
+            )
+        }
+        tcpFinStatesByPair.removeValue(forKey: pairID)
+        return records
+    }
+
     private func closeFlow(
         flow: FlowKey,
         context: FlowContext,
@@ -864,9 +954,24 @@ public actor PacketAnalyticsPipeline {
             )
         }
         flowContexts.removeValue(forKey: flow)
+        removeFlowFromPairIndex(flow)
         burstTracker.removeFlow(flow: flow)
         lineageTracker.close(flow: flow, now: timestamp)
         return records
+    }
+
+    private func removeFlowFromPairIndex(_ flow: FlowKey) {
+        let pairID = flow.bidirectionalIdentifierHex
+        guard var flows = flowKeysByPair[pairID] else {
+            return
+        }
+        flows.remove(flow)
+        if flows.isEmpty {
+            flowKeysByPair.removeValue(forKey: pairID)
+            tcpFinStatesByPair.removeValue(forKey: pairID)
+        } else {
+            flowKeysByPair[pairID] = flows
+        }
     }
 
     private func flowContextView(_ flowContext: FlowContext) -> FlowContextView {

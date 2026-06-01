@@ -20,8 +20,10 @@ private final class ManagedHandle: @unchecked Sendable {
     }
 
     deinit {
-        rp_dp_destroy(rawHandle)
-        callbackToken.release()
+        let result = rp_dp_destroy(rawHandle)
+        if result == 0 {
+            callbackToken.release()
+        }
     }
 }
 

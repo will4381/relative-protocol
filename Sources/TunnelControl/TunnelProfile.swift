@@ -32,6 +32,7 @@ public struct TunnelProfile: Sendable, Equatable {
     public let liveTapIncludeFlowSlices: Bool
     public let liveTapMaxBytes: Int
     public let signatureFileName: String
+    /// Transport selector retained for compatibility with the previous relay endpoint API.
     public let relayEndpoint: RelayEndpoint
     public let dataplaneConfigJSON: String
 
@@ -67,7 +68,7 @@ public struct TunnelProfile: Sendable, Equatable {
     ///     Keep this `false` for normal foreground reads and enable it only for richer inspection/debug builds.
     ///   - liveTapMaxBytes: Approximate memory budget for the live rolling packet tap.
     ///   - signatureFileName: Signature filename loaded by classifier.
-    ///   - relayEndpoint: Upstream relay endpoint metadata.
+    ///   - relayEndpoint: Legacy relay metadata plus the active UDP transport selector. Host and port are not egress destinations.
     ///   - dataplaneConfigJSON: Dataplane config template or raw config.
     public init(
         appGroupID: String,
@@ -199,13 +200,6 @@ public struct TunnelProfile: Sendable, Equatable {
         if providerConfiguration[TunnelProviderConfigurationKey.engineSocksPort] == nil {
             missing.append(TunnelProviderConfigurationKey.engineSocksPort)
         }
-        if providerConfiguration[TunnelProviderConfigurationKey.relayHost] == nil {
-            missing.append(TunnelProviderConfigurationKey.relayHost)
-        }
-        if providerConfiguration[TunnelProviderConfigurationKey.relayPort] == nil {
-            missing.append(TunnelProviderConfigurationKey.relayPort)
-        }
-
         guard missing.isEmpty else {
             throw TunnelProfileValidationError.missingRequiredKeys(missing.sorted())
         }
@@ -252,21 +246,13 @@ public struct TunnelProfile: Sendable, Equatable {
         if profile.ipv6Enabled, !isValidIPv6Address(profile.ipv6Address) {
             throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.ipv6Address, reason: "must be a valid IPv6 address when IPv6 is enabled")
         }
-        guard profile.relayEndpoint.port > 0 else {
-            throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.relayPort, reason: "must be greater than zero")
-        }
         guard exactUInt16(providerConfiguration[TunnelProviderConfigurationKey.engineSocksPort], allowingZero: true) != nil else {
             throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.engineSocksPort, reason: "must be in 0...65535")
-        }
-        guard exactUInt16(providerConfiguration[TunnelProviderConfigurationKey.relayPort], allowingZero: false) != nil else {
-            throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.relayPort, reason: "must be in 1...65535")
-        }
-        guard isValidHostNameOrAddress(profile.relayEndpoint.host) else {
-            throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.relayHost, reason: "must be a hostname or IP literal without whitespace")
         }
         guard isSafeFileName(profile.signatureFileName) else {
             throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.signatureFileName, reason: "must be a single file name without path separators")
         }
+        try validateStringArrayProviderValues(providerConfiguration)
         try validateDNSStrategy(profile.dnsStrategy)
         try validateDataplaneConfig(profile.dataplaneConfigJSON)
         return profile
@@ -397,8 +383,10 @@ public struct TunnelProfile: Sendable, Equatable {
             return value
         }
         if let value = value as? [Any] {
-            let strings = value.compactMap { $0 as? String }
-            return strings.isEmpty ? nil : strings
+            guard value.allSatisfy({ $0 is String }) else {
+                return nil
+            }
+            return value as? [String]
         }
         return nil
     }
@@ -576,6 +564,36 @@ public struct TunnelProfile: Sendable, Equatable {
         }
     }
 
+    private static func validateStringArrayProviderValues(_ providerConfiguration: [String: Any]) throws {
+        try validateStringArrayValue(
+            providerConfiguration[TunnelProviderConfigurationKey.dnsServers],
+            key: TunnelProviderConfigurationKey.dnsServers
+        )
+        guard let rawStrategy = providerConfiguration[TunnelProviderConfigurationKey.dnsStrategy] as? [String: Any] else {
+            return
+        }
+        try validateStringArrayValue(
+            rawStrategy["servers"],
+            key: "\(TunnelProviderConfigurationKey.dnsStrategy).servers"
+        )
+        try validateStringArrayValue(
+            rawStrategy["matchDomains"],
+            key: "\(TunnelProviderConfigurationKey.dnsStrategy).matchDomains"
+        )
+    }
+
+    private static func validateStringArrayValue(_ value: Any?, key: String) throws {
+        guard let value else {
+            return
+        }
+        if value is [String] {
+            return
+        }
+        guard let array = value as? [Any], array.allSatisfy({ $0 is String }) else {
+            throw TunnelProfileValidationError.invalidValue(key: key, reason: "must be an array of strings")
+        }
+    }
+
     private static func validateDNSServers(_ servers: [String], key: String) throws {
         guard !servers.isEmpty else {
             throw TunnelProfileValidationError.invalidValue(key: key, reason: "must include at least one resolver IP")
@@ -627,7 +645,49 @@ public struct TunnelProfile: Sendable, Equatable {
 
     private static func isValidHostNameOrAddress(_ value: String) -> Bool {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return !trimmed.isEmpty && trimmed == value && !containsWhitespace(value)
+        guard !trimmed.isEmpty,
+              trimmed == value,
+              !containsWhitespace(value),
+              value.range(of: "\0") == nil,
+              value.rangeOfCharacter(from: CharacterSet.controlCharacters) == nil,
+              !value.contains("/"),
+              !value.contains("\\"),
+              !value.contains("\""),
+              !value.contains("'")
+        else {
+            return false
+        }
+        if isValidIPv4Address(value) || isValidIPv6Address(value) {
+            return true
+        }
+        if value.contains(":") {
+            return false
+        }
+        if value.allSatisfy({ $0.isNumber || $0 == "." }) {
+            return false
+        }
+        let normalized = value.hasSuffix(".") ? String(value.dropLast()) : value
+        guard !normalized.isEmpty, normalized.utf8.count <= 253 else {
+            return false
+        }
+        let labels = normalized.split(separator: ".", omittingEmptySubsequences: false)
+        guard !labels.isEmpty else {
+            return false
+        }
+        for label in labels {
+            guard !label.isEmpty, label.utf8.count <= 63 else {
+                return false
+            }
+            guard label.first != "-", label.last != "-" else {
+                return false
+            }
+            guard label.allSatisfy({ character in
+                character.isASCII && (character.isLetter || character.isNumber || character == "-")
+            }) else {
+                return false
+            }
+        }
+        return true
     }
 
     private static func containsWhitespace(_ value: String) -> Bool {
@@ -655,20 +715,45 @@ public struct TunnelProfile: Sendable, Equatable {
             return
         }
 
-        let lower = trimmed.lowercased()
-        let blockedTokens = [
+        let blockedKeys: Set<String> = [
             "pid-file",
             "post-up-script",
             "pre-down-script",
             "daemon"
         ]
-        if let token = blockedTokens.first(where: { lower.contains($0) }) {
-            throw TunnelProfileValidationError.unsafeDataplaneConfig(token)
+        for line in trimmed.split(whereSeparator: \.isNewline) {
+            guard let entry = dataplaneConfigEntry(from: String(line)) else {
+                continue
+            }
+            if blockedKeys.contains(entry.key) {
+                throw TunnelProfileValidationError.unsafeDataplaneConfig(entry.key)
+            }
+            if entry.key == "log-file", entry.value != "stderr" {
+                throw TunnelProfileValidationError.unsafeDataplaneConfig("log-file")
+            }
         }
+    }
 
-        if lower.contains("log-file:") && !lower.contains("log-file: stderr") && !lower.contains("log-file:'stderr'") && !lower.contains("log-file: 'stderr'") {
-            throw TunnelProfileValidationError.unsafeDataplaneConfig("log-file")
+    private static func dataplaneConfigEntry(from line: String) -> (key: String, value: String)? {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else {
+            return nil
         }
+        guard let colon = trimmed.firstIndex(of: ":") else {
+            return nil
+        }
+        let rawKey = trimmed[..<colon]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+            .lowercased()
+        guard !rawKey.isEmpty else {
+            return nil
+        }
+        let rawValue = trimmed[trimmed.index(after: colon)...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+            .lowercased()
+        return (rawKey, rawValue)
     }
 }
 

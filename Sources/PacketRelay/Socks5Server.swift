@@ -1740,7 +1740,7 @@ final class Socks5TCPForwardUDPRelay: @unchecked Sendable {
     private let sendToClient: @Sendable (Data) -> Void
 
     private var sessions: [SessionKey: Socks5UDPSession] = [:]
-    private var sessionOrder: [SessionKey] = []
+    private var sessionOrder: ArraySlice<SessionKey> = []
     private var sessionsNeedingReplacement: Set<SessionKey> = []
     private var isStopped = false
 
@@ -1758,16 +1758,30 @@ final class Socks5TCPForwardUDPRelay: @unchecked Sendable {
     }
 
     func handleInboundBuffer(_ buffer: inout Data) -> Bool {
-        while !buffer.isEmpty {
-            switch Socks5Codec.parseTCPForwardUDPPacket(buffer) {
+        var cursor = buffer.startIndex
+        var packets: [Socks5UDPPacket] = []
+        while cursor < buffer.endIndex {
+            switch Socks5Codec.parseTCPForwardUDPPacket(buffer, startIndex: cursor) {
             case .needsMoreData:
+                if cursor > buffer.startIndex {
+                    buffer.removeSubrange(buffer.startIndex ..< cursor)
+                }
+                for packet in packets {
+                    forward(packet)
+                }
                 return true
             case .invalid:
                 return false
             case .packet(let packet, let consumedBytes):
-                buffer.removeSubrange(buffer.startIndex ..< buffer.startIndex + consumedBytes)
-                forward(packet)
+                cursor += consumedBytes
+                packets.append(packet)
             }
+        }
+        if cursor > buffer.startIndex {
+            buffer.removeSubrange(buffer.startIndex ..< cursor)
+        }
+        for packet in packets {
+            forward(packet)
         }
         return true
     }
@@ -1931,11 +1945,16 @@ final class Socks5TCPForwardUDPRelay: @unchecked Sendable {
         }
         session.cancel()
         sessionsNeedingReplacement.remove(key)
-        sessionOrder.removeAll { $0 == key }
     }
 
     private func evictOldestSessionIfNeeded() {
-        while sessions.count >= SessionPolicy.maxSessions, let key = sessionOrder.first {
+        while sessions.count >= SessionPolicy.maxSessions {
+            guard let key = sessionOrder.popFirst() else {
+                break
+            }
+            guard sessions[key] != nil else {
+                continue
+            }
             removeSession(for: key)
         }
     }
@@ -2247,9 +2266,13 @@ final class Socks5Connection: @unchecked Sendable {
                         outbound.cancel()
                         return
                     }
+                    guard let reply = Socks5Codec.buildReply(code: 0x00, bindAddress: .ipv4("0.0.0.0"), bindPort: 0) else {
+                        self.stop()
+                        return
+                    }
                     self.state = .tcpProxy(outbound)
                     self.connection.send(
-                        content: Socks5Codec.buildReply(code: 0x00, bindAddress: .ipv4("0.0.0.0"), bindPort: 0),
+                        content: reply,
                         completion: .contentProcessed { [weak self] error in
                             guard let self else { return }
                             self.runOnQueue {
@@ -2457,9 +2480,14 @@ final class Socks5Connection: @unchecked Sendable {
         do {
             let relay = try udpRelayFactory(provider, queue, mtu, logger)
             relay.start()
+            guard let reply = Socks5Codec.buildReply(code: 0x00, bindAddress: .ipv4("127.0.0.1"), bindPort: relay.port) else {
+                relay.stop()
+                stop()
+                return
+            }
             state = .udpProxy(relay)
             connection.send(
-                content: Socks5Codec.buildReply(code: 0x00, bindAddress: .ipv4("127.0.0.1"), bindPort: relay.port),
+                content: reply,
                 completion: .contentProcessed { [weak self] error in
                     guard let self, let error else { return }
                     self.runOnQueue {
@@ -2514,10 +2542,16 @@ final class Socks5Connection: @unchecked Sendable {
             }
         )
 
+        guard let reply = Socks5Codec.buildReply(code: 0x00, bindAddress: .ipv4("0.0.0.0"), bindPort: 0) else {
+            relay.stop()
+            stop()
+            return
+        }
+
         state = .udpForward(relay)
         udpForwardReplyInFlight = true
         connection.send(
-            content: Socks5Codec.buildReply(code: 0x00, bindAddress: .ipv4("0.0.0.0"), bindPort: 0),
+            content: reply,
             completion: .contentProcessed { [weak self] error in
                 guard let self else { return }
                 self.runOnQueue {
@@ -2540,8 +2574,12 @@ final class Socks5Connection: @unchecked Sendable {
     }
 
     private func sendFailure(replyCode: UInt8 = 0x01) {
+        guard let reply = Socks5Codec.buildReply(code: replyCode, bindAddress: .ipv4("0.0.0.0"), bindPort: 0) else {
+            stop()
+            return
+        }
         connection.send(
-            content: Socks5Codec.buildReply(code: replyCode, bindAddress: .ipv4("0.0.0.0"), bindPort: 0),
+            content: reply,
             completion: .contentProcessed { [weak self] error in
                 guard let self else { return }
                 self.runOnQueue {

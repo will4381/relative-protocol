@@ -381,12 +381,22 @@ final class AnalyticsTests: XCTestCase {
                 payload: Array(repeating: 0x17, count: 128)
             )
         )
-        let finPacket = Data(
+        let outboundFinPacket = Data(
             makeIPv4TCPPacket(
                 sourceAddress: [10, 0, 0, 2],
                 destinationAddress: [1, 1, 1, 1],
                 sourcePort: 50_000,
                 destinationPort: 443,
+                tcpFlags: 0x11,
+                payload: []
+            )
+        )
+        let inboundFinPacket = Data(
+            makeIPv4TCPPacket(
+                sourceAddress: [1, 1, 1, 1],
+                destinationAddress: [10, 0, 0, 2],
+                sourcePort: 443,
+                destinationPort: 50_000,
                 tcpFlags: 0x11,
                 payload: []
             )
@@ -410,17 +420,25 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertEqual(opened.map(\.kind), [.flowOpen])
 
         await clock.advance(by: 0.05)
-        let closed = await pipeline.ingest(packets: [finPacket], families: [], direction: .outbound, policy: policy)
-        XCTAssertEqual(closed.map(\.kind), [.flowClose])
+        let firstFin = await pipeline.ingest(packets: [outboundFinPacket], families: [], direction: .outbound, policy: policy)
+        XCTAssertEqual(firstFin.map(\.kind), [])
 
-        let close = try XCTUnwrap(closed.first)
-        XCTAssertEqual(close.closeReason, .tcpFin)
-        XCTAssertEqual(close.packetCount, 1)
-        XCTAssertEqual(close.tcpPacketCount, 1)
-        XCTAssertEqual(close.tcpFinCount, 1)
-        XCTAssertEqual(close.tcpSynCount, 0)
-        XCTAssertEqual(close.flowPacketCount, 2)
-        XCTAssertEqual(close.flowByteCount, dataPacket.count + finPacket.count)
+        await clock.advance(by: 0.05)
+        let closed = await pipeline.ingest(packets: [inboundFinPacket], families: [], direction: .inbound, policy: policy)
+        let closeRecords = closed.filter { $0.kind == .flowClose }
+        XCTAssertEqual(closeRecords.count, 2)
+
+        let originalClose = try XCTUnwrap(closeRecords.first { $0.flowByteCount == dataPacket.count + outboundFinPacket.count })
+        XCTAssertEqual(originalClose.closeReason, .tcpFin)
+        XCTAssertEqual(originalClose.flowPacketCount, 2)
+        XCTAssertEqual(originalClose.flowByteCount, dataPacket.count + outboundFinPacket.count)
+
+        let inboundClose = try XCTUnwrap(closeRecords.first { $0.flowByteCount == inboundFinPacket.count })
+        XCTAssertEqual(inboundClose.closeReason, .tcpFin)
+        XCTAssertEqual(inboundClose.packetCount, 1)
+        XCTAssertEqual(inboundClose.tcpPacketCount, 1)
+        XCTAssertEqual(inboundClose.tcpFinCount, 1)
+        XCTAssertEqual(inboundClose.tcpSynCount, 0)
     }
 
     /// Verifies idle flow eviction emits a synthetic `flowClose` record before new traffic is processed.
@@ -586,14 +604,15 @@ final class AnalyticsTests: XCTestCase {
         )
 
         let result = worker.submit(packets: [ackOnly], families: [], direction: .outbound)
-        let snapshot = worker.snapshot()
+        let queuedSnapshot = worker.snapshot()
         await worker.stopAndWait()
+        let drainedSnapshot = worker.snapshot()
 
-        XCTAssertFalse(result.accepted)
-        XCTAssertTrue(result.skipped)
-        XCTAssertEqual(snapshot.acceptedBatches, 0)
-        XCTAssertEqual(snapshot.queuedBatches, 0)
-        XCTAssertEqual(snapshot.skippedBatches, 1)
+        XCTAssertTrue(result.accepted)
+        XCTAssertFalse(result.skipped)
+        XCTAssertEqual(queuedSnapshot.acceptedBatches, 1)
+        XCTAssertEqual(drainedSnapshot.queuedBatches, 0)
+        XCTAssertEqual(drainedSnapshot.skippedBatches, 1)
     }
 
     /// Verifies stop waits for coalesced detector persistence before returning.
@@ -1080,7 +1099,7 @@ final class AnalyticsTests: XCTestCase {
                 destinationAddress: [1, 1, 1, 1],
                 sourcePort: 50_000,
                 destinationPort: 443,
-                tcpFlags: 0x01,
+                tcpFlags: 0x04,
                 payload: []
             )
         )
@@ -1354,6 +1373,10 @@ final class AnalyticsTests: XCTestCase {
         try await classifier.load(from: path)
         let classification = await classifier.classify(host: "cdn.social.example")
         XCTAssertEqual(classification, "social")
+        let trailingDotClassification = await classifier.classify(host: "cdn.social.example.")
+        XCTAssertEqual(trailingDotClassification, "social")
+        let boundaryMiss = await classifier.classify(host: "evilsocial.example")
+        XCTAssertNil(boundaryMiss)
     }
 
     /// Verifies burst detection emits a completed burst when a flow experiences a large timing gap.

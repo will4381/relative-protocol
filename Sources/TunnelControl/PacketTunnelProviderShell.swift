@@ -1004,7 +1004,7 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
         case 10:
             return "configurationRemoved"
         case 11:
-            return "superceded"
+            return "superseded"
         case 12:
             return "userLogout"
         case 13:
@@ -1476,11 +1476,15 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                     continuation.resume(throwing: error)
                 }
             }
-            Task {
+            let timeoutTask = Task {
                 try? await Task.sleep(nanoseconds: Self.NetworkSettingsPolicy.applyTimeoutNanoseconds)
+                guard !Task.isCancelled else {
+                    return
+                }
                 completion.call(.failure(TunnelProviderError.networkSettingsApplyTimedOut))
             }
             setTunnelNetworkSettings(settings) { error in
+                timeoutTask.cancel()
                 if let error {
                     completion.call(.failure(error))
                 } else {

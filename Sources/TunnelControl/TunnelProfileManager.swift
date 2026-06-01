@@ -43,8 +43,6 @@ public enum TunnelProfileManager {
             TunnelProviderConfigurationKey.liveTapIncludeFlowSlices: profile.liveTapIncludeFlowSlices,
             TunnelProviderConfigurationKey.liveTapMaxBytes: profile.liveTapMaxBytes,
             TunnelProviderConfigurationKey.signatureFileName: profile.signatureFileName,
-            TunnelProviderConfigurationKey.relayHost: profile.relayEndpoint.host,
-            TunnelProviderConfigurationKey.relayPort: Int(profile.relayEndpoint.port),
             TunnelProviderConfigurationKey.relayUDP: profile.relayEndpoint.useUDP,
             TunnelProviderConfigurationKey.dataplaneConfigJSON: profile.dataplaneConfigJSON
         ]

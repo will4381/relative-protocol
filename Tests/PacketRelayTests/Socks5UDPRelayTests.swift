@@ -765,11 +765,11 @@ final class Socks5UDPRelayTests: XCTestCase {
         destinationPort: UInt16,
         payload: Data = Data([0x01, 0x02, 0x03, 0x04])
     ) throws {
-        let frame = Socks5Codec.buildUDPPacket(
+        let frame = try XCTUnwrap(Socks5Codec.buildUDPPacket(
             address: destinationAddress,
             port: destinationPort,
             payload: payload
-        )
+        ))
 
         var address = sockaddr_in()
         address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
