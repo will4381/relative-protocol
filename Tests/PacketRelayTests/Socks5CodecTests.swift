@@ -121,6 +121,16 @@ final class Socks5CodecTests: XCTestCase {
         XCTAssertNil(Socks5Codec.parseRequest(&request))
     }
 
+    func testRequestFailureReplyCodeRejectsEmptyDomainAddress() {
+        let request = Data([
+            0x05, 0x01, 0x00, 0x03,
+            0x00,
+            0x01, 0xbb
+        ])
+
+        XCTAssertEqual(Socks5Codec.requestFailureReplyCode(request), 0x08)
+    }
+
     func testUDPPacketParserRejectsEmptyDomainAddress() {
         let packet = Data([
             0x00, 0x00, 0x00, 0x03,
@@ -139,6 +149,12 @@ final class Socks5CodecTests: XCTestCase {
             )
         }
         XCTAssertNil(parsed)
+    }
+
+    func testGreetingPrefixValidationRejectsNonSocksVersion() {
+        XCTAssertFalse(Socks5Codec.hasInvalidGreetingPrefix(Data()))
+        XCTAssertFalse(Socks5Codec.hasInvalidGreetingPrefix(Data([0x05])))
+        XCTAssertTrue(Socks5Codec.hasInvalidGreetingPrefix(Data([0x04])))
     }
 
     func testTCPForwardUDPParserRejectsAddressHeaderWithoutCompletePort() {

@@ -135,6 +135,27 @@ final class Socks5ServerTests: XCTestCase {
         }
     }
 
+    func testMalformedGreetingVersionClosesImmediately() {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.bad-greeting")
+        let inbound = FakeInboundConnection()
+        let provider = FakeProvider(outbound: ControlledTCPOutbound())
+        let connection = Socks5Connection(
+            connection: inbound,
+            provider: provider,
+            queue: queue,
+            mtu: 1500,
+            logger: StructuredLogger(sink: InMemoryLogSink())
+        )
+
+        queue.sync {
+            connection.start()
+            inbound.push(Data([0x04]))
+
+            XCTAssertTrue(inbound.cancelled)
+            XCTAssertTrue(inbound.sentPayloads.isEmpty)
+        }
+    }
+
     func testUDPAssociateReplyFailureStopsRelayAndConnection() {
         let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.udp-associate-reply-failure")
         let inbound = FakeInboundConnection()
@@ -230,6 +251,35 @@ final class Socks5ServerTests: XCTestCase {
                 [
                     Socks5Codec.buildMethodSelection(method: 0x00),
                     Socks5Codec.buildReply(code: 0x01, bindAddress: .ipv4("0.0.0.0"), bindPort: 0)
+                ]
+            )
+            XCTAssertTrue(inbound.cancelled)
+        }
+    }
+
+    func testEmptyDomainRequestFailsImmediately() {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.empty-domain")
+        let inbound = FakeInboundConnection()
+        let outbound = ControlledTCPOutbound()
+        let provider = FakeProvider(outbound: outbound)
+        let connection = Socks5Connection(
+            connection: inbound,
+            provider: provider,
+            queue: queue,
+            mtu: 1500,
+            logger: StructuredLogger(sink: InMemoryLogSink())
+        )
+
+        queue.sync {
+            connection.start()
+            inbound.push(Self.greeting)
+            inbound.push(Self.request(command: 0x01, host: "", port: 443))
+
+            XCTAssertEqual(
+                inbound.sentPayloads,
+                [
+                    Socks5Codec.buildMethodSelection(method: 0x00),
+                    Socks5Codec.buildReply(code: 0x08, bindAddress: .ipv4("0.0.0.0"), bindPort: 0)
                 ]
             )
             XCTAssertTrue(inbound.cancelled)
@@ -528,6 +578,153 @@ final class Socks5ServerTests: XCTestCase {
         XCTAssertFalse(secondSession === firstSession)
         XCTAssertEqual(provider.udpSessions.count, 2)
         XCTAssertEqual(secondSession.writtenDatagrams, [Data([0x01])])
+    }
+
+    func testTCPForwardUDPSchedulesReplacementAfterDatagramTooLargeWithoutClosingControlStream() throws {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.forward-udp-pmtu")
+        let outbound = ControlledTCPOutbound()
+        let provider = FakeProvider(outbound: outbound)
+        provider.onUDPSessionCreate = { session in
+            if provider.udpSessions.count == 1 {
+                session.nextWriteError = Socks5UDPDatagramError.exceedsMaximumDatagramSize(
+                    datagramSize: 1_400,
+                    maximumDatagramSize: 1_382,
+                    pathSummary: "status=satisfied uses=cellular"
+                )
+            }
+        }
+        let relay = Socks5TCPForwardUDPRelay(
+            provider: provider,
+            queue: queue,
+            logger: StructuredLogger(sink: InMemoryLogSink()),
+            sendToClient: { _ in }
+        )
+        defer { relay.stop() }
+        let frame = try XCTUnwrap(
+            Socks5Codec.buildTCPForwardUDPPacket(
+                address: .ipv4("1.1.1.1"),
+                port: 53,
+                payload: Data([0x01])
+            )
+        )
+
+        queue.sync {
+            var firstBuffer = frame
+            XCTAssertTrue(relay.handleInboundBuffer(&firstBuffer))
+        }
+
+        let firstSession = try XCTUnwrap(provider.udpSessions.first)
+        XCTAssertFalse(firstSession.cancelled)
+        XCTAssertEqual(provider.udpSessions.count, 1)
+
+        queue.sync {
+            var secondBuffer = frame
+            XCTAssertTrue(relay.handleInboundBuffer(&secondBuffer))
+        }
+
+        let secondSession = try XCTUnwrap(provider.udpSessions.last)
+        XCTAssertTrue(firstSession.cancelled)
+        XCTAssertFalse(secondSession === firstSession)
+        XCTAssertEqual(provider.udpSessions.count, 2)
+        XCTAssertEqual(secondSession.writtenDatagrams, [Data([0x01])])
+    }
+
+    func testTCPForwardUDPEvictionIgnoresRemovedSessionOrderEntries() throws {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.forward-udp-stale-eviction")
+        let provider = FakeProvider(outbound: ControlledTCPOutbound())
+        let relay = Socks5TCPForwardUDPRelay(
+            provider: provider,
+            queue: queue,
+            logger: StructuredLogger(sink: InMemoryLogSink()),
+            sendToClient: { _ in }
+        )
+        defer { relay.stop() }
+
+        let reusedFrame = try XCTUnwrap(
+            Socks5Codec.buildTCPForwardUDPPacket(
+                address: .ipv4("1.1.1.1"),
+                port: 53,
+                payload: Data([0x01])
+            )
+        )
+        let oldestFrame = try Self.tcpForwardUDPFrame(hostIndex: 0)
+
+        queue.sync {
+            var buffer = reusedFrame
+            XCTAssertTrue(relay.handleInboundBuffer(&buffer))
+        }
+        let removedSession = try XCTUnwrap(provider.udpSessions.last)
+
+        queue.sync {
+            removedSession.eventHandler?(.failed)
+
+            var oldestBuffer = oldestFrame
+            XCTAssertTrue(relay.handleInboundBuffer(&oldestBuffer))
+
+            var reusedBuffer = reusedFrame
+            XCTAssertTrue(relay.handleInboundBuffer(&reusedBuffer))
+        }
+        let recreatedSession = try XCTUnwrap(provider.udpSessions.last)
+
+        for index in 1 ... 254 {
+            let frame = try Self.tcpForwardUDPFrame(hostIndex: index)
+            queue.sync {
+                var buffer = frame
+                XCTAssertTrue(relay.handleInboundBuffer(&buffer))
+            }
+        }
+
+        let extraFrame = try Self.tcpForwardUDPFrame(hostIndex: 255)
+        queue.sync {
+            var buffer = extraFrame
+            XCTAssertTrue(relay.handleInboundBuffer(&buffer))
+        }
+
+        XCTAssertTrue(removedSession.cancelled)
+        XCTAssertFalse(recreatedSession === removedSession)
+        XCTAssertFalse(recreatedSession.cancelled)
+    }
+
+    func testTCPProxyHalfClosedClientFlushesFinalBytesAndKeepsReadingResponse() {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.tcp-half-close")
+        let inbound = FakeInboundConnection()
+        let outbound = ControlledTCPOutbound()
+        outbound.autoCompleteWrites = false
+        let provider = FakeProvider(outbound: outbound)
+        let connection = Socks5Connection(
+            connection: inbound,
+            provider: provider,
+            queue: queue,
+            mtu: 1500,
+            logger: StructuredLogger(sink: InMemoryLogSink())
+        )
+        let finalRequestBytes = Data("final-request".utf8)
+        let responseBytes = Data("response-after-half-close".utf8)
+
+        queue.sync {
+            connection.start()
+            inbound.push(Self.greeting)
+            inbound.push(Self.connectRequest(host: "example.com", port: 443))
+            outbound.succeedConnect()
+
+            inbound.push(finalRequestBytes, isComplete: true)
+            XCTAssertEqual(outbound.writes, [finalRequestBytes])
+            XCTAssertEqual(outbound.finishWritingCount, 0)
+            XCTAssertFalse(outbound.cancelled)
+            XCTAssertFalse(inbound.cancelled)
+
+            outbound.completeNextWrite()
+            XCTAssertEqual(outbound.finishWritingCount, 1)
+            XCTAssertFalse(outbound.cancelled)
+            XCTAssertFalse(inbound.cancelled)
+
+            outbound.queueRead(responseBytes)
+            XCTAssertEqual(inbound.sentPayloads.last, responseBytes)
+            XCTAssertFalse(inbound.cancelled)
+
+            outbound.queueRead(nil)
+            XCTAssertTrue(inbound.cancelled)
+        }
     }
 
     /// Verifies inbound client reads pause while one outbound relay write is still in flight.
@@ -1269,6 +1466,16 @@ final class Socks5ServerTests: XCTestCase {
             [UInt8((port >> 8) & 0xFF), UInt8(port & 0xFF)]
         )
     }
+
+    private static func tcpForwardUDPFrame(hostIndex: Int) throws -> Data {
+        try XCTUnwrap(
+            Socks5Codec.buildTCPForwardUDPPacket(
+                address: .domain("session-\(hostIndex).example"),
+                port: UInt16(10_000 + hostIndex),
+                payload: Data([UInt8(hostIndex & 0xFF)])
+            )
+        )
+    }
 }
 
 private enum TestConnectError: LocalizedError {
@@ -1351,6 +1558,7 @@ private final class ControlledTCPOutbound: @unchecked Sendable, Socks5PathAwareT
     private var storedCancelled = false
     private var storedReadRequests = 0
     private var storedRestartCount = 0
+    private var storedFinishWritingCount = 0
     private var storedAutoCompleteWrites = true
     private var storedOnRestart: (() -> Void)?
     private var storedEventHandler: ((TCPOutboundEvent) -> Void)?
@@ -1378,6 +1586,12 @@ private final class ControlledTCPOutbound: @unchecked Sendable, Socks5PathAwareT
         lock.lock()
         defer { lock.unlock() }
         return storedRestartCount
+    }
+
+    var finishWritingCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedFinishWritingCount
     }
 
     var autoCompleteWrites: Bool {
@@ -1475,6 +1689,13 @@ private final class ControlledTCPOutbound: @unchecked Sendable, Socks5PathAwareT
         }
     }
 
+    func finishWriting(completionHandler: @escaping @Sendable ((any Error)?) -> Void) {
+        lock.lock()
+        storedFinishWritingCount += 1
+        lock.unlock()
+        completionHandler(nil)
+    }
+
     func cancel() {
         lock.lock()
         storedCancelled = true
@@ -1565,6 +1786,7 @@ private final class ControlledUDPSession: @unchecked Sendable, Socks5UDPSession 
     private(set) var writtenDatagrams: [Data] = []
     private(set) var cancelled = false
     private(set) var restartCount = 0
+    var nextWriteError: Error?
     var eventHandler: ((Socks5UDPSessionEvent) -> Void)?
 
     init(endpoint: NWHostEndpoint) {
@@ -1577,7 +1799,12 @@ private final class ControlledUDPSession: @unchecked Sendable, Socks5UDPSession 
 
     func writeDatagram(_ datagram: Data, completionHandler: @escaping @Sendable (Error?) -> Void) {
         writtenDatagrams.append(datagram)
-        completionHandler(nil)
+        if let nextWriteError {
+            self.nextWriteError = nil
+            completionHandler(nextWriteError)
+        } else {
+            completionHandler(nil)
+        }
     }
 
     func restart() {
@@ -1614,6 +1841,7 @@ private final class ControlledUDPAssociateRelay: Socks5UDPRelayProtocol {
 private final class FakeProvider: Socks5FullConnectionProvider, @unchecked Sendable {
     private let outbound: ControlledTCPOutbound
     private(set) var udpSessions: [ControlledUDPSession] = []
+    var onUDPSessionCreate: ((ControlledUDPSession) -> Void)?
 
     init(outbound: ControlledTCPOutbound) {
         self.outbound = outbound
@@ -1631,6 +1859,7 @@ private final class FakeProvider: Socks5FullConnectionProvider, @unchecked Senda
     func makeUDPSession(to endpoint: NWHostEndpoint) -> any Socks5UDPSession {
         let session = ControlledUDPSession(endpoint: endpoint)
         udpSessions.append(session)
+        onUDPSessionCreate?(session)
         return session
     }
 }

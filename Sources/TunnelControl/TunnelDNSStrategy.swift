@@ -92,4 +92,48 @@ public enum TunnelDNSStrategy: Sendable, Equatable {
             }
         }
     }
+
+    static func areValidMatchDomains(_ matchDomains: [String]?) -> Bool {
+        guard let matchDomains else {
+            return true
+        }
+        guard !matchDomains.isEmpty else {
+            return false
+        }
+        return matchDomains.allSatisfy(isValidMatchDomain)
+    }
+
+    private static func isValidMatchDomain(_ value: String) -> Bool {
+        if value.isEmpty {
+            return true
+        }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed == value,
+              value.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
+              value.range(of: "\0") == nil,
+              value.rangeOfCharacter(from: .controlCharacters) == nil,
+              !value.contains("/"),
+              !value.contains("\\"),
+              !value.contains("\""),
+              !value.contains("'"),
+              !value.contains(":"),
+              !value.allSatisfy({ $0.isNumber || $0 == "." })
+        else {
+            return false
+        }
+
+        let normalized = value.hasSuffix(".") ? String(value.dropLast()) : value
+        guard !normalized.isEmpty, normalized.utf8.count <= 253 else {
+            return false
+        }
+
+        let labels = normalized.split(separator: ".", omittingEmptySubsequences: false)
+        return !labels.isEmpty && labels.allSatisfy { label in
+            !label.isEmpty &&
+                label.utf8.count <= 63 &&
+                label.first != "-" &&
+                label.last != "-" &&
+                label.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }
+        }
+    }
 }

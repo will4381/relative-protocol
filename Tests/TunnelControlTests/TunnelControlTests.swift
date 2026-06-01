@@ -273,6 +273,44 @@ final class TunnelControlTests: XCTestCase {
         }
     }
 
+    func testRuntimeProfileValidationRejectsEmptyDNSMatchDomainList() {
+        var configuration = makeRuntimeProviderConfiguration()
+        configuration["dnsStrategy"] = [
+            "type": "cleartext",
+            "servers": ["1.1.1.1"],
+            "matchDomains": []
+        ]
+
+        XCTAssertThrowsError(try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)) { error in
+            XCTAssertEqual(
+                error as? TunnelProfileValidationError,
+                .invalidValue(
+                    key: "dnsStrategy.matchDomains",
+                    reason: "must include at least one domain selector; use an empty string for the default domain"
+                )
+            )
+        }
+    }
+
+    func testRuntimeProfileValidationRejectsMalformedDNSMatchDomain() {
+        var configuration = makeRuntimeProviderConfiguration()
+        configuration["dnsStrategy"] = [
+            "type": "cleartext",
+            "servers": ["1.1.1.1"],
+            "matchDomains": ["bad/domain"]
+        ]
+
+        XCTAssertThrowsError(try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)) { error in
+            XCTAssertEqual(
+                error as? TunnelProfileValidationError,
+                .invalidValue(
+                    key: "dnsStrategy.matchDomains",
+                    reason: "must contain domain names without whitespace; use an empty string only for the default domain"
+                )
+            )
+        }
+    }
+
     func testRuntimeProfileValidationAcceptsCompleteProviderConfiguration() throws {
         let profile = try TunnelProfile.validatedRuntimeProfile(providerConfiguration: makeRuntimeProviderConfiguration())
         XCTAssertEqual(profile.appGroupID, "group.example")
@@ -611,6 +649,16 @@ final class TunnelControlTests: XCTestCase {
             dnsStrategy: .https(servers: ["1.1.1.1"], serverURL: "http://dns.example/dns-query")
         )
         XCTAssertNil(TunnelNetworkSettingsFactory.makeSettings(profile: malformedHTTPS).dnsSettings)
+
+        let emptyMatchDomains = makeProfile(
+            dnsStrategy: .cleartext(servers: ["1.1.1.1"], matchDomains: [])
+        )
+        XCTAssertNil(TunnelNetworkSettingsFactory.makeSettings(profile: emptyMatchDomains).dnsSettings)
+
+        let malformedMatchDomain = makeProfile(
+            dnsStrategy: .cleartext(servers: ["1.1.1.1"], matchDomains: ["bad/domain"])
+        )
+        XCTAssertNil(TunnelNetworkSettingsFactory.makeSettings(profile: malformedMatchDomain).dnsSettings)
     }
 
     func testDataplaneConfigHonorsRelayUDPTransportMode() {

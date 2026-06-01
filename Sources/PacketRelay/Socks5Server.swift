@@ -130,6 +130,7 @@ protocol Socks5TCPOutbound: AnyObject, Sendable {
     func waitUntilReady(completionHandler: @escaping @Sendable (Result<Void, Error>) -> Void)
     func readMinimumLength(_ minimumLength: Int, maximumLength: Int, completionHandler: @escaping @Sendable (Data?, Error?) -> Void)
     func write(_ data: Data, completionHandler: @escaping @Sendable (Error?) -> Void)
+    func finishWriting(completionHandler: @escaping @Sendable (Error?) -> Void)
     func cancel()
 }
 
@@ -340,6 +341,20 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
         connection.send(content: data, completion: .contentProcessed { error in
             completionHandler(error)
         })
+    }
+
+    func finishWriting(completionHandler: @escaping @Sendable (Error?) -> Void) {
+        startIfNeeded()
+        // Docs: NWConnection.ContentContext.finalMessage marks the stream's final send context; contentProcessed
+        // reports when Network.framework has processed that half-close request.
+        connection.send(
+            content: nil,
+            contentContext: .finalMessage,
+            isComplete: true,
+            completion: .contentProcessed { error in
+                completionHandler(error)
+            }
+        )
     }
 
     func cancel() {
@@ -567,6 +582,16 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
                 return
             }
             activeOutbound.write(data, completionHandler: completionHandler)
+        }
+    }
+
+    func finishWriting(completionHandler: @escaping @Sendable (Error?) -> Void) {
+        queue.async {
+            guard let activeOutbound = self.activeOutbound else {
+                completionHandler(self.readyResult?.failureError ?? Socks5OutboundError.failed("Outbound TCP not ready"))
+                return
+            }
+            activeOutbound.finishWriting(completionHandler: completionHandler)
         }
     }
 
@@ -1384,6 +1409,10 @@ private final class InvalidEndpointTCPOutbound: @unchecked Sendable, Socks5TCPOu
         completionHandler(Socks5OutboundError.failed("Invalid TCP endpoint \(hostname):\(port)"))
     }
 
+    func finishWriting(completionHandler: @escaping @Sendable (Error?) -> Void) {
+        completionHandler(Socks5OutboundError.failed("Invalid TCP endpoint \(hostname):\(port)"))
+    }
+
     func cancel() {}
 }
 
@@ -1803,6 +1832,21 @@ final class Socks5TCPForwardUDPRelay: @unchecked Sendable {
             guard let self, let session, let error else { return }
             self.runOnQueue {
                 guard !self.isStopped, self.sessions[key] === session else { return }
+                if let metadata = self.handleDatagramLimitError(error, for: key) {
+                    Task {
+                        await self.logger.log(
+                            level: .warning,
+                            phase: .relay,
+                            category: .relayUDP,
+                            component: "Socks5TCPForwardUDPRelay",
+                            event: "write-failed",
+                            errorCode: Socks5UDPDatagramError.datagramTooLargeErrorCode,
+                            message: "TCP-carried UDP relay dropped oversized datagram and scheduled session replacement",
+                            metadata: metadata
+                        )
+                    }
+                    return
+                }
                 self.removeSession(for: key)
                 Task {
                     await self.logger.log(
@@ -1926,6 +1970,29 @@ final class Socks5TCPForwardUDPRelay: @unchecked Sendable {
         }
     }
 
+    private func handleDatagramLimitError(_ error: Error, for key: SessionKey) -> [String: String]? {
+        guard let error = error as? Socks5UDPDatagramError,
+              case .exceedsMaximumDatagramSize(
+                let datagramSize,
+                let maximumDatagramSize,
+                let pathSummary
+              ) = error else {
+            return nil
+        }
+
+        sessionsNeedingReplacement.insert(key)
+        var metadata = Self.destinationMetadata(for: key)
+        metadata.merge([
+            "error_kind": "maximum-datagram-size",
+            "datagram_size": String(datagramSize),
+            "maximum_datagram_size": String(maximumDatagramSize),
+            "replacement_scheduled": "true",
+            "session_retained": "true",
+            "path": pathSummary
+        ]) { _, new in new }
+        return metadata
+    }
+
     private static func destinationMetadata(for key: SessionKey) -> [String: String] {
         let host: String
         switch key.address {
@@ -1945,6 +2012,7 @@ final class Socks5TCPForwardUDPRelay: @unchecked Sendable {
         }
         session.cancel()
         sessionsNeedingReplacement.remove(key)
+        sessionOrder = ArraySlice(sessionOrder.filter { $0 != key })
     }
 
     private func evictOldestSessionIfNeeded() {
@@ -1998,6 +2066,9 @@ final class Socks5Connection: @unchecked Sendable {
     private var inboundReceiveArmed = false
     private var outboundReadArmed = false
     private var outboundWriteInFlight = false
+    private var outboundFinishInFlight = false
+    private var outboundWriteFinished = false
+    private var inboundStreamComplete = false
     private var inboundSendInFlight = false
     private var udpForwardReplyInFlight = false
     private var activeTCPDestinationMetadata: [String: String] = [:]
@@ -2109,7 +2180,7 @@ final class Socks5Connection: @unchecked Sendable {
                     return
                 }
                 if isComplete {
-                    self.stop()
+                    self.handleInboundStreamComplete()
                     return
                 }
 
@@ -2124,6 +2195,9 @@ final class Socks5Connection: @unchecked Sendable {
     }
 
     private var shouldReadInbound: Bool {
+        guard !inboundStreamComplete else {
+            return false
+        }
         switch state {
         case .connectingTCP:
             return !isClosed
@@ -2137,6 +2211,21 @@ final class Socks5Connection: @unchecked Sendable {
     private func processBuffer() {
         switch state {
         case .greeting:
+            guard !Socks5Codec.hasInvalidGreetingPrefix(buffer) else {
+                Task {
+                    await logger.log(
+                        level: .warning,
+                        phase: .relay,
+                        category: .relayTCP,
+                        component: "Socks5Connection",
+                        event: "malformed-greeting",
+                        result: "closed",
+                        message: "Closing SOCKS5 connection after non-SOCKS5 greeting version"
+                    )
+                }
+                stop()
+                return
+            }
             guard let methods = Socks5Codec.parseGreeting(&buffer) else { return }
             let method: UInt8 = methods.contains(0x00) ? 0x00 : 0xFF
             connection.send(content: Socks5Codec.buildMethodSelection(method: method), completion: .contentProcessed { [weak self] error in
@@ -2171,6 +2260,7 @@ final class Socks5Connection: @unchecked Sendable {
             return
         case .tcpProxy(let outbound):
             guard !buffer.isEmpty, !outboundWriteInFlight else {
+                finishOutboundWritingIfNeeded(outbound)
                 return
             }
 
@@ -2407,7 +2497,63 @@ final class Socks5Connection: @unchecked Sendable {
                 }
 
                 self.processBuffer()
+                self.finishOutboundWritingIfNeeded(outbound)
                 self.armInboundReceiveIfNeeded()
+            }
+        }
+    }
+
+    private func handleInboundStreamComplete() {
+        inboundStreamComplete = true
+        switch state {
+        case .connectingTCP:
+            return
+        case .tcpProxy(let outbound):
+            finishOutboundWritingIfNeeded(outbound)
+        default:
+            stop()
+        }
+    }
+
+    private func finishOutboundWritingIfNeeded(_ outbound: Socks5TCPOutbound) {
+        guard inboundStreamComplete,
+              buffer.isEmpty,
+              !outboundWriteInFlight,
+              !outboundFinishInFlight,
+              !outboundWriteFinished
+        else {
+            return
+        }
+        guard case .tcpProxy(let activeOutbound) = state,
+              activeOutbound === outbound,
+              !isClosed else {
+            return
+        }
+
+        outboundFinishInFlight = true
+        outbound.finishWriting { [weak self] error in
+            guard let self else { return }
+            self.runOnQueue {
+                guard !self.isClosed else { return }
+                self.outboundFinishInFlight = false
+                if let error {
+                    Task {
+                        await self.logger.log(
+                            level: .error,
+                            phase: .relay,
+                            category: .relayTCP,
+                            component: "Socks5Connection",
+                            event: "outbound-finish-write-failed",
+                            errorCode: error.localizedDescription,
+                            message: "SOCKS5 outbound TCP write-side finish failed"
+                        )
+                    }
+                    self.stop()
+                    return
+                }
+
+                self.outboundWriteFinished = true
+                self.armOutboundReadIfNeeded(outbound)
             }
         }
     }

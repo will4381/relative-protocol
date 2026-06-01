@@ -483,6 +483,10 @@ private final class FaultTCPOutbound: @unchecked Sendable, Socks5PathAwareTCPOut
         completionHandler(nil)
     }
 
+    func finishWriting(completionHandler: @escaping @Sendable (Error?) -> Void) {
+        completionHandler(nil)
+    }
+
     func cancel() {
         lock.lock()
         storedCancelled = true

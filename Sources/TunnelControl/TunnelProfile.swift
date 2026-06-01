@@ -607,12 +607,15 @@ public struct TunnelProfile: Sendable, Equatable {
         guard let matchDomains else {
             return
         }
-        if matchDomains.contains(where: { domain in
-            if domain.isEmpty {
-                return false
-            }
-            return domain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || containsWhitespace(domain)
-        }) {
+        guard !matchDomains.isEmpty else {
+            throw TunnelProfileValidationError.invalidValue(
+                key: "\(TunnelProviderConfigurationKey.dnsStrategy).matchDomains",
+                reason: "must include at least one domain selector; use an empty string for the default domain"
+            )
+        }
+        // Apple NEDNSSettings.matchDomains selects which DNS queries use the tunnel resolvers.
+        // Keep invalid selectors out of provider configuration so tunnel startup fails closed during validation.
+        if !TunnelDNSStrategy.areValidMatchDomains(matchDomains) {
             throw TunnelProfileValidationError.invalidValue(
                 key: "\(TunnelProviderConfigurationKey.dnsStrategy).matchDomains",
                 reason: "must contain domain names without whitespace; use an empty string only for the default domain"

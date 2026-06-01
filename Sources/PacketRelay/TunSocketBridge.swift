@@ -15,6 +15,12 @@ public enum BridgeWriteResult: Sendable, Equatable {
 /// Bridges NE packetFlow data into a file descriptor pair consumed by the dataplane engine.
 /// Queue ownership: read/write sources and pending write state are only touched on `queue`.
 public final class TunSocketBridge: @unchecked Sendable {
+    private enum PacketSizing {
+        static let frameHeaderBytes = MemoryLayout<UInt32>.size
+        static let maxIPPacketBytes = 65_535
+        static let maxBridgeFrameBytes = frameHeaderBytes + maxIPPacketBytes
+    }
+
     private let logger: StructuredLogger
     private let mtu: Int
     private let queue: DispatchQueue
@@ -48,7 +54,9 @@ public final class TunSocketBridge: @unchecked Sendable {
         queue.setSpecific(key: queueSpecificKey, value: queueSpecificValue)
         self.maxPendingBytes = max(4_194_304, self.mtu * 1024)
         self.backpressureThreshold = maxPendingBytes * 3 / 4
-        self.readBuffer = [UInt8](repeating: 0, count: self.mtu + MemoryLayout<UInt32>.size)
+        // Apple NEPacketTunnelFlow read/write APIs move full IP packets; the configured MTU is an interface policy,
+        // not a safe receive-buffer ceiling for dataplane recovery paths.
+        self.readBuffer = [UInt8](repeating: 0, count: PacketSizing.maxBridgeFrameBytes)
 
         var fds = [Int32](repeating: 0, count: 2)
         let result = socketpair(AF_UNIX, SOCK_DGRAM, 0, &fds)
@@ -128,16 +136,17 @@ public final class TunSocketBridge: @unchecked Sendable {
             family = packet.first.map { (($0 >> 4) & 0x0F) == 6 ? AF_INET6 : AF_INET } ?? AF_INET
         }
 
+        guard let expectedLength = frameLength(for: packet) else {
+            return .failed(errorCode: EMSGSIZE)
+        }
+
         if pendingWrites.isEmpty {
-            guard let expectedLength = frameLength(for: packet) else {
-                return .failed(errorCode: EINVAL)
-            }
             let result = writePacketImmediate(packet, family: family)
             if result == expectedLength {
                 return .accepted
             }
             if result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
-                return enqueueWrite(framedPacket(packet, family: family))
+                return enqueueWrite(framedPacket(packet, family: family, expectedLength: expectedLength))
             }
             let errorCode = Int32(errno)
             Task {
@@ -154,7 +163,7 @@ public final class TunSocketBridge: @unchecked Sendable {
             return .failed(errorCode: errorCode)
         }
 
-        return enqueueWrite(framedPacket(packet, family: family))
+        return enqueueWrite(framedPacket(packet, family: family, expectedLength: expectedLength))
     }
 
     /// Returns whether queued bytes have crossed the backpressure threshold.
@@ -208,7 +217,7 @@ public final class TunSocketBridge: @unchecked Sendable {
     }
 
     private func drainReadable(handler: @escaping @Sendable ([Data], [Int32]) -> Void) {
-        let bufferSize = mtu + MemoryLayout<UInt32>.size
+        let bufferSize = PacketSizing.maxBridgeFrameBytes
         if readBuffer.count != bufferSize {
             readBuffer = [UInt8](repeating: 0, count: bufferSize)
         }
@@ -398,9 +407,9 @@ public final class TunSocketBridge: @unchecked Sendable {
         }
     }
 
-    private func framedPacket(_ packet: Data, family: Int32) -> Data {
+    private func framedPacket(_ packet: Data, family: Int32, expectedLength: Int) -> Data {
         var header = UInt32(family).bigEndian
-        var buffer = Data(capacity: frameLength(for: packet) ?? packet.count)
+        var buffer = Data(capacity: expectedLength)
         withUnsafeBytes(of: &header) { headerPtr in
             buffer.append(headerPtr.bindMemory(to: UInt8.self))
         }
@@ -410,7 +419,10 @@ public final class TunSocketBridge: @unchecked Sendable {
 
     private func frameLength(for packet: Data) -> Int? {
         let (length, overflow) = MemoryLayout<UInt32>.size.addingReportingOverflow(packet.count)
-        return overflow ? nil : length
+        guard !overflow, length <= PacketSizing.maxBridgeFrameBytes else {
+            return nil
+        }
+        return length
     }
 
     private func writePacketImmediate(_ packet: Data, family: Int32) -> Int {

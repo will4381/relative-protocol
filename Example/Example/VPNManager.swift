@@ -40,13 +40,13 @@ private struct ExampleDNSConfiguration: Equatable, Sendable {
 
 private final class OneShot<T>: @unchecked Sendable {
     private let lock = NSLock()
-    private var continuation: CheckedContinuation<T, Never>?
+    nonisolated(unsafe) private var continuation: CheckedContinuation<T, Never>?
 
-    init(_ continuation: CheckedContinuation<T, Never>) {
+    nonisolated init(_ continuation: CheckedContinuation<T, Never>) {
         self.continuation = continuation
     }
 
-    func resume(_ value: T) {
+    nonisolated func resume(_ value: T) {
         lock.lock()
         let continuation = self.continuation
         self.continuation = nil
@@ -508,6 +508,7 @@ final class VPNManager: ObservableObject {
     private let pathMonitorQueue = DispatchQueue(label: "relative.example.default-path", qos: .utility)
 
     private var manager: NETunnelProviderManager?
+    private var loadedManagers: [NETunnelProviderManager] = []
     private var statusObserver: NSObjectProtocol?
     private var pendingUserDisconnectRequest = false
     private var doctorTask: Task<Void, Never>?
@@ -607,7 +608,8 @@ final class VPNManager: ObservableObject {
         do {
             await refreshCurrentPath()
             let managers = try await loadAllManagers()
-            if let existing = managers.first {
+            loadedManagers = managers
+            if let existing = preferredManager(from: managers) {
                 applyManager(existing)
                 updateProfileDiagnostics(managers: managers, selectedManager: existing)
             } else {
@@ -641,7 +643,11 @@ final class VPNManager: ObservableObject {
             )
             let preparedManager = try await prepareManager()
             let managers = try await loadAllManagers()
-            updateProfileDiagnostics(managers: managers, selectedManager: preparedManager)
+            loadedManagers = managers
+            updateProfileDiagnostics(
+                managers: diagnosticManagers(from: managers, selectedManager: preparedManager),
+                selectedManager: preparedManager
+            )
             // Docs: https://developer.apple.com/documentation/networkextension/nevpnconnection/startvpntunnel()
             try preparedManager.connection.startVPNTunnel()
             pendingUserDisconnectRequest = false
@@ -1402,19 +1408,26 @@ final class VPNManager: ObservableObject {
         try await saveManager(manager)
         try await loadManager(manager)
         applyManager(manager)
-        updateProfileDiagnostics(managers: [manager], selectedManager: manager)
+        let managers = try await loadAllManagers()
+        loadedManagers = managers
+        updateProfileDiagnostics(
+            managers: diagnosticManagers(from: managers, selectedManager: manager),
+            selectedManager: manager
+        )
         return manager
     }
 
     private func loadOrCreateManager() async throws -> NETunnelProviderManager {
-        if let manager {
-            return manager
-        }
-
         let managers = try await loadAllManagers()
-        if let existing = managers.first {
+        loadedManagers = managers
+        if let existing = preferredManager(from: managers) {
             applyManager(existing)
             return existing
+        }
+
+        if let manager {
+            applyManager(manager)
+            return manager
         }
 
         let manager = NETunnelProviderManager()
@@ -1442,6 +1455,7 @@ final class VPNManager: ObservableObject {
 
     private func clearLoadedManager() {
         manager = nil
+        loadedManagers = []
         status = .invalid
         hasProfile = false
         pendingUserDisconnectRequest = false
@@ -1510,7 +1524,12 @@ final class VPNManager: ObservableObject {
 
     private func refreshProfileDiagnosticsForCurrentManager() {
         if let manager {
-            updateProfileDiagnostics(managers: [manager], selectedManager: manager)
+            updateProfileDiagnostics(
+                managers: diagnosticManagers(from: loadedManagers, selectedManager: manager),
+                selectedManager: manager
+            )
+        } else if !loadedManagers.isEmpty {
+            updateProfileDiagnostics(managers: loadedManagers, selectedManager: nil)
         } else {
             updateProfileDiagnostics(managers: [], selectedManager: nil)
         }
@@ -1583,6 +1602,31 @@ final class VPNManager: ObservableObject {
         }
 
         return "path \(status), interfaces \(interfaces.joined(separator: "/")), expensive \(path.isExpensive), constrained \(path.isConstrained), dns \(path.supportsDNS)"
+    }
+
+    private func preferredManager(from managers: [NETunnelProviderManager]) -> NETunnelProviderManager? {
+        let desiredProfile = profile
+        // Docs: NETunnelProviderManager.loadAllFromPreferences returns every configuration saved by this app,
+        // so duplicate repair must choose by decoded profile content instead of relying on array order.
+        if let exactMatch = managers.first(where: { Self.decodedProfile(from: $0) == desiredProfile }) {
+            return exactMatch
+        }
+        if let manager,
+           managers.contains(where: { $0 === manager }) {
+            return manager
+        }
+        return managers.first
+    }
+
+    private func diagnosticManagers(
+        from managers: [NETunnelProviderManager],
+        selectedManager: NETunnelProviderManager?
+    ) -> [NETunnelProviderManager] {
+        guard let selectedManager,
+              !managers.contains(where: { $0 === selectedManager }) else {
+            return managers
+        }
+        return managers + [selectedManager]
     }
 
     private func loadAllManagers() async throws -> [NETunnelProviderManager] {
@@ -3478,7 +3522,7 @@ private struct VPNStressRunner {
 
             let connection = NWConnection(host: NWEndpoint.Host(host), port: endpointPort, using: .tcp)
             let queue = DispatchQueue(label: "relative.example.stress.tcp.\(UUID().uuidString)", qos: .utility)
-            func finish(_ result: ProbeResult) {
+            @Sendable func finish(_ result: ProbeResult) {
                 connection.stateUpdateHandler = nil
                 connection.cancel()
                 gate.resume(result)
@@ -3600,7 +3644,7 @@ private struct VPNStressRunner {
             }
             let connection = NWConnection(host: NWEndpoint.Host(resolver), port: 53, using: .udp)
             let queue = DispatchQueue(label: "relative.example.stress.udp.\(UUID().uuidString)", qos: .utility)
-            func finish(_ result: ProbeResult) {
+            @Sendable func finish(_ result: ProbeResult) {
                 connection.stateUpdateHandler = nil
                 connection.cancel()
                 gate.resume(result)
@@ -3694,7 +3738,7 @@ private struct VPNStressRunner {
             let parameters = NWParameters.quic(alpn: ["h3"])
             let connection = NWConnection(host: NWEndpoint.Host(host), port: 443, using: parameters)
             let queue = DispatchQueue(label: "relative.example.stress.quic.\(UUID().uuidString)", qos: .utility)
-            func finish(_ result: ProbeResult) {
+            @Sendable func finish(_ result: ProbeResult) {
                 connection.stateUpdateHandler = nil
                 connection.cancel()
                 gate.resume(result)

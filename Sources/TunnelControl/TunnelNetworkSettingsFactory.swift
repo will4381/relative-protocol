@@ -48,7 +48,8 @@ public enum TunnelNetworkSettingsFactory {
         case .noOverride:
             return nil
         case .cleartext(let servers, let matchDomains, let matchDomainsNoSearch, let allowFailover):
-            guard areValidResolverServers(servers) else {
+            guard areValidResolverServers(servers),
+                  TunnelDNSStrategy.areValidMatchDomains(matchDomains) else {
                 return nil
             }
             let dnsSettings = NEDNSSettings(servers: servers)
@@ -60,7 +61,9 @@ public enum TunnelNetworkSettingsFactory {
             )
             return dnsSettings
         case .tls(let servers, let serverName, let matchDomains, let matchDomainsNoSearch, let allowFailover):
-            guard areValidResolverServers(servers), isValidHostName(serverName) else {
+            guard areValidResolverServers(servers),
+                  isValidHostName(serverName),
+                  TunnelDNSStrategy.areValidMatchDomains(matchDomains) else {
                 return nil
             }
             let dnsSettings = NEDNSOverTLSSettings(servers: servers)
@@ -74,6 +77,7 @@ public enum TunnelNetworkSettingsFactory {
             return dnsSettings
         case .https(let servers, let serverURL, let matchDomains, let matchDomainsNoSearch, let allowFailover):
             guard areValidResolverServers(servers),
+                  TunnelDNSStrategy.areValidMatchDomains(matchDomains),
                   let url = URL(string: serverURL),
                   url.scheme?.lowercased() == "https",
                   url.host?.isEmpty == false else {
@@ -97,6 +101,8 @@ public enum TunnelNetworkSettingsFactory {
         matchDomainsNoSearch: Bool,
         allowFailover: Bool
     ) {
+        // Apple NEDNSSettings.matchDomains is the resolver selection list; invalid selectors are rejected before
+        // settings creation so setTunnelNetworkSettings does not fail late with an opaque DNS configuration error.
         dnsSettings.matchDomains = matchDomains
         dnsSettings.matchDomainsNoSearch = matchDomainsNoSearch
         if #available(iOS 26.0, macOS 26.0, tvOS 26.0, *) {

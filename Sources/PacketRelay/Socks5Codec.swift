@@ -79,6 +79,15 @@ public enum Socks5Codec {
         return methods
     }
 
+    /// Returns true when the buffered prefix cannot be a SOCKS5 greeting.
+    /// RFC 1928 starts the negotiation with VER = 0x05, so a different first byte is a terminal protocol error.
+    public static func hasInvalidGreetingPrefix(_ buffer: Data) -> Bool {
+        guard let version = buffer.first else {
+            return false
+        }
+        return version != 0x05
+    }
+
     /// Attempts to parse a SOCKS5 request from the front of `buffer`.
     /// - Parameter buffer: Mutable receive buffer. Consumed bytes are removed on success.
     /// - Returns: Parsed request, or `nil` if more bytes are required.
@@ -112,6 +121,12 @@ public enum Socks5Codec {
         let atyp = buffer[buffer.startIndex + 3]
         if atyp != 0x01, atyp != 0x03, atyp != 0x04 {
             return 0x08
+        }
+        if atyp == 0x03 {
+            guard buffer.count >= 5 else { return nil }
+            if buffer[buffer.startIndex + 4] == 0 {
+                return 0x08
+            }
         }
         return nil
     }
