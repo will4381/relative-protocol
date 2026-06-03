@@ -282,6 +282,7 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
     private let connection: NWConnection
     private let queue: DispatchQueue
     private let logger: StructuredLogger
+    private let endpointMetadata: [String: String]
     private var readyHandlers: [(@Sendable (Result<Void, Error>) -> Void)] = []
     private var readyResult: Result<Void, Error>?
     private var didStart = false
@@ -293,10 +294,16 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
     ///   - connection: Outbound Network.framework connection.
     ///   - queue: Queue used for connection callbacks.
     ///   - logger: Structured logger for state transitions.
-    init(_ connection: NWConnection, queue: DispatchQueue, logger: StructuredLogger) {
+    init(
+        _ connection: NWConnection,
+        queue: DispatchQueue,
+        logger: StructuredLogger,
+        endpointMetadata: [String: String] = [:]
+    ) {
         self.connection = connection
         self.queue = queue
         self.logger = logger
+        self.endpointMetadata = endpointMetadata
         connection.stateUpdateHandler = { [weak self] state in
             self?.handleState(state)
         }
@@ -386,7 +393,7 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
                     component: "NWConnectionTCPAdapter",
                     event: "ready",
                     message: "Outbound TCP ready",
-                    metadata: ["path": path]
+                    metadata: self.metadata(path: path)
                 )
             }
         case .waiting(let error):
@@ -404,7 +411,7 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
                     event: "waiting",
                     errorCode: errorDescription,
                     message: "Outbound TCP waiting",
-                    metadata: ["path": path]
+                    metadata: self.metadata(path: path)
                 )
             }
         case .failed(let error):
@@ -420,7 +427,7 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
                     event: "failed",
                     errorCode: errorDescription,
                     message: "Outbound TCP failed",
-                    metadata: ["path": path]
+                    metadata: self.metadata(path: path)
                 )
             }
         case .cancelled:
@@ -439,14 +446,14 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
                 level: .debug,
                 phase: .path,
                 category: .relayTCP,
-                component: "NWConnectionTCPAdapter",
-                event: "path-update",
-                result: status,
-                message: "Outbound TCP path updated",
-                metadata: ["path": summary]
-            )
+                    component: "NWConnectionTCPAdapter",
+                    event: "path-update",
+                    result: status,
+                    message: "Outbound TCP path updated",
+                    metadata: self.metadata(path: summary)
+                )
+            }
         }
-    }
 
     private func handleViabilityUpdate(_ isViable: Bool) {
         let path = currentPathSummary()
@@ -459,7 +466,7 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
                 event: "viability-update",
                 result: isViable ? "viable" : "not-viable",
                 message: "Outbound TCP viability changed",
-                metadata: ["path": path]
+                metadata: self.metadata(path: path)
             )
         }
     }
@@ -479,9 +486,13 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
                 event: "better-path-available",
                 result: "preferred-path",
                 message: "Outbound TCP has a better path available",
-                metadata: ["path": path]
+                metadata: self.metadata(path: path)
             )
         }
+    }
+
+    private func metadata(path: String) -> [String: String] {
+        endpointMetadata.merging(["path": path]) { _, new in new }
     }
 
     private func currentPathSummary() -> String {
@@ -1366,7 +1377,17 @@ final class PacketTunnelProviderAdapter: @unchecked Sendable, Socks5FullConnecti
         }
 
         let connection = NWConnection(host: NWEndpoint.Host(host), port: port, using: parameters)
-        return NWConnectionTCPAdapter(connection, queue: queue, logger: logger)
+        return NWConnectionTCPAdapter(
+            connection,
+            queue: queue,
+            logger: logger,
+            endpointMetadata: relayDestinationMetadata(
+                host: host,
+                port: String(port.rawValue),
+                transport: "tcp",
+                tls: enableTLS
+            )
+        )
     }
 }
 

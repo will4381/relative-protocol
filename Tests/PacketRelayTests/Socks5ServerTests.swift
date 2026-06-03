@@ -1253,7 +1253,13 @@ final class Socks5ServerTests: XCTestCase {
         let adapter = NWConnectionTCPAdapter(
             connection,
             queue: queue,
-            logger: StructuredLogger(sink: sink)
+            logger: StructuredLogger(sink: sink),
+            endpointMetadata: [
+                "destination_host": "api.example.com",
+                "destination_port": "443",
+                "destination_host_kind": "domain",
+                "destination_transport": "tcp"
+            ]
         )
 
         adapter.waitUntilReady { _ in }
@@ -1261,15 +1267,21 @@ final class Socks5ServerTests: XCTestCase {
         connection.pathUpdateHandler?(path)
         connection.viabilityUpdateHandler?(false)
         connection.betterPathUpdateHandler?(true)
+        connection.stateUpdateHandler?(.failed(.posix(.ENETDOWN)))
 
         let records = try await eventuallyFetchRecords(from: sink) { records in
             records.contains { $0.component == "NWConnectionTCPAdapter" && $0.event == "path-update" } &&
                 records.contains { $0.component == "NWConnectionTCPAdapter" && $0.event == "viability-update" } &&
-                records.contains { $0.component == "NWConnectionTCPAdapter" && $0.event == "better-path-available" }
+                records.contains { $0.component == "NWConnectionTCPAdapter" && $0.event == "better-path-available" } &&
+                records.contains { $0.component == "NWConnectionTCPAdapter" && $0.event == "failed" }
         }
 
         let adapterRecords = records.filter { $0.component == "NWConnectionTCPAdapter" }
         XCTAssertTrue(adapterRecords.allSatisfy { $0.metadata["path"]?.contains("status=") == true })
+        XCTAssertTrue(adapterRecords.allSatisfy { $0.metadata["destination_host"] == "<redacted>" })
+        XCTAssertTrue(adapterRecords.allSatisfy { $0.metadata["destination_port"] == "443" })
+        XCTAssertTrue(adapterRecords.allSatisfy { $0.metadata["destination_host_kind"] == "domain" })
+        XCTAssertTrue(adapterRecords.allSatisfy { $0.metadata["destination_transport"] == "tcp" })
         XCTAssertTrue(adapter.pathSnapshot.contains("status="))
         adapter.cancel()
         withExtendedLifetime(adapter) {}
