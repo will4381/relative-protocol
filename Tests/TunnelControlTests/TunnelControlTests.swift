@@ -609,6 +609,45 @@ final class TunnelControlTests: XCTestCase {
         }
     }
 
+    func testSettingsFactorySuppressesIPv6RouteAndResolversOnIPv4OnlyPath() throws {
+        let profile = makeProfile(
+            dnsStrategy: .cleartext(
+                servers: TunnelDNSStrategy.defaultPublicResolvers,
+                matchDomains: [""],
+                matchDomainsNoSearch: true,
+                allowFailover: false
+            )
+        )
+
+        let settings = TunnelNetworkSettingsFactory.makeSettings(profile: profile, pathSupportsIPv6: false)
+        XCTAssertNil(settings.ipv6Settings)
+        let dnsSettings = try XCTUnwrap(settings.dnsSettings)
+        XCTAssertEqual(dnsSettings.servers, ["1.1.1.1", "1.0.0.1"])
+    }
+
+    func testSettingsFactoryKeepsIPv6RouteAndResolversWhenPathSupportsIPv6() throws {
+        let profile = makeProfile(dnsStrategy: .recommendedDefault)
+
+        let settings = TunnelNetworkSettingsFactory.makeSettings(profile: profile, pathSupportsIPv6: true)
+        let ipv6Settings = try XCTUnwrap(settings.ipv6Settings)
+        XCTAssertEqual(ipv6Settings.addresses, ["fd00:1::2"])
+        XCTAssertEqual(ipv6Settings.includedRoutes?.count, 1)
+        let dnsSettings = try XCTUnwrap(settings.dnsSettings)
+        XCTAssertEqual(dnsSettings.servers, TunnelDNSStrategy.defaultPublicResolvers)
+    }
+
+    func testSettingsFactoryDropsIPv6OnlyResolversWhenIPv6IsSuppressed() {
+        let profile = makeProfile(
+            dnsStrategy: .cleartext(
+                servers: ["2606:4700:4700::1111", "2606:4700:4700::1001"]
+            )
+        )
+
+        let settings = TunnelNetworkSettingsFactory.makeSettings(profile: profile, pathSupportsIPv6: false)
+        XCTAssertNil(settings.ipv6Settings)
+        XCTAssertNil(settings.dnsSettings)
+    }
+
     func testSettingsFactoryBuildsTLSAndHTTPSDNSSettings() throws {
         let tlsProfile = makeProfile(
             dnsStrategy: .tls(

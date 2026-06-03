@@ -82,6 +82,11 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
         static let applyTimeoutNanoseconds: UInt64 = 15_000_000_000
     }
 
+    private struct DefaultPathPreflight {
+        let supportsIPv6: Bool
+        let summary: String
+    }
+
     /// One-shot callback wrapper used when framework completion handlers need to cross into `Task`.
     /// Safety invariant: the callback is consumed under `lock`, so callers can safely invoke it from concurrent tasks
     /// without racing a second invocation.
@@ -158,7 +163,6 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
             completion.call(error)
             return
         }
-        let settings = TunnelNetworkSettingsFactory.makeSettings(profile: profile)
         let supersededComponents = takeCleanupSnapshot(markStopping: false)
         let startupID = beginStartup()
 
@@ -191,7 +195,23 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                 startupTelemetryWorker = telemetryWorker
                 recordStartupResources(startupID: startupID, telemetryWorker: telemetryWorker)
                 try self.checkStartupCurrent(startupID)
-                await self.preflightDefaultPath(logger: logger)
+                let defaultPath = await self.preflightDefaultPath(logger: logger)
+                let settings = TunnelNetworkSettingsFactory.makeSettings(
+                    profile: profile,
+                    pathSupportsIPv6: defaultPath.supportsIPv6
+                )
+                if profile.ipv6Enabled && !defaultPath.supportsIPv6 {
+                    await logger.log(
+                        level: .notice,
+                        phase: .path,
+                        category: .control,
+                        component: "PacketTunnelProviderShell",
+                        event: "ipv6-settings-suppressed",
+                        result: "path-ipv4-only",
+                        message: "Omitted IPv6 tunnel settings because the preflight path cannot route IPv6",
+                        metadata: ["path": defaultPath.summary]
+                    )
+                }
                 try self.checkStartupCurrent(startupID)
 
                 let settingsInterval = signposts.begin(.settingsApply, message: "setTunnelNetworkSettings")
@@ -248,6 +268,9 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                         "mtu": String(profile.mtu),
                         "mtu_strategy": Self.mtuStrategySummary(profile.mtuStrategy),
                         "dns_strategy": Self.dnsStrategySummary(profile.dnsStrategy),
+                        "ipv6_profile_enabled": String(profile.ipv6Enabled),
+                        "ipv6_settings_installed": String(settings.ipv6Settings != nil),
+                        "preflight_path_supports_ipv6": String(defaultPath.supportsIPv6),
                         "tcp_multipath_handover_enabled": String(profile.tcpMultipathHandoverEnabled),
                         "tcp_waiting_restart_enabled": "true",
                         "tcp_waiting_restart_max": "1",
@@ -841,9 +864,13 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
             .appendingPathComponent("VPNBridge-Analytics", isDirectory: true)
     }
 
-    private func preflightDefaultPath(logger: StructuredLogger) async {
+    private func preflightDefaultPath(logger: StructuredLogger) async -> DefaultPathPreflight {
         let path = await sampleDefaultNetworkPath()
         let summary = Self.providerPathSummary(path)
+        let snapshot = DefaultPathPreflight(
+            supportsIPv6: path.supportsIPv6,
+            summary: summary
+        )
         guard path.status == .satisfied else {
             await logger.log(
                 level: .warning,
@@ -855,7 +882,7 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                 message: "Underlying network path is not satisfied at startup; continuing so Network.framework can wait and recover",
                 metadata: ["path": summary]
             )
-            return
+            return snapshot
         }
         await logger.log(
             level: .notice,
@@ -867,6 +894,7 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
             message: "Underlying network path is satisfied before tunnel routes are installed",
             metadata: ["path": summary]
         )
+        return snapshot
     }
 
     private func sampleDefaultNetworkPath() async -> Network.NWPath {

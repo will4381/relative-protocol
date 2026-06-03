@@ -12,7 +12,10 @@ public enum TunnelNetworkSettingsFactory {
     /// Builds network settings consumed by `setTunnelNetworkSettings`.
     /// - Parameter profile: Normalized runtime profile values.
     /// - Returns: Fully configured packet tunnel interface settings.
-    public static func makeSettings(profile: TunnelProfile) -> NEPacketTunnelNetworkSettings {
+    public static func makeSettings(
+        profile: TunnelProfile,
+        pathSupportsIPv6: Bool? = nil
+    ) -> NEPacketTunnelNetworkSettings {
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: profile.tunnelRemoteAddress)
 
         // Docs: https://developer.apple.com/documentation/networkextension/neipv4settings
@@ -27,8 +30,14 @@ public enum TunnelNetworkSettingsFactory {
         #endif
         settings.ipv4Settings = ipv4
 
-        // Docs: https://developer.apple.com/documentation/networkextension/neipv6settings
-        if profile.ipv6Enabled {
+        // Apple docs: NWPath.supportsIPv6 indicates whether the path can route IPv6 traffic, while
+        // NEIPv6Settings.includedRoutes sends IPv6 traffic to the TUN interface. If startup preflight
+        // proves the underlay cannot route IPv6, omit the IPv6 default route so the relay does not
+        // accept IPv6 literals it cannot complete.
+        // Docs: https://developer.apple.com/documentation/network/nwpath/supportsipv6
+        // Docs: https://developer.apple.com/documentation/networkextension/neipv6settings/includedroutes
+        let installIPv6 = profile.ipv6Enabled && (pathSupportsIPv6 ?? true)
+        if installIPv6 {
             let ipv6 = NEIPv6Settings(
                 addresses: [profile.ipv6Address],
                 networkPrefixLengths: [NSNumber(value: profile.ipv6PrefixLength)]
@@ -37,17 +46,21 @@ public enum TunnelNetworkSettingsFactory {
             settings.ipv6Settings = ipv6
         }
 
-        settings.dnsSettings = makeDNSSettings(strategy: profile.dnsStrategy)
+        settings.dnsSettings = makeDNSSettings(
+            strategy: profile.dnsStrategy,
+            includeIPv6Servers: pathSupportsIPv6 ?? true
+        )
         applyMTUStrategy(profile.mtuStrategy, to: settings)
 
         return settings
     }
 
-    private static func makeDNSSettings(strategy: TunnelDNSStrategy) -> NEDNSSettings? {
+    private static func makeDNSSettings(strategy: TunnelDNSStrategy, includeIPv6Servers: Bool) -> NEDNSSettings? {
         switch strategy {
         case .noOverride:
             return nil
         case .cleartext(let servers, let matchDomains, let matchDomainsNoSearch, let allowFailover):
+            let servers = resolverServers(servers, includeIPv6Servers: includeIPv6Servers)
             guard areValidResolverServers(servers),
                   TunnelDNSStrategy.areValidMatchDomains(matchDomains) else {
                 return nil
@@ -61,6 +74,7 @@ public enum TunnelNetworkSettingsFactory {
             )
             return dnsSettings
         case .tls(let servers, let serverName, let matchDomains, let matchDomainsNoSearch, let allowFailover):
+            let servers = resolverServers(servers, includeIPv6Servers: includeIPv6Servers)
             guard areValidResolverServers(servers),
                   isValidHostName(serverName),
                   TunnelDNSStrategy.areValidMatchDomains(matchDomains) else {
@@ -76,6 +90,7 @@ public enum TunnelNetworkSettingsFactory {
             )
             return dnsSettings
         case .https(let servers, let serverURL, let matchDomains, let matchDomainsNoSearch, let allowFailover):
+            let servers = resolverServers(servers, includeIPv6Servers: includeIPv6Servers)
             guard areValidResolverServers(servers),
                   TunnelDNSStrategy.areValidMatchDomains(matchDomains),
                   let url = URL(string: serverURL),
@@ -93,6 +108,13 @@ public enum TunnelNetworkSettingsFactory {
             )
             return dnsSettings
         }
+    }
+
+    private static func resolverServers(_ servers: [String], includeIPv6Servers: Bool) -> [String] {
+        guard !includeIPv6Servers else {
+            return servers
+        }
+        return servers.filter { !isValidIPv6Address($0) }
     }
 
     private static func configureCommonDNSSettings(
