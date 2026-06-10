@@ -12,7 +12,9 @@ concurrency:
 jobs:
   quality-gate:
     name: Quality gate (build, warnings-as-errors, tests, perf baseline)
-    runs-on: macos-15
+    # The package compiles against iOS 26 / macOS 26 SDK symbols (NEDNSSettings.allowFailover),
+    # so the runner needs Xcode 26.x; macos-15's default Xcode 16 SDK cannot build it.
+    runs-on: macos-26
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
