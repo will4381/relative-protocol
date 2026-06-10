@@ -11,6 +11,33 @@ public enum LogLevel: String, Codable, Sendable {
     case fault
 }
 
+extension LogLevel: Comparable {
+    /// Severity ordering used by minimum-level gates so hot call sites can skip
+    /// building envelopes for events that no configured sink will retain.
+    public var severityRank: Int {
+        switch self {
+        case .trace:
+            return 0
+        case .debug:
+            return 1
+        case .info:
+            return 2
+        case .notice:
+            return 3
+        case .warning:
+            return 4
+        case .error:
+            return 5
+        case .fault:
+            return 6
+        }
+    }
+
+    public static func < (lhs: LogLevel, rhs: LogLevel) -> Bool {
+        lhs.severityRank < rhs.severityRank
+    }
+}
+
 /// Lifecycle phase classification used across all first-party modules.
 public enum LogPhase: String, Codable, Sendable, CaseIterable {
     case lifecycle

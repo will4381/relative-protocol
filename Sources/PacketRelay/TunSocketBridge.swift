@@ -131,6 +131,15 @@ public final class TunSocketBridge: @unchecked Sendable {
     }
 
     private func writePacketOnQueue(_ packet: Data, ipVersionHint: Int32) -> BridgeWriteResult {
+        // Refuse writes once stopped: the descriptors are closed (or about to close), and the kernel can
+        // recycle those fd numbers, so a late writev would corrupt an unrelated descriptor.
+        lifecycleLock.lock()
+        let stopped = isStopped
+        lifecycleLock.unlock()
+        guard !stopped else {
+            return .failed(errorCode: EBADF)
+        }
+
         var family: Int32 = ipVersionHint
         if family != AF_INET && family != AF_INET6 {
             family = packet.first.map { (($0 >> 4) & 0x0F) == 6 ? AF_INET6 : AF_INET } ?? AF_INET
@@ -177,25 +186,25 @@ public final class TunSocketBridge: @unchecked Sendable {
 
     /// Stops read/write sources and closes owned descriptors.
     public func stop() {
-        let source: DispatchSourceRead?
-        let writeSource: DispatchSourceWrite?
-        let shouldResumeWriteSource: Bool
-
         lifecycleLock.lock()
         guard !isStopped else {
             lifecycleLock.unlock()
             return
         }
         isStopped = true
-        source = readSource
-        readSource = nil
-        writeSource = self.writeSource
-        self.writeSource = nil
-        shouldResumeWriteSource = writeSource != nil && !writeSourceActive
-        writeSourceActive = false
         lifecycleLock.unlock()
 
+        // `writeSourceActive` is only mutated on `queue`, so the suspend/resume balance for the write source
+        // must also be decided on `queue`. Reading it off-queue can race `drainWritable` and either cancel a
+        // suspended source or over-resume an active one.
         performOnQueue {
+            lifecycleLock.lock()
+            let source = readSource
+            readSource = nil
+            let writeSource = self.writeSource
+            self.writeSource = nil
+            lifecycleLock.unlock()
+
             if let source {
                 source.cancel()
             } else {
@@ -203,11 +212,12 @@ public final class TunSocketBridge: @unchecked Sendable {
             }
 
             if let writeSource {
-                if shouldResumeWriteSource {
+                if !writeSourceActive {
                     writeSource.resume()
                 }
                 writeSource.cancel()
             }
+            writeSourceActive = false
 
             pendingWrites.removeAll(keepingCapacity: false)
             pendingBytes = 0

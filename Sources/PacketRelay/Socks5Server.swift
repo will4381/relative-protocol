@@ -383,18 +383,20 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
     private func handleState(_ state: NWConnection.State) {
         switch state {
         case .ready:
-            let path = currentPathSummary()
             finishReadyHandlers(with: .success(()))
-            Task {
-                await logger.log(
-                    level: .debug,
-                    phase: .relay,
-                    category: .relayTCP,
-                    component: "NWConnectionTCPAdapter",
-                    event: "ready",
-                    message: "Outbound TCP ready",
-                    metadata: self.metadata(path: path)
-                )
+            if logger.isEnabled(.debug) {
+                let path = currentPathSummary()
+                Task {
+                    await logger.log(
+                        level: .debug,
+                        phase: .relay,
+                        category: .relayTCP,
+                        component: "NWConnectionTCPAdapter",
+                        event: "ready",
+                        message: "Outbound TCP ready",
+                        metadata: self.metadata(path: path)
+                    )
+                }
             }
         case .waiting(let error):
             let path = currentPathSummary()
@@ -439,23 +441,29 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
 
     private func handlePathUpdate(_ path: Network.NWPath) {
         let summary = pathSummary(path)
-        let status = pathStatusName(path.status)
         updatePathSummary(summary)
+        guard logger.isEnabled(.debug) else {
+            return
+        }
+        let status = pathStatusName(path.status)
         Task {
             await logger.log(
                 level: .debug,
                 phase: .path,
                 category: .relayTCP,
-                    component: "NWConnectionTCPAdapter",
-                    event: "path-update",
-                    result: status,
-                    message: "Outbound TCP path updated",
-                    metadata: self.metadata(path: summary)
-                )
-            }
+                component: "NWConnectionTCPAdapter",
+                event: "path-update",
+                result: status,
+                message: "Outbound TCP path updated",
+                metadata: self.metadata(path: summary)
+            )
         }
+    }
 
     private func handleViabilityUpdate(_ isViable: Bool) {
+        guard logger.isEnabled(.debug) else {
+            return
+        }
         let path = currentPathSummary()
         Task {
             await logger.log(
@@ -475,8 +483,11 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
         guard betterPathAvailable else {
             return
         }
-        let path = currentPathSummary()
         eventHandler?(.betterPathAvailable)
+        guard logger.isEnabled(.debug) else {
+            return
+        }
+        let path = currentPathSummary()
         Task {
             await logger.log(
                 level: .debug,
@@ -522,6 +533,8 @@ final class NWConnectionTCPAdapter: @unchecked Sendable, Socks5PathAwareTCPOutbo
 
 final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
     private let queue: DispatchQueue
+    private let queueSpecificKey = DispatchSpecificKey<UUID>()
+    private let queueSpecificValue = UUID()
     private let logger: StructuredLogger
     private let policy: TCPConnectRetryPolicy
     private let pathSettings: Socks5TCPPathSettings
@@ -556,10 +569,22 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
         self.pathSettings = pathSettings
         self.endpointMetadata = endpointMetadata
         self.makeAttempt = makeAttempt
+        queue.setSpecific(key: queueSpecificKey, value: queueSpecificValue)
+    }
+
+    /// Runs `block` serialized on `queue`, inline when the caller is already on it.
+    /// The SOCKS connection drives reads/writes from this same queue, so the inline path
+    /// avoids one dispatch hop per relayed data chunk.
+    private func runOnQueue(_ block: @escaping @Sendable () -> Void) {
+        if DispatchQueue.getSpecific(key: queueSpecificKey) == queueSpecificValue {
+            block()
+        } else {
+            queue.async(execute: block)
+        }
     }
 
     func waitUntilReady(completionHandler: @escaping @Sendable (Result<Void, Error>) -> Void) {
-        queue.async {
+        runOnQueue {
             if let readyResult = self.readyResult {
                 completionHandler(readyResult)
                 return
@@ -577,7 +602,7 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
     }
 
     func readMinimumLength(_ minimumLength: Int, maximumLength: Int, completionHandler: @escaping @Sendable (Data?, Error?) -> Void) {
-        queue.async {
+        runOnQueue {
             guard let activeOutbound = self.activeOutbound else {
                 completionHandler(nil, self.readyResult?.failureError ?? Socks5OutboundError.failed("Outbound TCP not ready"))
                 return
@@ -587,7 +612,7 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
     }
 
     func write(_ data: Data, completionHandler: @escaping @Sendable (Error?) -> Void) {
-        queue.async {
+        runOnQueue {
             guard let activeOutbound = self.activeOutbound else {
                 completionHandler(self.readyResult?.failureError ?? Socks5OutboundError.failed("Outbound TCP not ready"))
                 return
@@ -597,7 +622,7 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
     }
 
     func finishWriting(completionHandler: @escaping @Sendable (Error?) -> Void) {
-        queue.async {
+        runOnQueue {
             guard let activeOutbound = self.activeOutbound else {
                 completionHandler(self.readyResult?.failureError ?? Socks5OutboundError.failed("Outbound TCP not ready"))
                 return
@@ -607,7 +632,7 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
     }
 
     func cancel() {
-        queue.async {
+        runOnQueue {
             guard !self.isCancelled else { return }
             self.isCancelled = true
             self.cancelScheduledWork()
@@ -1022,6 +1047,9 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
         message: String,
         extraMetadata: [String: String]
     ) {
+        guard logger.isEnabled(level) else {
+            return
+        }
         var metadata = endpointMetadata.merging(extraMetadata) { _, new in new }
         if let attemptElapsed = elapsedMilliseconds(since: currentAttemptStartedAt) {
             metadata["attempt_elapsed_ms"] = String(attemptElapsed)
@@ -1055,6 +1083,9 @@ final class RetryingTCPOutbound: @unchecked Sendable, Socks5TCPOutbound {
         message: String,
         extraMetadata: [String: String]
     ) {
+        guard logger.isEnabled(level) else {
+            return
+        }
         var metadata = endpointMetadata.merging(extraMetadata) { _, new in new }
         if let attemptElapsed = elapsedMilliseconds(since: currentAttemptStartedAt, now: now) {
             metadata["attempt_elapsed_ms"] = String(attemptElapsed)
@@ -1200,6 +1231,9 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
     }
 
     private func handlePathUpdate(_ path: Network.NWPath) {
+        guard logger.isEnabled(.debug) else {
+            return
+        }
         let summary = pathSummary(path)
         let status = pathStatusName(path.status)
         var metadata = endpointMetadata
@@ -1219,8 +1253,11 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
     }
 
     private func handleViabilityUpdate(_ isViable: Bool) {
-        let path = pathSummary(connection.currentPath)
         eventHandler?(.viabilityChanged(isViable))
+        guard logger.isEnabled(.debug) else {
+            return
+        }
+        let path = pathSummary(connection.currentPath)
         var metadata = endpointMetadata
         metadata["path"] = path
         Task {
@@ -1241,8 +1278,11 @@ final class NWConnectionUDPSessionAdapter: @unchecked Sendable, Socks5UDPSession
         guard betterPathAvailable else {
             return
         }
-        let path = pathSummary(connection.currentPath)
         eventHandler?(.betterPathAvailable)
+        guard logger.isEnabled(.debug) else {
+            return
+        }
+        let path = pathSummary(connection.currentPath)
         var metadata = endpointMetadata
         metadata["path"] = path
         Task {
@@ -1636,7 +1676,9 @@ public final class Socks5Server: @unchecked Sendable {
                     )
                 }
             case .failed(let error):
-                if self.isAddressInUse(error), remainingAttempts > 0 {
+                // Only retry while this listener is still the server's active listener.
+                // After `stop()` the failure callback must not resurrect a fresh listener.
+                if self.isAddressInUse(error), remainingAttempts > 0, self.listener === listener {
                     _ = completionGate.beginCompletion()
                     listener.cancel()
                     self.listener = nil
@@ -2189,11 +2231,21 @@ final class Socks5Connection: @unchecked Sendable {
                 self.inboundReceiveArmed = false
 
                 if let data, !data.isEmpty {
-                    guard self.admitInboundBufferBytes(data.count) else {
-                        return
+                    // Steady-state TCP proxy fast path: forward the received chunk directly instead of
+                    // copying it through `buffer` first. Only valid when nothing is already buffered and
+                    // no outbound write is in flight, so byte ordering is preserved.
+                    if case .tcpProxy(let outbound) = self.state,
+                       self.buffer.isEmpty,
+                       !self.outboundWriteInFlight {
+                        self.outboundWriteInFlight = true
+                        self.forwardToOutbound(data, outbound: outbound)
+                    } else {
+                        guard self.admitInboundBufferBytes(data.count) else {
+                            return
+                        }
+                        self.buffer.append(data)
+                        self.processBuffer()
                     }
-                    self.buffer.append(data)
-                    self.processBuffer()
                 }
                 if let error {
                     self.logInboundReadFailure(error)

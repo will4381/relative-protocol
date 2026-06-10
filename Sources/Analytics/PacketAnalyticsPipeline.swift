@@ -341,8 +341,10 @@ public actor PacketAnalyticsPipeline {
 
         var metadataProbesRemaining = policy.maxMetadataProbesPerBatch
 
+        // One clock read per batch: packets inside one ingest batch arrive together, so a shared
+        // timestamp preserves burst/slice semantics while removing an async clock call per packet.
+        let now = batchNow
         for (index, packet) in packets.enumerated() {
-            let now = await clock.now()
             let familyHint: Int32? = families.indices.contains(index) ? families[index] : nil
             let summary: FastPacketSummary
             if let summaries, summaries.indices.contains(index) {
@@ -486,7 +488,7 @@ public actor PacketAnalyticsPipeline {
             }
         }
 
-        records.append(contentsOf: trimOverflowFlowContextsIfNeeded(policy: policy, now: await clock.now()))
+        records.append(contentsOf: trimOverflowFlowContextsIfNeeded(policy: policy, now: batchNow))
         return records
     }
 

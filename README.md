@@ -11,6 +11,26 @@ It is designed so the tunnel can stay alive and keep detecting while the contain
 
 ## Recent Changes
 
+- correctness fixes from a full-package audit
+  - `TunSocketBridge.stop()` now resolves the write-source suspend/resume balance on the bridge queue, removing a teardown race that could cancel a suspended dispatch source or over-resume an active one
+  - the bridge now refuses `writePacket` after `stop()`, so a late write can never land on a recycled file descriptor
+  - the SOCKS listener's address-in-use retry no longer resurrects a fresh listener after `stop()`
+  - `Socks5Codec.parseRequest` uses absolute `Data` indices, so parsing from non-zero-based slices stays correct
+  - the telemetry worker now cancels its `NWPathMonitor` when stopped through the command channel instead of waiting for deallocation
+- hot-path battery and throughput work
+  - `StructuredLogger` gained a nonisolated `minimumLevel` gate; suppressed events now cost one comparison instead of a `Task` spawn, three actor hops, and metadata redaction, and the tunnel's production logger gates at `.info`
+  - relay upload chunks forward directly in the steady proxy state instead of copying through the connection buffer
+  - outbound TCP reads/writes run inline when already on the connection queue, removing two dispatch hops per relayed chunk
+  - the analytics pipeline reads the clock once per ingest batch instead of once per packet
+  - telemetry batch admission and provider packet accounting each take one lock per batch instead of two
+  - per-datagram IPv4 text formatting dropped from six allocations to two
+- QUIC Initial parsing is now anchored to platform crypto and official vectors
+  - header protection uses CommonCrypto AES (hardware-accelerated, FIPS-validated) instead of a hand-rolled software AES
+  - the full decrypt chain is pinned to the RFC 9001 Appendix A.2 known-answer vector, including truncation and corrupted-tag fail-closed cases
+- expanded edge-case test coverage that is impractical to reproduce on device
+  - seeded fuzz suites for the SOCKS5 codec and the deep packet parser, including non-zero-based slice corpora, hostile DNS compression pointers, and mutation/truncation fuzz over the RFC 9001 vector
+  - bridge stop/write concurrency regression tests, relay upload ordering tests across buffered and direct paths, logger level-gate contract tests, and telemetry worker lifecycle tests
+
 - protocol and production hardening
   - runtime provider configuration now fails closed for malformed IP addresses, subnet masks, relay hosts, DNS resolvers, DNS-over-TLS server names, and DNS-over-HTTPS URLs
   - encrypted DNS configuration no longer silently downgrades to cleartext when `serverName` or `serverURL` is missing

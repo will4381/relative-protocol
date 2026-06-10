@@ -1903,3 +1903,82 @@ private func eventuallyFetchCurrentPath(from connection: NWConnection) async thr
 private enum TestPathError: Error {
     case unavailable
 }
+
+extension Socks5ServerTests {
+    /// Regression for the proxy upload fast path: chunks buffered while a connect or write is pending and
+    /// chunks forwarded directly afterwards must reach the outbound stream in exact arrival order.
+    func testTCPProxyPreservesByteOrderAcrossBufferedAndDirectWrites() {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.fast-path-order")
+        let inbound = FakeInboundConnection()
+        let outbound = ControlledTCPOutbound()
+        outbound.autoCompleteWrites = false
+        let provider = FakeProvider(outbound: outbound)
+        let connection = Socks5Connection(
+            connection: inbound,
+            provider: provider,
+            queue: queue,
+            mtu: 1500,
+            logger: StructuredLogger(sink: InMemoryLogSink())
+        )
+
+        queue.sync {
+            connection.start()
+            inbound.push(Self.greeting)
+            inbound.push(Self.connectRequest(host: "example.com", port: 443))
+
+            // Pipelined bytes arrive before the outbound channel is ready: they must be buffered.
+            inbound.push(Data("alpha".utf8))
+            XCTAssertTrue(outbound.writes.isEmpty)
+
+            outbound.succeedConnect()
+            XCTAssertEqual(outbound.writes, [Data("alpha".utf8)])
+
+            // "beta" arrives while "alpha" is still in flight: it must queue behind it, not leapfrog it.
+            inbound.push(Data("beta".utf8))
+            XCTAssertEqual(outbound.writes, [Data("alpha".utf8)])
+
+            outbound.completeNextWrite()
+            XCTAssertEqual(outbound.writes, [Data("alpha".utf8), Data("beta".utf8)])
+            outbound.completeNextWrite()
+
+            // Steady-state chunk takes the direct fast path with nothing buffered ahead of it.
+            inbound.push(Data("gamma".utf8))
+            XCTAssertEqual(
+                outbound.writes,
+                [Data("alpha".utf8), Data("beta".utf8), Data("gamma".utf8)]
+            )
+            outbound.completeNextWrite()
+        }
+    }
+
+    /// Half-close arriving together with the final data chunk must flush the chunk before finishing the
+    /// outbound write side, including through the direct fast path.
+    func testTCPProxyFastPathFlushesFinalChunkBeforeHalfClose() {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.socks.fast-path-halfclose")
+        let inbound = FakeInboundConnection()
+        let outbound = ControlledTCPOutbound()
+        outbound.autoCompleteWrites = false
+        let provider = FakeProvider(outbound: outbound)
+        let connection = Socks5Connection(
+            connection: inbound,
+            provider: provider,
+            queue: queue,
+            mtu: 1500,
+            logger: StructuredLogger(sink: InMemoryLogSink())
+        )
+
+        queue.sync {
+            connection.start()
+            inbound.push(Self.greeting)
+            inbound.push(Self.connectRequest(host: "example.com", port: 443))
+            outbound.succeedConnect()
+
+            inbound.push(Data("tail".utf8), isComplete: true)
+            XCTAssertEqual(outbound.writes, [Data("tail".utf8)])
+            XCTAssertEqual(outbound.finishWritingCount, 0)
+
+            outbound.completeNextWrite()
+            XCTAssertEqual(outbound.finishWritingCount, 1)
+        }
+    }
+}

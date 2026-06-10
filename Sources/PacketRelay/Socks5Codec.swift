@@ -102,7 +102,9 @@ public enum Socks5Codec {
         var index = buffer.startIndex + 4
 
         guard let address = parseAddress(from: buffer, atyp: atyp, index: &index) else { return nil }
-        guard buffer.count >= index + 2 else { return nil }
+        // `index` is an absolute Data.Index, so the remaining-bytes check must compare against `endIndex`,
+        // not the relative `count`.
+        guard buffer.endIndex >= index + 2 else { return nil }
         let port = UInt16(buffer[index]) << 8 | UInt16(buffer[index + 1])
         buffer.removeSubrange(buffer.startIndex ..< index + 2)
         return Socks5Request(command: command, address: address, port: port)
@@ -294,11 +296,36 @@ public enum Socks5Codec {
         parseAddress(from: data, endIndex: data.endIndex, atyp: atyp, index: &index)
     }
 
+    /// Formats dotted-quad IPv4 text without intermediate per-octet strings.
+    /// This sits on the per-datagram UDP relay path, so allocation count matters.
+    private static func ipv4String(_ octet0: UInt8, _ octet1: UInt8, _ octet2: UInt8, _ octet3: UInt8) -> String {
+        var bytes = [UInt8]()
+        bytes.reserveCapacity(15)
+        appendDecimal(octet0, to: &bytes)
+        bytes.append(UInt8(ascii: "."))
+        appendDecimal(octet1, to: &bytes)
+        bytes.append(UInt8(ascii: "."))
+        appendDecimal(octet2, to: &bytes)
+        bytes.append(UInt8(ascii: "."))
+        appendDecimal(octet3, to: &bytes)
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
+    private static func appendDecimal(_ value: UInt8, to bytes: inout [UInt8]) {
+        if value >= 100 {
+            bytes.append(UInt8(ascii: "0") + value / 100)
+        }
+        if value >= 10 {
+            bytes.append(UInt8(ascii: "0") + (value / 10) % 10)
+        }
+        bytes.append(UInt8(ascii: "0") + value % 10)
+    }
+
     private static func parseAddress(from data: Data, endIndex: Data.Index, atyp: UInt8, index: inout Int) -> Socks5Address? {
         switch atyp {
         case 0x01:
             guard endIndex >= index + 4 else { return nil }
-            let value = [data[index], data[index + 1], data[index + 2], data[index + 3]].map(String.init).joined(separator: ".")
+            let value = ipv4String(data[index], data[index + 1], data[index + 2], data[index + 3])
             index += 4
             return .ipv4(value)
         case 0x04:
@@ -330,9 +357,8 @@ public enum Socks5Codec {
         switch atyp {
         case 0x01:
             guard count >= index + 4 else { return nil }
-            let octets = [data[index], data[index + 1], data[index + 2], data[index + 3]]
+            let value = ipv4String(data[index], data[index + 1], data[index + 2], data[index + 3])
             index += 4
-            let value = octets.map(String.init).joined(separator: ".")
             return .ipv4(value)
         case 0x04:
             guard count >= index + 16 else { return nil }

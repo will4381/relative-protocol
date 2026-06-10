@@ -71,6 +71,7 @@ public actor TunnelRuntime {
 
         let callbacks = DataplaneCallbacks(
             onLog: { [logger] value in
+                guard logger.isEnabled(.debug) else { return }
                 Task {
                     await logger.log(
                         level: .debug,
@@ -83,6 +84,7 @@ public actor TunnelRuntime {
                 }
             },
             onState: { [logger] state in
+                guard logger.isEnabled(.debug) else { return }
                 Task {
                     await logger.log(
                         level: .debug,

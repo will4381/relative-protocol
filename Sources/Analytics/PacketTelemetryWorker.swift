@@ -346,54 +346,8 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         let rawByteCount = packets.reduce(0) { partial, packet in
             Self.saturatingAdd(partial, packet.count)
         }
-        let initialDecision: (SubmitResult?, TrackingMode) = state.withLock { state in
-            guard !state.isStopped else {
-                return (
-                    SubmitResult(
-                        accepted: false,
-                        skipped: false,
-                        shouldLogSheddingStart: false,
-                        queuedBatches: state.queuedBatches,
-                        queuedBytes: state.queuedBytes,
-                        droppedBatches: state.droppedBatches
-                    ),
-                    .payloadOnlyUnderPressure
-                )
-            }
-
-            let trackingMode: TrackingMode =
-                state.queuedBatches >= QueuePolicy.payloadOnlyQueuedBatches ||
-                state.queuedBytes >= QueuePolicy.payloadOnlyQueuedBytes
-                ? .payloadOnlyUnderPressure
-                : .full
-
-            if state.queuedBatches >= QueuePolicy.maxQueuedBatches ||
-                state.queuedBytes >= QueuePolicy.maxQueuedBytes {
-                Self.incrementCounter(&state.droppedBatches)
-                let shouldLogSheddingStart = !state.hasEnteredShedMode
-                state.hasEnteredShedMode = true
-                return (
-                    SubmitResult(
-                        accepted: false,
-                        skipped: false,
-                        shouldLogSheddingStart: shouldLogSheddingStart,
-                        queuedBatches: state.queuedBatches,
-                        queuedBytes: state.queuedBytes,
-                        droppedBatches: state.droppedBatches
-                    ),
-                    trackingMode
-                )
-            }
-
-            return (
-                nil,
-                trackingMode
-            )
-        }
-        if let initialDecision = initialDecision.0 {
-            return initialDecision
-        }
-
+        // One lock acquisition per submitted batch: admission decision, counter updates, and
+        // the stream yield all happen under the same critical section.
         return state.withLock { state in
             guard !state.isStopped else {
                 return SubmitResult(
@@ -406,9 +360,18 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 )
             }
 
+            let trackingMode: TrackingMode =
+                state.queuedBatches >= QueuePolicy.payloadOnlyQueuedBatches ||
+                state.queuedBytes >= QueuePolicy.payloadOnlyQueuedBytes
+                ? .payloadOnlyUnderPressure
+                : .full
+
             let nextQueuedBatches = Self.saturatingAdd(state.queuedBatches, 1)
             let nextQueuedBytes = Self.saturatingAdd(state.queuedBytes, rawByteCount)
-            if nextQueuedBatches > QueuePolicy.maxQueuedBatches || nextQueuedBytes > QueuePolicy.maxQueuedBytes {
+            if state.queuedBatches >= QueuePolicy.maxQueuedBatches ||
+                state.queuedBytes >= QueuePolicy.maxQueuedBytes ||
+                nextQueuedBatches > QueuePolicy.maxQueuedBatches ||
+                nextQueuedBytes > QueuePolicy.maxQueuedBytes {
                 Self.incrementCounter(&state.droppedBatches)
                 let shouldLogSheddingStart = !state.hasEnteredShedMode
                 state.hasEnteredShedMode = true
@@ -427,15 +390,15 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
             Self.incrementCounter(&state.acceptedBatches)
             state.continuation?.yield(
                 .batch(
-                            Batch(
-                                packets: packets,
-                                families: families,
-                                direction: direction,
-                                byteCount: rawByteCount,
-                                trackingMode: initialDecision.1
-                            )
-                        )
+                    Batch(
+                        packets: packets,
+                        families: families,
+                        direction: direction,
+                        byteCount: rawByteCount,
+                        trackingMode: trackingMode
                     )
+                )
+            )
 
             return SubmitResult(
                 accepted: true,
@@ -740,6 +703,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 Self.setBufferedRecordCount(state: state, 0)
                 Self.finishContinuation(state: state)
                 await detectionPersistence?.flush()
+                pathRegimeProvider?.stop()
                 signal?.resume()
                 return
             }

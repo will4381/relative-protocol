@@ -11,13 +11,31 @@ public actor StructuredLogger {
     private let redactor: EndpointMetadataRedactor
     private var rateLimitStates: [String: RateLimitState] = [:]
 
+    /// Lowest severity this logger will record. Events below it are dropped before
+    /// envelope construction, metadata redaction, and sink fanout.
+    public nonisolated let minimumLevel: LogLevel
+
     /// Creates a structured logger with one sink and endpoint metadata redaction policy.
     /// - Parameters:
     ///   - sink: Destination sink implementation (OSLog, JSONL, fanout, etc.).
     ///   - redactor: Redaction policy applied to metadata before serialization.
-    public init(sink: any LogSink, redactor: EndpointMetadataRedactor = EndpointMetadataRedactor()) {
+    ///   - minimumLevel: Lowest severity retained by this logger. Hot paths should pair this
+    ///     with `isEnabled(_:)` so suppressed events also skip the `Task` spawn and actor hop.
+    public init(
+        sink: any LogSink,
+        redactor: EndpointMetadataRedactor = EndpointMetadataRedactor(),
+        minimumLevel: LogLevel = .trace
+    ) {
         self.sink = sink
         self.redactor = redactor
+        self.minimumLevel = minimumLevel
+    }
+
+    /// Returns whether an event at `level` would be recorded by this logger.
+    /// Synchronous and nonisolated so per-packet and per-connection paths can check it
+    /// before paying for metadata construction or a logging `Task`.
+    public nonisolated func isEnabled(_ level: LogLevel) -> Bool {
+        level >= minimumLevel
     }
 
     /// Emits one structured event using the canonical logging envelope.
@@ -52,6 +70,9 @@ public actor StructuredLogger {
         message: String,
         metadata: [String: String] = [:]
     ) async {
+        guard isEnabled(level) else {
+            return
+        }
         await write(
             timestamp: Date(),
             level: level,
@@ -92,6 +113,9 @@ public actor StructuredLogger {
         message: String,
         metadata: [String: String] = [:]
     ) async {
+        guard isEnabled(level) else {
+            return
+        }
         guard minimumInterval > 0 else {
             await write(
                 timestamp: now,

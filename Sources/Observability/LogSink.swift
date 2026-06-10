@@ -7,27 +7,6 @@ public protocol LogSink: Sendable {
     func write(_ envelope: LogEnvelope) async
 }
 
-private extension LogLevel {
-    var severityRank: Int {
-        switch self {
-        case .trace:
-            return 0
-        case .debug:
-            return 1
-        case .info:
-            return 2
-        case .notice:
-            return 3
-        case .warning:
-            return 4
-        case .error:
-            return 5
-        case .fault:
-            return 6
-        }
-    }
-}
-
 /// Fanout sink that forwards each event to every configured destination.
 public actor FanoutLogSink: LogSink {
     private let sinks: [any LogSink]

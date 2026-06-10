@@ -434,8 +434,14 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
     private func handleOutboundPackets(_ packets: [Data], protocols: [NSNumber]) {
         dispatchPrecondition(condition: .onQueue(ioQueue))
 
-        let snapshot = withState { state in
-            (
+        let packetCount = packets.count
+        let byteCount = Self.saturatingByteCount(packets)
+        let snapshot = withState { state -> (logger: StructuredLogger, bridge: TunSocketBridge?, telemetryWorker: PacketTelemetryWorker?, isStopping: Bool) in
+            if !state.isStopping, state.tunBridge != nil {
+                state.cumulativeOutboundPackets = Self.saturatingAdd(state.cumulativeOutboundPackets, packetCount)
+                state.cumulativeOutboundBytes = Self.saturatingAdd(state.cumulativeOutboundBytes, byteCount)
+            }
+            return (
                 logger: state.logger,
                 bridge: state.tunBridge,
                 telemetryWorker: state.telemetryWorker,
@@ -452,13 +458,6 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
         for index in packets.indices {
             let family = protocols.indices.contains(index) ? protocols[index].int32Value : 0
             families.append(family)
-        }
-
-        let packetCount = packets.count
-        let byteCount = Self.saturatingByteCount(packets)
-        withState { state in
-            state.cumulativeOutboundPackets = Self.saturatingAdd(state.cumulativeOutboundPackets, packetCount)
-            state.cumulativeOutboundBytes = Self.saturatingAdd(state.cumulativeOutboundBytes, byteCount)
         }
 
         let batch = PendingOutboundBatch(packets: packets, families: families, nextIndex: 0)
@@ -515,8 +514,14 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
     private func handleInboundPackets(_ packets: [Data], families: [Int32]) {
         dispatchPrecondition(condition: .onQueue(ioQueue))
 
-        let snapshot = withState { state in
-            (
+        let packetCount = packets.count
+        let byteCount = Self.saturatingByteCount(packets)
+        let snapshot = withState { state -> (logger: StructuredLogger, telemetryWorker: PacketTelemetryWorker?, isStopping: Bool) in
+            if !state.isStopping, !packets.isEmpty {
+                state.cumulativeInboundPackets = Self.saturatingAdd(state.cumulativeInboundPackets, packetCount)
+                state.cumulativeInboundBytes = Self.saturatingAdd(state.cumulativeInboundBytes, byteCount)
+            }
+            return (
                 logger: state.logger,
                 telemetryWorker: state.telemetryWorker,
                 isStopping: state.isStopping
@@ -538,13 +543,6 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                 } ?? Int32(AF_INET)
                 protocols.append(NSNumber(value: inferred))
             }
-        }
-
-        let packetCount = packets.count
-        let byteCount = Self.saturatingByteCount(packets)
-        withState { state in
-            state.cumulativeInboundPackets = Self.saturatingAdd(state.cumulativeInboundPackets, packetCount)
-            state.cumulativeInboundBytes = Self.saturatingAdd(state.cumulativeInboundBytes, byteCount)
         }
 
         // Docs: https://developer.apple.com/documentation/networkextension/nepackettunnelflow/writepackets(_:withprotocols:)
@@ -968,7 +966,10 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
         )
         sinks.append(MinimumLevelLogSink(minimumLevel: .info, sink: jsonSink))
 
-        return StructuredLogger(sink: FanoutLogSink(sinks: sinks))
+        // The lowest sink threshold is `.info`, so gate at the logger too: hot relay and
+        // packet paths can then skip the Task spawn, envelope build, and redaction for
+        // debug events instead of fanning them out just to be dropped.
+        return StructuredLogger(sink: FanoutLogSink(sinks: sinks), minimumLevel: .info)
     }
 
     /// Persists the most recent provider stop reason where host diagnostics can read it after disconnect.

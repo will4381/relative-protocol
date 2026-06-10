@@ -81,3 +81,50 @@ private final class BridgeReadCapture: @unchecked Sendable {
         return (storedPackets, storedFamilies)
     }
 }
+
+extension TunSocketBridgeTests {
+    /// Regression: `stop()` must coordinate write-source suspend/resume balance on the bridge queue.
+    /// Concurrent writers racing a stop previously risked cancelling a suspended dispatch source or
+    /// over-resuming an active one, both of which crash in libdispatch.
+    func testStopWhileConcurrentWritesInFlightDoesNotCrash() throws {
+        for round in 0..<8 {
+            let queue = DispatchQueue(label: "com.vpnbridge.tests.bridge.stop-race.\(round)")
+            let bridge = try TunSocketBridge(
+                mtu: 1_500,
+                queue: queue,
+                logger: StructuredLogger(sink: InMemoryLogSink())
+            )
+            bridge.startReadLoop { _, _ in }
+
+            let packet = Data(repeating: 0x45, count: 1_200)
+            let group = DispatchGroup()
+            for worker in 0..<4 {
+                DispatchQueue.global().async(group: group) {
+                    for _ in 0..<100 {
+                        _ = bridge.writePacket(packet, ipVersionHint: AF_INET)
+                    }
+                    _ = worker
+                }
+            }
+            DispatchQueue.global().async(group: group) {
+                bridge.stop()
+            }
+
+            XCTAssertEqual(group.wait(timeout: .now() + 10), .success, "round \(round)")
+            bridge.stop()
+        }
+    }
+
+    /// `stop()` must be idempotent and safe before the read loop ever starts.
+    func testStopBeforeReadLoopStartIsSafe() throws {
+        let queue = DispatchQueue(label: "com.vpnbridge.tests.bridge.early-stop")
+        let bridge = try TunSocketBridge(
+            mtu: 1_500,
+            queue: queue,
+            logger: StructuredLogger(sink: InMemoryLogSink())
+        )
+        bridge.stop()
+        bridge.stop()
+        XCTAssertEqual(bridge.writePacket(Data([0x45]), ipVersionHint: AF_INET), .failed(errorCode: EBADF))
+    }
+}
