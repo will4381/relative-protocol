@@ -859,7 +859,9 @@ final class Socks5ServerTests: XCTestCase {
         let outbound = RetryingTCPOutbound(
             queue: queue,
             logger: StructuredLogger(sink: InMemoryLogSink()),
-            policy: .init(attemptPreparingTimeout: 0.03, retryBackoff: 0.01, maxAttempts: 2, overallTimeout: 0.2)
+            // Only the per-attempt timeout drives this test; the overall budget stays generous so
+            // CI scheduler jitter cannot exhaust the connect before the retry under test happens.
+            policy: .init(attemptPreparingTimeout: 0.25, retryBackoff: 0.01, maxAttempts: 2, overallTimeout: 10)
         ) { attemptIndex in
             let attempt = ControlledTCPOutbound()
             lock.lock()
@@ -883,7 +885,7 @@ final class Socks5ServerTests: XCTestCase {
             }
         }
 
-        wait(for: [secondAttemptCreated], timeout: 1.0)
+        wait(for: [secondAttemptCreated], timeout: 5.0)
 
         lock.lock()
         let firstAttempt = attempts.first
@@ -891,7 +893,7 @@ final class Socks5ServerTests: XCTestCase {
         lock.unlock()
 
         retryAttempt?.succeedConnect()
-        wait(for: [ready], timeout: 1.0)
+        wait(for: [ready], timeout: 5.0)
 
         XCTAssertTrue(firstAttempt?.cancelled == true)
     }
@@ -905,7 +907,9 @@ final class Socks5ServerTests: XCTestCase {
         let outbound = RetryingTCPOutbound(
             queue: queue,
             logger: StructuredLogger(sink: InMemoryLogSink()),
-            policy: .init(attemptPreparingTimeout: 0.03, retryBackoff: 0.01, maxAttempts: 2, overallTimeout: 0.2)
+            // The attempt budget is what is under test, so the overall budget must never preempt it.
+            // A 0.2s overall timeout flaked on cold CI runners by exhausting after a single attempt.
+            policy: .init(attemptPreparingTimeout: 0.25, retryBackoff: 0.01, maxAttempts: 2, overallTimeout: 10)
         ) { _ in
             let attempt = ControlledTCPOutbound()
             lock.lock()
@@ -924,7 +928,7 @@ final class Socks5ServerTests: XCTestCase {
             }
         }
 
-        wait(for: [failed], timeout: 1.0)
+        wait(for: [failed], timeout: 5.0)
 
         lock.lock()
         let snapshot = attempts
@@ -942,7 +946,9 @@ final class Socks5ServerTests: XCTestCase {
         let outbound = RetryingTCPOutbound(
             queue: queue,
             logger: StructuredLogger(sink: sink),
-            policy: .init(attemptPreparingTimeout: 0.03, retryBackoff: 0.01, maxAttempts: 1, overallTimeout: 0.1),
+            // Asserts metadata on the per-attempt `connect-timeout` event; a generous overall budget
+            // keeps the overall-timeout path from racing it on slow runners.
+            policy: .init(attemptPreparingTimeout: 0.25, retryBackoff: 0.01, maxAttempts: 1, overallTimeout: 10),
             endpointMetadata: [
                 "destination_host": "api.example.com",
                 "destination_port": "443",
@@ -962,7 +968,7 @@ final class Socks5ServerTests: XCTestCase {
             }
         }
 
-        await fulfillment(of: [failed], timeout: 1.0)
+        await fulfillment(of: [failed], timeout: 5.0)
         let records = try await eventuallyFetchRecords(from: sink) { records in
             records.contains { $0.component == "RetryingTCPOutbound" && $0.event == "connect-timeout" }
         }
@@ -1162,7 +1168,9 @@ final class Socks5ServerTests: XCTestCase {
         let outbound = RetryingTCPOutbound(
             queue: queue,
             logger: StructuredLogger(sink: InMemoryLogSink()),
-            policy: .init(attemptPreparingTimeout: 0.08, retryBackoff: 0.01, maxAttempts: 2, overallTimeout: 0.4)
+            // The waiting attempt must hit its own per-attempt timeout; the overall budget stays
+            // generous so runner jitter cannot exhaust the connect first.
+            policy: .init(attemptPreparingTimeout: 0.25, retryBackoff: 0.01, maxAttempts: 2, overallTimeout: 10)
         ) { attemptIndex in
             let attempt = ControlledTCPOutbound()
             lock.lock()
@@ -1190,14 +1198,14 @@ final class Socks5ServerTests: XCTestCase {
             }
         }
 
-        wait(for: [firstAttemptCreated], timeout: 1.0)
+        wait(for: [firstAttemptCreated], timeout: 5.0)
         queue.sync {
             firstAttempt?.emit(.waiting)
         }
 
-        wait(for: [secondAttemptCreated], timeout: 1.0)
+        wait(for: [secondAttemptCreated], timeout: 5.0)
         secondAttempt?.succeedConnect()
-        wait(for: [ready], timeout: 1.0)
+        wait(for: [ready], timeout: 5.0)
 
         lock.lock()
         let snapshot = attempts
