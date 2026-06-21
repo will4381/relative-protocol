@@ -752,6 +752,9 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 detailRecords.append(record)
                 trimDetailRecords(&detailRecords)
 
+            case .packetCue:
+                continue
+
             case .metadata, .burst:
                 snapshotRecords.append(contentsOf: Self.drainDetailWindow(for: record, detailRecords: &detailRecords))
                 snapshotRecords.append(record)
@@ -864,7 +867,8 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 activitySampleMinimumBytes: 4_194_304,
                 activitySampleMinimumInterval: 30,
                 emitBurstEvents: true,
-                emitActivitySamples: false
+                emitActivitySamples: false,
+                emitPacketCues: runtimePlan.needsPacketCues
             )
         }
 
@@ -890,7 +894,8 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 activitySampleMinimumBytes: 524_288,
                 activitySampleMinimumInterval: 6,
                 emitBurstEvents: true,
-                emitActivitySamples: true
+                emitActivitySamples: true,
+                emitPacketCues: runtimePlan.needsPacketCues
             )
         case .fair:
             return PacketAnalyticsPipeline.EmissionPolicy(
@@ -911,7 +916,8 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 activitySampleMinimumBytes: 4_194_304,
                 activitySampleMinimumInterval: 30,
                 emitBurstEvents: true,
-                emitActivitySamples: false
+                emitActivitySamples: false,
+                emitPacketCues: runtimePlan.needsPacketCues
             )
         case .serious, .critical, .unknown:
             return PacketAnalyticsPipeline.EmissionPolicy(
@@ -932,7 +938,8 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 activitySampleMinimumBytes: 4_194_304,
                 activitySampleMinimumInterval: 30,
                 emitBurstEvents: true,
-                emitActivitySamples: false
+                emitActivitySamples: false,
+                emitPacketCues: runtimePlan.needsPacketCues
             )
         }
     }

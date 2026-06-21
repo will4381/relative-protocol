@@ -30,6 +30,8 @@ public struct DetectorFeatureFamily: OptionSet, Sendable, Hashable {
     public static let pathRegime = DetectorFeatureFamily(rawValue: 1 << 9)
     /// Fused service-family attribution built from signatures, host hints, and DNS association.
     public static let serviceAttribution = DetectorFeatureFamily(rawValue: 1 << 10)
+    /// Exact per-packet cue fields: packet length, payload length, TCP flags, and ACK/PSH booleans.
+    public static let packetDetails = DetectorFeatureFamily(rawValue: 1 << 11)
 
     /// Compatibility surface matching the package's pre-requirements detector view.
     public static let legacyDetectorSurface: DetectorFeatureFamily = [
@@ -67,7 +69,14 @@ public struct DetectorRequirements: Sendable, Hashable {
 
     /// Compatibility default used when a detector does not declare requirements explicitly.
     public static let legacyDefault = DetectorRequirements(
-        recordKinds: Set(PacketSampleKind.allCases),
+        recordKinds: [
+            .flowOpen,
+            .flowSlice,
+            .flowClose,
+            .metadata,
+            .burst,
+            .activitySample
+        ],
         featureFamilies: .legacyDetectorSurface,
         preferredFlowSliceIntervalMs: 250
     )
@@ -165,11 +174,12 @@ internal struct DetectorRuntimePlan: Sendable {
         unionFeatureFamilies.contains(.hostHints) ||
             unionFeatureFamilies.contains(.dnsAssociation) ||
             unionFeatureFamilies.contains(.serviceAttribution) ||
-            unionFeatureFamilies.contains(.dnsAnswerAddresses)
+            unionFeatureFamilies.contains(.dnsAnswerAddresses) ||
+            needsPacketCues
     }
 
     var needsDNSAssociation: Bool {
-        unionFeatureFamilies.contains(.dnsAssociation)
+        unionFeatureFamilies.contains(.dnsAssociation) || needsPacketCues
     }
 
     var needsLineage: Bool {
@@ -184,11 +194,15 @@ internal struct DetectorRuntimePlan: Sendable {
         unionFeatureFamilies.contains(.serviceAttribution)
     }
 
+    var needsPacketCues: Bool {
+        unionRecordKinds.contains(.packetCue)
+    }
+
     var needsQUICIdentity: Bool {
         unionFeatureFamilies.contains(.quicIdentity) || needsLineage || needsServiceAttribution
     }
 
     var needsHostHints: Bool {
-        unionFeatureFamilies.contains(.hostHints) || needsDNSAssociation || needsServiceAttribution
+        unionFeatureFamilies.contains(.hostHints) || needsDNSAssociation || needsServiceAttribution || needsPacketCues
     }
 }

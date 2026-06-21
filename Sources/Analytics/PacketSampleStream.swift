@@ -9,7 +9,7 @@ import Darwin
 
 /// Event kind used by the app-facing rolling packet tap.
 /// Decision: the tunnel writes fewer, more meaningful events (`flowOpen`, `flowSlice`, `flowClose`, `metadata`,
-/// `burst`, `activitySample`)
+/// `burst`, `activitySample`, `packetCue`)
 /// instead of one rich sample for every admitted packet.
 public enum PacketSampleKind: String, Codable, Sendable, Equatable, CaseIterable {
     case flowOpen
@@ -18,6 +18,7 @@ public enum PacketSampleKind: String, Codable, Sendable, Equatable, CaseIterable
     case metadata
     case burst
     case activitySample
+    case packetCue
 }
 
 /// Lifecycle reason attached to `flowClose` records.
@@ -93,6 +94,11 @@ public struct PacketSample: Codable, Sendable, Equatable {
     public let serviceFamily: String?
     public let serviceFamilyConfidence: Double?
     public let serviceAttributionSourceMask: UInt16?
+    public let packetLength: Int?
+    public let transportPayloadLength: Int?
+    public let tcpFlags: UInt8?
+    public let tcpAck: Bool?
+    public let tcpPsh: Bool?
 
     public init(
         kind: PacketSampleKind = .activitySample,
@@ -157,7 +163,12 @@ public struct PacketSample: Codable, Sendable, Equatable {
         pathChangedRecently: Bool? = nil,
         serviceFamily: String? = nil,
         serviceFamilyConfidence: Double? = nil,
-        serviceAttributionSourceMask: UInt16? = nil
+        serviceAttributionSourceMask: UInt16? = nil,
+        packetLength: Int? = nil,
+        transportPayloadLength: Int? = nil,
+        tcpFlags: UInt8? = nil,
+        tcpAck: Bool? = nil,
+        tcpPsh: Bool? = nil
     ) {
         self.kind = kind
         self.timestamp = timestamp
@@ -222,6 +233,11 @@ public struct PacketSample: Codable, Sendable, Equatable {
         self.serviceFamily = serviceFamily
         self.serviceFamilyConfidence = serviceFamilyConfidence
         self.serviceAttributionSourceMask = serviceAttributionSourceMask
+        self.packetLength = packetLength
+        self.transportPayloadLength = transportPayloadLength
+        self.tcpFlags = tcpFlags
+        self.tcpAck = tcpAck
+        self.tcpPsh = tcpPsh
     }
 }
 
@@ -323,6 +339,165 @@ public actor PacketSampleStream {
         let serviceFamily: String?
         let serviceFamilyConfidence: Double?
         let serviceAttributionSourceMask: UInt16?
+        let packetLength: Int?
+        let transportPayloadLength: Int?
+        let tcpFlags: UInt8?
+        let tcpAck: Bool?
+        let tcpPsh: Bool?
+
+        init(
+            kind: PacketSampleKind,
+            timestamp: Date,
+            direction: String,
+            bytes: Int,
+            packetCount: Int?,
+            flowPacketCount: Int?,
+            flowByteCount: Int?,
+            protocolHint: String,
+            ipVersion: UInt8?,
+            transportProtocolNumber: UInt8?,
+            sourcePort: UInt16?,
+            destinationPort: UInt16?,
+            flowHash: UInt64?,
+            textFlowId: String?,
+            sourceAddressLength: UInt8?,
+            sourceAddressHigh: UInt64?,
+            sourceAddressLow: UInt64?,
+            destinationAddressLength: UInt8?,
+            destinationAddressHigh: UInt64?,
+            destinationAddressLow: UInt64?,
+            textSourceAddress: String?,
+            textDestinationAddress: String?,
+            registrableDomain: String?,
+            dnsQueryName: String?,
+            dnsCname: String?,
+            dnsAnswerAddresses: [String]?,
+            tlsServerName: String?,
+            quicVersion: UInt32?,
+            quicPacketType: String?,
+            quicDestinationConnectionId: String?,
+            quicSourceConnectionId: String?,
+            classification: String?,
+            closeReason: FlowCloseReason?,
+            largePacketCount: Int?,
+            smallPacketCount: Int?,
+            udpPacketCount: Int?,
+            tcpPacketCount: Int?,
+            quicInitialCount: Int?,
+            tcpSynCount: Int?,
+            tcpFinCount: Int?,
+            tcpRstCount: Int?,
+            burstDurationMs: Int?,
+            burstPacketCount: Int?,
+            leadingBytes200ms: Int?,
+            leadingPackets200ms: Int?,
+            leadingBytes600ms: Int?,
+            leadingPackets600ms: Int?,
+            burstLargePacketCount: Int?,
+            burstUdpPacketCount: Int?,
+            burstTcpPacketCount: Int?,
+            burstQuicInitialCount: Int?,
+            associatedDomain: String?,
+            associationSource: DetectorAssociationSource?,
+            associationAgeMs: Int?,
+            associationConfidence: Double?,
+            lineageID: UInt64?,
+            lineageGeneration: Int?,
+            lineageAgeMs: Int?,
+            lineageReuseGapMs: Int?,
+            lineageReopenCount: Int?,
+            lineageSiblingCount: Int?,
+            pathEpoch: UInt32?,
+            pathInterfaceClass: PathInterfaceClass?,
+            pathIsExpensive: Bool?,
+            pathIsConstrained: Bool?,
+            pathSupportsDNS: Bool?,
+            pathChangedRecently: Bool?,
+            serviceFamily: String?,
+            serviceFamilyConfidence: Double?,
+            serviceAttributionSourceMask: UInt16?,
+            packetLength: Int? = nil,
+            transportPayloadLength: Int? = nil,
+            tcpFlags: UInt8? = nil,
+            tcpAck: Bool? = nil,
+            tcpPsh: Bool? = nil
+        ) {
+            self.kind = kind
+            self.timestamp = timestamp
+            self.direction = direction
+            self.bytes = bytes
+            self.packetCount = packetCount
+            self.flowPacketCount = flowPacketCount
+            self.flowByteCount = flowByteCount
+            self.protocolHint = protocolHint
+            self.ipVersion = ipVersion
+            self.transportProtocolNumber = transportProtocolNumber
+            self.sourcePort = sourcePort
+            self.destinationPort = destinationPort
+            self.flowHash = flowHash
+            self.textFlowId = textFlowId
+            self.sourceAddressLength = sourceAddressLength
+            self.sourceAddressHigh = sourceAddressHigh
+            self.sourceAddressLow = sourceAddressLow
+            self.destinationAddressLength = destinationAddressLength
+            self.destinationAddressHigh = destinationAddressHigh
+            self.destinationAddressLow = destinationAddressLow
+            self.textSourceAddress = textSourceAddress
+            self.textDestinationAddress = textDestinationAddress
+            self.registrableDomain = registrableDomain
+            self.dnsQueryName = dnsQueryName
+            self.dnsCname = dnsCname
+            self.dnsAnswerAddresses = dnsAnswerAddresses
+            self.tlsServerName = tlsServerName
+            self.quicVersion = quicVersion
+            self.quicPacketType = quicPacketType
+            self.quicDestinationConnectionId = quicDestinationConnectionId
+            self.quicSourceConnectionId = quicSourceConnectionId
+            self.classification = classification
+            self.closeReason = closeReason
+            self.largePacketCount = largePacketCount
+            self.smallPacketCount = smallPacketCount
+            self.udpPacketCount = udpPacketCount
+            self.tcpPacketCount = tcpPacketCount
+            self.quicInitialCount = quicInitialCount
+            self.tcpSynCount = tcpSynCount
+            self.tcpFinCount = tcpFinCount
+            self.tcpRstCount = tcpRstCount
+            self.burstDurationMs = burstDurationMs
+            self.burstPacketCount = burstPacketCount
+            self.leadingBytes200ms = leadingBytes200ms
+            self.leadingPackets200ms = leadingPackets200ms
+            self.leadingBytes600ms = leadingBytes600ms
+            self.leadingPackets600ms = leadingPackets600ms
+            self.burstLargePacketCount = burstLargePacketCount
+            self.burstUdpPacketCount = burstUdpPacketCount
+            self.burstTcpPacketCount = burstTcpPacketCount
+            self.burstQuicInitialCount = burstQuicInitialCount
+            self.associatedDomain = associatedDomain
+            self.associationSource = associationSource
+            self.associationAgeMs = associationAgeMs
+            self.associationConfidence = associationConfidence
+            self.lineageID = lineageID
+            self.lineageGeneration = lineageGeneration
+            self.lineageAgeMs = lineageAgeMs
+            self.lineageReuseGapMs = lineageReuseGapMs
+            self.lineageReopenCount = lineageReopenCount
+            self.lineageSiblingCount = lineageSiblingCount
+            self.pathEpoch = pathEpoch
+            self.pathInterfaceClass = pathInterfaceClass
+            self.pathIsExpensive = pathIsExpensive
+            self.pathIsConstrained = pathIsConstrained
+            self.pathSupportsDNS = pathSupportsDNS
+            self.pathChangedRecently = pathChangedRecently
+            self.serviceFamily = serviceFamily
+            self.serviceFamilyConfidence = serviceFamilyConfidence
+            self.serviceAttributionSourceMask = serviceAttributionSourceMask
+            self.packetLength = packetLength
+            self.transportPayloadLength = transportPayloadLength
+            self.tcpFlags = tcpFlags
+            self.tcpAck = tcpAck
+            self.tcpPsh = tcpPsh
+        }
     }
 
     private enum StoredPayload: Sendable {
@@ -699,7 +874,12 @@ public actor PacketSampleStream {
             pathChangedRecently: record.pathChangedRecently,
             serviceFamily: record.serviceFamily,
             serviceFamilyConfidence: record.serviceFamilyConfidence,
-            serviceAttributionSourceMask: record.serviceAttributionSourceMask
+            serviceAttributionSourceMask: record.serviceAttributionSourceMask,
+            packetLength: record.packetLength,
+            transportPayloadLength: record.transportPayloadLength,
+            tcpFlags: record.tcpFlags,
+            tcpAck: record.tcpAck,
+            tcpPsh: record.tcpPsh
         )
     }
 

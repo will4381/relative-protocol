@@ -91,6 +91,13 @@ struct FastPacketSummary: Sendable {
         return Int(transportPayloadLengthRaw)
     }
 
+    var transportPayloadLengthIfAvailable: Int? {
+        guard transportPayloadOffset > 0 else {
+            return nil
+        }
+        return Int(transportPayloadLengthRaw)
+    }
+
     var hasPorts: Bool {
         (flags & UInt8(RBPI_FLAG_HAS_PORTS)) != 0
     }
@@ -143,6 +150,14 @@ struct FastPacketSummary: Sendable {
 
     var hasTCPRST: Bool {
         transport == .tcp && (tcpFlags & 0x04) != 0
+    }
+
+    var hasTCPACK: Bool {
+        transport == .tcp && (tcpFlags & 0x10) != 0
+    }
+
+    var hasTCPPSH: Bool {
+        transport == .tcp && (tcpFlags & 0x08) != 0
     }
 
     var flowKey: FlowKey {

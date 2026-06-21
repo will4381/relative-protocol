@@ -885,6 +885,238 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertEqual(record.serviceAttributionSourceMask, 0b11)
     }
 
+    /// Verifies packet-cue records expose the exact packet-level fields required by detector implementations.
+    func testDetectorRecordCollectionProjectsPacketCueFieldsByDefault() throws {
+        let streamRecord = PacketSampleStream.PacketStreamRecord(
+            kind: .packetCue,
+            timestamp: Date(timeIntervalSince1970: 1.25),
+            direction: PacketDirection.outbound.rawValue,
+            bytes: 75,
+            packetCount: 1,
+            flowPacketCount: 3,
+            flowByteCount: 512,
+            protocolHint: "tcp",
+            ipVersion: 4,
+            transportProtocolNumber: 6,
+            sourcePort: 50_000,
+            destinationPort: 443,
+            flowHash: 0xfeed_beef,
+            textFlowId: nil,
+            sourceAddressLength: 4,
+            sourceAddressHigh: 0,
+            sourceAddressLow: 0x0000_0000_0a00_0002,
+            destinationAddressLength: 4,
+            destinationAddressHigh: 0,
+            destinationAddressLow: 0x0000_0000_0101_0101,
+            textSourceAddress: nil,
+            textDestinationAddress: nil,
+            registrableDomain: "example.com",
+            dnsQueryName: "api.example.com",
+            dnsCname: nil,
+            dnsAnswerAddresses: nil,
+            tlsServerName: "api.example.com",
+            quicVersion: nil,
+            quicPacketType: nil,
+            quicDestinationConnectionId: nil,
+            quicSourceConnectionId: nil,
+            classification: nil,
+            closeReason: nil,
+            largePacketCount: nil,
+            smallPacketCount: nil,
+            udpPacketCount: nil,
+            tcpPacketCount: nil,
+            quicInitialCount: nil,
+            tcpSynCount: nil,
+            tcpFinCount: nil,
+            tcpRstCount: nil,
+            burstDurationMs: nil,
+            burstPacketCount: nil,
+            leadingBytes200ms: nil,
+            leadingPackets200ms: nil,
+            leadingBytes600ms: nil,
+            leadingPackets600ms: nil,
+            burstLargePacketCount: nil,
+            burstUdpPacketCount: nil,
+            burstTcpPacketCount: nil,
+            burstQuicInitialCount: nil,
+            associatedDomain: "example.com",
+            associationSource: nil,
+            associationAgeMs: nil,
+            associationConfidence: nil,
+            lineageID: nil,
+            lineageGeneration: nil,
+            lineageAgeMs: nil,
+            lineageReuseGapMs: nil,
+            lineageReopenCount: nil,
+            lineageSiblingCount: nil,
+            pathEpoch: nil,
+            pathInterfaceClass: nil,
+            pathIsExpensive: nil,
+            pathIsConstrained: nil,
+            pathSupportsDNS: nil,
+            pathChangedRecently: nil,
+            serviceFamily: nil,
+            serviceFamilyConfidence: nil,
+            serviceAttributionSourceMask: nil,
+            packetLength: 75,
+            transportPayloadLength: 35,
+            tcpFlags: 0x18,
+            tcpAck: true,
+            tcpPsh: true
+        )
+        let requirements = DetectorRequirements(recordKinds: [.packetCue])
+        let collection = DetectorRecordCollection([streamRecord], projection: DetectorRecordProjection(requirements: requirements))
+
+        let record = try XCTUnwrap(collection.first)
+        XCTAssertEqual(record.kind, .packetCue)
+        XCTAssertEqual(record.timestampMs, 1_250, accuracy: 0.001)
+        XCTAssertEqual(record.direction, PacketDirection.outbound.rawValue)
+        XCTAssertEqual(record.transportProtocol, .tcp)
+        XCTAssertEqual(record.packetLength, 75)
+        XCTAssertEqual(record.transportPayloadLength, 35)
+        XCTAssertEqual(record.tcpFlags, 0x18)
+        XCTAssertEqual(record.tcpAck, true)
+        XCTAssertEqual(record.tcpPsh, true)
+        XCTAssertEqual(record.sourceAddress, "10.0.0.2")
+        XCTAssertEqual(record.sourcePort, 50_000)
+        XCTAssertEqual(record.destinationAddress, "1.1.1.1")
+        XCTAssertEqual(record.destinationPort, 443)
+        XCTAssertEqual(record.flowId, "00000000feedbeef")
+        XCTAssertEqual(record.tlsServerName, "api.example.com")
+        XCTAssertEqual(record.registrableDomain, "example.com")
+        XCTAssertEqual(record.associatedDomain, "example.com")
+        XCTAssertEqual(record.dnsQueryName, "api.example.com")
+    }
+
+    /// Verifies legacy detector defaults do not start receiving packet-cue records implicitly.
+    func testLegacyDetectorRequirementsDoNotProjectPacketCueRecords() {
+        let records = [
+            makePacketStreamRecord(
+                kind: .flowOpen,
+                timestamp: Date(timeIntervalSince1970: 1),
+                flowHash: 0xfeed_beef,
+                registrableDomain: nil,
+                tlsServerName: nil,
+                bytes: 75,
+                packetCount: 1
+            ),
+            makePacketStreamRecord(
+                kind: .packetCue,
+                timestamp: Date(timeIntervalSince1970: 1),
+                flowHash: 0xfeed_beef,
+                registrableDomain: nil,
+                tlsServerName: nil,
+                bytes: 75,
+                packetCount: 1
+            )
+        ]
+
+        let collection = DetectorRecordCollection(records)
+        XCTAssertEqual(collection.map(\.kind), [.flowOpen])
+    }
+
+    /// Verifies the analytics pipeline emits generic packet-cue records for configured TCP and UDP packet shapes.
+    func testPacketAnalyticsPipelineEmitsPacketCueRecordsWhenRequested() async throws {
+        let clock = DeterministicClock(startTime: Date(timeIntervalSince1970: 0))
+        let pipeline = PacketAnalyticsPipeline(
+            clock: clock,
+            burstTracker: BurstTracker(thresholdMs: 350),
+            signatureClassifier: SignatureClassifier(logger: StructuredLogger(sink: InMemoryLogSink()))
+        )
+        let policy = PacketAnalyticsPipeline.EmissionPolicy(
+            allowDeepMetadata: false,
+            maxMetadataProbesPerBatch: 0,
+            emitFlowSlices: false,
+            flowSliceIntervalMs: 250,
+            emitFlowCloseEvents: false,
+            emitBurstShapeCounters: false,
+            activitySampleMinimumPackets: 1_024,
+            activitySampleMinimumBytes: 16 * 1_024 * 1_024,
+            activitySampleMinimumInterval: 60,
+            emitBurstEvents: false,
+            emitActivitySamples: false,
+            emitPacketCues: true
+        )
+
+        let tcpPacket = Data(
+            makeIPv4TCPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [1, 1, 1, 1],
+                sourcePort: 50_000,
+                destinationPort: 443,
+                tcpFlags: 0x18,
+                payload: Array(repeating: 0x17, count: 35)
+            )
+        )
+        let tcpRecords = await pipeline.ingest(packets: [tcpPacket], families: [], direction: .outbound, policy: policy)
+        let tcpCue = try XCTUnwrap(tcpRecords.first { $0.kind == .packetCue })
+        XCTAssertEqual(tcpCue.packetLength, tcpPacket.count)
+        XCTAssertEqual(tcpCue.transportPayloadLength, 35)
+        XCTAssertEqual(tcpCue.tcpFlags, 0x18)
+        XCTAssertEqual(tcpCue.tcpAck, true)
+        XCTAssertEqual(tcpCue.tcpPsh, true)
+        XCTAssertEqual(tcpCue.sourcePort, 50_000)
+        XCTAssertEqual(tcpCue.destinationPort, 443)
+
+        await clock.advance(by: 0.1)
+        let udpPacket = Data(
+            makeIPv4UDPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [1, 1, 1, 2],
+                sourcePort: 50_001,
+                destinationPort: 443,
+                payload: Array(repeating: 0x42, count: 572)
+            )
+        )
+        let udpRecords = await pipeline.ingest(packets: [udpPacket], families: [], direction: .outbound, policy: policy)
+        let udpCue = try XCTUnwrap(udpRecords.first { $0.kind == .packetCue })
+        XCTAssertEqual(udpCue.packetLength, udpPacket.count)
+        XCTAssertEqual(udpCue.transportPayloadLength, 572)
+        XCTAssertNil(udpCue.tcpFlags)
+        XCTAssertNil(udpCue.tcpAck)
+        XCTAssertNil(udpCue.tcpPsh)
+        XCTAssertEqual(udpCue.protocolHint, "udp")
+    }
+
+    /// Verifies the worker only enables packet-cue emission for detectors that opt into the new record kind.
+    func testPacketTelemetryWorkerEmitsPacketCueRecordsOnlyForRequestingDetectors() async throws {
+        let clock = DeterministicClock(startTime: Date(timeIntervalSince1970: 0))
+        let pipeline = PacketAnalyticsPipeline(
+            clock: clock,
+            burstTracker: BurstTracker(thresholdMs: 350),
+            signatureClassifier: SignatureClassifier(logger: StructuredLogger(sink: InMemoryLogSink()))
+        )
+        let legacyDetector = RecordingDetector()
+        let packetCueDetector = ProjectionRecordingDetector(
+            identifier: "packet-cue",
+            requirements: DetectorRequirements(recordKinds: [.packetCue])
+        )
+        let worker = PacketTelemetryWorker(
+            pipeline: pipeline,
+            packetStream: nil,
+            detectors: [legacyDetector, packetCueDetector],
+            logger: StructuredLogger(sink: InMemoryLogSink())
+        )
+
+        let packet = Data(
+            makeIPv4TCPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [1, 1, 1, 1],
+                sourcePort: 50_000,
+                destinationPort: 443,
+                tcpFlags: 0x18,
+                payload: Array(repeating: 0x17, count: 35)
+            )
+        )
+
+        XCTAssertTrue(worker.submit(packets: [packet], families: [], direction: .outbound).accepted)
+        await worker.flushAndWait()
+        await worker.stopAndWait()
+
+        XCTAssertEqual(legacyDetector.recordedKinds(), [.flowOpen])
+        XCTAssertEqual(packetCueDetector.recordedKinds(), [.packetCue])
+    }
+
     /// Verifies DNS answers can be reused to attribute later hostless UDP/443 traffic and derive service-family hints.
     func testPacketAnalyticsPipelineEmitsDNSAssociationAndServiceAttributionWhenRequested() async throws {
         let clock = DeterministicClock(startTime: Date(timeIntervalSince1970: 0))

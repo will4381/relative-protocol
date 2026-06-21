@@ -74,6 +74,29 @@ public struct DetectorRecord: Sendable, Equatable {
     public let serviceFamily: String?
     public let serviceFamilyConfidence: Double?
     public let serviceAttributionSourceMask: UInt16?
+    public let packetLength: Int?
+    public let transportPayloadLength: Int?
+    public let tcpFlags: UInt8?
+    public let tcpAck: Bool?
+    public let tcpPsh: Bool?
+
+    public var timestampMs: Double {
+        timestamp.timeIntervalSince1970 * 1_000
+    }
+
+    public var transportProtocol: TransportProtocol? {
+        transportProtocolNumber.map(TransportProtocol.init(rawValue:))
+    }
+
+    public var flowId: String {
+        if let textFlowId, !textFlowId.isEmpty {
+            return textFlowId
+        }
+        if let flowHash {
+            return String(format: "%016llx", flowHash)
+        }
+        return "unknown-flow"
+    }
 
     public var sourceAddress: String? {
         if let sourceAddressStorage {
@@ -163,7 +186,12 @@ public struct DetectorRecord: Sendable, Equatable {
         pathChangedRecently: Bool? = nil,
         serviceFamily: String? = nil,
         serviceFamilyConfidence: Double? = nil,
-        serviceAttributionSourceMask: UInt16? = nil
+        serviceAttributionSourceMask: UInt16? = nil,
+        packetLength: Int? = nil,
+        transportPayloadLength: Int? = nil,
+        tcpFlags: UInt8? = nil,
+        tcpAck: Bool? = nil,
+        tcpPsh: Bool? = nil
     ) {
         self.kind = kind
         self.timestamp = timestamp
@@ -235,17 +263,23 @@ public struct DetectorRecord: Sendable, Equatable {
         self.serviceFamily = serviceFamily
         self.serviceFamilyConfidence = serviceFamilyConfidence
         self.serviceAttributionSourceMask = serviceAttributionSourceMask
+        self.packetLength = packetLength
+        self.transportPayloadLength = transportPayloadLength
+        self.tcpFlags = tcpFlags
+        self.tcpAck = tcpAck
+        self.tcpPsh = tcpPsh
     }
 
     init(compactRecord record: PacketSampleStream.PacketStreamRecord, projection: DetectorRecordProjection) {
+        let includePacketCueFields = record.kind == .packetCue || projection.includes(.packetDetails)
         let includePacketShape = projection.includes(.packetShape)
         let includeControlSignals = projection.includes(.controlSignals)
         let includeBurstShape = projection.includes(.burstShape)
-        let includeHostHints = projection.includes(.hostHints)
+        let includeHostHints = projection.includes(.hostHints) || includePacketCueFields
         let includeQUICIdentity = projection.includes(.quicIdentity)
-        let includeStringAddresses = projection.includes(.stringAddresses)
+        let includeStringAddresses = projection.includes(.stringAddresses) || includePacketCueFields
         let includeDNSAnswerAddresses = projection.includes(.dnsAnswerAddresses)
-        let includeDNSAssociation = projection.includes(.dnsAssociation)
+        let includeDNSAssociation = projection.includes(.dnsAssociation) || includePacketCueFields
         let includeLineage = projection.includes(.lineage)
         let includePathRegime = projection.includes(.pathRegime)
         let includeServiceAttribution = projection.includes(.serviceAttribution)
@@ -320,6 +354,11 @@ public struct DetectorRecord: Sendable, Equatable {
         self.serviceFamily = includeServiceAttribution ? record.serviceFamily : nil
         self.serviceFamilyConfidence = includeServiceAttribution ? record.serviceFamilyConfidence : nil
         self.serviceAttributionSourceMask = includeServiceAttribution ? record.serviceAttributionSourceMask : nil
+        self.packetLength = includePacketCueFields ? record.packetLength : nil
+        self.transportPayloadLength = includePacketCueFields ? record.transportPayloadLength : nil
+        self.tcpFlags = includePacketCueFields ? record.tcpFlags : nil
+        self.tcpAck = includePacketCueFields ? record.tcpAck : nil
+        self.tcpPsh = includePacketCueFields ? record.tcpPsh : nil
     }
 }
 

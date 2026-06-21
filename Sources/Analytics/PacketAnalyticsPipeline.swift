@@ -11,6 +11,12 @@ public actor PacketAnalyticsPipeline {
         static let arrivalQueueCompactionThreshold = 128
     }
 
+    private enum PacketCuePolicy {
+        static let maxTCPPayloadLength = 800
+        static let udpPacketLengthRange = 500...1_300
+        static let maxHostAssociatedPacketLength = 1_300
+    }
+
     /// Emission policy applied by the long-lived telemetry worker.
     /// Decision: always-on capture stays cheap, while richer metadata and activity samples are reduced as thermal pressure rises.
     public struct EmissionPolicy: Sendable {
@@ -32,6 +38,7 @@ public actor PacketAnalyticsPipeline {
         public let activitySampleMinimumInterval: TimeInterval
         public let emitBurstEvents: Bool
         public let emitActivitySamples: Bool
+        public let emitPacketCues: Bool
 
         public init(
             allowDeepMetadata: Bool,
@@ -51,7 +58,8 @@ public actor PacketAnalyticsPipeline {
             activitySampleMinimumBytes: Int,
             activitySampleMinimumInterval: TimeInterval,
             emitBurstEvents: Bool,
-            emitActivitySamples: Bool
+            emitActivitySamples: Bool,
+            emitPacketCues: Bool = false
         ) {
             self.allowDeepMetadata = allowDeepMetadata
             self.maxMetadataProbesPerBatch = max(0, maxMetadataProbesPerBatch)
@@ -71,6 +79,7 @@ public actor PacketAnalyticsPipeline {
             self.activitySampleMinimumInterval = max(0, activitySampleMinimumInterval)
             self.emitBurstEvents = emitBurstEvents
             self.emitActivitySamples = emitActivitySamples
+            self.emitPacketCues = emitPacketCues
         }
     }
 
@@ -411,6 +420,7 @@ public actor PacketAnalyticsPipeline {
                 context.hasEmittedFlowOpen = true
             }
 
+            var didUpdateMetadata = false
             if allowMetadataProbe,
                shouldProbeDeepMetadata(summary: summary, flowContext: context) {
                 if let deepMetadata = PacketParser.parse(packet, ipVersionHint: familyHint) {
@@ -427,6 +437,7 @@ public actor PacketAnalyticsPipeline {
                     let nextFingerprint = metadataFingerprint(for: context)
                     if nextFingerprint != previousFingerprint {
                         context.lastMetadataFingerprint = nextFingerprint
+                        didUpdateMetadata = true
                         records.append(
                             makeRecord(
                                 kind: .metadata,
@@ -438,6 +449,19 @@ public actor PacketAnalyticsPipeline {
                         )
                     }
                 }
+            }
+
+            if shouldEmitPacketCue(summary: summary, direction: direction, flowContext: context, didUpdateMetadata: didUpdateMetadata, policy: policy) {
+                records.append(
+                    makeRecord(
+                        kind: .packetCue,
+                        timestamp: now,
+                        direction: direction,
+                        flowContext: context,
+                        counters: CounterSet(summary: summary),
+                        packetSummary: summary
+                    )
+                )
             }
 
             if shouldEmitFlowSlice(context: context, now: now, policy: policy) {
@@ -615,6 +639,65 @@ public actor PacketAnalyticsPipeline {
         }
     }
 
+    private func shouldEmitPacketCue(
+        summary: FastPacketSummary,
+        direction: PacketDirection,
+        flowContext: FlowContext,
+        didUpdateMetadata: Bool,
+        policy: EmissionPolicy
+    ) -> Bool {
+        guard policy.emitPacketCues else {
+            return false
+        }
+        if didUpdateMetadata && (summary.transport == .tcp || summary.transport == .udp) {
+            return true
+        }
+        guard direction == .outbound else {
+            return false
+        }
+
+        switch summary.transport {
+        case .tcp:
+            if summary.hasTCPACK,
+               summary.hasTCPPSH,
+               let payloadLength = summary.transportPayloadLengthIfAvailable,
+               payloadLength <= PacketCuePolicy.maxTCPPayloadLength {
+                return true
+            }
+            return hasHostAssociation(flowContext) &&
+                summary.transportPayloadLengthIfAvailable != nil &&
+                summary.packetLength <= PacketCuePolicy.maxHostAssociatedPacketLength
+        case .udp:
+            if PacketCuePolicy.udpPacketLengthRange.contains(summary.packetLength) {
+                return true
+            }
+            return hasHostAssociation(flowContext) &&
+                summary.transportPayloadLengthIfAvailable != nil &&
+                summary.packetLength <= PacketCuePolicy.maxHostAssociatedPacketLength
+        default:
+            return false
+        }
+    }
+
+    private func hasHostAssociation(_ flowContext: FlowContext) -> Bool {
+        if let tlsServerName = flowContext.tlsServerName, !tlsServerName.isEmpty {
+            return true
+        }
+        if let registrableDomain = flowContext.registrableDomain, !registrableDomain.isEmpty {
+            return true
+        }
+        if let dnsQueryName = flowContext.dnsQueryName, !dnsQueryName.isEmpty {
+            return true
+        }
+        if let dnsCname = flowContext.dnsCname, !dnsCname.isEmpty {
+            return true
+        }
+        if let associatedDomain = flowContext.association?.associatedDomain, !associatedDomain.isEmpty {
+            return true
+        }
+        return false
+    }
+
     private func shouldEmitActivitySample(context: FlowContext, now: Date, policy: EmissionPolicy) -> Bool {
         guard policy.emitActivitySamples else {
             return false
@@ -749,7 +832,8 @@ public actor PacketAnalyticsPipeline {
         burstLargePacketCount: Int? = nil,
         burstUdpPacketCount: Int? = nil,
         burstTcpPacketCount: Int? = nil,
-        burstQuicInitialCount: Int? = nil
+        burstQuicInitialCount: Int? = nil,
+        packetSummary: FastPacketSummary? = nil
     ) -> PacketSampleStream.PacketStreamRecord {
         let counters = counters ?? CounterSet()
         let template = flowContext.recordTemplate
@@ -823,7 +907,12 @@ public actor PacketAnalyticsPipeline {
             pathChangedRecently: flowContext.pathRegime.map { $0.changedRecently(at: timestamp) },
             serviceFamily: flowContext.serviceAttribution?.family,
             serviceFamilyConfidence: flowContext.serviceAttribution?.confidence,
-            serviceAttributionSourceMask: flowContext.serviceAttribution?.sourceMask
+            serviceAttributionSourceMask: flowContext.serviceAttribution?.sourceMask,
+            packetLength: packetSummary?.packetLength,
+            transportPayloadLength: packetSummary?.transportPayloadLengthIfAvailable,
+            tcpFlags: packetSummary?.transport == .tcp ? packetSummary?.tcpFlags : nil,
+            tcpAck: packetSummary?.transport == .tcp ? packetSummary?.hasTCPACK : nil,
+            tcpPsh: packetSummary?.transport == .tcp ? packetSummary?.hasTCPPSH : nil
         )
     }
 
