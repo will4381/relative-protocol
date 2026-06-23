@@ -1969,6 +1969,10 @@ final class VPNManager: ObservableObject {
             return "Burst"
         case .activitySample:
             return "Activity"
+        case .packetCue:
+            return "Packet Cue"
+        case .sourceAppFlow:
+            return "Source App Flow"
         }
     }
 

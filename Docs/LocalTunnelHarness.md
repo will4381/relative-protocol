@@ -1,5 +1,7 @@
 # Local Tunnel Harness
 
+[Docs Index](README.md)
+
 This package cannot exactly emulate iOS `NEPacketTunnelProvider` on Linux or in a normal local process. Apple owns the real provider lifecycle, VPN preference store, tunnel network settings install, route and DNS application, background lifecycle, App Group access, and `NEPacketTunnelFlow` packet delivery.
 
 The local harness is therefore a test ladder, not an iPhone replacement:

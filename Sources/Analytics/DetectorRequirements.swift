@@ -32,6 +32,18 @@ public struct DetectorFeatureFamily: OptionSet, Sendable, Hashable {
     public static let serviceAttribution = DetectorFeatureFamily(rawValue: 1 << 10)
     /// Exact per-packet cue fields: packet length, payload length, TCP flags, and ACK/PSH booleans.
     public static let packetDetails = DetectorFeatureFamily(rawValue: 1 << 11)
+    /// App/session context supplied by the host app rather than inferred by the VPN.
+    public static let sessionContext = DetectorFeatureFamily(rawValue: 1 << 12)
+    /// Explicit remote endpoint and owner keys derived from packet direction and endpoints.
+    public static let remoteEndpoint = DetectorFeatureFamily(rawValue: 1 << 13)
+    /// Normalized role string derived from service, host, DNS, and classification hints.
+    public static let roleAttribution = DetectorFeatureFamily(rawValue: 1 << 14)
+    /// Address or role scope family used when host role strings are missing.
+    public static let addressScope = DetectorFeatureFamily(rawValue: 1 << 15)
+    /// Stable typed detector-fire audit records on detection events.
+    public static let eventAudit = DetectorFeatureFamily(rawValue: 1 << 16)
+    /// Source-app flow attribution emitted by a passive content-filter sidecar.
+    public static let sourceAppAttribution = DetectorFeatureFamily(rawValue: 1 << 17)
 
     /// Compatibility surface matching the package's pre-requirements detector view.
     public static let legacyDetectorSurface: DetectorFeatureFamily = [
@@ -174,6 +186,7 @@ internal struct DetectorRuntimePlan: Sendable {
         unionFeatureFamilies.contains(.hostHints) ||
             unionFeatureFamilies.contains(.dnsAssociation) ||
             unionFeatureFamilies.contains(.serviceAttribution) ||
+            unionFeatureFamilies.contains(.roleAttribution) ||
             unionFeatureFamilies.contains(.dnsAnswerAddresses) ||
             needsPacketCues
     }
@@ -194,6 +207,22 @@ internal struct DetectorRuntimePlan: Sendable {
         unionFeatureFamilies.contains(.serviceAttribution)
     }
 
+    var needsRoleAttribution: Bool {
+        unionFeatureFamilies.contains(.roleAttribution)
+    }
+
+    var needsAddressScope: Bool {
+        unionFeatureFamilies.contains(.addressScope)
+    }
+
+    var needsRemoteEndpoint: Bool {
+        unionFeatureFamilies.contains(.remoteEndpoint) || needsPacketCues || needsSourceAppAttribution
+    }
+
+    var needsSourceAppAttribution: Bool {
+        unionFeatureFamilies.contains(.sourceAppAttribution) || unionRecordKinds.contains(.sourceAppFlow)
+    }
+
     var needsPacketCues: Bool {
         unionRecordKinds.contains(.packetCue)
     }
@@ -203,6 +232,6 @@ internal struct DetectorRuntimePlan: Sendable {
     }
 
     var needsHostHints: Bool {
-        unionFeatureFamilies.contains(.hostHints) || needsDNSAssociation || needsServiceAttribution || needsPacketCues
+        unionFeatureFamilies.contains(.hostHints) || needsDNSAssociation || needsServiceAttribution || needsRoleAttribution || needsPacketCues
     }
 }

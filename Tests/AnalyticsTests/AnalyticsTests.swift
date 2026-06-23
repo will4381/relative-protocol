@@ -837,6 +837,66 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertEqual(detector.recordedKinds(), [.flowOpen, .flowSlice])
     }
 
+    /// Verifies app-supplied session context is stamped by the worker onto detector records that request it.
+    func testPacketTelemetryWorkerStampsSessionContextWhenRequested() async throws {
+        let clock = DeterministicClock(startTime: Date(timeIntervalSince1970: 0))
+        let pipeline = PacketAnalyticsPipeline(
+            clock: clock,
+            burstTracker: BurstTracker(thresholdMs: 350),
+            signatureClassifier: SignatureClassifier(logger: StructuredLogger(sink: InMemoryLogSink()))
+        )
+        let detector = ProjectionRecordingDetector(
+            identifier: "session-detector",
+            requirements: DetectorRequirements(recordKinds: [.flowOpen], featureFamilies: [.sessionContext])
+        )
+        let policy = PacketAnalyticsPipeline.EmissionPolicy(
+            allowDeepMetadata: false,
+            maxMetadataProbesPerBatch: 0,
+            emitFlowSlices: false,
+            flowSliceIntervalMs: 250,
+            emitFlowCloseEvents: false,
+            emitBurstShapeCounters: false,
+            activitySampleMinimumPackets: 1_024,
+            activitySampleMinimumBytes: 16 * 1_024 * 1_024,
+            activitySampleMinimumInterval: 60,
+            emitBurstEvents: false,
+            emitActivitySamples: false
+        )
+        let worker = PacketTelemetryWorker(
+            pipeline: pipeline,
+            detectors: [detector],
+            logger: StructuredLogger(sink: InMemoryLogSink()),
+            processInfo: .processInfo,
+            emissionPolicyOverride: policy
+        )
+
+        await worker.updateSessionContextAndWait(
+            DetectorSessionContext(
+                sessionId: "session-1",
+                packetStreamStartedAtMs: 1_000,
+                foregroundReadyAtMs: 1_100,
+                appOpenAtMs: 900,
+                targetApp: "instagram"
+            )
+        )
+        let packet = Data(
+            makeIPv4UDPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [157, 240, 1, 1],
+                sourcePort: 50_000,
+                destinationPort: 443,
+                payload: Array(repeating: 0x41, count: 600)
+            )
+        )
+
+        XCTAssertTrue(worker.submit(packets: [packet], families: [], direction: .outbound).accepted)
+        await worker.flushAndWait()
+        await worker.stopAndWait()
+
+        XCTAssertEqual(detector.recordedKinds(), [.flowOpen])
+        XCTAssertEqual(detector.firstSessionID(), "session-1")
+    }
+
     /// Verifies detector projections filter record kinds and omit unrequested enrichment families.
     func testDetectorRecordCollectionProjectsKindsAndFieldsByRequirements() {
         let records = [
@@ -986,6 +1046,143 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertEqual(record.registrableDomain, "example.com")
         XCTAssertEqual(record.associatedDomain, "example.com")
         XCTAssertEqual(record.dnsQueryName, "api.example.com")
+        XCTAssertEqual(record.remoteAddress, "1.1.1.1")
+        XCTAssertEqual(record.remotePort, 443)
+        XCTAssertEqual(record.remoteEndpoint, "tcp://1.1.1.1:443")
+        XCTAssertEqual(record.role, "example.com")
+        XCTAssertEqual(record.ownerKey, "role:example.com")
+    }
+
+    /// Verifies remote endpoint derivation follows packet direction.
+    func testDetectorRecordRemoteEndpointUsesRemoteSideForInboundAndOutbound() throws {
+        let outbound = makePacketStreamRecord(
+            kind: .flowSlice,
+            timestamp: Date(timeIntervalSince1970: 1),
+            flowHash: 0xfeed_beef,
+            registrableDomain: nil,
+            tlsServerName: nil,
+            bytes: 512,
+            packetCount: 2,
+            direction: .outbound,
+            protocolHint: "udp",
+            transportProtocolNumber: 17,
+            sourceAddress: "10.0.0.2",
+            sourcePort: 50_000,
+            destinationAddress: "203.0.113.10",
+            destinationPort: 443
+        )
+        let inbound = makePacketStreamRecord(
+            kind: .flowSlice,
+            timestamp: Date(timeIntervalSince1970: 2),
+            flowHash: 0xfeed_beef,
+            registrableDomain: nil,
+            tlsServerName: nil,
+            bytes: 256,
+            packetCount: 1,
+            direction: .inbound,
+            protocolHint: "udp",
+            transportProtocolNumber: 17,
+            sourceAddress: "203.0.113.10",
+            sourcePort: 443,
+            destinationAddress: "10.0.0.2",
+            destinationPort: 50_000
+        )
+        let requirements = DetectorRequirements(
+            recordKinds: [.flowSlice],
+            featureFamilies: [.remoteEndpoint]
+        )
+        let collection = DetectorRecordCollection(
+            [outbound, inbound],
+            projection: DetectorRecordProjection(requirements: requirements)
+        )
+
+        XCTAssertEqual(collection[0].remoteEndpoint, "udp://203.0.113.10:443")
+        XCTAssertEqual(collection[1].remoteEndpoint, "udp://203.0.113.10:443")
+    }
+
+    /// Verifies topology records can expose lineage, owner, role, and scope when detectors request them.
+    func testTopologyRecordsProjectLineageOwnerRoleAndScope() throws {
+        let record = makePacketStreamRecord(
+            kind: .flowSlice,
+            timestamp: Date(timeIntervalSince1970: 4),
+            flowHash: 0xabc,
+            registrableDomain: "cdninstagram.com",
+            tlsServerName: nil,
+            bytes: 1_200,
+            packetCount: 3,
+            sourceAddress: "10.0.0.2",
+            destinationAddress: "203.0.113.40",
+            lineageID: 99,
+            lineageGeneration: 2,
+            lineageAgeMs: 1_500,
+            lineageReopenCount: 1,
+            lineageSiblingCount: 4,
+            serviceFamily: "cdninstagram.com",
+            addressScopeFamily: .meta,
+            addressScopeSource: .prefix,
+            addressScopeConfidence: 0.91
+        )
+        let requirements = DetectorRequirements(
+            recordKinds: [.flowSlice],
+            featureFamilies: [.lineage, .remoteEndpoint, .roleAttribution, .addressScope]
+        )
+        let collection = DetectorRecordCollection([record], projection: DetectorRecordProjection(requirements: requirements))
+        let projected = try XCTUnwrap(collection.first)
+
+        XCTAssertEqual(projected.lineageID, 99)
+        XCTAssertEqual(projected.lineageAgeMs, 1_500)
+        XCTAssertEqual(projected.lineageReopenCount, 1)
+        XCTAssertEqual(projected.lineageSiblingCount, 4)
+        XCTAssertEqual(projected.remoteEndpoint, "udp://203.0.113.40:443")
+        XCTAssertEqual(projected.role, "cdninstagram.com")
+        XCTAssertEqual(projected.ownerKey, "role:cdninstagram.com")
+        XCTAssertEqual(projected.addressScopeFamily, .meta)
+        XCTAssertEqual(projected.addressScopeSource, .prefix)
+        XCTAssertEqual(projected.addressScopeConfidence, 0.91)
+    }
+
+    /// Verifies passive content-filter attribution records expose source app identity without packet fields.
+    func testSourceAppFlowRecordsProjectContentFilterAttribution() throws {
+        let record = makePacketStreamRecord(
+            kind: .sourceAppFlow,
+            timestamp: Date(timeIntervalSince1970: 5),
+            flowHash: 0x1234,
+            registrableDomain: nil,
+            tlsServerName: nil,
+            bytes: 0,
+            packetCount: 0,
+            sourceAddress: "10.0.0.2",
+            destinationAddress: "203.0.113.55",
+            sourceAppIdentifier: "com.burbn.instagram",
+            sourceAppUniqueIdentifierHash: "hash-1",
+            sourceAppVersion: "340.0",
+            attributionFlowId: "filter-flow-1",
+            attributionSource: .contentFilter,
+            attributionObservedAtMs: 5_000,
+            localEndpoint: "10.0.0.2:50000",
+            remoteEndpoint: "tcp://203.0.113.55:443",
+            remoteHostname: "gateway.instagram.com"
+        )
+        let requirements = DetectorRequirements(
+            recordKinds: [.sourceAppFlow],
+            featureFamilies: [.sourceAppAttribution, .remoteEndpoint, .addressScope]
+        )
+        let collection = DetectorRecordCollection([record], projection: DetectorRecordProjection(requirements: requirements))
+        let projected = try XCTUnwrap(collection.first)
+
+        XCTAssertEqual(projected.kind, .sourceAppFlow)
+        XCTAssertEqual(projected.sourceAppIdentifier, "com.burbn.instagram")
+        XCTAssertEqual(projected.sourceAppUniqueIdentifierHash, "hash-1")
+        XCTAssertEqual(projected.sourceAppVersion, "340.0")
+        XCTAssertEqual(projected.attributionFlowId, "filter-flow-1")
+        XCTAssertEqual(projected.attributionSource, .contentFilter)
+        XCTAssertEqual(projected.attributionObservedAtMs, 5_000)
+        XCTAssertEqual(projected.localEndpoint, "10.0.0.2:50000")
+        XCTAssertEqual(projected.remoteEndpoint, "tcp://203.0.113.55:443")
+        XCTAssertEqual(projected.remoteHostname, "gateway.instagram.com")
+        XCTAssertEqual(projected.ownerKey, "app:com.burbn.instagram")
+        XCTAssertEqual(projected.addressScopeFamily, .meta)
+        XCTAssertEqual(projected.addressScopeSource, .sourceApp)
     }
 
     /// Verifies legacy detector defaults do not start receiving packet-cue records implicitly.
@@ -1076,6 +1273,50 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertNil(udpCue.tcpAck)
         XCTAssertNil(udpCue.tcpPsh)
         XCTAssertEqual(udpCue.protocolHint, "udp")
+    }
+
+    /// Verifies no-role traffic can still carry address scope when a supplied prefix catalog knows the remote IP.
+    func testPacketAnalyticsPipelineAddsAddressScopeFromConfiguredPrefixes() async throws {
+        let prefix = try XCTUnwrap(AddressScopePrefix(cidr: "203.0.113.0/24", family: .meta, confidence: 0.88))
+        let clock = DeterministicClock(startTime: Date(timeIntervalSince1970: 0))
+        let pipeline = PacketAnalyticsPipeline(
+            clock: clock,
+            burstTracker: BurstTracker(thresholdMs: 350),
+            signatureClassifier: SignatureClassifier(logger: StructuredLogger(sink: InMemoryLogSink())),
+            addressScopeClassifier: AddressScopeClassifier(prefixes: [prefix])
+        )
+        let policy = PacketAnalyticsPipeline.EmissionPolicy(
+            allowDeepMetadata: false,
+            maxMetadataProbesPerBatch: 0,
+            emitFlowSlices: false,
+            flowSliceIntervalMs: 250,
+            emitFlowCloseEvents: false,
+            emitBurstShapeCounters: false,
+            emitAddressScopeFields: true,
+            activitySampleMinimumPackets: 1_024,
+            activitySampleMinimumBytes: 16 * 1_024 * 1_024,
+            activitySampleMinimumInterval: 60,
+            emitBurstEvents: false,
+            emitActivitySamples: false
+        )
+        let packet = Data(
+            makeIPv4UDPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [203, 0, 113, 42],
+                sourcePort: 50_000,
+                destinationPort: 443,
+                payload: Array(repeating: 0x42, count: 64)
+            )
+        )
+
+        let records = await pipeline.ingest(packets: [packet], families: [], direction: .outbound, policy: policy)
+        let flowOpen = try XCTUnwrap(records.first(where: { $0.kind == .flowOpen }))
+
+        XCTAssertEqual(flowOpen.addressScopeFamily, .meta)
+        XCTAssertEqual(flowOpen.addressScopeSource, .prefix)
+        XCTAssertEqual(flowOpen.addressScopeConfidence, 0.88)
+        XCTAssertNil(flowOpen.registrableDomain)
+        XCTAssertNil(flowOpen.tlsServerName)
     }
 
     /// Verifies the worker only enables packet-cue emission for detectors that opt into the new record kind.
@@ -1584,6 +1825,47 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertNil(try store.load())
     }
 
+    /// Verifies typed detector fire metadata survives Codable round trips without stringly parsing `metadata`.
+    func testDetectionEventFireRecordRoundTrip() throws {
+        let event = DetectionEvent(
+            id: "event-1",
+            detectorIdentifier: "packet-detector",
+            signal: "swipe-cue",
+            target: "instagram",
+            timestamp: Date(timeIntervalSince1970: 20),
+            confidence: 0.91,
+            trigger: "packetCue",
+            flowId: "flow-1",
+            host: "cdninstagram.com",
+            classification: nil,
+            bytes: 896,
+            packetCount: 1,
+            durationMs: nil,
+            metadata: ["legacy": "kept"],
+            fireRecord: DetectorFireRecord(
+                detectorName: "packet-detector",
+                configId: "config-v1",
+                fireTime: Date(timeIntervalSince1970: 20),
+                sourcePacketTime: Date(timeIntervalSince1970: 19.95),
+                reason: "outbound-udp-length-rank",
+                ownerKey: "endpoint:udp://203.0.113.40:443",
+                role: "cdninstagram.com",
+                packetLength: 896,
+                payloadLength: 868,
+                flowId: "flow-1",
+                lineageId: 42
+            )
+        )
+
+        let data = try JSONEncoder().encode(event)
+        let decoded = try JSONDecoder().decode(DetectionEvent.self, from: data)
+
+        XCTAssertEqual(decoded, event)
+        XCTAssertEqual(decoded.fireRecord?.configId, "config-v1")
+        XCTAssertEqual(decoded.fireRecord?.reason, "outbound-udp-length-rank")
+        XCTAssertEqual(decoded.fireRecord?.sourcePacketTime, Date(timeIntervalSince1970: 19.95))
+    }
+
     /// Verifies signature reload updates in-memory cache and matching behavior.
     func testSignatureClassifierReloadAndCache() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -1710,6 +1992,7 @@ final class AnalyticsTests: XCTestCase {
         private let lock = NSLock()
         private var kinds: [PacketSampleKind] = []
         private var lineageIDs: [UInt64] = []
+        private var sessionIDs: [String] = []
 
         init(identifier: String, requirements: DetectorRequirements) {
             self.identifier = identifier
@@ -1720,6 +2003,7 @@ final class AnalyticsTests: XCTestCase {
             lock.lock()
             kinds.append(contentsOf: records.map(\.kind))
             lineageIDs.append(contentsOf: records.compactMap(\.lineageID))
+            sessionIDs.append(contentsOf: records.compactMap(\.sessionId))
             lock.unlock()
             return []
         }
@@ -1728,6 +2012,7 @@ final class AnalyticsTests: XCTestCase {
             lock.lock()
             kinds.removeAll(keepingCapacity: false)
             lineageIDs.removeAll(keepingCapacity: false)
+            sessionIDs.removeAll(keepingCapacity: false)
             lock.unlock()
         }
 
@@ -1741,6 +2026,12 @@ final class AnalyticsTests: XCTestCase {
             lock.lock()
             defer { lock.unlock() }
             return lineageIDs.first
+        }
+
+        func firstSessionID() -> String? {
+            lock.lock()
+            defer { lock.unlock() }
+            return sessionIDs.first
         }
     }
 
@@ -1787,6 +2078,13 @@ final class AnalyticsTests: XCTestCase {
         tlsServerName: String?,
         bytes: Int,
         packetCount: Int,
+        direction: PacketDirection = .outbound,
+        protocolHint: String = "udp",
+        transportProtocolNumber: UInt8 = 17,
+        sourceAddress: String? = nil,
+        sourcePort: UInt16 = 50_000,
+        destinationAddress: String? = nil,
+        destinationPort: UInt16 = 443,
         closeReason: FlowCloseReason? = nil,
         largePacketCount: Int? = nil,
         smallPacketCount: Int? = nil,
@@ -1824,21 +2122,35 @@ final class AnalyticsTests: XCTestCase {
         pathChangedRecently: Bool? = nil,
         serviceFamily: String? = nil,
         serviceFamilyConfidence: Double? = nil,
-        serviceAttributionSourceMask: UInt16? = nil
+        serviceAttributionSourceMask: UInt16? = nil,
+        sessionContext: DetectorSessionContext? = nil,
+        role: String? = nil,
+        addressScopeFamily: AddressScopeFamily? = nil,
+        addressScopeSource: AddressScopeSource? = nil,
+        addressScopeConfidence: Double? = nil,
+        sourceAppIdentifier: String? = nil,
+        sourceAppUniqueIdentifierHash: String? = nil,
+        sourceAppVersion: String? = nil,
+        attributionFlowId: String? = nil,
+        attributionSource: SourceAppAttributionSource? = nil,
+        attributionObservedAtMs: Double? = nil,
+        localEndpoint: String? = nil,
+        remoteEndpoint: String? = nil,
+        remoteHostname: String? = nil
     ) -> PacketSampleStream.PacketStreamRecord {
         PacketSampleStream.PacketStreamRecord(
             kind: kind,
             timestamp: timestamp,
-            direction: PacketDirection.outbound.rawValue,
+            direction: direction.rawValue,
             bytes: bytes,
             packetCount: packetCount,
             flowPacketCount: packetCount,
             flowByteCount: bytes,
-            protocolHint: "udp",
+            protocolHint: protocolHint,
             ipVersion: 4,
-            transportProtocolNumber: 17,
-            sourcePort: 50_000,
-            destinationPort: 443,
+            transportProtocolNumber: transportProtocolNumber,
+            sourcePort: sourcePort,
+            destinationPort: destinationPort,
             flowHash: flowHash,
             textFlowId: nil,
             sourceAddressLength: nil,
@@ -1847,8 +2159,8 @@ final class AnalyticsTests: XCTestCase {
             destinationAddressLength: nil,
             destinationAddressHigh: nil,
             destinationAddressLow: nil,
-            textSourceAddress: nil,
-            textDestinationAddress: nil,
+            textSourceAddress: sourceAddress,
+            textDestinationAddress: destinationAddress,
             registrableDomain: registrableDomain,
             dnsQueryName: nil,
             dnsCname: nil,
@@ -1896,7 +2208,21 @@ final class AnalyticsTests: XCTestCase {
             pathChangedRecently: pathChangedRecently,
             serviceFamily: serviceFamily,
             serviceFamilyConfidence: serviceFamilyConfidence,
-            serviceAttributionSourceMask: serviceAttributionSourceMask
+            serviceAttributionSourceMask: serviceAttributionSourceMask,
+            sessionContext: sessionContext,
+            remoteEndpoint: remoteEndpoint,
+            role: role,
+            addressScopeFamily: addressScopeFamily,
+            addressScopeSource: addressScopeSource,
+            addressScopeConfidence: addressScopeConfidence,
+            sourceAppIdentifier: sourceAppIdentifier,
+            sourceAppUniqueIdentifierHash: sourceAppUniqueIdentifierHash,
+            sourceAppVersion: sourceAppVersion,
+            attributionFlowId: attributionFlowId,
+            attributionSource: attributionSource,
+            attributionObservedAtMs: attributionObservedAtMs,
+            localEndpoint: localEndpoint,
+            remoteHostname: remoteHostname
         )
     }
 

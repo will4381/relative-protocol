@@ -30,6 +30,7 @@ public actor PacketAnalyticsPipeline {
         public let emitLineageFields: Bool
         public let emitPathRegimeFields: Bool
         public let emitServiceAttributionFields: Bool
+        public let emitAddressScopeFields: Bool
         public let includeHostHints: Bool
         public let includeDNSAnswerAddresses: Bool
         public let includeQUICIdentity: Bool
@@ -51,6 +52,7 @@ public actor PacketAnalyticsPipeline {
             emitLineageFields: Bool = false,
             emitPathRegimeFields: Bool = false,
             emitServiceAttributionFields: Bool = false,
+            emitAddressScopeFields: Bool = false,
             includeHostHints: Bool = true,
             includeDNSAnswerAddresses: Bool = true,
             includeQUICIdentity: Bool = true,
@@ -71,6 +73,7 @@ public actor PacketAnalyticsPipeline {
             self.emitLineageFields = emitLineageFields
             self.emitPathRegimeFields = emitPathRegimeFields
             self.emitServiceAttributionFields = emitServiceAttributionFields
+            self.emitAddressScopeFields = emitAddressScopeFields
             self.includeHostHints = includeHostHints
             self.includeDNSAnswerAddresses = includeDNSAnswerAddresses
             self.includeQUICIdentity = includeQUICIdentity
@@ -85,6 +88,12 @@ public actor PacketAnalyticsPipeline {
 
     struct RuntimeContext: Sendable {
         let pathRegime: PathRegimeSnapshot?
+        let sessionContext: DetectorSessionContext?
+
+        init(pathRegime: PathRegimeSnapshot?, sessionContext: DetectorSessionContext? = nil) {
+            self.pathRegime = pathRegime
+            self.sessionContext = sessionContext
+        }
 
         static let empty = RuntimeContext(pathRegime: nil)
     }
@@ -253,6 +262,8 @@ public actor PacketAnalyticsPipeline {
         var lineage: FlowLineageSnapshot?
         var pathRegime: PathRegimeSnapshot?
         var serviceAttribution: ServiceAttribution?
+        var sessionContext: DetectorSessionContext?
+        var addressScope: AddressScopeClassifier.Match?
         var lastSeen: Date
         var lastDirection: PacketDirection
         var hasEmittedFlowOpen = false
@@ -279,6 +290,7 @@ public actor PacketAnalyticsPipeline {
     private let clock: any Clock
     private let burstTracker: BurstTracker
     private let signatureClassifier: SignatureClassifier
+    private let addressScopeClassifier: AddressScopeClassifier
 
     private var flowContexts: [FlowKey: FlowContext] = [:]
     private var flowContextArrivalQueue: ArraySlice<FlowKey> = []
@@ -313,11 +325,13 @@ public actor PacketAnalyticsPipeline {
     public init(
         clock: any Clock,
         burstTracker: BurstTracker,
-        signatureClassifier: SignatureClassifier
+        signatureClassifier: SignatureClassifier,
+        addressScopeClassifier: AddressScopeClassifier = .empty
     ) {
         self.clock = clock
         self.burstTracker = burstTracker
         self.signatureClassifier = signatureClassifier
+        self.addressScopeClassifier = addressScopeClassifier
     }
 
     /// Ingests a packet batch and returns compact detector-facing records.
@@ -382,6 +396,9 @@ public actor PacketAnalyticsPipeline {
             if policy.emitPathRegimeFields {
                 context.pathRegime = runtimeContext.pathRegime
             }
+            if let sessionContext = runtimeContext.sessionContext {
+                context.sessionContext = sessionContext
+            }
             if policy.emitLineageFields {
                 context.lineage = lineageTracker.snapshot(for: flow, summary: summary, direction: direction, now: now)
             }
@@ -405,6 +422,9 @@ public actor PacketAnalyticsPipeline {
             mergeCheapMetadata(into: &context, summary: summary, policy: policy)
             if policy.emitServiceAttributionFields {
                 context.serviceAttribution = ServiceAttributionBuilder.make(flowContext: flowContextView(context))
+            }
+            if policy.emitAddressScopeFields {
+                context.addressScope = addressScopeMatch(for: summary, direction: direction)
             }
 
             if !context.hasEmittedFlowOpen {
@@ -433,6 +453,9 @@ public actor PacketAnalyticsPipeline {
                     }
                     if policy.emitServiceAttributionFields {
                         context.serviceAttribution = ServiceAttributionBuilder.make(flowContext: flowContextView(context))
+                    }
+                    if policy.emitAddressScopeFields, context.addressScope == nil {
+                        context.addressScope = addressScopeMatch(for: summary, direction: direction)
                     }
                     let nextFingerprint = metadataFingerprint(for: context)
                     if nextFingerprint != previousFingerprint {
@@ -561,6 +584,8 @@ public actor PacketAnalyticsPipeline {
             lineage: nil,
             pathRegime: nil,
             serviceAttribution: nil,
+            sessionContext: nil,
+            addressScope: nil,
             lastSeen: now,
             lastDirection: direction
         )
@@ -912,8 +937,28 @@ public actor PacketAnalyticsPipeline {
             transportPayloadLength: packetSummary?.transportPayloadLengthIfAvailable,
             tcpFlags: packetSummary?.transport == .tcp ? packetSummary?.tcpFlags : nil,
             tcpAck: packetSummary?.transport == .tcp ? packetSummary?.hasTCPACK : nil,
-            tcpPsh: packetSummary?.transport == .tcp ? packetSummary?.hasTCPPSH : nil
+            tcpPsh: packetSummary?.transport == .tcp ? packetSummary?.hasTCPPSH : nil,
+            sessionContext: flowContext.sessionContext,
+            addressScopeFamily: flowContext.addressScope?.family,
+            addressScopeSource: flowContext.addressScope?.source,
+            addressScopeConfidence: flowContext.addressScope?.confidence
         )
+    }
+
+    private func addressScopeMatch(for summary: FastPacketSummary, direction: PacketDirection) -> AddressScopeClassifier.Match? {
+        let addressLength: UInt8
+        let high: UInt64
+        let low: UInt64
+        if direction == .outbound {
+            addressLength = summary.destinationAddressLength
+            high = summary.destinationAddressHigh
+            low = summary.destinationAddressLow
+        } else {
+            addressLength = summary.sourceAddressLength
+            high = summary.sourceAddressHigh
+            low = summary.sourceAddressLow
+        }
+        return addressScopeClassifier.classify(addressLength: addressLength, high: high, low: low)
     }
 
     /// Decision: flow-context cleanup is amortized because sweeping a large dictionary on every batch adds heat

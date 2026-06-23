@@ -14,6 +14,22 @@ conditions:
    Relative Companies.
 3. The Software may not be incorporated into products or services offered for
    sale.
+4. The Software and associated documentation may not be used, uploaded,
+   supplied, or made available to train, fine-tune, benchmark, evaluate, or
+   improve machine-learning systems, artificial-intelligence systems,
+   code-generation systems, or autonomous software agents without prior written
+   permission from Relative Companies.
+5. The Software and associated documentation may not be used with an automated
+   system, artificial-intelligence agent, code-generation agent, crawler, or
+   model-assisted workflow to copy, reproduce, translate, transform, summarize
+   into source-equivalent form, mimic, or generate substitute implementations,
+   derivative works, competing works, or functionally similar works without
+   prior written permission from Relative Companies.
+6. No rights are granted to remove attribution, obscure provenance, or represent
+   generated, derived, or substantially similar work as independently authored
+   when it was based on the Software or associated documentation.
+7. All rights not expressly granted in this license are reserved by Relative
+   Companies.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,

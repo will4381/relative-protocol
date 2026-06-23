@@ -174,6 +174,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
 
     private enum Command: Sendable {
         case batch(Batch)
+        case updateSessionContext(DetectorSessionContext?, CommandSignal?)
         case reset(CommandSignal?)
         case clearDetections(CommandSignal?)
         case barrier(CommandSignal?)
@@ -481,6 +482,16 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         await enqueueAndWait { .clearDetections($0) }
     }
 
+    /// Updates app-supplied detector session context stamped onto future records.
+    public func updateSessionContext(_ context: DetectorSessionContext?) {
+        enqueue(.updateSessionContext(context, nil))
+    }
+
+    /// Updates app-supplied detector session context and waits until future batches will observe it.
+    public func updateSessionContextAndWait(_ context: DetectorSessionContext?) async {
+        await enqueueAndWait { .updateSessionContext(context, $0) }
+    }
+
     /// Waits until all previously enqueued telemetry work has been processed.
     public func flushAndWait() async {
         await enqueueAndWait { .barrier($0) }
@@ -623,6 +634,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         liveTapPolicy: LiveTapPolicy
     ) async {
         var detailRecords: [PacketSampleStream.PacketStreamRecord] = []
+        var sessionContext: DetectorSessionContext?
 
         for await command in stream {
             switch command {
@@ -639,7 +651,8 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 }
                 let policy = emissionPolicyOverride ?? Self.currentEmissionPolicy(processInfo: processInfo, runtimePlan: runtimePlan)
                 let runtimeContext = PacketAnalyticsPipeline.RuntimeContext(
-                    pathRegime: policy.emitPathRegimeFields ? pathRegimeProvider?.currentSnapshot : nil
+                    pathRegime: policy.emitPathRegimeFields ? pathRegimeProvider?.currentSnapshot : nil,
+                    sessionContext: sessionContext
                 )
                 let records = await pipeline.ingest(
                     packets: filtered.packets,
@@ -677,6 +690,10 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 if !snapshotRecords.isEmpty {
                     await Self.publish(packetStream: packetStream, logger: logger, snapshotRecords)
                 }
+
+            case .updateSessionContext(let context, let signal):
+                sessionContext = context
+                signal?.resume()
 
             case .reset(let signal):
                 detailRecords.removeAll(keepingCapacity: false)
@@ -754,6 +771,9 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
 
             case .packetCue:
                 continue
+
+            case .sourceAppFlow:
+                snapshotRecords.append(record)
 
             case .metadata, .burst:
                 snapshotRecords.append(contentsOf: Self.drainDetailWindow(for: record, detailRecords: &detailRecords))
@@ -860,6 +880,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 emitLineageFields: false,
                 emitPathRegimeFields: runtimePlan.needsPathRegime,
                 emitServiceAttributionFields: false,
+                emitAddressScopeFields: runtimePlan.needsAddressScope,
                 includeHostHints: runtimePlan.liveTapFeatureFamilies.contains(.hostHints),
                 includeDNSAnswerAddresses: runtimePlan.unionFeatureFamilies.contains(.dnsAnswerAddresses),
                 includeQUICIdentity: runtimePlan.needsQUICIdentity || runtimePlan.liveTapFeatureFamilies.contains(.quicIdentity),
@@ -887,6 +908,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 emitLineageFields: runtimePlan.needsLineage,
                 emitPathRegimeFields: runtimePlan.needsPathRegime,
                 emitServiceAttributionFields: runtimePlan.needsServiceAttribution,
+                emitAddressScopeFields: runtimePlan.needsAddressScope,
                 includeHostHints: runtimePlan.needsHostHints || runtimePlan.liveTapFeatureFamilies.contains(.hostHints),
                 includeDNSAnswerAddresses: runtimePlan.unionFeatureFamilies.contains(.dnsAnswerAddresses),
                 includeQUICIdentity: runtimePlan.needsQUICIdentity || runtimePlan.liveTapFeatureFamilies.contains(.quicIdentity),
@@ -909,6 +931,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 emitLineageFields: runtimePlan.needsLineage,
                 emitPathRegimeFields: runtimePlan.needsPathRegime,
                 emitServiceAttributionFields: runtimePlan.needsServiceAttribution,
+                emitAddressScopeFields: runtimePlan.needsAddressScope,
                 includeHostHints: runtimePlan.needsHostHints || runtimePlan.liveTapFeatureFamilies.contains(.hostHints),
                 includeDNSAnswerAddresses: runtimePlan.unionFeatureFamilies.contains(.dnsAnswerAddresses),
                 includeQUICIdentity: runtimePlan.needsQUICIdentity || runtimePlan.liveTapFeatureFamilies.contains(.quicIdentity),
@@ -931,6 +954,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 emitLineageFields: false,
                 emitPathRegimeFields: runtimePlan.needsPathRegime,
                 emitServiceAttributionFields: false,
+                emitAddressScopeFields: runtimePlan.needsAddressScope,
                 includeHostHints: runtimePlan.liveTapFeatureFamilies.contains(.hostHints),
                 includeDNSAnswerAddresses: runtimePlan.unionFeatureFamilies.contains(.dnsAnswerAddresses),
                 includeQUICIdentity: runtimePlan.needsQUICIdentity || runtimePlan.liveTapFeatureFamilies.contains(.quicIdentity),
