@@ -1,5 +1,6 @@
-// Copyright (c) 2026 Relative Companies Inc.
-// See LICENSE for terms.
+// Created by Will Kusch, Relative Companies, Inc.
+// Copyright (c) 2026 Relative Companies, Inc.
+// Licensed for personal, non-commercial use only. See LICENSE for terms.
 
 import Combine
 import Foundation

@@ -1,3 +1,9 @@
+<!--
+Created by Will Kusch, Relative Companies, Inc.
+Copyright (c) 2026 Relative Companies, Inc.
+Licensed for personal, non-commercial use only. See LICENSE for terms.
+-->
+
 # Documentation Index
 
 This directory holds the detailed docs for `relative-protocol`. The root [README](../README.md) is intentionally short; use this index when you need implementation details.

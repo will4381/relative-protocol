@@ -1,3 +1,9 @@
+<!--
+Created by Will Kusch, Relative Companies, Inc.
+Copyright (c) 2026 Relative Companies, Inc.
+Licensed for personal, non-commercial use only. See LICENSE for terms.
+-->
+
 # Reference
 
 This is the quick lookup page for package products, public types, detector fields, profile knobs, artifacts, and verification commands.
@@ -189,13 +195,13 @@ For narrative setup, use [Getting Started](GettingStarted.md). For detector desi
 | `swift run HarnessLocal <scenario.json>` | Synthetic local replay |
 | `swift run HarnessLocal --pcap capture.pcap --max-packets 500` | PCAP replay |
 
-The Example simulator build may emit this known non-blocking linker warning while still compiling successfully:
+Some local `swift test` runs and Example simulator builds may emit this known non-blocking linker warning while still compiling successfully:
 
 ```text
 ld: warning: reducing alignment of section __DATA,__common from 0x8000 to 0x4000 because it exceeds segment maximum alignment
 ```
 
-Treat that exact warning as accepted for now when it is the only warning. New compiler warnings, test failures, or additional linker warnings are not covered by this exception.
+Treat that exact warning as accepted for now when it is the only warning and the command exits successfully. New compiler warnings, test failures, or additional linker warnings are not covered by this exception.
 
 ## Apple API References
 

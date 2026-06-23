@@ -1,3 +1,9 @@
+<!--
+Created by Will Kusch, Relative Companies, Inc.
+Copyright (c) 2026 Relative Companies, Inc.
+Licensed for personal, non-commercial use only. See LICENSE for terms.
+-->
+
 # Operations and Debugging
 
 This guide covers production policy, observability, debugging, and release checks.
@@ -248,13 +254,13 @@ Before calling a build production-ready, validate:
 13. no sustained telemetry shedding, bridge backpressure, or pending outbound queue growth
 14. no repeated TCP overall timeouts or UDP waiting loops after path changes
 
-Known Example simulator linker warning:
+Known local linker warning:
 
 ```text
 ld: warning: reducing alignment of section __DATA,__common from 0x8000 to 0x4000 because it exceeds segment maximum alignment
 ```
 
-This warning is currently accepted as non-blocking when the Example app build succeeds and no other warnings are present. Keep it visible in release notes and fix it when practical, but do not treat it as a package regression by itself.
+This warning is currently accepted as non-blocking when `swift test` or the Example app build succeeds and no other warnings are present. Keep it visible in release notes and fix it when practical, but do not treat it as a package regression by itself.
 
 `Scripts/quality-gate.sh` always validates the perf baseline schema.
 To enforce real perf numbers, set `VPN_BRIDGE_PERF_RESULTS` to a JSON file containing either a metrics object or a metrics array with `name` and `value` fields.

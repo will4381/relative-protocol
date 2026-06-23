@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Created by Will Kusch, Relative Companies, Inc.
+# Copyright (c) 2026 Relative Companies, Inc.
+# Licensed for personal, non-commercial use only. See LICENSE for terms.
+
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

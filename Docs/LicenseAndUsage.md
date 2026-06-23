@@ -1,3 +1,9 @@
+<!--
+Created by Will Kusch, Relative Companies, Inc.
+Copyright (c) 2026 Relative Companies, Inc.
+Licensed for personal, non-commercial use only. See LICENSE for terms.
+-->
+
 # License and Usage Notes
 
 This package is infrastructure. Its compliance story depends on how a host product uses it.

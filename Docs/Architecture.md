@@ -1,3 +1,9 @@
+<!--
+Created by Will Kusch, Relative Companies, Inc.
+Copyright (c) 2026 Relative Companies, Inc.
+Licensed for personal, non-commercial use only. See LICENSE for terms.
+-->
+
 # Architecture
 
 `relative-protocol` is built around a single rule: the tunnel extension owns runtime detection.

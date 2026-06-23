@@ -1,3 +1,7 @@
+// Created by Will Kusch, Relative Companies, Inc.
+// Copyright (c) 2026 Relative Companies, Inc.
+// Licensed for personal, non-commercial use only. See LICENSE for terms.
+
 import Foundation
 
 /// Expected dataplane API/ABI versions used to reject incompatible binaries.

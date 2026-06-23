@@ -1,3 +1,9 @@
+<!--
+Created by Will Kusch, Relative Companies, Inc.
+Copyright (c) 2026 Relative Companies, Inc.
+Licensed for personal, non-commercial use only. See LICENSE for terms.
+-->
+
 # Changelog and Migration Notes
 
 This file tracks high-level package changes and migration guidance. It is not a substitute for git history, but it gives integrators a stable place to check compatibility notes.
@@ -31,7 +37,7 @@ This file tracks high-level package changes and migration guidance. It is not a 
 - dataplane bridge lifecycle fields and stats updates are protected by one synchronization boundary
 - lwIP random source ports and TCP initial sequence numbers use first-party secure randomness hooks
 - `Scripts/quality-gate.sh` validates `Config/PerfBaseline.json` and can compare metrics through `VPN_BRIDGE_PERF_RESULTS`
-- documented the known non-blocking Example simulator linker alignment warning so successful builds are not mistaken for failures
+- documented the known non-blocking local linker alignment warning so successful `swift test` and Example simulator builds are not mistaken for failures
 
 ### Recovery and Concurrency
 

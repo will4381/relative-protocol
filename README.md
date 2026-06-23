@@ -1,3 +1,9 @@
+<!--
+Created by Will Kusch, Relative Companies, Inc.
+Copyright (c) 2026 Relative Companies, Inc.
+Licensed for personal, non-commercial use only. See LICENSE for terms.
+-->
+
 # relative-protocol
 
 `relative-protocol` is a Swift package for packet-tunnel VPN products that need:
@@ -129,14 +135,14 @@ xcodebuild -project Example/Example.xcodeproj -scheme Example -sdk iphonesimulat
 Scripts/quality-gate.sh
 ```
 
-Known non-blocking Example build note:
+Known non-blocking local build note:
 
-Some iOS Simulator builds of the Example target may emit this linker warning even when the build succeeds:
+Some local `swift test` runs and iOS Simulator builds of the Example target may emit this linker warning even when the command succeeds:
 
 ```text
 ld: warning: reducing alignment of section __DATA,__common from 0x8000 to 0x4000 because it exceeds segment maximum alignment
 ```
 
-Treat this specific linker warning as non-blocking for now when it is the only build warning. It is tracked as cleanup work, not a release blocker. Swift compiler warnings, test failures, or any new linker warnings should still be investigated before shipping.
+Treat this specific linker warning as non-blocking for now when it is the only build warning and the command exits successfully. It is tracked as cleanup work, not a release blocker. Swift compiler warnings, test failures, or any new linker warnings should still be investigated before shipping.
 
 Use the Example app's stress matrix and load drill before releasing changes that touch tunnel startup, DNS, MTU, relay behavior, telemetry, UDP, QUIC, or path transitions.
