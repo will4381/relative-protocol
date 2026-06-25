@@ -619,6 +619,87 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertEqual(drainedSnapshot.skippedBatches, 1)
     }
 
+    /// Verifies the optional rich packet JSONL stream writes packet-level facts without requiring a detector.
+    func testPacketTelemetryWorkerWritesRichPacketLogRecords() async throws {
+        let clock = DeterministicClock(startTime: Date(timeIntervalSince1970: 123))
+        let pipeline = PacketAnalyticsPipeline(
+            clock: clock,
+            burstTracker: BurstTracker(thresholdMs: 350),
+            signatureClassifier: SignatureClassifier(logger: StructuredLogger(sink: InMemoryLogSink()))
+        )
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let richStore = RichPacketLogStore(
+            rootURL: root,
+            policy: RichPacketLogPolicy(
+                isEnabled: true,
+                includePacketBytePrefix: true,
+                packetBytePrefixLength: 4,
+                filePrefix: "debug packets"
+            )
+        )
+        let worker = PacketTelemetryWorker(
+            pipeline: pipeline,
+            clock: clock,
+            packetStream: nil,
+            detectors: [],
+            richPacketLogStore: richStore,
+            logger: StructuredLogger(sink: InMemoryLogSink()),
+            writerProcess: "unit-test-worker"
+        )
+        await worker.updateSessionContextAndWait(
+            DetectorSessionContext(
+                sessionId: "session-a",
+                packetStreamStartedAtMs: 123_000,
+                sessionTarget: "example-service"
+            )
+        )
+
+        let packet = Data(
+            makeIPv4TCPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [93, 184, 216, 34],
+                sourcePort: 50_000,
+                destinationPort: 443,
+                tcpFlags: 0x18,
+                payload: [0x17, 0x03, 0x03]
+            )
+        )
+
+        let result = worker.submit(packets: [packet], families: [], direction: .outbound)
+        XCTAssertTrue(result.accepted)
+        await worker.flushAndWait()
+
+        let records = try await richStore.readRecords()
+        let record = try XCTUnwrap(records.first)
+        XCTAssertEqual(records.count, 1)
+        XCTAssertEqual(record.schemaVersion, 1)
+        XCTAssertEqual(record.sequenceNumber, 1)
+        XCTAssertEqual(record.timestampMs, 123_000)
+        XCTAssertEqual(record.direction, .outbound)
+        XCTAssertEqual(record.writerProcess, "unit-test-worker")
+        XCTAssertEqual(record.sessionId, "session-a")
+        XCTAssertEqual(record.sessionTarget, "example-service")
+        XCTAssertEqual(record.protocolHint, "tcp")
+        XCTAssertEqual(record.packetLength, 43)
+        XCTAssertEqual(record.transportPayloadLength, 3)
+        XCTAssertEqual(record.sourceAddress, "10.0.0.2")
+        XCTAssertEqual(record.sourcePort, 50_000)
+        XCTAssertEqual(record.destinationAddress, "93.184.216.34")
+        XCTAssertEqual(record.destinationPort, 443)
+        XCTAssertEqual(record.remoteEndpoint, "tcp://93.184.216.34:443")
+        XCTAssertEqual(record.flowIdentity.remoteEndpoint, "tcp://93.184.216.34:443")
+        XCTAssertEqual(record.tcpFlags, 0x18)
+        XCTAssertEqual(record.tcpAck, true)
+        XCTAssertEqual(record.tcpPsh, true)
+        XCTAssertEqual(record.tcpSyn, false)
+        XCTAssertEqual(record.packetBytePrefixHex, "4500002b")
+        let richSnapshot = try await richStore.snapshot()
+        XCTAssertFalse(richSnapshot.files.isEmpty)
+
+        await worker.stopAndWait()
+    }
+
     /// Verifies stop waits for coalesced detector persistence before returning.
     func testPacketTelemetryWorkerStopFlushesPersistedDetections() async throws {
         let clock = DeterministicClock(startTime: Date(timeIntervalSince1970: 0))
@@ -880,7 +961,7 @@ final class AnalyticsTests: XCTestCase {
                 packetStreamStartedAtMs: 1_000,
                 foregroundReadyAtMs: 1_100,
                 appOpenAtMs: 900,
-                targetApp: "instagram"
+                sessionTarget: "example-session"
             )
         )
         let packet = Data(
@@ -1026,7 +1107,8 @@ final class AnalyticsTests: XCTestCase {
             transportPayloadLength: 35,
             tcpFlags: 0x18,
             tcpAck: true,
-            tcpPsh: true
+            tcpPsh: true,
+            packetCueReason: .tcpAckPshPayloadRange
         )
         let requirements = DetectorRequirements(recordKinds: [.packetCue])
         let collection = DetectorRecordCollection([streamRecord], projection: DetectorRecordProjection(requirements: requirements))
@@ -1041,6 +1123,7 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertEqual(record.tcpFlags, 0x18)
         XCTAssertEqual(record.tcpAck, true)
         XCTAssertEqual(record.tcpPsh, true)
+        XCTAssertEqual(record.packetCueReason, .tcpAckPshPayloadRange)
         XCTAssertEqual(record.sourceAddress, "10.0.0.2")
         XCTAssertEqual(record.sourcePort, 50_000)
         XCTAssertEqual(record.destinationAddress, "1.1.1.1")
@@ -1053,8 +1136,9 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertEqual(record.remoteAddress, "1.1.1.1")
         XCTAssertEqual(record.remotePort, 443)
         XCTAssertEqual(record.remoteEndpoint, "tcp://1.1.1.1:443")
-        XCTAssertEqual(record.role, "example.com")
-        XCTAssertEqual(record.ownerKey, "role:example.com")
+        XCTAssertEqual(record.flowIdentity?.remoteEndpoint, "tcp://1.1.1.1:443")
+        XCTAssertNil(record.role)
+        XCTAssertEqual(record.ownerKey, "endpoint:tcp://1.1.1.1:443")
     }
 
     /// Verifies remote endpoint derivation follows packet direction.
@@ -1104,13 +1188,14 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertEqual(collection[1].remoteEndpoint, "udp://203.0.113.10:443")
     }
 
-    /// Verifies topology records can expose lineage, owner, role, and scope when detectors request them.
+    /// Verifies topology records can expose lineage, owner, explicit role labels, and injected scope.
     func testTopologyRecordsProjectLineageOwnerRoleAndScope() throws {
+        let scopeFamily = "video-cdn"
         let record = makePacketStreamRecord(
             kind: .flowSlice,
             timestamp: Date(timeIntervalSince1970: 4),
             flowHash: 0xabc,
-            registrableDomain: "cdninstagram.com",
+            registrableDomain: "media.example",
             tlsServerName: nil,
             bytes: 1_200,
             packetCount: 3,
@@ -1121,8 +1206,9 @@ final class AnalyticsTests: XCTestCase {
             lineageAgeMs: 1_500,
             lineageReopenCount: 1,
             lineageSiblingCount: 4,
-            serviceFamily: "cdninstagram.com",
-            addressScopeFamily: .meta,
+            serviceFamily: "media.example",
+            role: "media-example-role",
+            addressScopeFamily: scopeFamily,
             addressScopeSource: .prefix,
             addressScopeConfidence: 0.91
         )
@@ -1138,15 +1224,16 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertEqual(projected.lineageReopenCount, 1)
         XCTAssertEqual(projected.lineageSiblingCount, 4)
         XCTAssertEqual(projected.remoteEndpoint, "udp://203.0.113.40:443")
-        XCTAssertEqual(projected.role, "cdninstagram.com")
-        XCTAssertEqual(projected.ownerKey, "role:cdninstagram.com")
-        XCTAssertEqual(projected.addressScopeFamily, .meta)
+        XCTAssertEqual(projected.role, "media-example-role")
+        XCTAssertEqual(projected.ownerKey, "endpoint:udp://203.0.113.40:443")
+        XCTAssertEqual(projected.addressScopeFamily, scopeFamily)
         XCTAssertEqual(projected.addressScopeSource, .prefix)
         XCTAssertEqual(projected.addressScopeConfidence, 0.91)
     }
 
     /// Verifies passive content-filter attribution records expose source app identity without packet fields.
     func testSourceAppFlowRecordsProjectContentFilterAttribution() throws {
+        let scopeFamily = "example-service"
         let record = makePacketStreamRecord(
             kind: .sourceAppFlow,
             timestamp: Date(timeIntervalSince1970: 5),
@@ -1157,7 +1244,9 @@ final class AnalyticsTests: XCTestCase {
             packetCount: 0,
             sourceAddress: "10.0.0.2",
             destinationAddress: "203.0.113.55",
-            sourceAppIdentifier: "com.burbn.instagram",
+            addressScopeFamily: scopeFamily,
+            addressScopeSource: .contentFilter,
+            sourceAppIdentifier: "com.example.video",
             sourceAppUniqueIdentifierHash: "hash-1",
             sourceAppVersion: "340.0",
             attributionFlowId: "filter-flow-1",
@@ -1165,7 +1254,7 @@ final class AnalyticsTests: XCTestCase {
             attributionObservedAtMs: 5_000,
             localEndpoint: "10.0.0.2:50000",
             remoteEndpoint: "tcp://203.0.113.55:443",
-            remoteHostname: "gateway.instagram.com"
+            remoteHostname: "gateway.example.com"
         )
         let requirements = DetectorRequirements(
             recordKinds: [.sourceAppFlow],
@@ -1175,7 +1264,7 @@ final class AnalyticsTests: XCTestCase {
         let projected = try XCTUnwrap(collection.first)
 
         XCTAssertEqual(projected.kind, .sourceAppFlow)
-        XCTAssertEqual(projected.sourceAppIdentifier, "com.burbn.instagram")
+        XCTAssertEqual(projected.sourceAppIdentifier, "com.example.video")
         XCTAssertEqual(projected.sourceAppUniqueIdentifierHash, "hash-1")
         XCTAssertEqual(projected.sourceAppVersion, "340.0")
         XCTAssertEqual(projected.attributionFlowId, "filter-flow-1")
@@ -1183,10 +1272,10 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertEqual(projected.attributionObservedAtMs, 5_000)
         XCTAssertEqual(projected.localEndpoint, "10.0.0.2:50000")
         XCTAssertEqual(projected.remoteEndpoint, "tcp://203.0.113.55:443")
-        XCTAssertEqual(projected.remoteHostname, "gateway.instagram.com")
-        XCTAssertEqual(projected.ownerKey, "app:com.burbn.instagram")
-        XCTAssertEqual(projected.addressScopeFamily, .meta)
-        XCTAssertEqual(projected.addressScopeSource, .sourceApp)
+        XCTAssertEqual(projected.remoteHostname, "gateway.example.com")
+        XCTAssertEqual(projected.ownerKey, "app:com.example.video")
+        XCTAssertEqual(projected.addressScopeFamily, scopeFamily)
+        XCTAssertEqual(projected.addressScopeSource, .contentFilter)
     }
 
     /// Verifies legacy detector defaults do not start receiving packet-cue records implicitly.
@@ -1236,7 +1325,14 @@ final class AnalyticsTests: XCTestCase {
             activitySampleMinimumInterval: 60,
             emitBurstEvents: false,
             emitActivitySamples: false,
-            emitPacketCues: true
+            emitPacketCues: true,
+            packetCuePolicy: PacketCueEmissionPolicy(
+                tcpPayloadLengthRange: PacketLengthRange(0...800),
+                udpPacketLengthRange: PacketLengthRange(500...1_300),
+                directions: [.outbound],
+                requireTcpAck: true,
+                requireTcpPsh: true
+            )
         )
 
         let tcpPacket = Data(
@@ -1256,6 +1352,7 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertEqual(tcpCue.tcpFlags, 0x18)
         XCTAssertEqual(tcpCue.tcpAck, true)
         XCTAssertEqual(tcpCue.tcpPsh, true)
+        XCTAssertEqual(tcpCue.packetCueReason, .tcpAckPshPayloadRange)
         XCTAssertEqual(tcpCue.sourcePort, 50_000)
         XCTAssertEqual(tcpCue.destinationPort, 443)
 
@@ -1276,12 +1373,14 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertNil(udpCue.tcpFlags)
         XCTAssertNil(udpCue.tcpAck)
         XCTAssertNil(udpCue.tcpPsh)
+        XCTAssertEqual(udpCue.packetCueReason, .udpPacketLengthRange)
         XCTAssertEqual(udpCue.protocolHint, "udp")
     }
 
     /// Verifies no-role traffic can still carry address scope when a supplied prefix catalog knows the remote IP.
     func testPacketAnalyticsPipelineAddsAddressScopeFromConfiguredPrefixes() async throws {
-        let prefix = try XCTUnwrap(AddressScopePrefix(cidr: "203.0.113.0/24", family: .meta, confidence: 0.88))
+        let scopeFamily = "video-cdn"
+        let prefix = try XCTUnwrap(AddressScopePrefix(cidr: "203.0.113.0/24", family: scopeFamily, confidence: 0.88))
         let clock = DeterministicClock(startTime: Date(timeIntervalSince1970: 0))
         let pipeline = PacketAnalyticsPipeline(
             clock: clock,
@@ -1316,7 +1415,7 @@ final class AnalyticsTests: XCTestCase {
         let records = await pipeline.ingest(packets: [packet], families: [], direction: .outbound, policy: policy)
         let flowOpen = try XCTUnwrap(records.first(where: { $0.kind == .flowOpen }))
 
-        XCTAssertEqual(flowOpen.addressScopeFamily, .meta)
+        XCTAssertEqual(flowOpen.addressScopeFamily, scopeFamily)
         XCTAssertEqual(flowOpen.addressScopeSource, .prefix)
         XCTAssertEqual(flowOpen.addressScopeConfidence, 0.88)
         XCTAssertNil(flowOpen.registrableDomain)
@@ -1340,7 +1439,13 @@ final class AnalyticsTests: XCTestCase {
             pipeline: pipeline,
             packetStream: nil,
             detectors: [legacyDetector, packetCueDetector],
-            logger: StructuredLogger(sink: InMemoryLogSink())
+            logger: StructuredLogger(sink: InMemoryLogSink()),
+            packetCuePolicy: PacketCueEmissionPolicy(
+                tcpPayloadLengthRange: PacketLengthRange(0...800),
+                directions: [.outbound],
+                requireTcpAck: true,
+                requireTcpPsh: true
+            )
         )
 
         let packet = Data(
@@ -1360,6 +1465,90 @@ final class AnalyticsTests: XCTestCase {
 
         XCTAssertEqual(legacyDetector.recordedKinds(), [.flowOpen])
         XCTAssertEqual(packetCueDetector.recordedKinds(), [.packetCue])
+    }
+
+    /// Verifies packet cues can be exported through the app-facing live tap when explicitly configured.
+    func testPacketTelemetryWorkerPublishesPacketCuesHealthAndLivenessIntoLiveTap() async throws {
+        let clock = DeterministicClock(startTime: Date(timeIntervalSince1970: 0))
+        let pipeline = PacketAnalyticsPipeline(
+            clock: clock,
+            burstTracker: BurstTracker(thresholdMs: 350),
+            signatureClassifier: SignatureClassifier(logger: StructuredLogger(sink: InMemoryLogSink()))
+        )
+        let packetStream = PacketSampleStream(
+            maxBytes: 64 * 1_024,
+            clock: clock,
+            logger: StructuredLogger(sink: InMemoryLogSink())
+        )
+        let worker = PacketTelemetryWorker(
+            pipeline: pipeline,
+            packetStream: packetStream,
+            detectors: [],
+            logger: StructuredLogger(sink: InMemoryLogSink()),
+            includePacketCuesInLiveTap: true,
+            packetCuePolicy: PacketCueEmissionPolicy(
+                tcpPayloadLengthRange: PacketLengthRange(0...800),
+                directions: [.outbound],
+                requireTcpAck: true,
+                requireTcpPsh: true
+            )
+        )
+
+        let packet = Data(
+            makeIPv4TCPPacket(
+                sourceAddress: [10, 0, 0, 2],
+                destinationAddress: [1, 1, 1, 1],
+                sourcePort: 50_000,
+                destinationPort: 443,
+                tcpFlags: 0x18,
+                payload: Array(repeating: 0x17, count: 35)
+            )
+        )
+
+        XCTAssertTrue(worker.submit(packets: [packet], families: [], direction: .outbound).accepted)
+        await worker.flushAndWait()
+        let snapshot = await worker.recentSnapshot(limit: 10, includeValidationRecords: true)
+        await worker.stopAndWait()
+
+        let cue = try XCTUnwrap(snapshot.samples.first { $0.kind == .packetCue })
+        XCTAssertEqual(cue.packetLength, packet.count)
+        XCTAssertEqual(cue.transportPayloadLength, 35)
+        XCTAssertEqual(cue.tcpAck, true)
+        XCTAssertEqual(cue.tcpPsh, true)
+        XCTAssertEqual(cue.packetCueReason, .tcpAckPshPayloadRange)
+        XCTAssertEqual(cue.remoteEndpoint, "tcp://1.1.1.1:443")
+        XCTAssertEqual(cue.flowIdentity?.remoteEndpoint, "tcp://1.1.1.1:443")
+        XCTAssertTrue(snapshot.validationRecords.contains { $0.kind == .packetCue })
+        XCTAssertTrue(snapshot.health?.availableFeatureFamilies.contains("packetDetails") == true)
+        XCTAssertFalse(snapshot.health?.missingFeatureFamilies.contains("packetDetails") == true)
+        XCTAssertEqual(snapshot.liveness?.sessionId, nil)
+        XCTAssertNotNil(snapshot.liveness?.streamStartedAtMs)
+        XCTAssertNotNil(snapshot.liveness?.lastRecordAtMs)
+        XCTAssertGreaterThan(snapshot.liveness?.sequenceNumber ?? 0, 0)
+
+        let responseData = try TunnelTelemetryMessageCodec.encodeResponse(.snapshot(snapshot))
+        let decodedResponse = try TunnelTelemetryMessageCodec.decodeResponse(responseData)
+        let decodedSnapshot = try XCTUnwrap(decodedResponse.snapshot)
+        let decodedCue = try XCTUnwrap(decodedSnapshot.samples.first { $0.kind == .packetCue })
+        XCTAssertEqual(decodedCue.packetLength, packet.count)
+        XCTAssertEqual(decodedCue.transportPayloadLength, 35)
+        XCTAssertEqual(decodedCue.timestampMs, cue.timestampMs)
+        XCTAssertEqual(decodedSnapshot.liveness?.sequenceNumber, snapshot.liveness?.sequenceNumber)
+        XCTAssertEqual(decodedSnapshot.liveness?.lastRecordAtMs, snapshot.liveness?.lastRecordAtMs)
+        XCTAssertTrue(decodedSnapshot.validationRecords.contains { $0.kind == .packetCue && $0.timestampMs == cue.timestampMs })
+
+        let exportedObject = try XCTUnwrap(JSONSerialization.jsonObject(with: responseData) as? [String: Any])
+        let exportedSnapshot = try XCTUnwrap(exportedObject["snapshot"] as? [String: Any])
+        let exportedLiveness = try XCTUnwrap(exportedSnapshot["liveness"] as? [String: Any])
+        XCTAssertNotNil(exportedLiveness["sequenceNumber"])
+        XCTAssertNotNil(exportedLiveness["lastRecordAtMs"])
+        let exportedSamples = try XCTUnwrap(exportedSnapshot["samples"] as? [[String: Any]])
+        let exportedCue = try XCTUnwrap(exportedSamples.first { $0["kind"] as? String == PacketSampleKind.packetCue.rawValue })
+        XCTAssertNotNil(exportedCue["timestampMs"])
+        XCTAssertEqual((exportedCue["packetLength"] as? NSNumber)?.intValue, packet.count)
+        XCTAssertEqual((exportedCue["transportPayloadLength"] as? NSNumber)?.intValue, 35)
+        let exportedValidationRecords = try XCTUnwrap(exportedSnapshot["validationRecords"] as? [[String: Any]])
+        XCTAssertTrue(exportedValidationRecords.contains { $0["kind"] as? String == PacketSampleKind.packetCue.rawValue && $0["timestampMs"] != nil })
     }
 
     /// Verifies DNS answers can be reused to attribute later hostless UDP/443 traffic and derive service-family hints.
@@ -1835,12 +2024,12 @@ final class AnalyticsTests: XCTestCase {
             id: "event-1",
             detectorIdentifier: "packet-detector",
             signal: "swipe-cue",
-            target: "instagram",
+            target: "example-target",
             timestamp: Date(timeIntervalSince1970: 20),
             confidence: 0.91,
             trigger: "packetCue",
             flowId: "flow-1",
-            host: "cdninstagram.com",
+            host: "media.example",
             classification: nil,
             bytes: 896,
             packetCount: 1,
@@ -1853,7 +2042,7 @@ final class AnalyticsTests: XCTestCase {
                 sourcePacketTime: Date(timeIntervalSince1970: 19.95),
                 reason: "outbound-udp-length-rank",
                 ownerKey: "endpoint:udp://203.0.113.40:443",
-                role: "cdninstagram.com",
+                role: "media-example-role",
                 packetLength: 896,
                 payloadLength: 868,
                 flowId: "flow-1",
@@ -2070,6 +2259,46 @@ final class AnalyticsTests: XCTestCase {
         }
     }
 
+    /// Verifies newer host code tolerates older snapshot payloads that predate validation records.
+    func testTunnelTelemetrySnapshotDecodesWithoutValidationFields() throws {
+        let payload = """
+        {
+          "version": 1,
+          "kind": "snapshot",
+          "snapshot": {
+            "samples": [],
+            "retainedSampleCount": 0,
+            "retainedBytes": 0,
+            "oldestSampleAt": null,
+            "latestSampleAt": null,
+            "acceptedBatches": 0,
+            "queuedBatches": 0,
+            "queuedBytes": 0,
+            "droppedBatches": 0,
+            "skippedBatches": 0,
+            "bufferedRecords": 0,
+            "thermalState": "nominal",
+            "lowPowerModeEnabled": false,
+            "detections": {
+              "updatedAt": null,
+              "totalDetectionCount": 0,
+              "countsByDetector": {},
+              "countsByTarget": {},
+              "recentEvents": []
+            }
+          },
+          "message": null
+        }
+        """.data(using: .utf8)!
+
+        let response = try TunnelTelemetryMessageCodec.decodeResponse(payload)
+        let snapshot = try XCTUnwrap(response.snapshot)
+
+        XCTAssertNil(snapshot.health)
+        XCTAssertNil(snapshot.liveness)
+        XCTAssertEqual(snapshot.validationRecords, [])
+    }
+
     private func estimatedRecordSize(_ sample: PacketSample) -> Int {
         PacketSampleStream.estimatedRecordSize(for: sample)
     }
@@ -2129,7 +2358,7 @@ final class AnalyticsTests: XCTestCase {
         serviceAttributionSourceMask: UInt16? = nil,
         sessionContext: DetectorSessionContext? = nil,
         role: String? = nil,
-        addressScopeFamily: AddressScopeFamily? = nil,
+        addressScopeFamily: String? = nil,
         addressScopeSource: AddressScopeSource? = nil,
         addressScopeConfidence: Double? = nil,
         sourceAppIdentifier: String? = nil,

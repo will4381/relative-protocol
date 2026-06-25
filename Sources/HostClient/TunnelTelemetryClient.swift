@@ -63,16 +63,31 @@ public struct TunnelTelemetryClient: Sendable {
 
     public init() {}
 
-    public func snapshot(from connection: NEVPNConnection, packetLimit: Int? = nil) async throws -> TunnelTelemetrySnapshot {
+    public func snapshot(
+        from connection: NEVPNConnection,
+        packetLimit: Int? = nil,
+        includeValidationRecords: Bool? = nil
+    ) async throws -> TunnelTelemetrySnapshot {
         guard let session = connection as? NETunnelProviderSession else {
             throw TunnelTelemetryClientError.invalidSession
         }
-        return try await snapshot(from: session, packetLimit: packetLimit)
+        return try await snapshot(
+            from: session,
+            packetLimit: packetLimit,
+            includeValidationRecords: includeValidationRecords
+        )
     }
 
-    public func snapshot(from session: NETunnelProviderSession, packetLimit: Int? = nil) async throws -> TunnelTelemetrySnapshot {
+    public func snapshot(
+        from session: NETunnelProviderSession,
+        packetLimit: Int? = nil,
+        includeValidationRecords: Bool? = nil
+    ) async throws -> TunnelTelemetrySnapshot {
         let response = try await send(
-            TunnelTelemetryRequest.snapshot(packetLimit: packetLimit),
+            TunnelTelemetryRequest.snapshot(
+                packetLimit: packetLimit,
+                includeValidationRecords: includeValidationRecords
+            ),
             through: session
         )
         switch response.kind {

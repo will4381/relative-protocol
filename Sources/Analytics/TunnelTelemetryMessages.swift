@@ -72,19 +72,26 @@ public struct TunnelTelemetryRequest: Codable, Sendable, Equatable {
     public let version: Int
     public let command: TunnelTelemetryCommand
     public let packetLimit: Int?
+    public let includeValidationRecords: Bool?
 
     public init(
         version: Int = TunnelTelemetryProtocolVersion.current,
         command: TunnelTelemetryCommand,
-        packetLimit: Int? = nil
+        packetLimit: Int? = nil,
+        includeValidationRecords: Bool? = nil
     ) {
         self.version = version
         self.command = command
         self.packetLimit = packetLimit
+        self.includeValidationRecords = includeValidationRecords
     }
 
-    public static func snapshot(packetLimit: Int? = nil) -> TunnelTelemetryRequest {
-        TunnelTelemetryRequest(command: .snapshot, packetLimit: packetLimit)
+    public static func snapshot(packetLimit: Int? = nil, includeValidationRecords: Bool? = nil) -> TunnelTelemetryRequest {
+        TunnelTelemetryRequest(
+            command: .snapshot,
+            packetLimit: packetLimit,
+            includeValidationRecords: includeValidationRecords
+        )
     }
 
     public static let clearRecentEvents = TunnelTelemetryRequest(command: .clearRecentEvents)
@@ -96,6 +103,26 @@ public struct TunnelTelemetryRequest: Codable, Sendable, Equatable {
 /// Ownership: this payload is intentionally compact so it can cross `sendProviderMessage` without turning the app
 /// refresh path into another always-on telemetry hotspot.
 public struct TunnelTelemetrySnapshot: Codable, Sendable, Equatable {
+    enum CodingKeys: String, CodingKey {
+        case samples
+        case retainedSampleCount
+        case retainedBytes
+        case oldestSampleAt
+        case latestSampleAt
+        case acceptedBatches
+        case queuedBatches
+        case queuedBytes
+        case droppedBatches
+        case skippedBatches
+        case bufferedRecords
+        case thermalState
+        case lowPowerModeEnabled
+        case detections
+        case health
+        case liveness
+        case validationRecords
+    }
+
     public let samples: [PacketSample]
     public let retainedSampleCount: Int
     public let retainedBytes: Int
@@ -110,6 +137,9 @@ public struct TunnelTelemetrySnapshot: Codable, Sendable, Equatable {
     public let thermalState: TunnelThermalState
     public let lowPowerModeEnabled: Bool
     public let detections: DetectionSnapshot
+    public let health: TelemetryHealthRecord?
+    public let liveness: TelemetryStreamLiveness?
+    public let validationRecords: [PacketSample]
 
     public init(
         samples: [PacketSample],
@@ -125,7 +155,10 @@ public struct TunnelTelemetrySnapshot: Codable, Sendable, Equatable {
         bufferedRecords: Int,
         thermalState: TunnelThermalState,
         lowPowerModeEnabled: Bool,
-        detections: DetectionSnapshot
+        detections: DetectionSnapshot,
+        health: TelemetryHealthRecord? = nil,
+        liveness: TelemetryStreamLiveness? = nil,
+        validationRecords: [PacketSample] = []
     ) {
         self.samples = samples
         self.retainedSampleCount = retainedSampleCount
@@ -141,6 +174,30 @@ public struct TunnelTelemetrySnapshot: Codable, Sendable, Equatable {
         self.thermalState = thermalState
         self.lowPowerModeEnabled = lowPowerModeEnabled
         self.detections = detections
+        self.health = health
+        self.liveness = liveness
+        self.validationRecords = validationRecords
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.samples = try container.decode([PacketSample].self, forKey: .samples)
+        self.retainedSampleCount = try container.decode(Int.self, forKey: .retainedSampleCount)
+        self.retainedBytes = try container.decode(Int.self, forKey: .retainedBytes)
+        self.oldestSampleAt = try container.decodeIfPresent(Date.self, forKey: .oldestSampleAt)
+        self.latestSampleAt = try container.decodeIfPresent(Date.self, forKey: .latestSampleAt)
+        self.acceptedBatches = try container.decode(Int.self, forKey: .acceptedBatches)
+        self.queuedBatches = try container.decode(Int.self, forKey: .queuedBatches)
+        self.queuedBytes = try container.decode(Int.self, forKey: .queuedBytes)
+        self.droppedBatches = try container.decode(Int.self, forKey: .droppedBatches)
+        self.skippedBatches = try container.decode(Int.self, forKey: .skippedBatches)
+        self.bufferedRecords = try container.decode(Int.self, forKey: .bufferedRecords)
+        self.thermalState = try container.decode(TunnelThermalState.self, forKey: .thermalState)
+        self.lowPowerModeEnabled = try container.decode(Bool.self, forKey: .lowPowerModeEnabled)
+        self.detections = try container.decode(DetectionSnapshot.self, forKey: .detections)
+        self.health = try container.decodeIfPresent(TelemetryHealthRecord.self, forKey: .health)
+        self.liveness = try container.decodeIfPresent(TelemetryStreamLiveness.self, forKey: .liveness)
+        self.validationRecords = try container.decodeIfPresent([PacketSample].self, forKey: .validationRecords) ?? []
     }
 
     public static let empty = TunnelTelemetrySnapshot(
@@ -157,7 +214,10 @@ public struct TunnelTelemetrySnapshot: Codable, Sendable, Equatable {
         bufferedRecords: 0,
         thermalState: .unknown,
         lowPowerModeEnabled: false,
-        detections: .empty
+        detections: .empty,
+        health: nil,
+        liveness: nil,
+        validationRecords: []
     )
 }
 

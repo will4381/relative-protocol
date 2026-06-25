@@ -40,9 +40,9 @@ public struct DetectorFeatureFamily: OptionSet, Sendable, Hashable {
     public static let sessionContext = DetectorFeatureFamily(rawValue: 1 << 12)
     /// Explicit remote endpoint and owner keys derived from packet direction and endpoints.
     public static let remoteEndpoint = DetectorFeatureFamily(rawValue: 1 << 13)
-    /// Normalized role string derived from service, host, DNS, and classification hints.
+    /// Optional app-supplied role label projection. The package does not classify platforms or companies.
     public static let roleAttribution = DetectorFeatureFamily(rawValue: 1 << 14)
-    /// Address or role scope family used when host role strings are missing.
+    /// App-injected or prefix-classifier scope labels used when host strings are missing.
     public static let addressScope = DetectorFeatureFamily(rawValue: 1 << 15)
     /// Stable typed detector-fire audit records on detection events.
     public static let eventAudit = DetectorFeatureFamily(rawValue: 1 << 16)
@@ -125,7 +125,7 @@ internal struct DetectorRuntimePlan: Sendable {
     let flowSliceIntervalMs: Int
     let liveTapFeatureFamilies: DetectorFeatureFamily
 
-    init(detectors: [any TrafficDetector], liveTapEnabled: Bool) {
+    init(detectors: [any TrafficDetector], liveTapEnabled: Bool, includePacketCuesInLiveTap: Bool = false) {
         var requirementsByIdentifier: [String: DetectorRequirements] = [:]
         var unionRecordKinds: Set<PacketSampleKind> = []
         var unionFeatureFamilies: DetectorFeatureFamily = []
@@ -144,13 +144,19 @@ internal struct DetectorRuntimePlan: Sendable {
         if liveTapEnabled {
             unionRecordKinds.formUnion(Self.liveTapRecordKinds)
             unionFeatureFamilies.formUnion(Self.liveTapFeatureFamilies)
+            if includePacketCuesInLiveTap {
+                unionRecordKinds.insert(.packetCue)
+                unionFeatureFamilies.formUnion(Self.packetCueLiveTapFeatureFamilies)
+            }
         }
 
         self.detectorRequirements = requirementsByIdentifier
         self.unionRecordKinds = unionRecordKinds
         self.unionFeatureFamilies = unionFeatureFamilies
         self.flowSliceIntervalMs = preferredFlowSliceIntervals.min() ?? 250
-        self.liveTapFeatureFamilies = liveTapEnabled ? Self.liveTapFeatureFamilies : []
+        self.liveTapFeatureFamilies = liveTapEnabled
+            ? Self.liveTapFeatureFamilies.union(includePacketCuesInLiveTap ? Self.packetCueLiveTapFeatureFamilies : [])
+            : []
     }
 
     private static let liveTapRecordKinds: Set<PacketSampleKind> = [
@@ -168,6 +174,14 @@ internal struct DetectorRuntimePlan: Sendable {
         .hostHints,
         .quicIdentity,
         .dnsAnswerAddresses
+    ]
+
+    private static let packetCueLiveTapFeatureFamilies: DetectorFeatureFamily = [
+        .packetDetails,
+        .stringAddresses,
+        .remoteEndpoint,
+        .hostHints,
+        .dnsAssociation
     ]
 
     func projection(for detector: any TrafficDetector) -> DetectorRecordProjection {

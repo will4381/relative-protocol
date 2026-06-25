@@ -23,6 +23,8 @@ Recommended baseline:
 - keep `telemetryEnabled = true` in production so detectors, stop breadcrumbs, health samples, and bounded logs exist when something goes wrong
 - keep `liveTapEnabled = true` for support/debug builds
 - keep `liveTapIncludeFlowSlices = false` unless you are intentionally collecting richer foreground diagnostics
+- keep `liveTapIncludePacketCues = false` unless an app-side detector or validation run needs exact packet cues
+- keep `liveTapIncludeValidationRecords = false` outside scoring/QA builds
 - read `TunnelStopStore` and JSONL logs after every unexpected disconnect before changing tunnel behavior
 
 ## DNS Policy
@@ -70,8 +72,13 @@ Current package defaults:
 - default live tap does not publish `flowSlice`
 - default live tap does not publish `packetCue`
 - default `liveTapIncludeFlowSlices`: `false`
+- default `liveTapIncludePacketCues`: `false`
+- default `liveTapIncludeValidationRecords`: `false`
+- default `packetCuePolicy`: disabled
+- default `telemetryReduceOnLowPowerMode`: `true`
+- default `telemetryReduceOnThermalPressure`: `true`
 - health sample interval: `60s`
-- more aggressive telemetry backoff at elevated thermal states
+- more aggressive telemetry backoff when enabled pressure policies apply
 
 These defaults bias toward tunnel stability and battery efficiency over exhaustive logging.
 
@@ -81,6 +88,13 @@ The worker reads:
 
 - `ProcessInfo.thermalState`
 - `ProcessInfo.isLowPowerModeEnabled`
+
+Telemetry reduction is controlled by `TelemetryDegradationPolicy`:
+
+- `reduceOnLowPowerMode`
+- `reduceOnThermalPressure`
+
+`TunnelProfile` persists these through `telemetryReduceOnLowPowerMode` and `telemetryReduceOnThermalPressure`. Leave both enabled for production battery/thermal safety, or disable one side for validation runs that need stable detector fields under that condition.
 
 Policy shape:
 
@@ -141,11 +155,13 @@ Inspect both:
 
 1. live tap snapshots from `TunnelTelemetryClient`
 2. persisted detection summaries from `TunnelDetectionStore`
+3. optional rich packet JSONL from `TunnelRichPacketLogStore` when `RichPacketLogPolicy.isEnabled`
 
 That split matters:
 
 - live tap explains the last few seconds
 - persisted detections explain long background spans
+- rich packet logs explain packet-level parser and endpoint facts during explicit debug runs
 
 Useful questions:
 
@@ -156,6 +172,14 @@ Useful questions:
 5. did shed mode materially affect the detector?
 
 If a foreground snapshot shows `0` `flowSlice` rows, that is expected with default package policy.
+
+Use rich packet logging only for bounded debug sessions. It writes under:
+
+```text
+<AppGroup>/Analytics/RichPacketLogs/
+```
+
+Keep packet byte-prefix logging disabled unless you intentionally need a short payload prefix for parser development.
 
 ## On-Device Stress Matrix
 

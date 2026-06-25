@@ -10,6 +10,7 @@ import Foundation
 public struct DetectorRecord: Sendable, Equatable {
     public let kind: PacketSampleKind
     public let timestamp: Date
+    public let timestampMs: Double
     public let direction: String
     public let bytes: Int
     public let packetCount: Int?
@@ -83,31 +84,33 @@ public struct DetectorRecord: Sendable, Equatable {
     public let tcpFlags: UInt8?
     public let tcpAck: Bool?
     public let tcpPsh: Bool?
+    public let packetCueReason: PacketCueReason?
     public let sessionId: String?
     public let packetStreamStartedAtMs: Double?
     public let foregroundReadyAtMs: Double?
     public let appOpenAtMs: Double?
-    public let targetApp: String?
+    public let sessionTarget: String?
     public let remoteAddress: String?
     public let remotePort: UInt16?
     public let remoteEndpoint: String?
     public let ownerKey: String?
+    public let flowIdentity: FlowIdentity?
     public let role: String?
-    public let addressScopeFamily: AddressScopeFamily?
+    public let addressScopeFamily: String?
     public let addressScopeSource: AddressScopeSource?
     public let addressScopeConfidence: Double?
+    public let sourceBundleId: String?
     public let sourceAppIdentifier: String?
     public let sourceAppUniqueIdentifierHash: String?
     public let sourceAppVersion: String?
     public let attributionFlowId: String?
     public let attributionSource: SourceAppAttributionSource?
     public let attributionObservedAtMs: Double?
+    public let attributionStartTimeMs: Double?
+    public let attributionEndTimeMs: Double?
+    public let attributionConfidence: Double?
     public let localEndpoint: String?
     public let remoteHostname: String?
-
-    public var timestampMs: Double {
-        timestamp.timeIntervalSince1970 * 1_000
-    }
 
     public var transportProtocol: TransportProtocol? {
         transportProtocolNumber.map(TransportProtocol.init(rawValue:))
@@ -154,6 +157,7 @@ public struct DetectorRecord: Sendable, Equatable {
     public init(
         kind: PacketSampleKind,
         timestamp: Date,
+        timestampMs: Double? = nil,
         direction: String,
         bytes: Int,
         packetCount: Int?,
@@ -221,26 +225,33 @@ public struct DetectorRecord: Sendable, Equatable {
         tcpFlags: UInt8? = nil,
         tcpAck: Bool? = nil,
         tcpPsh: Bool? = nil,
+        packetCueReason: PacketCueReason? = nil,
         sessionContext: DetectorSessionContext? = nil,
         remoteAddress: String? = nil,
         remotePort: UInt16? = nil,
         remoteEndpoint: String? = nil,
         ownerKey: String? = nil,
+        flowIdentity: FlowIdentity? = nil,
         role: String? = nil,
-        addressScopeFamily: AddressScopeFamily? = nil,
+        addressScopeFamily: String? = nil,
         addressScopeSource: AddressScopeSource? = nil,
         addressScopeConfidence: Double? = nil,
+        sourceBundleId: String? = nil,
         sourceAppIdentifier: String? = nil,
         sourceAppUniqueIdentifierHash: String? = nil,
         sourceAppVersion: String? = nil,
         attributionFlowId: String? = nil,
         attributionSource: SourceAppAttributionSource? = nil,
         attributionObservedAtMs: Double? = nil,
+        attributionStartTimeMs: Double? = nil,
+        attributionEndTimeMs: Double? = nil,
+        attributionConfidence: Double? = nil,
         localEndpoint: String? = nil,
         remoteHostname: String? = nil
     ) {
         self.kind = kind
         self.timestamp = timestamp
+        self.timestampMs = timestampMs ?? timestamp.timeIntervalSince1970 * 1_000
         self.direction = direction
         self.bytes = bytes
         self.packetCount = packetCount
@@ -314,11 +325,12 @@ public struct DetectorRecord: Sendable, Equatable {
         self.tcpFlags = tcpFlags
         self.tcpAck = tcpAck
         self.tcpPsh = tcpPsh
+        self.packetCueReason = packetCueReason
         self.sessionId = sessionContext?.sessionId
         self.packetStreamStartedAtMs = sessionContext?.packetStreamStartedAtMs
         self.foregroundReadyAtMs = sessionContext?.foregroundReadyAtMs
         self.appOpenAtMs = sessionContext?.appOpenAtMs
-        self.targetApp = sessionContext?.targetApp
+        self.sessionTarget = sessionContext?.sessionTarget
         let flowIdentifier = Self.makeFlowId(textFlowId: textFlowId, flowHash: flowHash)
         let derivedRemoteAddress = remoteAddress ?? DetectorRecordDerivation.remoteAddress(
             direction: direction,
@@ -335,48 +347,40 @@ public struct DetectorRecord: Sendable, Equatable {
             address: derivedRemoteAddress,
             port: derivedRemotePort
         )
-        let derivedRole = role ?? DetectorRecordDerivation.role(
-            serviceFamily: serviceFamily,
-            associatedDomain: associatedDomain,
-            registrableDomain: registrableDomain,
-            tlsServerName: tlsServerName,
-            dnsQueryName: dnsQueryName,
-            dnsCname: dnsCname,
-            classification: classification
-        )
-        let derivedScopeFamily = DetectorRecordDerivation.scopeFamily(
-            sourceAppIdentifier: sourceAppIdentifier,
-            role: derivedRole,
-            hosts: [associatedDomain, registrableDomain, tlsServerName, dnsQueryName, dnsCname]
-        )
-        let derivedScopeSource: AddressScopeSource? = {
-            guard derivedScopeFamily != nil else { return nil }
-            let sourceAppScope = DetectorRecordDerivation.scopeFamily(
-                sourceAppIdentifier: sourceAppIdentifier,
-                role: nil,
-                hosts: []
-            )
-            return sourceAppScope == nil ? .role : .sourceApp
-        }()
         self.remoteAddress = derivedRemoteAddress
         self.remotePort = derivedRemotePort
         self.remoteEndpoint = derivedRemoteEndpoint
+        self.flowIdentity = flowIdentity ?? DetectorRecordDerivation.flowIdentity(
+            protocolHint: protocolHint,
+            direction: direction,
+            sourceAddress: sourceAddress,
+            sourcePort: sourcePort,
+            destinationAddress: destinationAddress,
+            destinationPort: destinationPort,
+            flowId: flowIdentifier,
+            lineageId: lineageID,
+            generation: lineageGeneration
+        )
         self.ownerKey = ownerKey ?? DetectorRecordDerivation.ownerKey(
+            sourceBundleId: sourceBundleId,
             sourceAppIdentifier: sourceAppIdentifier,
-            role: derivedRole,
             remoteEndpoint: derivedRemoteEndpoint,
             flowId: flowIdentifier
         )
-        self.role = derivedRole
-        self.addressScopeFamily = addressScopeFamily ?? derivedScopeFamily
-        self.addressScopeSource = addressScopeSource ?? derivedScopeSource
-        self.addressScopeConfidence = addressScopeConfidence ?? (derivedScopeFamily == nil ? nil : 0.66)
+        self.role = role
+        self.addressScopeFamily = addressScopeFamily
+        self.addressScopeSource = addressScopeSource
+        self.addressScopeConfidence = addressScopeConfidence
+        self.sourceBundleId = sourceBundleId
         self.sourceAppIdentifier = sourceAppIdentifier
         self.sourceAppUniqueIdentifierHash = sourceAppUniqueIdentifierHash
         self.sourceAppVersion = sourceAppVersion
         self.attributionFlowId = attributionFlowId
         self.attributionSource = attributionSource
         self.attributionObservedAtMs = attributionObservedAtMs
+        self.attributionStartTimeMs = attributionStartTimeMs
+        self.attributionEndTimeMs = attributionEndTimeMs
+        self.attributionConfidence = attributionConfidence
         self.localEndpoint = localEndpoint
         self.remoteHostname = remoteHostname
     }
@@ -402,6 +406,7 @@ public struct DetectorRecord: Sendable, Equatable {
 
         self.kind = record.kind
         self.timestamp = record.timestamp
+        self.timestampMs = record.timestampMs ?? record.timestamp.timeIntervalSince1970 * 1_000
         self.direction = record.direction
         self.bytes = record.bytes
         self.packetCount = record.packetCount
@@ -475,11 +480,12 @@ public struct DetectorRecord: Sendable, Equatable {
         self.tcpFlags = includePacketCueFields ? record.tcpFlags : nil
         self.tcpAck = includePacketCueFields ? record.tcpAck : nil
         self.tcpPsh = includePacketCueFields ? record.tcpPsh : nil
+        self.packetCueReason = includePacketCueFields ? record.packetCueReason : nil
         self.sessionId = includeSessionContext ? record.sessionId : nil
         self.packetStreamStartedAtMs = includeSessionContext ? record.packetStreamStartedAtMs : nil
         self.foregroundReadyAtMs = includeSessionContext ? record.foregroundReadyAtMs : nil
         self.appOpenAtMs = includeSessionContext ? record.appOpenAtMs : nil
-        self.targetApp = includeSessionContext ? record.targetApp : nil
+        self.sessionTarget = includeSessionContext ? record.sessionTarget : nil
 
         let decodedSourceAddress = includeRemoteEndpoint ? PacketSampleStream.decodedAddress(
             length: includeStringAddresses ? record.sourceAddressLength : nil,
@@ -511,56 +517,41 @@ public struct DetectorRecord: Sendable, Equatable {
         self.remoteAddress = derivedRemoteAddress
         self.remotePort = derivedRemotePort
         self.remoteEndpoint = derivedRemoteEndpoint
-
-        let derivedRole = includeRoleAttribution ? record.role ?? DetectorRecordDerivation.role(
-            serviceFamily: record.serviceFamily,
-            associatedDomain: record.associatedDomain,
-            registrableDomain: record.registrableDomain,
-            tlsServerName: record.tlsServerName,
-            dnsQueryName: record.dnsQueryName,
-            dnsCname: record.dnsCname,
-            classification: record.classification
+        let flowIdentifier = Self.makeFlowId(textFlowId: record.textFlowId, flowHash: record.flowHash)
+        self.flowIdentity = includeRemoteEndpoint ? record.flowIdentity ?? DetectorRecordDerivation.flowIdentity(
+            protocolHint: record.protocolHint,
+            direction: record.direction,
+            sourceAddress: decodedSourceAddress,
+            sourcePort: record.sourcePort,
+            destinationAddress: decodedDestinationAddress,
+            destinationPort: record.destinationPort,
+            flowId: flowIdentifier,
+            lineageId: includeLineage ? record.lineageID : nil,
+            generation: includeLineage ? record.lineageGeneration : nil
         ) : nil
-        self.role = derivedRole
-
-        let derivedScopeFamily = includeAddressScope ? DetectorRecordDerivation.scopeFamily(
-            sourceAppIdentifier: includeSourceAppAttribution ? record.sourceAppIdentifier : nil,
-            role: derivedRole,
-            hosts: [
-                includeDNSAssociation ? record.associatedDomain : nil,
-                includeHostHints ? record.registrableDomain : nil,
-                includeHostHints ? record.tlsServerName : nil,
-                includeHostHints ? record.dnsQueryName : nil,
-                includeHostHints ? record.dnsCname : nil
-            ]
-        ) : nil
-        let derivedScopeSource: AddressScopeSource? = {
-            guard includeAddressScope, derivedScopeFamily != nil else { return nil }
-            let sourceAppScope = DetectorRecordDerivation.scopeFamily(
-                sourceAppIdentifier: includeSourceAppAttribution ? record.sourceAppIdentifier : nil,
-                role: nil,
-                hosts: []
-            )
-            return sourceAppScope == nil ? .role : .sourceApp
-        }()
-        self.addressScopeFamily = includeAddressScope ? record.addressScopeFamily ?? derivedScopeFamily : nil
-        self.addressScopeSource = includeAddressScope ? record.addressScopeSource ?? derivedScopeSource : nil
-        self.addressScopeConfidence = includeAddressScope ? record.addressScopeConfidence ?? (derivedScopeFamily == nil ? nil : 0.66) : nil
+        self.role = includeRoleAttribution ? record.role : nil
+        self.addressScopeFamily = includeAddressScope ? record.addressScopeFamily : nil
+        self.addressScopeSource = includeAddressScope ? record.addressScopeSource : nil
+        self.addressScopeConfidence = includeAddressScope ? record.addressScopeConfidence : nil
 
         let projectedSourceAppIdentifier = includeSourceAppAttribution ? record.sourceAppIdentifier : nil
+        self.sourceBundleId = includeSourceAppAttribution ? record.sourceBundleId : nil
         self.sourceAppIdentifier = projectedSourceAppIdentifier
         self.sourceAppUniqueIdentifierHash = includeSourceAppAttribution ? record.sourceAppUniqueIdentifierHash : nil
         self.sourceAppVersion = includeSourceAppAttribution ? record.sourceAppVersion : nil
         self.attributionFlowId = includeSourceAppAttribution ? record.attributionFlowId : nil
         self.attributionSource = includeSourceAppAttribution ? record.attributionSource : nil
         self.attributionObservedAtMs = includeSourceAppAttribution ? record.attributionObservedAtMs : nil
+        self.attributionStartTimeMs = includeSourceAppAttribution ? record.attributionStartTimeMs : nil
+        self.attributionEndTimeMs = includeSourceAppAttribution ? record.attributionEndTimeMs : nil
+        self.attributionConfidence = includeSourceAppAttribution ? record.attributionConfidence : nil
         self.localEndpoint = includeSourceAppAttribution ? record.localEndpoint : nil
         self.remoteHostname = includeSourceAppAttribution ? record.remoteHostname : nil
         self.ownerKey = includeRemoteEndpoint || includeRoleAttribution || includeSourceAppAttribution ? record.ownerKey ?? DetectorRecordDerivation.ownerKey(
+            sourceBundleId: includeSourceAppAttribution ? record.sourceBundleId : nil,
             sourceAppIdentifier: projectedSourceAppIdentifier,
-            role: derivedRole,
             remoteEndpoint: derivedRemoteEndpoint,
-            flowId: Self.makeFlowId(textFlowId: record.textFlowId, flowHash: record.flowHash)
+            flowId: flowIdentifier
         ) : nil
     }
 }
@@ -570,12 +561,15 @@ public struct DetectorFireRecord: Codable, Sendable, Equatable {
     public let configId: String?
     public let fireTime: Date
     public let sourcePacketTime: Date?
+    public let sourcePacketTimeMs: Double?
     public let reason: String
     public let ownerKey: String?
     public let role: String?
+    public let packetCueReason: PacketCueReason?
     public let packetLength: Int?
     public let payloadLength: Int?
     public let flowId: String?
+    public let flowIdentity: FlowIdentity?
     public let lineageId: UInt64?
 
     public init(
@@ -583,24 +577,30 @@ public struct DetectorFireRecord: Codable, Sendable, Equatable {
         configId: String? = nil,
         fireTime: Date,
         sourcePacketTime: Date? = nil,
+        sourcePacketTimeMs: Double? = nil,
         reason: String,
         ownerKey: String? = nil,
         role: String? = nil,
+        packetCueReason: PacketCueReason? = nil,
         packetLength: Int? = nil,
         payloadLength: Int? = nil,
         flowId: String? = nil,
+        flowIdentity: FlowIdentity? = nil,
         lineageId: UInt64? = nil
     ) {
         self.detectorName = detectorName
         self.configId = configId
         self.fireTime = fireTime
         self.sourcePacketTime = sourcePacketTime
+        self.sourcePacketTimeMs = sourcePacketTimeMs ?? sourcePacketTime.map { $0.timeIntervalSince1970 * 1_000 }
         self.reason = reason
         self.ownerKey = ownerKey
         self.role = role
+        self.packetCueReason = packetCueReason
         self.packetLength = packetLength
         self.payloadLength = payloadLength
         self.flowId = flowId
+        self.flowIdentity = flowIdentity
         self.lineageId = lineageId
     }
 }

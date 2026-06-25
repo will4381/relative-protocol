@@ -48,6 +48,11 @@ public enum AnalyticsStoragePaths {
             .appendingPathComponent("AppSignatures", isDirectory: true)
     }
 
+    public static func richPacketLogsRoot(appGroupID: String) throws -> URL {
+        try analyticsRoot(appGroupID: appGroupID)
+            .appendingPathComponent("RichPacketLogs", isDirectory: true)
+    }
+
     public static func signatureURL(appGroupID: String, fileName: String) throws -> URL {
         guard isSafeFileName(fileName) else {
             throw Error.invalidFileName(fileName)

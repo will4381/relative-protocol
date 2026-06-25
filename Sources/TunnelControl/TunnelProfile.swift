@@ -3,6 +3,7 @@
 // Licensed for personal, non-commercial use only. See LICENSE for terms.
 
 import Darwin
+import Analytics
 import Foundation
 import PacketRelay
 
@@ -34,7 +35,12 @@ public struct TunnelProfile: Sendable, Equatable {
     public let telemetryEnabled: Bool
     public let liveTapEnabled: Bool
     public let liveTapIncludeFlowSlices: Bool
+    public let liveTapIncludePacketCues: Bool
+    public let liveTapIncludeValidationRecords: Bool
     public let liveTapMaxBytes: Int
+    public let packetCuePolicy: PacketCueEmissionPolicy
+    public let telemetryDegradationPolicy: TelemetryDegradationPolicy
+    public let richPacketLogPolicy: RichPacketLogPolicy
     public let signatureFileName: String
     /// Transport selector retained for compatibility with the previous relay endpoint API.
     public let relayEndpoint: RelayEndpoint
@@ -70,7 +76,12 @@ public struct TunnelProfile: Sendable, Equatable {
     ///     will be published to the containing app.
     ///   - liveTapIncludeFlowSlices: Opts the live rolling packet tap into detector-grade `flowSlice` records.
     ///     Keep this `false` for normal foreground reads and enable it only for richer inspection/debug builds.
+    ///   - liveTapIncludePacketCues: Opts the live rolling packet tap into packet-level cue records.
+    ///   - liveTapIncludeValidationRecords: Includes validation-grade debug records in foreground snapshots.
     ///   - liveTapMaxBytes: Approximate memory budget for the live rolling packet tap.
+    ///   - packetCuePolicy: Generic packet-level cue emission policy. Defaults to disabled.
+    ///   - telemetryDegradationPolicy: Controls whether low power mode and thermal pressure reduce telemetry detail.
+    ///   - richPacketLogPolicy: Opt-in durable JSONL packet metadata logging policy for debug builds.
     ///   - signatureFileName: Signature filename loaded by classifier.
     ///   - relayEndpoint: Legacy relay metadata plus the active UDP transport selector. Host and port are not egress destinations.
     ///   - dataplaneConfigJSON: Dataplane config template or raw config.
@@ -94,7 +105,12 @@ public struct TunnelProfile: Sendable, Equatable {
         telemetryEnabled: Bool,
         liveTapEnabled: Bool,
         liveTapIncludeFlowSlices: Bool,
+        liveTapIncludePacketCues: Bool = false,
+        liveTapIncludeValidationRecords: Bool = false,
         liveTapMaxBytes: Int,
+        packetCuePolicy: PacketCueEmissionPolicy = .disabled,
+        telemetryDegradationPolicy: TelemetryDegradationPolicy = .default,
+        richPacketLogPolicy: RichPacketLogPolicy = .disabled,
         signatureFileName: String,
         relayEndpoint: RelayEndpoint,
         dataplaneConfigJSON: String
@@ -125,7 +141,12 @@ public struct TunnelProfile: Sendable, Equatable {
         self.telemetryEnabled = telemetryEnabled
         self.liveTapEnabled = liveTapEnabled
         self.liveTapIncludeFlowSlices = liveTapIncludeFlowSlices
+        self.liveTapIncludePacketCues = liveTapIncludePacketCues
+        self.liveTapIncludeValidationRecords = liveTapIncludeValidationRecords
         self.liveTapMaxBytes = liveTapMaxBytes
+        self.packetCuePolicy = packetCuePolicy
+        self.telemetryDegradationPolicy = telemetryDegradationPolicy
+        self.richPacketLogPolicy = richPacketLogPolicy
         self.signatureFileName = signatureFileName
         self.relayEndpoint = relayEndpoint
         self.dataplaneConfigJSON = dataplaneConfigJSON
@@ -147,6 +168,8 @@ public struct TunnelProfile: Sendable, Equatable {
         let mtuValue = configuredMTU ?? mtuStrategy.bufferMTUHint
         let dnsStrategy = dnsStrategy(from: providerConfiguration)
         let ipv4RouteStrategy = ipv4RouteStrategy(from: providerConfiguration)
+        let packetCuePolicy = packetCuePolicy(from: providerConfiguration)
+        let richPacketLogPolicy = richPacketLogPolicy(from: providerConfiguration)
 
         return TunnelProfile(
             appGroupID: providerConfiguration[TunnelProviderConfigurationKey.appGroupID] as? String ?? "",
@@ -168,7 +191,15 @@ public struct TunnelProfile: Sendable, Equatable {
             telemetryEnabled: bool(providerConfiguration[TunnelProviderConfigurationKey.telemetryEnabled], default: true),
             liveTapEnabled: bool(providerConfiguration[TunnelProviderConfigurationKey.liveTapEnabled], default: false),
             liveTapIncludeFlowSlices: bool(providerConfiguration[TunnelProviderConfigurationKey.liveTapIncludeFlowSlices], default: false),
+            liveTapIncludePacketCues: bool(providerConfiguration[TunnelProviderConfigurationKey.liveTapIncludePacketCues], default: false),
+            liveTapIncludeValidationRecords: bool(providerConfiguration[TunnelProviderConfigurationKey.liveTapIncludeValidationRecords], default: false),
             liveTapMaxBytes: int(providerConfiguration[TunnelProviderConfigurationKey.liveTapMaxBytes], default: 5_000_000),
+            packetCuePolicy: packetCuePolicy,
+            telemetryDegradationPolicy: TelemetryDegradationPolicy(
+                reduceOnLowPowerMode: bool(providerConfiguration[TunnelProviderConfigurationKey.telemetryReduceOnLowPowerMode], default: true),
+                reduceOnThermalPressure: bool(providerConfiguration[TunnelProviderConfigurationKey.telemetryReduceOnThermalPressure], default: true)
+            ),
+            richPacketLogPolicy: richPacketLogPolicy,
             signatureFileName: providerConfiguration[TunnelProviderConfigurationKey.signatureFileName] as? String ?? "app_signatures.json",
             relayEndpoint: RelayEndpoint(host: relayHost, port: relayPort, useUDP: useUDP),
             dataplaneConfigJSON: providerConfiguration[TunnelProviderConfigurationKey.dataplaneConfigJSON] as? String ?? "{}"
@@ -391,6 +422,61 @@ public struct TunnelProfile: Sendable, Equatable {
                 return nil
             }
             return value as? [String]
+        }
+        return nil
+    }
+
+    private static func packetCuePolicy(from providerConfiguration: [String: Any]) -> PacketCueEmissionPolicy {
+        guard let rawPolicy = providerConfiguration[TunnelProviderConfigurationKey.packetCuePolicy] as? [String: Any] else {
+            return .disabled
+        }
+        let directions = Set((stringArray(rawPolicy["directions"]) ?? []).compactMap(PacketDirection.init(rawValue:)))
+        return PacketCueEmissionPolicy(
+            tcpPayloadLengthRange: packetLengthRange(rawPolicy["tcpPayloadLengthRange"]),
+            udpPacketLengthRange: packetLengthRange(rawPolicy["udpPacketLengthRange"]),
+            directions: directions,
+            requireTcpAck: bool(rawPolicy["requireTcpAck"], default: false),
+            requireTcpPsh: bool(rawPolicy["requireTcpPsh"], default: false),
+            includeHostAssociatedPackets: bool(rawPolicy["includeHostAssociatedPackets"], default: false),
+            maxHostAssociatedPacketLength: exactInt(rawPolicy["maxHostAssociatedPacketLength"]),
+            emitMetadataRefreshCues: bool(rawPolicy["emitMetadataRefreshCues"], default: false)
+        )
+    }
+
+    private static func richPacketLogPolicy(from providerConfiguration: [String: Any]) -> RichPacketLogPolicy {
+        guard let rawPolicy = providerConfiguration[TunnelProviderConfigurationKey.richPacketLogPolicy] as? [String: Any] else {
+            return .disabled
+        }
+        let directions = Set((stringArray(rawPolicy["directions"]) ?? []).compactMap(PacketDirection.init(rawValue:)))
+        return RichPacketLogPolicy(
+            isEnabled: bool(rawPolicy["isEnabled"], default: false),
+            directions: directions,
+            includeParsedMetadata: bool(rawPolicy["includeParsedMetadata"], default: true),
+            includeDNSAnswerAddresses: bool(rawPolicy["includeDNSAnswerAddresses"], default: true),
+            includeQUICConnectionIDs: bool(rawPolicy["includeQUICConnectionIDs"], default: true),
+            includePacketBytePrefix: bool(rawPolicy["includePacketBytePrefix"], default: false),
+            packetBytePrefixLength: int(rawPolicy["packetBytePrefixLength"], default: 0),
+            maxPacketLength: exactInt(rawPolicy["maxPacketLength"]),
+            maxRecordsPerBatch: int(rawPolicy["maxRecordsPerBatch"], default: 256),
+            metadataProbeLimitPerBatch: int(rawPolicy["metadataProbeLimitPerBatch"], default: 16),
+            filePrefix: string(rawPolicy["filePrefix"]) ?? RichPacketLogPolicy.defaultFilePrefix,
+            maxBytesPerFile: int(rawPolicy["maxBytesPerFile"], default: 4_194_304),
+            maxFileCount: int(rawPolicy["maxFileCount"], default: 8),
+            maxTotalBytes: int(rawPolicy["maxTotalBytes"], default: 33_554_432)
+        )
+    }
+
+    private static func packetLengthRange(_ value: Any?) -> PacketLengthRange? {
+        if let value = value as? [String: Any],
+           let lowerBound = exactInt(value["lowerBound"]),
+           let upperBound = exactInt(value["upperBound"]) {
+            return PacketLengthRange(lowerBound: lowerBound, upperBound: upperBound)
+        }
+        if let value = value as? [Any],
+           value.count == 2,
+           let lowerBound = exactInt(value[0]),
+           let upperBound = exactInt(value[1]) {
+            return PacketLengthRange(lowerBound: lowerBound, upperBound: upperBound)
         }
         return nil
     }

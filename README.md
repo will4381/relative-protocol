@@ -17,9 +17,11 @@ The package is detector-first, not packet-log-first. The tunnel extension owns r
 ## Current Status
 
 - Packet tunnel runtime, relay, telemetry, and detector execution are package-owned.
-- The detector stream includes sparse lifecycle/window records plus exact `packetCue` records.
-- `packetCue` records expose packet length, payload length, TCP flags, ACK/PSH booleans, endpoint fields, flow id, and host/domain association.
-- Detector records expose remote endpoint, owner key, role, address scope, session context, source-app attribution fields, and typed fire audit records.
+- The detector stream includes sparse lifecycle/window records plus exact `packetCue` records controlled by generic `PacketCueEmissionPolicy` knobs.
+- `packetCue` records expose packet length, payload length, TCP flags, ACK/PSH booleans, endpoint fields, flow id, host/domain association, cue reason, and canonical flow identity.
+- Optional rich packet JSONL logging is available through `RichPacketLogPolicy`; it is disabled by default, bounded, and intended for debug/research builds.
+- Detector records expose remote endpoint, owner key, app-supplied role labels, app-injected address scope, session context, source-app attribution fields, health/liveness, and typed fire audit records.
+- The package does not ship named platform-specific role/scope logic. Product-specific classification belongs in the containing app or app-supplied catalogs.
 - Source-app bundle attribution requires a separate host-app Content Filter extension target. The package has the `sourceAppFlow` record contract, but it does not create or install the `NEFilterDataProvider` target for you.
 
 ## Quick Start
@@ -84,6 +86,9 @@ Most host apps interact with these types:
 - `TrafficDetector`
 - `DetectorRequirements`
 - `DetectorFeatureFamily`
+- `PacketCueEmissionPolicy`
+- `RichPacketLogPolicy`
+- `TelemetryDegradationPolicy`
 - `DetectorArmingStateMachine`
 - `DetectionEvent`
 - `DetectionSnapshot`
@@ -101,7 +106,7 @@ Most host apps interact with these types:
 - `Sources/DataplaneFFI`
   - Swift/C bridge into the bundled dataplane runtime
 - `Sources/HostClient`
-  - host-app snapshot client and persisted store readers
+  - host-app snapshot client and persisted store readers, including optional rich packet log reads
 - `Sources/Observability`
   - structured logging, JSONL/OSLog sinks, signposts
 - `Sources/HarnessLocal`
@@ -114,13 +119,15 @@ Most host apps interact with these types:
 - emits a bounded in-memory rolling telemetry window
 - runs one or more detectors inside the tunnel extension
 - persists compact detector outputs and stop breadcrumbs to the App Group container
+- optionally writes bounded rich packet metadata JSONL for debug builds
 - exposes foreground snapshots through `NETunnelProviderSession.sendProviderMessage`
 
 ## What This Package Does Not Do
 
-- continuously persist raw packet history to disk
+- continuously persist packet history to disk by default
 - assume the containing app can stay awake forever in the background
 - force one product-specific detector vocabulary on all package users
+- classify traffic as a named third-party app/platform from domains or IP prefixes
 - infer foreground app-open timing on its own
 - infer another app's bundle identifier from `NEPacketTunnelProvider` packet data alone
 - install a Content Filter extension target for source-app attribution

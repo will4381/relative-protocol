@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Relative Companies, Inc.
 // Licensed for personal, non-commercial use only. See LICENSE for terms.
 
+import Analytics
 import Foundation
 import NetworkExtension
 
@@ -45,7 +46,13 @@ public enum TunnelProfileManager {
             TunnelProviderConfigurationKey.telemetryEnabled: profile.telemetryEnabled,
             TunnelProviderConfigurationKey.liveTapEnabled: profile.liveTapEnabled,
             TunnelProviderConfigurationKey.liveTapIncludeFlowSlices: profile.liveTapIncludeFlowSlices,
+            TunnelProviderConfigurationKey.liveTapIncludePacketCues: profile.liveTapIncludePacketCues,
+            TunnelProviderConfigurationKey.liveTapIncludeValidationRecords: profile.liveTapIncludeValidationRecords,
             TunnelProviderConfigurationKey.liveTapMaxBytes: profile.liveTapMaxBytes,
+            TunnelProviderConfigurationKey.packetCuePolicy: providerConfiguration(for: profile.packetCuePolicy),
+            TunnelProviderConfigurationKey.telemetryReduceOnLowPowerMode: profile.telemetryDegradationPolicy.reduceOnLowPowerMode,
+            TunnelProviderConfigurationKey.telemetryReduceOnThermalPressure: profile.telemetryDegradationPolicy.reduceOnThermalPressure,
+            TunnelProviderConfigurationKey.richPacketLogPolicy: providerConfiguration(for: profile.richPacketLogPolicy),
             TunnelProviderConfigurationKey.signatureFileName: profile.signatureFileName,
             TunnelProviderConfigurationKey.relayUDP: profile.relayEndpoint.useUDP,
             TunnelProviderConfigurationKey.dataplaneConfigJSON: profile.dataplaneConfigJSON
@@ -79,5 +86,54 @@ public enum TunnelProfileManager {
                 partialResult[pair.key] = pair.value
             }
         }
+    }
+
+    private static func providerConfiguration(for policy: PacketCueEmissionPolicy) -> [String: Any] {
+        var configuration: [String: Any] = [
+            "directions": policy.directions.map(\.rawValue).sorted(),
+            "requireTcpAck": policy.requireTcpAck,
+            "requireTcpPsh": policy.requireTcpPsh,
+            "includeHostAssociatedPackets": policy.includeHostAssociatedPackets,
+            "emitMetadataRefreshCues": policy.emitMetadataRefreshCues
+        ]
+        if let tcpPayloadLengthRange = policy.tcpPayloadLengthRange {
+            configuration["tcpPayloadLengthRange"] = providerConfiguration(for: tcpPayloadLengthRange)
+        }
+        if let udpPacketLengthRange = policy.udpPacketLengthRange {
+            configuration["udpPacketLengthRange"] = providerConfiguration(for: udpPacketLengthRange)
+        }
+        if let maxHostAssociatedPacketLength = policy.maxHostAssociatedPacketLength {
+            configuration["maxHostAssociatedPacketLength"] = maxHostAssociatedPacketLength
+        }
+        return configuration
+    }
+
+    private static func providerConfiguration(for range: PacketLengthRange) -> [String: Any] {
+        [
+            "lowerBound": range.lowerBound,
+            "upperBound": range.upperBound
+        ]
+    }
+
+    private static func providerConfiguration(for policy: RichPacketLogPolicy) -> [String: Any] {
+        var configuration: [String: Any] = [
+            "isEnabled": policy.isEnabled,
+            "directions": policy.directions.map(\.rawValue).sorted(),
+            "includeParsedMetadata": policy.includeParsedMetadata,
+            "includeDNSAnswerAddresses": policy.includeDNSAnswerAddresses,
+            "includeQUICConnectionIDs": policy.includeQUICConnectionIDs,
+            "includePacketBytePrefix": policy.includePacketBytePrefix,
+            "packetBytePrefixLength": policy.packetBytePrefixLength,
+            "maxRecordsPerBatch": policy.maxRecordsPerBatch,
+            "metadataProbeLimitPerBatch": policy.metadataProbeLimitPerBatch,
+            "filePrefix": policy.filePrefix,
+            "maxBytesPerFile": policy.maxBytesPerFile,
+            "maxFileCount": policy.maxFileCount,
+            "maxTotalBytes": policy.maxTotalBytes
+        ]
+        if let maxPacketLength = policy.maxPacketLength {
+            configuration["maxPacketLength"] = maxPacketLength
+        }
+        return configuration
     }
 }

@@ -96,7 +96,11 @@ Important fields in `TunnelProfile`:
 - `telemetryEnabled`
 - `liveTapEnabled`
 - `liveTapIncludeFlowSlices`
+- `liveTapIncludePacketCues`
+- `liveTapIncludeValidationRecords`
 - `liveTapMaxBytes`
+- `packetCuePolicy`
+- `richPacketLogPolicy`
 - `signatureFileName`
 - `relayEndpoint`
 - `dataplaneConfigJSON`
@@ -113,6 +117,12 @@ Important fields in `TunnelProfile`:
 - foreground packet/event snapshots
 
 `liveTapIncludeFlowSlices = true` opts the app-facing live tap into detector-grade `flowSlice` records. Keep this off for normal product reads and enable it only when you intentionally want a richer debug surface.
+
+`liveTapIncludePacketCues = true` opts the app-facing live tap into configured packet-level cue records. It only emits cues that match `packetCuePolicy`.
+
+`liveTapIncludeValidationRecords = true` adds validation-grade debug records to foreground snapshots. Use it for scoring and QA, not as an always-on raw packet export.
+
+`richPacketLogPolicy` enables a separate bounded JSONL packet metadata stream under the App Group for debugging or external analysis. Keep it `.disabled` for normal production builds.
 
 `liveTapEnabled` only has effect when `telemetryEnabled` is also `true`.
 
@@ -138,7 +148,12 @@ let profile = TunnelProfile(
     telemetryEnabled: true,
     liveTapEnabled: true,
     liveTapIncludeFlowSlices: false,
+    liveTapIncludePacketCues: false,
+    liveTapIncludeValidationRecords: false,
     liveTapMaxBytes: 1_048_576,
+    packetCuePolicy: .disabled,
+    telemetryDegradationPolicy: .default,
+    richPacketLogPolicy: .disabled,
     signatureFileName: "app_signatures.json",
     relayEndpoint: RelayEndpoint(host: "127.0.0.1", port: 1080, useUDP: false),
     dataplaneConfigJSON: "{}"

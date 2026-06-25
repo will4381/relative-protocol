@@ -4,10 +4,27 @@
 
 import Foundation
 
+/// One coherent timestamp from the runtime clock.
+public struct ClockInstant: Sendable, Equatable {
+    public let date: Date
+    public let milliseconds: Double
+
+    public init(date: Date, milliseconds: Double) {
+        self.date = date
+        self.milliseconds = milliseconds
+    }
+
+    public static func wallClock(_ date: Date) -> ClockInstant {
+        ClockInstant(date: date, milliseconds: date.timeIntervalSince1970 * 1_000)
+    }
+}
+
 /// Time source abstraction to make runtime and analytics deterministic in tests.
 public protocol Clock: Sendable {
     /// Returns current clock time.
     func now() async -> Date
+    /// Returns current clock time and detector-facing milliseconds in one domain.
+    func instant() async -> ClockInstant
     /// Suspends until at least `seconds` have elapsed for this clock.
     /// - Parameter seconds: Duration to sleep.
     func sleep(for seconds: TimeInterval) async throws
@@ -16,14 +33,32 @@ public protocol Clock: Sendable {
     func advance(by seconds: TimeInterval) async
 }
 
-/// Production clock that delegates to system wall time.
-public struct SystemClock: Clock {
-    /// Creates a system-backed clock.
-    public init() {}
+public extension Clock {
+    /// Default instant for replay/test clocks that already own their date progression.
+    func instant() async -> ClockInstant {
+        ClockInstant.wallClock(await now())
+    }
+}
 
-    /// Returns current wall-clock time.
+/// Production clock anchored once to wall time, then advanced by monotonic system uptime.
+public struct SystemClock: Clock {
+    private let wallAnchor: Date
+    private let uptimeAnchor: TimeInterval
+
+    /// Creates a system-backed clock.
+    public init() {
+        self.wallAnchor = Date()
+        self.uptimeAnchor = ProcessInfo.processInfo.systemUptime
+    }
+
+    /// Returns current clock time advanced from a wall-clock anchor by monotonic uptime.
     public func now() async -> Date {
-        Date()
+        currentInstant().date
+    }
+
+    /// Returns detector-facing milliseconds advanced from a wall-clock anchor by monotonic uptime.
+    public func instant() async -> ClockInstant {
+        currentInstant()
     }
 
     /// Sleeps the current task using system monotonic clock.
@@ -39,6 +74,12 @@ public struct SystemClock: Clock {
     /// No-op for system clock because wall time cannot be manually advanced.
     public func advance(by _: TimeInterval) async {
         // System clock cannot be manually advanced.
+    }
+
+    private func currentInstant() -> ClockInstant {
+        let elapsed = max(0, ProcessInfo.processInfo.systemUptime - uptimeAnchor)
+        let date = wallAnchor.addingTimeInterval(elapsed)
+        return ClockInstant.wallClock(date)
     }
 }
 

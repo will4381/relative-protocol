@@ -3,6 +3,7 @@
 // Licensed for personal, non-commercial use only. See LICENSE for terms.
 
 import Foundation
+import Analytics
 @preconcurrency import NetworkExtension
 import PacketRelay
 @testable import TunnelControl
@@ -16,6 +17,91 @@ final class TunnelControlTests: XCTestCase {
         XCTAssertEqual(profile.mtuStrategy, .recommendedGeneric)
         XCTAssertEqual(profile.dnsStrategy, .recommendedDefault)
         XCTAssertEqual(profile.dnsServers, TunnelDNSStrategy.defaultPublicResolvers)
+        XCTAssertFalse(profile.liveTapIncludePacketCues)
+        XCTAssertFalse(profile.liveTapIncludeValidationRecords)
+        XCTAssertEqual(profile.packetCuePolicy, .disabled)
+        XCTAssertEqual(profile.telemetryDegradationPolicy, .default)
+        XCTAssertEqual(profile.richPacketLogPolicy, .disabled)
+    }
+
+    func testTunnelProfileParsesPacketCuePolicy() {
+        let profile = TunnelProfile.from(
+            providerConfiguration: [
+                TunnelProviderConfigurationKey.liveTapIncludePacketCues: true,
+                TunnelProviderConfigurationKey.liveTapIncludeValidationRecords: true,
+                TunnelProviderConfigurationKey.packetCuePolicy: [
+                    "tcpPayloadLengthRange": ["lowerBound": 0, "upperBound": 800],
+                    "udpPacketLengthRange": [500, 1_300],
+                    "directions": ["outbound"],
+                    "requireTcpAck": true,
+                    "requireTcpPsh": true,
+                    "includeHostAssociatedPackets": true,
+                    "maxHostAssociatedPacketLength": 1_500,
+                    "emitMetadataRefreshCues": true
+                ]
+            ]
+        )
+
+        XCTAssertTrue(profile.liveTapIncludePacketCues)
+        XCTAssertTrue(profile.liveTapIncludeValidationRecords)
+        XCTAssertEqual(profile.packetCuePolicy.tcpPayloadLengthRange, PacketLengthRange(0...800))
+        XCTAssertEqual(profile.packetCuePolicy.udpPacketLengthRange, PacketLengthRange(500...1_300))
+        XCTAssertEqual(profile.packetCuePolicy.directions, [.outbound])
+        XCTAssertTrue(profile.packetCuePolicy.requireTcpAck)
+        XCTAssertTrue(profile.packetCuePolicy.requireTcpPsh)
+        XCTAssertTrue(profile.packetCuePolicy.includeHostAssociatedPackets)
+        XCTAssertEqual(profile.packetCuePolicy.maxHostAssociatedPacketLength, 1_500)
+        XCTAssertTrue(profile.packetCuePolicy.emitMetadataRefreshCues)
+    }
+
+    func testTunnelProfileParsesRichPacketLogPolicy() {
+        let profile = TunnelProfile.from(
+            providerConfiguration: [
+                TunnelProviderConfigurationKey.richPacketLogPolicy: [
+                    "isEnabled": true,
+                    "directions": ["outbound"],
+                    "includeParsedMetadata": true,
+                    "includeDNSAnswerAddresses": false,
+                    "includeQUICConnectionIDs": false,
+                    "includePacketBytePrefix": true,
+                    "packetBytePrefixLength": 96,
+                    "maxPacketLength": 1_500,
+                    "maxRecordsPerBatch": 32,
+                    "metadataProbeLimitPerBatch": 4,
+                    "filePrefix": "debug packets",
+                    "maxBytesPerFile": 65_536,
+                    "maxFileCount": 3,
+                    "maxTotalBytes": 196_608
+                ]
+            ]
+        )
+
+        XCTAssertTrue(profile.richPacketLogPolicy.isEnabled)
+        XCTAssertEqual(profile.richPacketLogPolicy.directions, [.outbound])
+        XCTAssertTrue(profile.richPacketLogPolicy.includeParsedMetadata)
+        XCTAssertFalse(profile.richPacketLogPolicy.includeDNSAnswerAddresses)
+        XCTAssertFalse(profile.richPacketLogPolicy.includeQUICConnectionIDs)
+        XCTAssertTrue(profile.richPacketLogPolicy.includePacketBytePrefix)
+        XCTAssertEqual(profile.richPacketLogPolicy.packetBytePrefixLength, 96)
+        XCTAssertEqual(profile.richPacketLogPolicy.maxPacketLength, 1_500)
+        XCTAssertEqual(profile.richPacketLogPolicy.maxRecordsPerBatch, 32)
+        XCTAssertEqual(profile.richPacketLogPolicy.metadataProbeLimitPerBatch, 4)
+        XCTAssertEqual(profile.richPacketLogPolicy.filePrefix, "debug packets")
+        XCTAssertEqual(profile.richPacketLogPolicy.maxBytesPerFile, 65_536)
+        XCTAssertEqual(profile.richPacketLogPolicy.maxFileCount, 3)
+        XCTAssertEqual(profile.richPacketLogPolicy.maxTotalBytes, 196_608)
+    }
+
+    func testTunnelProfileParsesTelemetryDegradationPolicy() {
+        let profile = TunnelProfile.from(
+            providerConfiguration: [
+                TunnelProviderConfigurationKey.telemetryReduceOnLowPowerMode: false,
+                TunnelProviderConfigurationKey.telemetryReduceOnThermalPressure: true
+            ]
+        )
+
+        XCTAssertFalse(profile.telemetryDegradationPolicy.reduceOnLowPowerMode)
+        XCTAssertTrue(profile.telemetryDegradationPolicy.reduceOnThermalPressure)
     }
 
     func testRuntimeProfileValidationFailsClosedForEmptyProviderConfiguration() {
@@ -493,6 +579,53 @@ final class TunnelControlTests: XCTestCase {
         XCTAssertNil(configuration["relayPort"])
     }
 
+    func testTunnelProfileManagerPersistsRichPacketLogPolicy() throws {
+        let manager = NETunnelProviderManager()
+        let profile = makeProfile(
+            richPacketLogPolicy: RichPacketLogPolicy(
+                isEnabled: true,
+                directions: [.inbound],
+                includeParsedMetadata: false,
+                includeDNSAnswerAddresses: false,
+                includeQUICConnectionIDs: true,
+                includePacketBytePrefix: true,
+                packetBytePrefixLength: 32,
+                maxPacketLength: 900,
+                maxRecordsPerBatch: 12,
+                metadataProbeLimitPerBatch: 2,
+                filePrefix: "rich-debug",
+                maxBytesPerFile: 65_536,
+                maxFileCount: 2,
+                maxTotalBytes: 131_072
+            )
+        )
+
+        TunnelProfileManager.configure(
+            manager: manager,
+            profile: profile,
+            providerBundleIdentifier: "com.example.tunnel",
+            localizedDescription: "Test Tunnel"
+        )
+
+        let proto = try XCTUnwrap(manager.protocolConfiguration as? NETunnelProviderProtocol)
+        let configuration = try XCTUnwrap(proto.providerConfiguration)
+        let policy = try XCTUnwrap(configuration[TunnelProviderConfigurationKey.richPacketLogPolicy] as? [String: Any])
+        XCTAssertEqual((policy["isEnabled"] as? NSNumber)?.boolValue, true)
+        XCTAssertEqual(policy["directions"] as? [String], ["inbound"])
+        XCTAssertEqual((policy["includeParsedMetadata"] as? NSNumber)?.boolValue, false)
+        XCTAssertEqual((policy["includeDNSAnswerAddresses"] as? NSNumber)?.boolValue, false)
+        XCTAssertEqual((policy["includeQUICConnectionIDs"] as? NSNumber)?.boolValue, true)
+        XCTAssertEqual((policy["includePacketBytePrefix"] as? NSNumber)?.boolValue, true)
+        XCTAssertEqual((policy["packetBytePrefixLength"] as? NSNumber)?.intValue, 32)
+        XCTAssertEqual((policy["maxPacketLength"] as? NSNumber)?.intValue, 900)
+        XCTAssertEqual((policy["maxRecordsPerBatch"] as? NSNumber)?.intValue, 12)
+        XCTAssertEqual((policy["metadataProbeLimitPerBatch"] as? NSNumber)?.intValue, 2)
+        XCTAssertEqual(policy["filePrefix"] as? String, "rich-debug")
+        XCTAssertEqual((policy["maxBytesPerFile"] as? NSNumber)?.intValue, 65_536)
+        XCTAssertEqual((policy["maxFileCount"] as? NSNumber)?.intValue, 2)
+        XCTAssertEqual((policy["maxTotalBytes"] as? NSNumber)?.intValue, 131_072)
+    }
+
     func testTunnelProfileManagerPreservesHostOwnedKeysAcrossRepeatedReconfigure() throws {
         let manager = NETunnelProviderManager()
         let existingProto = NETunnelProviderProtocol()
@@ -726,7 +859,8 @@ final class TunnelControlTests: XCTestCase {
         dnsStrategy: TunnelDNSStrategy? = nil,
         tcpMultipathHandoverEnabled: Bool = false,
         relayUseUDP: Bool = false,
-        ipv4RouteStrategy: TunnelIPv4RouteStrategy? = nil
+        ipv4RouteStrategy: TunnelIPv4RouteStrategy? = nil,
+        richPacketLogPolicy: RichPacketLogPolicy = .disabled
     ) -> TunnelProfile {
         TunnelProfile(
             appGroupID: appGroupID,
@@ -749,6 +883,7 @@ final class TunnelControlTests: XCTestCase {
             liveTapEnabled: false,
             liveTapIncludeFlowSlices: false,
             liveTapMaxBytes: 5_000_000,
+            richPacketLogPolicy: richPacketLogPolicy,
             signatureFileName: "app_signatures.json",
             relayEndpoint: RelayEndpoint(host: "127.0.0.1", port: 1080, useUDP: relayUseUDP),
             dataplaneConfigJSON: "{}"

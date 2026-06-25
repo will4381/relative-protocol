@@ -26,7 +26,7 @@ This directory holds the detailed docs for `relative-protocol`. The root [README
   - `TrafficDetector`
   - `DetectorRequirements`
   - `packetCue`
-  - remote endpoint / role / address scope
+  - remote endpoint / app-supplied role / app-injected address scope
   - session context
   - optional Content Filter source-app attribution
   - detection event audit contract
@@ -73,7 +73,7 @@ Use [Getting Started](GettingStarted.md).
 
 Use [Detector Stream and Custom Detectors](DetectorStream.md), then override `PacketTunnelProviderShell.makeDetectors(...)`.
 
-### Where do I verify exact packet fields for TikTok or Instagram-style detectors?
+### Where do I verify exact packet fields for custom detectors?
 
 Use the `packetCue` and typed field sections in [Detector Stream and Custom Detectors](DetectorStream.md).
 

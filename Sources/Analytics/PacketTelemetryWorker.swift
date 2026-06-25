@@ -30,6 +30,8 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         let includeActivitySamples: Bool
         let includeFlowSlices: Bool
         let includeFlowCloseEvents: Bool
+        let includePacketCues: Bool
+        let includeValidationRecords: Bool
 
         /// Decision: the default app-facing live tap stays leaner than the detector-facing sparse stream.
         /// `flowSlice` remains detector-only by default because pushing every cadence record into the
@@ -38,14 +40,22 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         static let `default` = LiveTapPolicy(
             includeActivitySamples: true,
             includeFlowSlices: false,
-            includeFlowCloseEvents: true
+            includeFlowCloseEvents: true,
+            includePacketCues: false,
+            includeValidationRecords: false
         )
 
-        static func configured(includeFlowSlices: Bool) -> LiveTapPolicy {
+        static func configured(
+            includeFlowSlices: Bool,
+            includePacketCues: Bool,
+            includeValidationRecords: Bool
+        ) -> LiveTapPolicy {
             LiveTapPolicy(
                 includeActivitySamples: true,
                 includeFlowSlices: includeFlowSlices,
-                includeFlowCloseEvents: true
+                includeFlowCloseEvents: true,
+                includePacketCues: includePacketCues,
+                includeValidationRecords: includeValidationRecords
             )
         }
     }
@@ -161,6 +171,12 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         var droppedBatches = 0
         var skippedBatches = 0
         var bufferedRecords = 0
+        var streamStartedAtMs: Double?
+        var lastRecordAtMs: Double?
+        var sequenceNumber: UInt64 = 0
+        var droppedSequenceCount = 0
+        var lastPacketTimestampMs: Double?
+        var sessionId: String?
         var detectionSnapshot: DetectionSnapshot
         var hasEnteredShedMode = false
         var isStopped = false
@@ -203,12 +219,16 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         public let bufferedRecords: Int
         public let thermalState: TunnelThermalState
         public let lowPowerModeEnabled: Bool
+        public let health: TelemetryHealthRecord
+        public let liveness: TelemetryStreamLiveness
     }
 
     private let pipeline: PacketAnalyticsPipeline
+    private let clock: any Clock
     private let packetStream: PacketSampleStream?
     private let detectors: [any TrafficDetector]
     private let detectionPersistence: DetectionPersistenceCoordinator?
+    private let richPacketLogStore: RichPacketLogStore?
     private let logger: StructuredLogger
     private let processInfo: ProcessInfo
     private let state: SharedState
@@ -216,6 +236,9 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
     private let runtimePlan: DetectorRuntimePlan
     private let pathRegimeProvider: (any PathRegimeProvider)?
     private let liveTapPolicy: LiveTapPolicy
+    private let packetCuePolicy: PacketCueEmissionPolicy
+    private let telemetryDegradationPolicy: TelemetryDegradationPolicy
+    private let writerProcess: String
 
     private var workerTask: Task<Void, Never>?
 
@@ -226,44 +249,75 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
     /// without paying for per-packet notification handling.
     public convenience init(
         pipeline: PacketAnalyticsPipeline,
+        clock: any Clock = SystemClock(),
         packetStream: PacketSampleStream? = nil,
         detectors: [any TrafficDetector] = [],
         initialDetectionSnapshot: DetectionSnapshot = .empty,
         detectionStore: DetectionStore? = nil,
+        richPacketLogStore: RichPacketLogStore? = nil,
         logger: StructuredLogger,
         processInfo: ProcessInfo = .processInfo,
-        includeFlowSlicesInLiveTap: Bool = false
+        includeFlowSlicesInLiveTap: Bool = false,
+        includePacketCuesInLiveTap: Bool = false,
+        includeValidationRecordsInLiveTap: Bool = false,
+        packetCuePolicy: PacketCueEmissionPolicy = .disabled,
+        telemetryDegradationPolicy: TelemetryDegradationPolicy = .default,
+        writerProcess: String = "packetTunnelProvider"
     ) {
         self.init(
             pipeline: pipeline,
+            clock: clock,
             packetStream: packetStream,
             detectors: detectors,
             initialDetectionSnapshot: initialDetectionSnapshot,
             detectionStore: detectionStore,
+            richPacketLogStore: richPacketLogStore,
             logger: logger,
             processInfo: processInfo,
             emissionPolicyOverride: nil,
             pathRegimeProvider: nil,
-            includeFlowSlicesInLiveTap: includeFlowSlicesInLiveTap
+            includeFlowSlicesInLiveTap: includeFlowSlicesInLiveTap,
+            includePacketCuesInLiveTap: includePacketCuesInLiveTap,
+            includeValidationRecordsInLiveTap: includeValidationRecordsInLiveTap,
+            packetCuePolicy: packetCuePolicy,
+            telemetryDegradationPolicy: telemetryDegradationPolicy,
+            writerProcess: writerProcess
         )
     }
 
     init(
         pipeline: PacketAnalyticsPipeline,
+        clock: any Clock = SystemClock(),
         packetStream: PacketSampleStream? = nil,
         detectors: [any TrafficDetector] = [],
         initialDetectionSnapshot: DetectionSnapshot = .empty,
         detectionStore: DetectionStore? = nil,
+        richPacketLogStore: RichPacketLogStore? = nil,
         logger: StructuredLogger,
         processInfo: ProcessInfo = .processInfo,
         emissionPolicyOverride: PacketAnalyticsPipeline.EmissionPolicy?,
         pathRegimeProvider: (any PathRegimeProvider)? = nil,
-        includeFlowSlicesInLiveTap: Bool = false
+        includeFlowSlicesInLiveTap: Bool = false,
+        includePacketCuesInLiveTap: Bool = false,
+        includeValidationRecordsInLiveTap: Bool = false,
+        packetCuePolicy: PacketCueEmissionPolicy = .disabled,
+        telemetryDegradationPolicy: TelemetryDegradationPolicy = .default,
+        writerProcess: String = "packetTunnelProvider"
     ) {
         self.pipeline = pipeline
+        self.clock = clock
         self.packetStream = packetStream
         self.detectors = detectors
-        self.runtimePlan = DetectorRuntimePlan(detectors: detectors, liveTapEnabled: packetStream != nil)
+        self.richPacketLogStore = richPacketLogStore
+        self.packetCuePolicy = packetCuePolicy
+        self.telemetryDegradationPolicy = telemetryDegradationPolicy
+        self.writerProcess = writerProcess
+        let includePacketCueStream = includePacketCuesInLiveTap || includeValidationRecordsInLiveTap
+        self.runtimePlan = DetectorRuntimePlan(
+            detectors: detectors,
+            liveTapEnabled: packetStream != nil,
+            includePacketCuesInLiveTap: includePacketCueStream
+        )
         if let detectionStore {
             self.detectionPersistence = DetectionPersistenceCoordinator(store: detectionStore, logger: logger)
         } else {
@@ -273,7 +327,11 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         self.processInfo = processInfo
         self.state = SharedState(initialDetectionSnapshot: initialDetectionSnapshot)
         self.emissionPolicyOverride = emissionPolicyOverride
-        self.liveTapPolicy = .configured(includeFlowSlices: includeFlowSlicesInLiveTap)
+        self.liveTapPolicy = .configured(
+            includeFlowSlices: includeFlowSlicesInLiveTap,
+            includePacketCues: includePacketCueStream,
+            includeValidationRecords: includeValidationRecordsInLiveTap
+        )
         if self.runtimePlan.needsPathRegime {
             self.pathRegimeProvider = pathRegimeProvider ?? NWPathRegimeMonitor()
         } else {
@@ -289,9 +347,11 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         }
 
         let pipeline = self.pipeline
+        let clock = self.clock
         let packetStream = self.packetStream
         let detectors = self.detectors
         let detectionPersistence = self.detectionPersistence
+        let richPacketLogStore = self.richPacketLogStore
         let logger = self.logger
         let processInfo = self.processInfo
         let state = self.state
@@ -299,21 +359,29 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         let runtimePlan = self.runtimePlan
         let pathRegimeProvider = self.pathRegimeProvider
         let liveTapPolicy = self.liveTapPolicy
+        let packetCuePolicy = self.packetCuePolicy
+        let telemetryDegradationPolicy = self.telemetryDegradationPolicy
+        let writerProcess = self.writerProcess
 
-        self.workerTask = Task { [state, pipeline, packetStream, detectors, detectionPersistence, logger, processInfo, emissionPolicyOverride, runtimePlan, pathRegimeProvider, liveTapPolicy] in
+        self.workerTask = Task { [state, pipeline, clock, packetStream, detectors, detectionPersistence, richPacketLogStore, logger, processInfo, emissionPolicyOverride, runtimePlan, pathRegimeProvider, liveTapPolicy, packetCuePolicy, telemetryDegradationPolicy, writerProcess] in
             await Self.runLoop(
                 stream: stream,
                 state: state,
                 pipeline: pipeline,
+                clock: clock,
                 packetStream: packetStream,
                 detectors: detectors,
                 detectionPersistence: detectionPersistence,
+                richPacketLogStore: richPacketLogStore,
                 logger: logger,
                 processInfo: processInfo,
                 emissionPolicyOverride: emissionPolicyOverride,
                 runtimePlan: runtimePlan,
                 pathRegimeProvider: pathRegimeProvider,
-                liveTapPolicy: liveTapPolicy
+                liveTapPolicy: liveTapPolicy,
+                packetCuePolicy: packetCuePolicy,
+                telemetryDegradationPolicy: telemetryDegradationPolicy,
+                writerProcess: writerProcess
             )
         }
     }
@@ -419,7 +487,13 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
     /// Returns a cheap synchronous telemetry snapshot for health sampling.
     public func snapshot() -> Snapshot {
         state.withLock { state in
-            Snapshot(
+            let policy = emissionPolicyOverride ?? Self.currentEmissionPolicy(
+                processInfo: processInfo,
+                runtimePlan: runtimePlan,
+                packetCuePolicy: packetCuePolicy,
+                telemetryDegradationPolicy: telemetryDegradationPolicy
+            )
+            return Snapshot(
                 acceptedBatches: state.acceptedBatches,
                 queuedBatches: state.queuedBatches,
                 queuedBytes: state.queuedBytes,
@@ -427,13 +501,28 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 skippedBatches: state.skippedBatches,
                 bufferedRecords: state.bufferedRecords,
                 thermalState: processInfo.tunnelThermalState,
-                lowPowerModeEnabled: processInfo.tunnelLowPowerModeEnabled
+                lowPowerModeEnabled: processInfo.tunnelLowPowerModeEnabled,
+                health: Self.healthRecord(
+                    state: state,
+                    runtimePlan: runtimePlan,
+                    policy: policy,
+                    processInfo: processInfo,
+                    telemetryDegradationPolicy: telemetryDegradationPolicy
+                ),
+                liveness: TelemetryStreamLiveness(
+                    streamStartedAtMs: state.streamStartedAtMs,
+                    lastRecordAtMs: state.lastRecordAtMs,
+                    sequenceNumber: state.sequenceNumber,
+                    droppedSequenceCount: state.droppedSequenceCount,
+                    sessionId: state.sessionId,
+                    writerProcess: writerProcess
+                )
             )
         }
     }
 
     /// Returns the latest rolling packet snapshot for the containing app.
-    public func recentSnapshot(limit: Int?) async -> TunnelTelemetrySnapshot {
+    public func recentSnapshot(limit: Int?, includeValidationRecords: Bool = false) async -> TunnelTelemetrySnapshot {
         let normalizedLimit = min(max(limit ?? DetailPolicy.maxSnapshotPacketLimit, 0), DetailPolicy.maxSnapshotPacketLimit)
         let streamSnapshot = if let packetStream {
             await packetStream.snapshot(limit: normalizedLimit)
@@ -462,7 +551,12 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
             bufferedRecords: state.bufferedRecords,
             thermalState: state.thermalState,
             lowPowerModeEnabled: state.lowPowerModeEnabled,
-            detections: detections
+            detections: detections,
+            health: state.health,
+            liveness: state.liveness,
+            validationRecords: liveTapPolicy.includeValidationRecords || includeValidationRecords
+                ? streamSnapshot.samples.filter { $0.kind == .packetCue || $0.kind == .metadata || $0.kind == .sourceAppFlow }
+                : []
         )
     }
 
@@ -548,6 +642,51 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         }
     }
 
+    private static func notePipelineRecords(state: SharedState, records: [PacketSampleStream.PacketStreamRecord]) {
+        guard let lastTimestampMs = records.last?.timestampMs else {
+            return
+        }
+        state.withLock { state in
+            state.lastPacketTimestampMs = lastTimestampMs
+        }
+    }
+
+    private static func noteRichPacketLogRecords(state: SharedState, records: [RichPacketLogRecord]) {
+        guard let lastTimestampMs = records.last?.timestampMs else {
+            return
+        }
+        state.withLock { state in
+            state.lastPacketTimestampMs = lastTimestampMs
+        }
+    }
+
+    private static func notePublishedRecords(state: SharedState, records: [PacketSampleStream.PacketStreamRecord]) {
+        guard !records.isEmpty else {
+            return
+        }
+        let firstTimestampMs = records.first?.timestampMs
+        let lastTimestampMs = records.last?.timestampMs
+        state.withLock { state in
+            if state.streamStartedAtMs == nil {
+                state.streamStartedAtMs = firstTimestampMs
+            }
+            state.lastRecordAtMs = lastTimestampMs ?? state.lastRecordAtMs
+            let next = state.sequenceNumber.addingReportingOverflow(UInt64(records.count))
+            if next.overflow {
+                state.sequenceNumber = UInt64.max
+                state.droppedSequenceCount = saturatingAdd(state.droppedSequenceCount, records.count)
+            } else {
+                state.sequenceNumber = next.partialValue
+            }
+        }
+    }
+
+    private static func setSessionContext(state: SharedState, _ context: DetectorSessionContext?) {
+        state.withLock { state in
+            state.sessionId = context?.sessionId
+        }
+    }
+
     private static func setDetectionSnapshot(state: SharedState, _ snapshot: DetectionSnapshot) {
         state.withLock { state in
             state.detectionSnapshot = snapshot
@@ -559,6 +698,116 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
             state.detectionSnapshot
         }
     }
+
+    private static func healthRecord(
+        state: SharedState,
+        runtimePlan: DetectorRuntimePlan,
+        policy: PacketAnalyticsPipeline.EmissionPolicy,
+        processInfo: ProcessInfo,
+        telemetryDegradationPolicy: TelemetryDegradationPolicy
+    ) -> TelemetryHealthRecord {
+        let requested = Self.featureNames(for: runtimePlan.unionFeatureFamilies)
+        let available = Self.availableFeatureNames(policy: policy)
+        let missing = requested.filter { !available.contains($0) }.sorted()
+        let availableSorted = available.sorted()
+        let degradedReason: String?
+        if telemetryDegradationPolicy.reduceOnLowPowerMode, processInfo.tunnelLowPowerModeEnabled {
+            degradedReason = "lowPowerMode"
+        } else if telemetryDegradationPolicy.reduceOnThermalPressure {
+            switch processInfo.tunnelThermalState {
+            case .serious:
+                degradedReason = "thermalSerious"
+            case .critical:
+                degradedReason = "thermalCritical"
+            case .unknown where !missing.isEmpty:
+                degradedReason = "thermalUnknown"
+            case .nominal, .fair, .unknown:
+                degradedReason = nil
+            }
+        } else {
+            degradedReason = nil
+        }
+        return TelemetryHealthRecord(
+            availableFeatureFamilies: availableSorted,
+            missingFeatureFamilies: missing,
+            degradedReason: degradedReason,
+            droppedRecordCount: saturatingAdd(state.droppedBatches, state.skippedBatches),
+            lastPacketTimestampMs: state.lastPacketTimestampMs
+        )
+    }
+
+    private static func featureNames(for families: DetectorFeatureFamily) -> Set<String> {
+        var names: Set<String> = []
+        for entry in featureNameTable where families.contains(entry.family) {
+            names.insert(entry.name)
+        }
+        return names
+    }
+
+    private static func availableFeatureNames(policy: PacketAnalyticsPipeline.EmissionPolicy) -> Set<String> {
+        var available: Set<String> = [
+            "packetShape",
+            "controlSignals",
+            "stringAddresses",
+            "sessionContext",
+            "remoteEndpoint",
+            "roleAttribution",
+            "eventAudit",
+            "sourceAppAttribution"
+        ]
+        if policy.emitBurstShapeCounters {
+            available.insert("burstShape")
+        }
+        if policy.includeHostHints {
+            available.insert("hostHints")
+        }
+        if policy.includeQUICIdentity {
+            available.insert("quicIdentity")
+        }
+        if policy.includeDNSAnswerAddresses {
+            available.insert("dnsAnswerAddresses")
+        }
+        if policy.emitDNSAssociationFields {
+            available.insert("dnsAssociation")
+        }
+        if policy.emitLineageFields {
+            available.insert("lineage")
+        }
+        if policy.emitPathRegimeFields {
+            available.insert("pathRegime")
+        }
+        if policy.emitServiceAttributionFields {
+            available.insert("serviceAttribution")
+        }
+        if policy.emitPacketCues {
+            available.insert("packetDetails")
+        }
+        if policy.emitAddressScopeFields {
+            available.insert("addressScope")
+        }
+        return available
+    }
+
+    private static let featureNameTable: [(family: DetectorFeatureFamily, name: String)] = [
+        (.packetShape, "packetShape"),
+        (.controlSignals, "controlSignals"),
+        (.burstShape, "burstShape"),
+        (.hostHints, "hostHints"),
+        (.quicIdentity, "quicIdentity"),
+        (.stringAddresses, "stringAddresses"),
+        (.dnsAnswerAddresses, "dnsAnswerAddresses"),
+        (.dnsAssociation, "dnsAssociation"),
+        (.lineage, "lineage"),
+        (.pathRegime, "pathRegime"),
+        (.serviceAttribution, "serviceAttribution"),
+        (.packetDetails, "packetDetails"),
+        (.sessionContext, "sessionContext"),
+        (.remoteEndpoint, "remoteEndpoint"),
+        (.roleAttribution, "roleAttribution"),
+        (.addressScope, "addressScope"),
+        (.eventAudit, "eventAudit"),
+        (.sourceAppAttribution, "sourceAppAttribution")
+    ]
 
     private static func recordDetections(state: SharedState, events: [DetectionEvent]) -> DetectionSnapshot {
         state.withLock { state in
@@ -627,18 +876,24 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         stream: AsyncStream<Command>,
         state: SharedState,
         pipeline: PacketAnalyticsPipeline,
+        clock: any Clock,
         packetStream: PacketSampleStream?,
         detectors: [any TrafficDetector],
         detectionPersistence: DetectionPersistenceCoordinator?,
+        richPacketLogStore: RichPacketLogStore?,
         logger: StructuredLogger,
         processInfo: ProcessInfo,
         emissionPolicyOverride: PacketAnalyticsPipeline.EmissionPolicy?,
         runtimePlan: DetectorRuntimePlan,
         pathRegimeProvider: (any PathRegimeProvider)?,
-        liveTapPolicy: LiveTapPolicy
+        liveTapPolicy: LiveTapPolicy,
+        packetCuePolicy: PacketCueEmissionPolicy,
+        telemetryDegradationPolicy: TelemetryDegradationPolicy,
+        writerProcess: String
     ) async {
         var detailRecords: [PacketSampleStream.PacketStreamRecord] = []
         var sessionContext: DetectorSessionContext?
+        var richPacketLogSequenceNumber: UInt64 = 0
 
         for await command in stream {
             switch command {
@@ -653,7 +908,30 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                     Self.didSkipBatch(state: state)
                     continue
                 }
-                let policy = emissionPolicyOverride ?? Self.currentEmissionPolicy(processInfo: processInfo, runtimePlan: runtimePlan)
+                let now = await clock.now()
+                if let richPacketLogStore {
+                    let richRecords = Self.makeRichPacketLogRecords(
+                        packets: filtered.packets,
+                        families: filtered.families,
+                        summaries: filtered.summaries,
+                        direction: batch.direction,
+                        timestamp: now,
+                        sessionContext: sessionContext,
+                        writerProcess: writerProcess,
+                        policy: richPacketLogStore.policy,
+                        sequenceNumber: &richPacketLogSequenceNumber
+                    )
+                    if !richRecords.isEmpty {
+                        await richPacketLogStore.append(records: richRecords)
+                        Self.noteRichPacketLogRecords(state: state, records: richRecords)
+                    }
+                }
+                let policy = emissionPolicyOverride ?? Self.currentEmissionPolicy(
+                    processInfo: processInfo,
+                    runtimePlan: runtimePlan,
+                    packetCuePolicy: packetCuePolicy,
+                    telemetryDegradationPolicy: telemetryDegradationPolicy
+                )
                 let runtimeContext = PacketAnalyticsPipeline.RuntimeContext(
                     pathRegime: policy.emitPathRegimeFields ? pathRegimeProvider?.currentSnapshot : nil,
                     sessionContext: sessionContext
@@ -669,6 +947,7 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 guard !records.isEmpty else {
                     continue
                 }
+                Self.notePipelineRecords(state: state, records: records)
 
                 if !detectors.isEmpty {
                     var emittedDetections: [DetectionEvent] = []
@@ -693,10 +972,12 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 Self.setBufferedRecordCount(state: state, detailRecords.count)
                 if !snapshotRecords.isEmpty {
                     await Self.publish(packetStream: packetStream, logger: logger, snapshotRecords)
+                    Self.notePublishedRecords(state: state, records: snapshotRecords)
                 }
 
             case .updateSessionContext(let context, let signal):
                 sessionContext = context
+                Self.setSessionContext(state: state, context)
                 signal?.resume()
 
             case .reset(let signal):
@@ -774,7 +1055,10 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 trimDetailRecords(&detailRecords)
 
             case .packetCue:
-                continue
+                guard liveTapPolicy.includePacketCues || liveTapPolicy.includeValidationRecords else {
+                    continue
+                }
+                snapshotRecords.append(record)
 
             case .sourceAppFlow:
                 snapshotRecords.append(record)
@@ -865,12 +1149,179 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
         }
     }
 
+    private static func makeRichPacketLogRecords(
+        packets: [Data],
+        families: [Int32],
+        summaries: [FastPacketSummary],
+        direction: PacketDirection,
+        timestamp: Date,
+        sessionContext: DetectorSessionContext?,
+        writerProcess: String,
+        policy: RichPacketLogPolicy,
+        sequenceNumber: inout UInt64
+    ) -> [RichPacketLogRecord] {
+        guard policy.isEnabled, policy.includes(direction: direction), !summaries.isEmpty else {
+            return []
+        }
+
+        let timestampMs = timestamp.timeIntervalSince1970 * 1_000
+        var records: [RichPacketLogRecord] = []
+        records.reserveCapacity(min(summaries.count, policy.maxRecordsPerBatch))
+        var metadataProbeCount = 0
+
+        for (index, summary) in summaries.enumerated() {
+            guard records.count < policy.maxRecordsPerBatch else {
+                break
+            }
+            if let maxPacketLength = policy.maxPacketLength, summary.packetLength > maxPacketLength {
+                continue
+            }
+
+            let packet = packets.indices.contains(index) ? packets[index] : Data()
+            let familyHint = families.indices.contains(index) ? families[index] : 0
+            let metadata: PacketMetadata?
+            if policy.includeParsedMetadata, metadataProbeCount < policy.metadataProbeLimitPerBatch {
+                metadataProbeCount += 1
+                metadata = PacketParser.parse(packet, ipVersionHint: familyHint)
+            } else {
+                metadata = nil
+            }
+
+            let sourceAddress = metadata?.srcAddress.stringValue ?? PacketSampleStream.decodedAddress(
+                length: summary.sourceAddressLength,
+                high: summary.sourceAddressHigh,
+                low: summary.sourceAddressLow,
+                fallback: nil
+            )
+            let destinationAddress = metadata?.dstAddress.stringValue ?? PacketSampleStream.decodedAddress(
+                length: summary.destinationAddressLength,
+                high: summary.destinationAddressHigh,
+                low: summary.destinationAddressLow,
+                fallback: nil
+            )
+            let sourcePort = summary.hasPorts ? summary.sourcePort : metadata?.srcPort
+            let destinationPort = summary.hasPorts ? summary.destinationPort : metadata?.dstPort
+            let flowId = String(format: "%016llx", summary.flowHash)
+            let directionRaw = direction.rawValue
+            let remoteAddress = DetectorRecordDerivation.remoteAddress(
+                direction: directionRaw,
+                sourceAddress: sourceAddress,
+                destinationAddress: destinationAddress
+            )
+            let remotePort = DetectorRecordDerivation.remotePort(
+                direction: directionRaw,
+                sourcePort: sourcePort,
+                destinationPort: destinationPort
+            )
+            let localAddress = DetectorRecordDerivation.localAddress(
+                direction: directionRaw,
+                sourceAddress: sourceAddress,
+                destinationAddress: destinationAddress
+            )
+            let localPort = DetectorRecordDerivation.localPort(
+                direction: directionRaw,
+                sourcePort: sourcePort,
+                destinationPort: destinationPort
+            )
+            let remoteEndpoint = DetectorRecordDerivation.endpoint(
+                protocolHint: summary.protocolHint,
+                address: remoteAddress,
+                port: remotePort
+            )
+            let flowIdentity = DetectorRecordDerivation.flowIdentity(
+                protocolHint: summary.protocolHint,
+                direction: directionRaw,
+                sourceAddress: sourceAddress,
+                sourcePort: sourcePort,
+                destinationAddress: destinationAddress,
+                destinationPort: destinationPort,
+                flowId: flowId,
+                lineageId: nil,
+                generation: nil
+            )
+            let tcpFlags = summary.transport == .tcp ? summary.tcpFlags : nil
+            let dnsAnswerAddresses = policy.includeDNSAnswerAddresses
+                ? metadata?.dnsAnswerAddresses?.map(\.stringValue)
+                : nil
+            let packetBytePrefixHex = policy.includePacketBytePrefix
+                ? Self.hexString(Data(packet.prefix(policy.packetBytePrefixLength)))
+                : nil
+
+            sequenceNumber = sequenceNumber == UInt64.max ? UInt64.max : sequenceNumber + 1
+            records.append(
+                RichPacketLogRecord(
+                    sequenceNumber: sequenceNumber,
+                    timestamp: timestamp,
+                    timestampMs: timestampMs,
+                    direction: direction,
+                    writerProcess: writerProcess,
+                    sessionContext: sessionContext,
+                    packetLength: summary.packetLength,
+                    transportPayloadLength: summary.transportPayloadLengthIfAvailable,
+                    ipVersion: summary.ipVersion,
+                    transportProtocolNumber: summary.transportProtocolNumber,
+                    protocolHint: summary.protocolHint,
+                    sourceAddress: sourceAddress,
+                    sourcePort: sourcePort,
+                    destinationAddress: destinationAddress,
+                    destinationPort: destinationPort,
+                    localAddress: localAddress,
+                    localPort: localPort,
+                    remoteAddress: remoteAddress,
+                    remotePort: remotePort,
+                    remoteEndpoint: remoteEndpoint,
+                    flowId: flowId,
+                    flowIdentity: flowIdentity,
+                    tcpFlags: tcpFlags,
+                    tcpAck: summary.transport == .tcp ? summary.hasTCPACK : nil,
+                    tcpPsh: summary.transport == .tcp ? summary.hasTCPPSH : nil,
+                    tcpSyn: summary.transport == .tcp ? summary.hasTCPSYN : nil,
+                    tcpFin: summary.transport == .tcp ? summary.hasTCPFIN : nil,
+                    tcpRst: summary.transport == .tcp ? summary.hasTCPRST : nil,
+                    isDNSCandidate: summary.isDNSCandidate,
+                    isTLSClientHelloCandidate: summary.isTLSClientHelloCandidate,
+                    isQUICCandidate: summary.isQUICCandidate,
+                    isQUICLongHeader: summary.isQUICLongHeader,
+                    isQUICInitialCandidate: summary.isQUICInitialCandidate,
+                    metadataParsed: metadata != nil,
+                    dnsQueryName: metadata?.dnsQueryName,
+                    dnsCname: metadata?.dnsCname,
+                    dnsAnswerAddresses: dnsAnswerAddresses,
+                    registrableDomain: metadata?.registrableDomain,
+                    tlsServerName: metadata?.tlsServerName,
+                    quicVersion: metadata?.quicVersion ?? summary.quicVersion,
+                    quicPacketType: metadata?.quicPacketType?.rawValue ?? summary.quicPacketType?.rawValue,
+                    quicDestinationConnectionId: policy.includeQUICConnectionIDs
+                        ? metadata?.quicDestinationConnectionId ?? Self.hexString(summary.quicDestinationConnectionID)
+                        : nil,
+                    quicSourceConnectionId: policy.includeQUICConnectionIDs
+                        ? metadata?.quicSourceConnectionId ?? Self.hexString(summary.quicSourceConnectionID)
+                        : nil,
+                    addressFamilyHint: familyHint == 0 ? nil : Int(familyHint),
+                    packetBytePrefixHex: packetBytePrefixHex
+                )
+            )
+        }
+
+        return records
+    }
+
+    private static func hexString(_ data: Data?) -> String? {
+        guard let data, !data.isEmpty else {
+            return nil
+        }
+        return data.map { String(format: "%02x", $0) }.joined()
+    }
+
     private static func currentEmissionPolicy(
         processInfo: ProcessInfo,
-        runtimePlan: DetectorRuntimePlan
+        runtimePlan: DetectorRuntimePlan,
+        packetCuePolicy: PacketCueEmissionPolicy,
+        telemetryDegradationPolicy: TelemetryDegradationPolicy
     ) -> PacketAnalyticsPipeline.EmissionPolicy {
-        let thermalState = processInfo.tunnelThermalState
-        let lowPowerModeEnabled = processInfo.tunnelLowPowerModeEnabled
+        let reportedThermalState = processInfo.tunnelThermalState
+        let thermalState = telemetryDegradationPolicy.reduceOnThermalPressure ? reportedThermalState : .nominal
+        let lowPowerModeEnabled = telemetryDegradationPolicy.reduceOnLowPowerMode && processInfo.tunnelLowPowerModeEnabled
 
         if lowPowerModeEnabled || thermalState == .critical {
             return PacketAnalyticsPipeline.EmissionPolicy(
@@ -893,7 +1344,8 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 activitySampleMinimumInterval: 30,
                 emitBurstEvents: true,
                 emitActivitySamples: false,
-                emitPacketCues: runtimePlan.needsPacketCues
+                emitPacketCues: runtimePlan.needsPacketCues,
+                packetCuePolicy: packetCuePolicy
             )
         }
 
@@ -921,7 +1373,8 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 activitySampleMinimumInterval: 6,
                 emitBurstEvents: true,
                 emitActivitySamples: true,
-                emitPacketCues: runtimePlan.needsPacketCues
+                emitPacketCues: runtimePlan.needsPacketCues,
+                packetCuePolicy: packetCuePolicy
             )
         case .fair:
             return PacketAnalyticsPipeline.EmissionPolicy(
@@ -944,7 +1397,8 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 activitySampleMinimumInterval: 30,
                 emitBurstEvents: true,
                 emitActivitySamples: false,
-                emitPacketCues: runtimePlan.needsPacketCues
+                emitPacketCues: runtimePlan.needsPacketCues,
+                packetCuePolicy: packetCuePolicy
             )
         case .serious, .critical, .unknown:
             return PacketAnalyticsPipeline.EmissionPolicy(
@@ -967,7 +1421,8 @@ public final class PacketTelemetryWorker: @unchecked Sendable {
                 activitySampleMinimumInterval: 30,
                 emitBurstEvents: true,
                 emitActivitySamples: false,
-                emitPacketCues: runtimePlan.needsPacketCues
+                emitPacketCues: runtimePlan.needsPacketCues,
+                packetCuePolicy: packetCuePolicy
             )
         }
     }

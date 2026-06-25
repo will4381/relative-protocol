@@ -113,6 +113,9 @@ The package writes small, explicit artifacts under the App Group container:
 <AppGroup>/Analytics/
   Detections/
     detections.json
+  RichPacketLogs/
+    rich-packets.current.jsonl
+    rich-packets.<timestamp>.<sequence>.jsonl
   last-stop.json
 <AppGroup>/Logs/
   events.current.jsonl
@@ -123,7 +126,7 @@ The package writes small, explicit artifacts under the App Group container:
 
 Persisted App Group artifacts are file-protected and excluded from device/iCloud backup.
 
-The package does not persist the rolling live tap. It does persist bounded JSONL tunnel logs by default. If a containing app also writes JSONL diagnostics into the same App Group, give that app its own `JSONLLogSink` file prefix so both processes never append to one active file.
+The package does not persist the rolling live tap. It does persist bounded JSONL tunnel logs by default. Optional rich packet logs are a separate `RichPacketLogPolicy` debug stream under `Analytics/RichPacketLogs`, disabled by default. If a containing app also writes JSONL diagnostics into the same App Group, give that app its own file prefix so both processes never append to one active file.
 
 ## Background Correctness Rules
 
@@ -147,6 +150,7 @@ The package is intentionally shaped to minimize data retention:
 - rolling live tap is memory-only
 - detector outputs are compact and explicit
 - persisted detector snapshots are privacy-redacted, file-protected, and excluded from backup
-- no continuous raw packet log is written by default
+- no continuous packet log is written by default
+- optional rich packet logs are bounded and do not include packet byte prefixes unless explicitly enabled
 
 If you add custom detectors, keep that same discipline. Only persist what the product truly needs.

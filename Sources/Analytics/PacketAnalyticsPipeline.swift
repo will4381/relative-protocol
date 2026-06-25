@@ -15,12 +15,6 @@ public actor PacketAnalyticsPipeline {
         static let arrivalQueueCompactionThreshold = 128
     }
 
-    private enum PacketCuePolicy {
-        static let maxTCPPayloadLength = 800
-        static let udpPacketLengthRange = 500...1_300
-        static let maxHostAssociatedPacketLength = 1_300
-    }
-
     /// Emission policy applied by the long-lived telemetry worker.
     /// Decision: always-on capture stays cheap, while richer metadata and activity samples are reduced as thermal pressure rises.
     public struct EmissionPolicy: Sendable {
@@ -44,6 +38,7 @@ public actor PacketAnalyticsPipeline {
         public let emitBurstEvents: Bool
         public let emitActivitySamples: Bool
         public let emitPacketCues: Bool
+        public let packetCuePolicy: PacketCueEmissionPolicy
 
         public init(
             allowDeepMetadata: Bool,
@@ -65,7 +60,8 @@ public actor PacketAnalyticsPipeline {
             activitySampleMinimumInterval: TimeInterval,
             emitBurstEvents: Bool,
             emitActivitySamples: Bool,
-            emitPacketCues: Bool = false
+            emitPacketCues: Bool = false,
+            packetCuePolicy: PacketCueEmissionPolicy = .disabled
         ) {
             self.allowDeepMetadata = allowDeepMetadata
             self.maxMetadataProbesPerBatch = max(0, maxMetadataProbesPerBatch)
@@ -86,7 +82,8 @@ public actor PacketAnalyticsPipeline {
             self.activitySampleMinimumInterval = max(0, activitySampleMinimumInterval)
             self.emitBurstEvents = emitBurstEvents
             self.emitActivitySamples = emitActivitySamples
-            self.emitPacketCues = emitPacketCues
+            self.emitPacketCues = emitPacketCues && packetCuePolicy.isEnabled
+            self.packetCuePolicy = packetCuePolicy
         }
     }
 
@@ -361,16 +358,19 @@ public actor PacketAnalyticsPipeline {
             return []
         }
 
-        let batchNow = await clock.now()
+        let batchInstant = await clock.instant()
+        let batchNow = batchInstant.date
+        let batchTimestampMs = batchInstant.milliseconds
         var records: [PacketSampleStream.PacketStreamRecord] = []
         records.reserveCapacity(min(packets.count, 64) * 2)
-        records.append(contentsOf: maybeEvictExpiredFlowContexts(now: batchNow, policy: policy))
+        records.append(contentsOf: maybeEvictExpiredFlowContexts(now: batchNow, timestampMs: batchTimestampMs, policy: policy))
 
         var metadataProbesRemaining = policy.maxMetadataProbesPerBatch
 
         // One clock read per batch: packets inside one ingest batch arrive together, so a shared
         // timestamp preserves burst/slice semantics while removing an async clock call per packet.
         let now = batchNow
+        let nowMs = batchTimestampMs
         for (index, packet) in packets.enumerated() {
             let familyHint: Int32? = families.indices.contains(index) ? families[index] : nil
             let summary: FastPacketSummary
@@ -412,7 +412,7 @@ public actor PacketAnalyticsPipeline {
 
             if let burst = burstTracker.recordPacket(flow: flow, now: now) {
                 if policy.emitBurstEvents, !context.currentBurst.isEmpty {
-                    records.append(makeBurstRecord(timestamp: now, direction: direction, flowContext: context, burst: burst, policy: policy))
+                    records.append(makeBurstRecord(timestamp: now, timestampMs: nowMs, direction: direction, flowContext: context, burst: burst, policy: policy))
                 }
                 context.currentBurst.reset()
             }
@@ -436,6 +436,7 @@ public actor PacketAnalyticsPipeline {
                     makeRecord(
                         kind: .flowOpen,
                         timestamp: now,
+                        timestampMs: nowMs,
                         direction: direction,
                         flowContext: context,
                         counters: CounterSet(summary: summary)
@@ -469,6 +470,7 @@ public actor PacketAnalyticsPipeline {
                             makeRecord(
                                 kind: .metadata,
                                 timestamp: now,
+                                timestampMs: nowMs,
                                 direction: direction,
                                 flowContext: context,
                                 counters: CounterSet(summary: summary)
@@ -478,15 +480,17 @@ public actor PacketAnalyticsPipeline {
                 }
             }
 
-            if shouldEmitPacketCue(summary: summary, direction: direction, flowContext: context, didUpdateMetadata: didUpdateMetadata, policy: policy) {
+            if let packetCueReason = packetCueReason(summary: summary, direction: direction, flowContext: context, didUpdateMetadata: didUpdateMetadata, policy: policy) {
                 records.append(
                     makeRecord(
                         kind: .packetCue,
                         timestamp: now,
+                        timestampMs: nowMs,
                         direction: direction,
                         flowContext: context,
                         counters: CounterSet(summary: summary),
-                        packetSummary: summary
+                        packetSummary: summary,
+                        packetCueReason: packetCueReason
                     )
                 )
             }
@@ -496,6 +500,7 @@ public actor PacketAnalyticsPipeline {
                     makeRecord(
                         kind: .flowSlice,
                         timestamp: now,
+                        timestampMs: nowMs,
                         direction: direction,
                         flowContext: context,
                         counters: context.slice.counters
@@ -509,6 +514,7 @@ public actor PacketAnalyticsPipeline {
                     makeRecord(
                         kind: .activitySample,
                         timestamp: now,
+                        timestampMs: nowMs,
                         direction: direction,
                         flowContext: context,
                         counters: context.activityCounters
@@ -524,6 +530,7 @@ public actor PacketAnalyticsPipeline {
                         flow: flow,
                         context: context,
                         timestamp: now,
+                        timestampMs: nowMs,
                         direction: direction,
                         reason: closeReason,
                         policy: policy,
@@ -539,7 +546,7 @@ public actor PacketAnalyticsPipeline {
             }
         }
 
-        records.append(contentsOf: trimOverflowFlowContextsIfNeeded(policy: policy, now: batchNow))
+        records.append(contentsOf: trimOverflowFlowContextsIfNeeded(policy: policy, now: batchNow, timestampMs: batchTimestampMs))
         return records
     }
 
@@ -668,43 +675,57 @@ public actor PacketAnalyticsPipeline {
         }
     }
 
-    private func shouldEmitPacketCue(
+    private func packetCueReason(
         summary: FastPacketSummary,
         direction: PacketDirection,
         flowContext: FlowContext,
         didUpdateMetadata: Bool,
         policy: EmissionPolicy
-    ) -> Bool {
+    ) -> PacketCueReason? {
         guard policy.emitPacketCues else {
-            return false
+            return nil
         }
+        let cuePolicy = policy.packetCuePolicy
         if didUpdateMetadata && (summary.transport == .tcp || summary.transport == .udp) {
-            return true
+            return cuePolicy.emitMetadataRefreshCues ? .metadataRefresh : nil
         }
-        guard direction == .outbound else {
-            return false
+        guard cuePolicy.directions.isEmpty || cuePolicy.directions.contains(direction) else {
+            return nil
         }
 
         switch summary.transport {
         case .tcp:
-            if summary.hasTCPACK,
-               summary.hasTCPPSH,
+            if (!cuePolicy.requireTcpAck || summary.hasTCPACK),
+               (!cuePolicy.requireTcpPsh || summary.hasTCPPSH),
                let payloadLength = summary.transportPayloadLengthIfAvailable,
-               payloadLength <= PacketCuePolicy.maxTCPPayloadLength {
-                return true
+               let tcpPayloadLengthRange = cuePolicy.tcpPayloadLengthRange,
+               tcpPayloadLengthRange.contains(payloadLength) {
+                if cuePolicy.requireTcpAck && cuePolicy.requireTcpPsh {
+                    return .tcpAckPshPayloadRange
+                }
+                return .explicitPolicyMatch
             }
-            return hasHostAssociation(flowContext) &&
-                summary.transportPayloadLengthIfAvailable != nil &&
-                summary.packetLength <= PacketCuePolicy.maxHostAssociatedPacketLength
+            if cuePolicy.includeHostAssociatedPackets,
+               hasHostAssociation(flowContext),
+               summary.transportPayloadLengthIfAvailable != nil,
+               cuePolicy.maxHostAssociatedPacketLength.map({ summary.packetLength <= $0 }) ?? true {
+                return .hostAssociatedPacket
+            }
+            return nil
         case .udp:
-            if PacketCuePolicy.udpPacketLengthRange.contains(summary.packetLength) {
-                return true
+            if let udpPacketLengthRange = cuePolicy.udpPacketLengthRange,
+               udpPacketLengthRange.contains(summary.packetLength) {
+                return .udpPacketLengthRange
             }
-            return hasHostAssociation(flowContext) &&
-                summary.transportPayloadLengthIfAvailable != nil &&
-                summary.packetLength <= PacketCuePolicy.maxHostAssociatedPacketLength
+            if cuePolicy.includeHostAssociatedPackets,
+               hasHostAssociation(flowContext),
+               summary.transportPayloadLengthIfAvailable != nil,
+               cuePolicy.maxHostAssociatedPacketLength.map({ summary.packetLength <= $0 }) ?? true {
+                return .hostAssociatedPacket
+            }
+            return nil
         default:
-            return false
+            return nil
         }
     }
 
@@ -821,6 +842,7 @@ public actor PacketAnalyticsPipeline {
 
     private func makeBurstRecord(
         timestamp: Date,
+        timestampMs: Double,
         direction: PacketDirection,
         flowContext: FlowContext,
         burst: BurstSample,
@@ -829,6 +851,7 @@ public actor PacketAnalyticsPipeline {
         makeRecord(
             kind: .burst,
             timestamp: timestamp,
+            timestampMs: timestampMs,
             direction: direction,
             flowContext: flowContext,
             counters: flowContext.currentBurst.counters,
@@ -848,6 +871,7 @@ public actor PacketAnalyticsPipeline {
     private func makeRecord(
         kind: PacketSampleKind,
         timestamp: Date,
+        timestampMs: Double? = nil,
         direction: PacketDirection,
         flowContext: FlowContext,
         counters: CounterSet? = nil,
@@ -862,13 +886,28 @@ public actor PacketAnalyticsPipeline {
         burstUdpPacketCount: Int? = nil,
         burstTcpPacketCount: Int? = nil,
         burstQuicInitialCount: Int? = nil,
-        packetSummary: FastPacketSummary? = nil
+        packetSummary: FastPacketSummary? = nil,
+        packetCueReason: PacketCueReason? = nil
     ) -> PacketSampleStream.PacketStreamRecord {
         let counters = counters ?? CounterSet()
         let template = flowContext.recordTemplate
+        let sourceAddress = PacketSampleStream.decodedAddress(
+            length: template.sourceAddressLength,
+            high: template.sourceAddressHigh,
+            low: template.sourceAddressLow,
+            fallback: nil
+        )
+        let destinationAddress = PacketSampleStream.decodedAddress(
+            length: template.destinationAddressLength,
+            high: template.destinationAddressHigh,
+            low: template.destinationAddressLow,
+            fallback: nil
+        )
+        let flowId = String(format: "%016llx", template.flowHash)
         return PacketSampleStream.PacketStreamRecord(
             kind: kind,
             timestamp: timestamp,
+            timestampMs: timestampMs ?? timestamp.timeIntervalSince1970 * 1_000,
             direction: direction.rawValue,
             bytes: counters.bytes,
             packetCount: counters.isEmpty ? nil : counters.packetCount,
@@ -942,7 +981,19 @@ public actor PacketAnalyticsPipeline {
             tcpFlags: packetSummary?.transport == .tcp ? packetSummary?.tcpFlags : nil,
             tcpAck: packetSummary?.transport == .tcp ? packetSummary?.hasTCPACK : nil,
             tcpPsh: packetSummary?.transport == .tcp ? packetSummary?.hasTCPPSH : nil,
+            packetCueReason: packetCueReason,
             sessionContext: flowContext.sessionContext,
+            flowIdentity: DetectorRecordDerivation.flowIdentity(
+                protocolHint: template.protocolHint,
+                direction: direction.rawValue,
+                sourceAddress: sourceAddress,
+                sourcePort: template.sourcePort,
+                destinationAddress: destinationAddress,
+                destinationPort: template.destinationPort,
+                flowId: flowId,
+                lineageId: flowContext.lineage?.lineageID,
+                generation: flowContext.lineage?.generation
+            ),
             addressScopeFamily: flowContext.addressScope?.family,
             addressScopeSource: flowContext.addressScope?.source,
             addressScopeConfidence: flowContext.addressScope?.confidence
@@ -967,7 +1018,11 @@ public actor PacketAnalyticsPipeline {
 
     /// Decision: flow-context cleanup is amortized because sweeping a large dictionary on every batch adds heat
     /// without improving detector quality.
-    private func maybeEvictExpiredFlowContexts(now: Date, policy: EmissionPolicy) -> [PacketSampleStream.PacketStreamRecord] {
+    private func maybeEvictExpiredFlowContexts(
+        now: Date,
+        timestampMs: Double,
+        policy: EmissionPolicy
+    ) -> [PacketSampleStream.PacketStreamRecord] {
         if let lastFlowContextSweepAt,
            now.timeIntervalSince(lastFlowContextSweepAt) < FlowCachePolicy.evictionSweepIntervalSeconds,
            flowContexts.count < FlowCachePolicy.maxTrackedFlows {
@@ -983,13 +1038,17 @@ public actor PacketAnalyticsPipeline {
             guard let context = flowContexts[flow] else {
                 continue
             }
-            records.append(contentsOf: closeFlow(flow: flow, context: context, timestamp: now, direction: context.lastDirection, reason: .idleEviction, policy: policy))
+            records.append(contentsOf: closeFlow(flow: flow, context: context, timestamp: now, timestampMs: timestampMs, direction: context.lastDirection, reason: .idleEviction, policy: policy))
         }
         pruneFlowContextArrivalQueueIfNeeded(force: !expiredFlows.isEmpty)
         return records
     }
 
-    private func trimOverflowFlowContextsIfNeeded(policy: EmissionPolicy, now: Date) -> [PacketSampleStream.PacketStreamRecord] {
+    private func trimOverflowFlowContextsIfNeeded(
+        policy: EmissionPolicy,
+        now: Date,
+        timestampMs: Double
+    ) -> [PacketSampleStream.PacketStreamRecord] {
         guard flowContexts.count > FlowCachePolicy.maxTrackedFlows else {
             return []
         }
@@ -1002,14 +1061,14 @@ public actor PacketAnalyticsPipeline {
                 guard let context = flowContexts[candidate] else {
                     continue
                 }
-                records.append(contentsOf: closeFlow(flow: candidate, context: context, timestamp: now, direction: context.lastDirection, reason: .overflowEviction, policy: policy))
+                records.append(contentsOf: closeFlow(flow: candidate, context: context, timestamp: now, timestampMs: timestampMs, direction: context.lastDirection, reason: .overflowEviction, policy: policy))
             } else if let fallback = flowContexts.keys.first {
                 // Decision: this should stay cold because the arrival queue is the primary eviction path.
                 // If the queue is unexpectedly empty, removing any active flow is cheaper than re-sorting the actor state.
                 guard let context = flowContexts[fallback] else {
                     continue
                 }
-                records.append(contentsOf: closeFlow(flow: fallback, context: context, timestamp: now, direction: context.lastDirection, reason: .overflowEviction, policy: policy))
+                records.append(contentsOf: closeFlow(flow: fallback, context: context, timestamp: now, timestampMs: timestampMs, direction: context.lastDirection, reason: .overflowEviction, policy: policy))
             } else {
                 break
             }
@@ -1023,6 +1082,7 @@ public actor PacketAnalyticsPipeline {
         flow: FlowKey,
         context: FlowContext,
         timestamp: Date,
+        timestampMs: Double,
         direction: PacketDirection,
         reason: FlowCloseReason,
         policy: EmissionPolicy,
@@ -1034,6 +1094,7 @@ public actor PacketAnalyticsPipeline {
             flow: flow,
             context: context,
             timestamp: timestamp,
+            timestampMs: timestampMs,
             direction: direction,
             reason: reason,
             policy: policy,
@@ -1048,6 +1109,7 @@ public actor PacketAnalyticsPipeline {
                     flow: relatedFlow,
                     context: relatedContext,
                     timestamp: timestamp,
+                    timestampMs: timestampMs,
                     direction: relatedContext.lastDirection,
                     reason: reason,
                     policy: policy,
@@ -1063,6 +1125,7 @@ public actor PacketAnalyticsPipeline {
         flow: FlowKey,
         context: FlowContext,
         timestamp: Date,
+        timestampMs: Double,
         direction: PacketDirection,
         reason: FlowCloseReason,
         policy: EmissionPolicy,
@@ -1074,6 +1137,7 @@ public actor PacketAnalyticsPipeline {
                 makeRecord(
                     kind: .flowSlice,
                     timestamp: timestamp,
+                    timestampMs: timestampMs,
                     direction: direction,
                     flowContext: context,
                     counters: context.slice.counters
@@ -1086,6 +1150,7 @@ public actor PacketAnalyticsPipeline {
                 makeRecord(
                     kind: .flowClose,
                     timestamp: timestamp,
+                    timestampMs: timestampMs,
                     direction: direction,
                     flowContext: context,
                     counters: closingSummary == nil ? nil : closingCounters,

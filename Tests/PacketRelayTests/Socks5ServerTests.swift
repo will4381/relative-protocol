@@ -364,7 +364,7 @@ final class Socks5ServerTests: XCTestCase {
         let payload = Data([0x01, 0x02, 0x03])
         let frame = try XCTUnwrap(
             Socks5Codec.buildTCPForwardUDPPacket(
-                address: .domain("i.instagram.com"),
+                address: .domain("media.example.com"),
                 port: 443,
                 payload: payload
             )
@@ -378,7 +378,7 @@ final class Socks5ServerTests: XCTestCase {
         }
 
         let session = try XCTUnwrap(provider.udpSessions.first)
-        XCTAssertEqual(session.endpoint.hostname, "i.instagram.com")
+        XCTAssertEqual(session.endpoint.hostname, "media.example.com")
         XCTAssertEqual(session.endpoint.port, "443")
         XCTAssertEqual(session.writtenDatagrams, [payload])
         XCTAssertEqual(
@@ -395,7 +395,7 @@ final class Socks5ServerTests: XCTestCase {
 
         let responseFrame = try XCTUnwrap(
             Socks5Codec.buildTCPForwardUDPPacket(
-                address: .domain("i.instagram.com"),
+                address: .domain("media.example.com"),
                 port: 443,
                 payload: responsePayload
             )

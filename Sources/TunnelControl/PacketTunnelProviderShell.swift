@@ -695,7 +695,17 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
         let detectionStore = DetectionStore(fileURL: detectionStoreURL)
         let initialDetectionSnapshot = (try? detectionStore.load()) ?? .empty
         let detectors = try await makeDetectors(profile: profile, analyticsRootURL: root, logger: logger)
-        if packetStream == nil && detectors.isEmpty {
+
+        let richPacketLogStore: RichPacketLogStore? = if profile.richPacketLogPolicy.isEnabled {
+            RichPacketLogStore(
+                rootURL: richPacketLogRootURL(profile: profile, analyticsRootURL: root),
+                policy: profile.richPacketLogPolicy
+            )
+        } else {
+            nil
+        }
+
+        if packetStream == nil && detectors.isEmpty && richPacketLogStore == nil {
             return nil
         }
 
@@ -711,13 +721,27 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
 
         return PacketTelemetryWorker(
             pipeline: pipeline,
+            clock: clock,
             packetStream: packetStream,
             detectors: detectors,
             initialDetectionSnapshot: initialDetectionSnapshot,
             detectionStore: detectionStore,
+            richPacketLogStore: richPacketLogStore,
             logger: logger,
-            includeFlowSlicesInLiveTap: profile.liveTapIncludeFlowSlices
+            includeFlowSlicesInLiveTap: profile.liveTapIncludeFlowSlices,
+            includePacketCuesInLiveTap: profile.liveTapIncludePacketCues,
+            includeValidationRecordsInLiveTap: profile.liveTapIncludeValidationRecords,
+            packetCuePolicy: profile.packetCuePolicy,
+            telemetryDegradationPolicy: profile.telemetryDegradationPolicy
         )
+    }
+
+    private func richPacketLogRootURL(profile: TunnelProfile, analyticsRootURL: URL) -> URL {
+        if !profile.appGroupID.isEmpty,
+           let root = try? AnalyticsStoragePaths.richPacketLogsRoot(appGroupID: profile.appGroupID) {
+            return root
+        }
+        return analyticsRootURL.appendingPathComponent("RichPacketLogs", isDirectory: true)
     }
 
     /// Returns the detector set used by the provider's telemetry worker.
@@ -747,7 +771,10 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                 let limit = normalizedPacketLimit(request.packetLimit)
                 let telemetrySnapshot: TunnelTelemetrySnapshot
                 if let telemetryWorker = snapshot.telemetryWorker {
-                    telemetrySnapshot = await telemetryWorker.recentSnapshot(limit: limit)
+                    telemetrySnapshot = await telemetryWorker.recentSnapshot(
+                        limit: limit,
+                        includeValidationRecords: request.includeValidationRecords ?? false
+                    )
                 } else {
                     telemetrySnapshot = .empty
                 }

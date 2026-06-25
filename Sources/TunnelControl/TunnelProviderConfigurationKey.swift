@@ -25,7 +25,13 @@ enum TunnelProviderConfigurationKey {
     static let telemetryEnabled = "telemetryEnabled"
     static let liveTapEnabled = "liveTapEnabled"
     static let liveTapIncludeFlowSlices = "liveTapIncludeFlowSlices"
+    static let liveTapIncludePacketCues = "liveTapIncludePacketCues"
+    static let liveTapIncludeValidationRecords = "liveTapIncludeValidationRecords"
     static let liveTapMaxBytes = "liveTapMaxBytes"
+    static let packetCuePolicy = "packetCuePolicy"
+    static let telemetryReduceOnLowPowerMode = "telemetryReduceOnLowPowerMode"
+    static let telemetryReduceOnThermalPressure = "telemetryReduceOnThermalPressure"
+    static let richPacketLogPolicy = "richPacketLogPolicy"
     static let signatureFileName = "signatureFileName"
     static let relayHost = "relayHost"
     static let relayPort = "relayPort"
@@ -54,7 +60,13 @@ enum TunnelProviderConfigurationKey {
         telemetryEnabled,
         liveTapEnabled,
         liveTapIncludeFlowSlices,
+        liveTapIncludePacketCues,
+        liveTapIncludeValidationRecords,
         liveTapMaxBytes,
+        packetCuePolicy,
+        telemetryReduceOnLowPowerMode,
+        telemetryReduceOnThermalPressure,
+        richPacketLogPolicy,
         signatureFileName,
         relayHost,
         relayPort,

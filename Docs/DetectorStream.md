@@ -19,7 +19,7 @@ final class MyDetector: TrafficDetector {
     let identifier = "my-detector"
     let requirements = DetectorRequirements(
         recordKinds: [.flowOpen, .packetCue, .metadata],
-        featureFamilies: [.remoteEndpoint, .roleAttribution, .addressScope]
+        featureFamilies: [.remoteEndpoint, .addressScope]
     )
 
     func ingest(_ records: DetectorRecordCollection) -> [DetectionEvent] {
@@ -98,33 +98,162 @@ For `packetCue` records, `DetectorRecord` automatically projects:
 - `tcpFlags`
 - `tcpAck`
 - `tcpPsh`
+- `packetCueReason`
 - `sourceAddress`
 - `sourcePort`
 - `destinationAddress`
 - `destinationPort`
 - `flowId`
+- `flowIdentity`
 - `remoteAddress`
 - `remotePort`
 - `remoteEndpoint`
 - `ownerKey`
-- `role`
+- `role` when supplied by the app or detector integration
 - `tlsServerName`
 - `registrableDomain`
 - `associatedDomain`
 - `dnsQueryName`
 - `dnsCname`
 
-`packetCue` emission is intentionally sparse. The tunnel emits it for likely useful packets:
+`timestampMs` is the detector clock domain used for packet sequencing, Content Filter attribution windows, session context, and fire records. In production, `SystemClock` anchors once to wall time and advances this value from monotonic uptime so later wall-clock changes do not reorder the detector stream.
 
-- outbound TCP with ACK + PSH and payload length `<= 800`
-- outbound UDP with packet length `500...1300`
-- packets associated with useful host/domain metadata
+`packetCue` emission is intentionally sparse and configurable. The package does not hardcode product-specific packet ranges.
+
+Use `PacketCueEmissionPolicy` to choose the generic packet shapes your app wants:
+
+```swift
+let packetCuePolicy = PacketCueEmissionPolicy(
+    tcpPayloadLengthRange: PacketLengthRange(0...800),
+    udpPacketLengthRange: PacketLengthRange(500...1_300),
+    directions: [.outbound],
+    requireTcpAck: true,
+    requireTcpPsh: true,
+    includeHostAssociatedPackets: true,
+    maxHostAssociatedPacketLength: 1_500,
+    emitMetadataRefreshCues: true
+)
+```
+
+Possible `packetCueReason` values are:
+
+- `tcpAckPshPayloadRange`
+- `udpPacketLengthRange`
+- `hostAssociatedPacket`
+- `metadataRefresh`
+- `explicitPolicyMatch`
 
 This lets detectors distinguish exact packet sequences such as `896` then `904`, instead of only seeing an aggregate like `bytes = 1800, packetCount = 2`.
 
-The foreground live tap intentionally does not publish `packetCue` records by default. They are detector-facing records, not raw packet capture.
+The foreground live tap intentionally does not publish `packetCue` records by default. To expose packet cues to an app-side detector, enable the live-tap flag and pass a generic policy:
 
-## Remote Endpoint, Owner, and Role
+```swift
+let profile = TunnelProfile(
+    // existing profile fields...
+    telemetryEnabled: true,
+    liveTapEnabled: true,
+    liveTapIncludeFlowSlices: false,
+    liveTapIncludePacketCues: true,
+    liveTapIncludeValidationRecords: true,
+    liveTapMaxBytes: 1_048_576,
+    packetCuePolicy: packetCuePolicy,
+    // remaining profile fields...
+)
+```
+
+Foreground snapshots also include stream health and liveness:
+
+- `TelemetryHealthRecord`
+  - `availableFeatureFamilies`
+  - `missingFeatureFamilies`
+  - `degradedReason`
+  - `droppedRecordCount`
+  - `lastPacketTimestampMs`
+- `TelemetryStreamLiveness`
+  - `streamStartedAtMs`
+  - `lastRecordAtMs`
+  - `sequenceNumber`
+  - `droppedSequenceCount`
+  - `sessionId`
+  - `writerProcess`
+
+Use these fields before scoring app-side detectors. If a feature family is missing because of low power mode, thermal pressure, or configuration, the app should treat absent fields as degraded data rather than negative evidence.
+
+Low-power and thermal reductions are controlled independently through `TelemetryDegradationPolicy`. The defaults preserve production backoff; validation runs can disable either `reduceOnLowPowerMode` or `reduceOnThermalPressure` when stable packet fields are more important than reducing telemetry cost.
+
+`TunnelTelemetryMessageCodec` preserves packet-cue `timestampMs`, packet fields, validation records, and liveness sequence fields across the host-visible JSON response.
+
+## Rich Packet Debug JSONL
+
+Use `RichPacketLogPolicy` when you need a durable packet-metadata file for debugging, offline scoring, or building a separate analysis app. This is not enabled by default and is intentionally separate from the production detector stream.
+
+When enabled, the tunnel writes JSONL records under:
+
+```text
+<AppGroup>/Analytics/RichPacketLogs/<filePrefix>.current.jsonl
+<AppGroup>/Analytics/RichPacketLogs/<filePrefix>.<timestamp>.<sequence>.jsonl
+```
+
+Each `RichPacketLogRecord` includes:
+
+- sequence number, timestamp, timestamp milliseconds, writer process, and session context
+- direction, IP version, protocol, packet length, and transport payload length
+- source/destination addresses and ports
+- local/remote addresses and ports, `remoteEndpoint`, `flowId`, and canonical `flowIdentity`
+- TCP flags plus ACK/PSH/SYN/FIN/RST booleans
+- DNS/TLS/QUIC metadata when parser budget allows
+- optional packet byte prefix hex, off by default
+
+Example profile policy:
+
+```swift
+let richLogPolicy = RichPacketLogPolicy(
+    isEnabled: true,
+    directions: [.outbound],
+    includeParsedMetadata: true,
+    includeDNSAnswerAddresses: true,
+    includeQUICConnectionIDs: true,
+    includePacketBytePrefix: false,
+    maxPacketLength: 1_500,
+    maxRecordsPerBatch: 256,
+    metadataProbeLimitPerBatch: 16,
+    filePrefix: "rich-packets",
+    maxBytesPerFile: 4_194_304,
+    maxFileCount: 8,
+    maxTotalBytes: 33_554_432
+)
+```
+
+Attach it to `TunnelProfile`:
+
+```swift
+let profile = TunnelProfile(
+    // existing profile fields...
+    packetCuePolicy: packetCuePolicy,
+    telemetryDegradationPolicy: .default,
+    richPacketLogPolicy: richLogPolicy,
+    // remaining profile fields...
+)
+```
+
+Read it from a host app or a separate App Group-enabled utility app:
+
+```swift
+import HostClient
+
+let store = TunnelRichPacketLogStore(appGroupID: "group.com.example.vpn")
+let recentRecords = try store.readRecords(limit: 500)
+```
+
+Privacy/cost rules:
+
+- keep `RichPacketLogPolicy.disabled` for normal production builds
+- byte-prefix logging is off by default because it can retain payload bytes
+- metadata parsing is bounded by `metadataProbeLimitPerBatch`
+- file retention is bounded by `maxBytesPerFile`, `maxFileCount`, and `maxTotalBytes`
+- rich logging can keep the telemetry worker alive even when no detector or live tap is installed
+
+## Remote Endpoint and Owner
 
 Detectors should use package-derived owner fields instead of re-deriving endpoint identity everywhere:
 
@@ -132,7 +261,6 @@ Detectors should use package-derived owner fields instead of re-deriving endpoin
 - `remotePort`
 - `remoteEndpoint`
 - `ownerKey`
-- `role`
 
 Remote means the non-phone side of the flow:
 
@@ -149,26 +277,29 @@ IPv6 addresses are bracketed in the endpoint string.
 
 `ownerKey` falls back in this order:
 
-1. source app id
-2. normalized role
+1. `sourceBundleId`
+2. legacy `sourceAppIdentifier`
 3. remote endpoint
 4. flow id
 
-`role` is a normalized package-owned label derived from service attribution, associated domain, registrable domain, TLS SNI, DNS name, CNAME, or classification. The original source fields are still exposed when requested.
+The package exposes raw host facts such as `tlsServerName`, `registrableDomain`, `associatedDomain`, `dnsQueryName`, and `dnsCname`.
+It does not decide that those facts belong to a particular company, app, or platform. Product-specific role classification belongs in the containing app or in app-supplied signature catalogs.
 
 ## Address Scope
 
-Use `.addressScope` when a detector needs coarse family attribution even when host strings are missing.
+Use `.addressScope` when a detector needs coarse app-owned or prefix-owned family labels even when host strings are missing.
 
 The package supports:
 
-- role/host token scope derivation
-- source-app token scope derivation for `sourceAppFlow`
+- app-injected string families such as `"video-cdn"` or `"example-service"`
+- source markers: `.prefix`, `.host`, `.dns`, `.contentFilter`, `.appProvided`
 - optional prefix-based classification through `AddressScopeClassifier`
+
+There are no built-in platform families. The app owns catalogs and labels.
 
 ```swift
 let classifier = AddressScopeClassifier(prefixes: [
-    AddressScopePrefix(cidr: "157.240.0.0/16", family: .meta, confidence: 0.88)!
+    AddressScopePrefix(cidr: "203.0.113.0/24", family: "video-cdn", confidence: 0.88)!
 ])
 
 let pipeline = PacketAnalyticsPipeline(
@@ -193,7 +324,7 @@ await telemetryWorker.updateSessionContextAndWait(
         packetStreamStartedAtMs: Date().timeIntervalSince1970 * 1000,
         foregroundReadyAtMs: nil,
         appOpenAtMs: nil,
-        targetApp: "instagram"
+        sessionTarget: "example-session"
     )
 )
 ```
@@ -204,7 +335,7 @@ Detectors must request `.sessionContext` to receive:
 - `packetStreamStartedAtMs`
 - `foregroundReadyAtMs`
 - `appOpenAtMs`
-- `targetApp`
+- `sessionTarget`
 
 These fields are stamped onto future records after the worker receives the update.
 
@@ -229,12 +360,17 @@ The package currently provides the detector record contract:
 - `SourceAppFlowAttribution`
 - `SourceAppAttributionSource`
 - `SourceAppAttributionMode`
+- `sourceBundleId`
 - `sourceAppIdentifier`
 - `sourceAppUniqueIdentifierHash`
 - `sourceAppVersion`
 - `attributionFlowId`
 - `attributionSource`
 - `attributionObservedAtMs`
+- `attributionStartTimeMs`
+- `attributionEndTimeMs`
+- `attributionConfidence`
+- `flowTuple`
 - `localEndpoint`
 - `remoteEndpoint`
 - `remoteHostname`
@@ -265,9 +401,11 @@ These typed fields are available on `DetectorRecord`, depending on the detector'
 - flow/lifecycle
   - `kind`
   - `timestamp`
+  - `timestampMs`
   - `direction`
   - `flowHash`
   - `flowId`
+  - `flowIdentity`
   - `flowPacketCount`
   - `flowByteCount`
   - `closeReason`
@@ -304,12 +442,12 @@ These typed fields are available on `DetectorRecord`, depending on the detector'
   - `tlsServerName`
   - `classification`
 - packet-level cues
-  - `timestampMs`
   - `packetLength`
   - `transportPayloadLength`
   - `tcpFlags`
   - `tcpAck`
   - `tcpPsh`
+  - `packetCueReason`
 - DNS association
   - `associatedDomain`
   - `associationSource`
@@ -347,14 +485,18 @@ These typed fields are available on `DetectorRecord`, depending on the detector'
   - `packetStreamStartedAtMs`
   - `foregroundReadyAtMs`
   - `appOpenAtMs`
-  - `targetApp`
+  - `sessionTarget`
 - source-app attribution
+  - `sourceBundleId`
   - `sourceAppIdentifier`
   - `sourceAppUniqueIdentifierHash`
   - `sourceAppVersion`
   - `attributionFlowId`
   - `attributionSource`
   - `attributionObservedAtMs`
+  - `attributionStartTimeMs`
+  - `attributionEndTimeMs`
+  - `attributionConfidence`
   - `localEndpoint`
   - `remoteHostname`
 - burst-shape fields
@@ -386,12 +528,15 @@ Use `DetectorFireRecord` when a detector needs a stable audit contract for why i
 - config id
 - fire time
 - source packet time
+- source packet time in milliseconds
 - reason
 - owner key
-- role
+- optional app-supplied role
+- packet cue reason
 - packet length
 - payload length
 - flow id
+- flow identity
 - lineage id
 
 ## Detector Persistence Model

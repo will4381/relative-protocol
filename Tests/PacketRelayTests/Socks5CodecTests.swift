@@ -39,7 +39,7 @@ final class Socks5CodecTests: XCTestCase {
         let secondPayload = Data([0x04, 0x05])
         let firstFrame = try XCTUnwrap(
             Socks5Codec.buildTCPForwardUDPPacket(
-                address: .domain("i.instagram.com"),
+                address: .domain("media.example.com"),
                 port: 443,
                 payload: firstPayload
             )
@@ -62,7 +62,7 @@ final class Socks5CodecTests: XCTestCase {
 
         XCTAssertEqual(
             firstPacket,
-            Socks5UDPPacket(address: .domain("i.instagram.com"), port: 443, payload: firstPayload)
+            Socks5UDPPacket(address: .domain("media.example.com"), port: 443, payload: firstPayload)
         )
         XCTAssertEqual(consumedBytes, firstFrame.count)
 

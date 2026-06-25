@@ -32,6 +32,7 @@ The package is shaped to minimize retained data:
 - detector outputs are compact and explicit
 - persisted detector snapshots are privacy-redacted, file-protected, and excluded from backup
 - continuous raw packet logging is not enabled by default
+- rich packet metadata JSONL logging is opt-in, bounded, and intended for debug or research builds
 
 Host apps should preserve that model. Persist only the detector outputs or operational breadcrumbs that the product actually needs.
 

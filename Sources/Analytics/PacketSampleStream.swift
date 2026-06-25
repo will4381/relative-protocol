@@ -33,20 +33,20 @@ public struct DetectorSessionContext: Codable, Sendable, Equatable {
     public let packetStreamStartedAtMs: Double?
     public let foregroundReadyAtMs: Double?
     public let appOpenAtMs: Double?
-    public let targetApp: String?
+    public let sessionTarget: String?
 
     public init(
         sessionId: String? = nil,
         packetStreamStartedAtMs: Double? = nil,
         foregroundReadyAtMs: Double? = nil,
         appOpenAtMs: Double? = nil,
-        targetApp: String? = nil
+        sessionTarget: String? = nil
     ) {
         self.sessionId = sessionId
         self.packetStreamStartedAtMs = packetStreamStartedAtMs
         self.foregroundReadyAtMs = foregroundReadyAtMs
         self.appOpenAtMs = appOpenAtMs
-        self.targetApp = targetApp
+        self.sessionTarget = sessionTarget
     }
 }
 
@@ -61,48 +61,68 @@ public enum SourceAppAttributionMode: Codable, Sendable, Equatable {
 
 public struct SourceAppFlowAttribution: Codable, Sendable, Equatable {
     public let observedAtMs: Double
+    public let sourceBundleId: String?
     public let sourceAppIdentifier: String?
     public let sourceAppUniqueIdentifierHash: String?
     public let sourceAppVersion: String?
     public let attributionFlowId: String?
     public let attributionSource: SourceAppAttributionSource
+    public let flowTuple: FlowIdentity?
+    public let startTimeMs: Double?
+    public let endTimeMs: Double?
+    public let confidence: Double?
     public let localEndpoint: String?
     public let remoteEndpoint: String?
     public let remoteHostname: String?
+    public let addressScopeFamily: String?
+    public let addressScopeSource: AddressScopeSource?
+    public let addressScopeConfidence: Double?
 
     public init(
         observedAtMs: Double,
+        sourceBundleId: String? = nil,
         sourceAppIdentifier: String?,
         sourceAppUniqueIdentifierHash: String? = nil,
         sourceAppVersion: String? = nil,
         attributionFlowId: String? = nil,
         attributionSource: SourceAppAttributionSource = .contentFilter,
+        flowTuple: FlowIdentity? = nil,
+        startTimeMs: Double? = nil,
+        endTimeMs: Double? = nil,
+        confidence: Double? = nil,
         localEndpoint: String? = nil,
         remoteEndpoint: String? = nil,
-        remoteHostname: String? = nil
+        remoteHostname: String? = nil,
+        addressScopeFamily: String? = nil,
+        addressScopeSource: AddressScopeSource? = nil,
+        addressScopeConfidence: Double? = nil
     ) {
         self.observedAtMs = observedAtMs
-        self.sourceAppIdentifier = sourceAppIdentifier
+        self.sourceBundleId = sourceBundleId ?? sourceAppIdentifier
+        self.sourceAppIdentifier = sourceAppIdentifier ?? sourceBundleId
         self.sourceAppUniqueIdentifierHash = sourceAppUniqueIdentifierHash
         self.sourceAppVersion = sourceAppVersion
         self.attributionFlowId = attributionFlowId
         self.attributionSource = attributionSource
+        self.flowTuple = flowTuple
+        self.startTimeMs = startTimeMs
+        self.endTimeMs = endTimeMs
+        self.confidence = confidence.map { max(0, min($0, 1)) }
         self.localEndpoint = localEndpoint
-        self.remoteEndpoint = remoteEndpoint
+        self.remoteEndpoint = remoteEndpoint ?? flowTuple?.remoteEndpoint
         self.remoteHostname = remoteHostname
+        self.addressScopeFamily = addressScopeFamily
+        self.addressScopeSource = addressScopeSource
+        self.addressScopeConfidence = addressScopeConfidence.map { max(0, min($0, 1)) }
     }
-}
-
-public enum AddressScopeFamily: String, Codable, Sendable, Equatable, Hashable {
-    case meta
-    case tiktok
-    case unknown
 }
 
 public enum AddressScopeSource: String, Codable, Sendable, Equatable, Hashable {
     case prefix
-    case role
-    case sourceApp
+    case host
+    case dns
+    case contentFilter
+    case appProvided
 }
 
 /// Lifecycle reason attached to `flowClose` records.
@@ -117,6 +137,7 @@ public enum FlowCloseReason: String, Codable, Sendable, Equatable {
 public struct PacketSample: Codable, Sendable, Equatable {
     public let kind: PacketSampleKind
     public let timestamp: Date
+    public let timestampMs: Double?
     public let direction: String
     public let flowId: String
     public let bytes: Int
@@ -183,31 +204,38 @@ public struct PacketSample: Codable, Sendable, Equatable {
     public let tcpFlags: UInt8?
     public let tcpAck: Bool?
     public let tcpPsh: Bool?
+    public let packetCueReason: PacketCueReason?
     public let sessionId: String?
     public let packetStreamStartedAtMs: Double?
     public let foregroundReadyAtMs: Double?
     public let appOpenAtMs: Double?
-    public let targetApp: String?
+    public let sessionTarget: String?
     public let remoteAddress: String?
     public let remotePort: UInt16?
     public let remoteEndpoint: String?
     public let ownerKey: String?
+    public let flowIdentity: FlowIdentity?
     public let role: String?
-    public let addressScopeFamily: AddressScopeFamily?
+    public let addressScopeFamily: String?
     public let addressScopeSource: AddressScopeSource?
     public let addressScopeConfidence: Double?
+    public let sourceBundleId: String?
     public let sourceAppIdentifier: String?
     public let sourceAppUniqueIdentifierHash: String?
     public let sourceAppVersion: String?
     public let attributionFlowId: String?
     public let attributionSource: SourceAppAttributionSource?
     public let attributionObservedAtMs: Double?
+    public let attributionStartTimeMs: Double?
+    public let attributionEndTimeMs: Double?
+    public let attributionConfidence: Double?
     public let localEndpoint: String?
     public let remoteHostname: String?
 
     public init(
         kind: PacketSampleKind = .activitySample,
         timestamp: Date,
+        timestampMs: Double? = nil,
         direction: String,
         flowId: String,
         bytes: Int,
@@ -274,26 +302,33 @@ public struct PacketSample: Codable, Sendable, Equatable {
         tcpFlags: UInt8? = nil,
         tcpAck: Bool? = nil,
         tcpPsh: Bool? = nil,
+        packetCueReason: PacketCueReason? = nil,
         sessionContext: DetectorSessionContext? = nil,
         remoteAddress: String? = nil,
         remotePort: UInt16? = nil,
         remoteEndpoint: String? = nil,
         ownerKey: String? = nil,
+        flowIdentity: FlowIdentity? = nil,
         role: String? = nil,
-        addressScopeFamily: AddressScopeFamily? = nil,
+        addressScopeFamily: String? = nil,
         addressScopeSource: AddressScopeSource? = nil,
         addressScopeConfidence: Double? = nil,
+        sourceBundleId: String? = nil,
         sourceAppIdentifier: String? = nil,
         sourceAppUniqueIdentifierHash: String? = nil,
         sourceAppVersion: String? = nil,
         attributionFlowId: String? = nil,
         attributionSource: SourceAppAttributionSource? = nil,
         attributionObservedAtMs: Double? = nil,
+        attributionStartTimeMs: Double? = nil,
+        attributionEndTimeMs: Double? = nil,
+        attributionConfidence: Double? = nil,
         localEndpoint: String? = nil,
         remoteHostname: String? = nil
     ) {
         self.kind = kind
         self.timestamp = timestamp
+        self.timestampMs = timestampMs ?? timestamp.timeIntervalSince1970 * 1_000
         self.direction = direction
         self.flowId = flowId
         self.bytes = bytes
@@ -360,25 +395,31 @@ public struct PacketSample: Codable, Sendable, Equatable {
         self.tcpFlags = tcpFlags
         self.tcpAck = tcpAck
         self.tcpPsh = tcpPsh
+        self.packetCueReason = packetCueReason
         self.sessionId = sessionContext?.sessionId
         self.packetStreamStartedAtMs = sessionContext?.packetStreamStartedAtMs
         self.foregroundReadyAtMs = sessionContext?.foregroundReadyAtMs
         self.appOpenAtMs = sessionContext?.appOpenAtMs
-        self.targetApp = sessionContext?.targetApp
+        self.sessionTarget = sessionContext?.sessionTarget
         self.remoteAddress = remoteAddress
         self.remotePort = remotePort
         self.remoteEndpoint = remoteEndpoint
         self.ownerKey = ownerKey
+        self.flowIdentity = flowIdentity
         self.role = role
         self.addressScopeFamily = addressScopeFamily
         self.addressScopeSource = addressScopeSource
         self.addressScopeConfidence = addressScopeConfidence
+        self.sourceBundleId = sourceBundleId
         self.sourceAppIdentifier = sourceAppIdentifier
         self.sourceAppUniqueIdentifierHash = sourceAppUniqueIdentifierHash
         self.sourceAppVersion = sourceAppVersion
         self.attributionFlowId = attributionFlowId
         self.attributionSource = attributionSource
         self.attributionObservedAtMs = attributionObservedAtMs
+        self.attributionStartTimeMs = attributionStartTimeMs
+        self.attributionEndTimeMs = attributionEndTimeMs
+        self.attributionConfidence = attributionConfidence
         self.localEndpoint = localEndpoint
         self.remoteHostname = remoteHostname
     }
@@ -399,14 +440,10 @@ public extension PacketSample {
             ?? attribution.remoteEndpoint
             ?? attribution.sourceAppIdentifier
             ?? "source-app-flow"
-        let scopeFamily = DetectorRecordDerivation.scopeFamily(
-            sourceAppIdentifier: attribution.sourceAppIdentifier,
-            role: nil,
-            hosts: [attribution.remoteHostname]
-        )
         return PacketSample(
             kind: .sourceAppFlow,
             timestamp: timestamp,
+            timestampMs: attribution.observedAtMs,
             direction: PacketDirection.outbound.rawValue,
             flowId: flowId,
             bytes: 0,
@@ -419,19 +456,25 @@ public extension PacketSample {
             sessionContext: sessionContext,
             remoteEndpoint: attribution.remoteEndpoint,
             ownerKey: DetectorRecordDerivation.ownerKey(
+                sourceBundleId: attribution.sourceBundleId,
                 sourceAppIdentifier: attribution.sourceAppIdentifier,
-                role: nil,
                 remoteEndpoint: attribution.remoteEndpoint,
                 flowId: flowId
             ),
-            addressScopeFamily: scopeFamily,
-            addressScopeSource: scopeFamily == nil ? nil : .sourceApp,
+            flowIdentity: attribution.flowTuple,
+            addressScopeFamily: attribution.addressScopeFamily,
+            addressScopeSource: attribution.addressScopeSource,
+            addressScopeConfidence: attribution.addressScopeConfidence,
+            sourceBundleId: attribution.sourceBundleId,
             sourceAppIdentifier: attribution.sourceAppIdentifier,
             sourceAppUniqueIdentifierHash: attribution.sourceAppUniqueIdentifierHash,
             sourceAppVersion: attribution.sourceAppVersion,
             attributionFlowId: attribution.attributionFlowId,
             attributionSource: attribution.attributionSource,
             attributionObservedAtMs: attribution.observedAtMs,
+            attributionStartTimeMs: attribution.startTimeMs,
+            attributionEndTimeMs: attribution.endTimeMs,
+            attributionConfidence: attribution.confidence,
             localEndpoint: attribution.localEndpoint,
             remoteHostname: attribution.remoteHostname
         )
@@ -468,6 +511,7 @@ public actor PacketSampleStream {
     struct PacketStreamRecord: Sendable {
         let kind: PacketSampleKind
         let timestamp: Date
+        let timestampMs: Double?
         let direction: String
         let bytes: Int
         let packetCount: Int?
@@ -541,31 +585,38 @@ public actor PacketSampleStream {
         let tcpFlags: UInt8?
         let tcpAck: Bool?
         let tcpPsh: Bool?
+        let packetCueReason: PacketCueReason?
         let sessionId: String?
         let packetStreamStartedAtMs: Double?
         let foregroundReadyAtMs: Double?
         let appOpenAtMs: Double?
-        let targetApp: String?
+        let sessionTarget: String?
         let remoteAddress: String?
         let remotePort: UInt16?
         let remoteEndpoint: String?
         let ownerKey: String?
+        let flowIdentity: FlowIdentity?
         let role: String?
-        let addressScopeFamily: AddressScopeFamily?
+        let addressScopeFamily: String?
         let addressScopeSource: AddressScopeSource?
         let addressScopeConfidence: Double?
+        let sourceBundleId: String?
         let sourceAppIdentifier: String?
         let sourceAppUniqueIdentifierHash: String?
         let sourceAppVersion: String?
         let attributionFlowId: String?
         let attributionSource: SourceAppAttributionSource?
         let attributionObservedAtMs: Double?
+        let attributionStartTimeMs: Double?
+        let attributionEndTimeMs: Double?
+        let attributionConfidence: Double?
         let localEndpoint: String?
         let remoteHostname: String?
 
         init(
             kind: PacketSampleKind,
             timestamp: Date,
+            timestampMs: Double? = nil,
             direction: String,
             bytes: Int,
             packetCount: Int?,
@@ -639,26 +690,33 @@ public actor PacketSampleStream {
             tcpFlags: UInt8? = nil,
             tcpAck: Bool? = nil,
             tcpPsh: Bool? = nil,
+            packetCueReason: PacketCueReason? = nil,
             sessionContext: DetectorSessionContext? = nil,
             remoteAddress: String? = nil,
             remotePort: UInt16? = nil,
             remoteEndpoint: String? = nil,
             ownerKey: String? = nil,
+            flowIdentity: FlowIdentity? = nil,
             role: String? = nil,
-            addressScopeFamily: AddressScopeFamily? = nil,
+            addressScopeFamily: String? = nil,
             addressScopeSource: AddressScopeSource? = nil,
             addressScopeConfidence: Double? = nil,
+            sourceBundleId: String? = nil,
             sourceAppIdentifier: String? = nil,
             sourceAppUniqueIdentifierHash: String? = nil,
             sourceAppVersion: String? = nil,
             attributionFlowId: String? = nil,
             attributionSource: SourceAppAttributionSource? = nil,
             attributionObservedAtMs: Double? = nil,
+            attributionStartTimeMs: Double? = nil,
+            attributionEndTimeMs: Double? = nil,
+            attributionConfidence: Double? = nil,
             localEndpoint: String? = nil,
             remoteHostname: String? = nil
         ) {
             self.kind = kind
             self.timestamp = timestamp
+            self.timestampMs = timestampMs ?? timestamp.timeIntervalSince1970 * 1_000
             self.direction = direction
             self.bytes = bytes
             self.packetCount = packetCount
@@ -732,25 +790,31 @@ public actor PacketSampleStream {
             self.tcpFlags = tcpFlags
             self.tcpAck = tcpAck
             self.tcpPsh = tcpPsh
+            self.packetCueReason = packetCueReason
             self.sessionId = sessionContext?.sessionId
             self.packetStreamStartedAtMs = sessionContext?.packetStreamStartedAtMs
             self.foregroundReadyAtMs = sessionContext?.foregroundReadyAtMs
             self.appOpenAtMs = sessionContext?.appOpenAtMs
-            self.targetApp = sessionContext?.targetApp
+            self.sessionTarget = sessionContext?.sessionTarget
             self.remoteAddress = remoteAddress
             self.remotePort = remotePort
             self.remoteEndpoint = remoteEndpoint
             self.ownerKey = ownerKey
+            self.flowIdentity = flowIdentity
             self.role = role
             self.addressScopeFamily = addressScopeFamily
             self.addressScopeSource = addressScopeSource
             self.addressScopeConfidence = addressScopeConfidence
+            self.sourceBundleId = sourceBundleId
             self.sourceAppIdentifier = sourceAppIdentifier
             self.sourceAppUniqueIdentifierHash = sourceAppUniqueIdentifierHash
             self.sourceAppVersion = sourceAppVersion
             self.attributionFlowId = attributionFlowId
             self.attributionSource = attributionSource
             self.attributionObservedAtMs = attributionObservedAtMs
+            self.attributionStartTimeMs = attributionStartTimeMs
+            self.attributionEndTimeMs = attributionEndTimeMs
+            self.attributionConfidence = attributionConfidence
             self.localEndpoint = localEndpoint
             self.remoteHostname = remoteHostname
         }
@@ -909,11 +973,12 @@ public actor PacketSampleStream {
         add(sample.associatedDomain)
         add(sample.serviceFamily)
         add(sample.sessionId)
-        add(sample.targetApp)
+        add(sample.sessionTarget)
         add(sample.remoteAddress)
         add(sample.remoteEndpoint)
         add(sample.ownerKey)
         add(sample.role)
+        add(sample.sourceBundleId)
         add(sample.sourceAppIdentifier)
         add(sample.sourceAppUniqueIdentifierHash)
         add(sample.sourceAppVersion)
@@ -960,11 +1025,12 @@ public actor PacketSampleStream {
         add(record.associatedDomain)
         add(record.serviceFamily)
         add(record.sessionId)
-        add(record.targetApp)
+        add(record.sessionTarget)
         add(record.remoteAddress)
         add(record.remoteEndpoint)
         add(record.ownerKey)
         add(record.role)
+        add(record.sourceBundleId)
         add(record.sourceAppIdentifier)
         add(record.sourceAppUniqueIdentifierHash)
         add(record.sourceAppVersion)
@@ -1109,40 +1175,21 @@ public actor PacketSampleStream {
             address: remoteAddress,
             port: remotePort
         )
-        let role = record.role ?? DetectorRecordDerivation.role(
-            serviceFamily: record.serviceFamily,
-            associatedDomain: record.associatedDomain,
-            registrableDomain: record.registrableDomain,
-            tlsServerName: record.tlsServerName,
-            dnsQueryName: record.dnsQueryName,
-            dnsCname: record.dnsCname,
-            classification: record.classification
+        let flowIdentity = record.flowIdentity ?? DetectorRecordDerivation.flowIdentity(
+            protocolHint: record.protocolHint,
+            direction: record.direction,
+            sourceAddress: sourceAddress,
+            sourcePort: record.sourcePort,
+            destinationAddress: destinationAddress,
+            destinationPort: record.destinationPort,
+            flowId: flowId,
+            lineageId: record.lineageID,
+            generation: record.lineageGeneration
         )
-        let derivedScopeFamily = DetectorRecordDerivation.scopeFamily(
-            sourceAppIdentifier: record.sourceAppIdentifier,
-            role: role,
-            hosts: [
-                record.associatedDomain,
-                record.registrableDomain,
-                record.tlsServerName,
-                record.dnsQueryName,
-                record.dnsCname
-            ]
-        )
-        let derivedScopeSource: AddressScopeSource? = {
-            guard derivedScopeFamily != nil else { return nil }
-            let sourceAppScope = DetectorRecordDerivation.scopeFamily(
-                sourceAppIdentifier: record.sourceAppIdentifier,
-                role: nil,
-                hosts: []
-            )
-            return sourceAppScope == nil ? .role : .sourceApp
-        }()
-        let addressScopeFamily = record.addressScopeFamily ?? derivedScopeFamily
-        let addressScopeSource = record.addressScopeSource ?? derivedScopeSource
         return PacketSample(
             kind: record.kind,
             timestamp: record.timestamp,
+            timestampMs: record.timestampMs,
             direction: record.direction,
             flowId: flowId,
             bytes: record.bytes,
@@ -1209,32 +1256,38 @@ public actor PacketSampleStream {
             tcpFlags: record.tcpFlags,
             tcpAck: record.tcpAck,
             tcpPsh: record.tcpPsh,
+            packetCueReason: record.packetCueReason,
             sessionContext: DetectorSessionContext(
                 sessionId: record.sessionId,
                 packetStreamStartedAtMs: record.packetStreamStartedAtMs,
                 foregroundReadyAtMs: record.foregroundReadyAtMs,
                 appOpenAtMs: record.appOpenAtMs,
-                targetApp: record.targetApp
+                sessionTarget: record.sessionTarget
             ),
             remoteAddress: remoteAddress,
             remotePort: remotePort,
             remoteEndpoint: remoteEndpoint,
             ownerKey: record.ownerKey ?? DetectorRecordDerivation.ownerKey(
+                sourceBundleId: record.sourceBundleId,
                 sourceAppIdentifier: record.sourceAppIdentifier,
-                role: role,
                 remoteEndpoint: remoteEndpoint,
                 flowId: flowId
             ),
-            role: role,
-            addressScopeFamily: addressScopeFamily,
-            addressScopeSource: addressScopeSource,
-            addressScopeConfidence: record.addressScopeConfidence ?? (derivedScopeFamily == nil ? nil : 0.66),
+            flowIdentity: flowIdentity,
+            role: record.role,
+            addressScopeFamily: record.addressScopeFamily,
+            addressScopeSource: record.addressScopeSource,
+            addressScopeConfidence: record.addressScopeConfidence,
+            sourceBundleId: record.sourceBundleId,
             sourceAppIdentifier: record.sourceAppIdentifier,
             sourceAppUniqueIdentifierHash: record.sourceAppUniqueIdentifierHash,
             sourceAppVersion: record.sourceAppVersion,
             attributionFlowId: record.attributionFlowId,
             attributionSource: record.attributionSource,
             attributionObservedAtMs: record.attributionObservedAtMs,
+            attributionStartTimeMs: record.attributionStartTimeMs,
+            attributionEndTimeMs: record.attributionEndTimeMs,
+            attributionConfidence: record.attributionConfidence,
             localEndpoint: record.localEndpoint,
             remoteHostname: record.remoteHostname
         )

@@ -18,6 +18,14 @@ internal enum DetectorRecordDerivation {
         direction == PacketDirection.inbound.rawValue ? sourcePort : destinationPort
     }
 
+    static func localAddress(direction: String, sourceAddress: String?, destinationAddress: String?) -> String? {
+        direction == PacketDirection.inbound.rawValue ? destinationAddress : sourceAddress
+    }
+
+    static func localPort(direction: String, sourcePort: UInt16?, destinationPort: UInt16?) -> UInt16? {
+        direction == PacketDirection.inbound.rawValue ? destinationPort : sourcePort
+    }
+
     static func endpoint(protocolHint: String, address: String?, port: UInt16?) -> String? {
         guard let address, !address.isEmpty, let port else {
             return nil
@@ -26,51 +34,43 @@ internal enum DetectorRecordDerivation {
         return "\(protocolHint.lowercased())://\(host):\(port)"
     }
 
-    static func ownerKey(sourceAppIdentifier: String?, role: String?, remoteEndpoint: String?, flowId: String) -> String {
+    static func flowIdentity(
+        protocolHint: String,
+        direction: String,
+        sourceAddress: String?,
+        sourcePort: UInt16?,
+        destinationAddress: String?,
+        destinationPort: UInt16?,
+        flowId: String,
+        lineageId: UInt64?,
+        generation: Int?
+    ) -> FlowIdentity {
+        let remoteAddress = remoteAddress(direction: direction, sourceAddress: sourceAddress, destinationAddress: destinationAddress)
+        let remotePort = remotePort(direction: direction, sourcePort: sourcePort, destinationPort: destinationPort)
+        return FlowIdentity(
+            protocolName: protocolHint,
+            localAddress: localAddress(direction: direction, sourceAddress: sourceAddress, destinationAddress: destinationAddress),
+            localPort: localPort(direction: direction, sourcePort: sourcePort, destinationPort: destinationPort),
+            remoteAddress: remoteAddress,
+            remotePort: remotePort,
+            direction: direction,
+            flowId: flowId,
+            lineageId: lineageId,
+            generation: generation
+        )
+    }
+
+    static func ownerKey(sourceBundleId: String?, sourceAppIdentifier: String?, remoteEndpoint: String?, flowId: String) -> String {
+        if let sourceBundleId = normalizedLabel(sourceBundleId) {
+            return "app:\(sourceBundleId)"
+        }
         if let sourceAppIdentifier = normalizedLabel(sourceAppIdentifier) {
             return "app:\(sourceAppIdentifier)"
-        }
-        if let role = normalizedLabel(role) {
-            return "role:\(role)"
         }
         if let remoteEndpoint, !remoteEndpoint.isEmpty {
             return "endpoint:\(remoteEndpoint)"
         }
         return "flow:\(flowId)"
-    }
-
-    static func role(
-        serviceFamily: String?,
-        associatedDomain: String?,
-        registrableDomain: String?,
-        tlsServerName: String?,
-        dnsQueryName: String?,
-        dnsCname: String?,
-        classification: String?
-    ) -> String? {
-        normalizedLabel(serviceFamily)
-            ?? normalizedDomain(associatedDomain)
-            ?? normalizedLabel(classification)
-            ?? normalizedDomain(registrableDomain)
-            ?? normalizedDomain(tlsServerName)
-            ?? normalizedDomain(dnsCname)
-            ?? normalizedDomain(dnsQueryName)
-    }
-
-    static func scopeFamily(sourceAppIdentifier: String?, role: String?, hosts: [String?]) -> AddressScopeFamily? {
-        let candidates = [sourceAppIdentifier, role] + hosts
-        for candidate in candidates {
-            guard let value = normalizedLabel(candidate) else {
-                continue
-            }
-            if containsMetaToken(value) {
-                return .meta
-            }
-            if containsTikTokToken(value) {
-                return .tiktok
-            }
-        }
-        return nil
     }
 
     static func normalizedLabel(_ value: String?) -> String? {
@@ -79,39 +79,10 @@ internal enum DetectorRecordDerivation {
         }
         return value
     }
-
-    private static func normalizedDomain(_ value: String?) -> String? {
-        if let domain = DomainNormalizer.registrableDomain(from: value) {
-            return domain.lowercased()
-        }
-        return normalizedLabel(value)
-    }
-
-    private static func containsMetaToken(_ value: String) -> Bool {
-        value == "meta" ||
-            value.hasPrefix("meta.") ||
-            value.hasSuffix(".meta") ||
-            value.contains(".meta.") ||
-            value.contains("meta.com") ||
-            value.contains("instagram") ||
-            value.contains("cdninstagram") ||
-            value.contains("facebook") ||
-            value.contains("fbcdn") ||
-            value.contains("whatsapp")
-    }
-
-    private static func containsTikTokToken(_ value: String) -> Bool {
-        value.contains("tiktok") ||
-            value.contains("ttcdn") ||
-            value.contains("tiktokv") ||
-            value.contains("bytedance") ||
-            value.contains("byteoversea") ||
-            value.contains("muscdn")
-    }
 }
 
 public struct AddressScopePrefix: Sendable, Equatable {
-    public let family: AddressScopeFamily
+    public let family: String
     public let confidence: Double
     let addressLength: UInt8
     let high: UInt64
@@ -120,7 +91,7 @@ public struct AddressScopePrefix: Sendable, Equatable {
 
     public init?(
         cidr: String,
-        family: AddressScopeFamily,
+        family: String,
         confidence: Double = 0.72
     ) {
         let parts = cidr.split(separator: "/", maxSplits: 1).map(String.init)
@@ -208,7 +179,7 @@ public struct AddressScopePrefix: Sendable, Equatable {
 
 public struct AddressScopeClassifier: Sendable, Equatable {
     public struct Match: Sendable, Equatable {
-        public let family: AddressScopeFamily
+        public let family: String
         public let source: AddressScopeSource
         public let confidence: Double
     }

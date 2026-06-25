@@ -13,11 +13,19 @@ This file tracks high-level package changes and migration guidance. It is not a 
 ### Detector Stream Contract
 
 - added `packetCue` records for exact detector-facing packet signals without dumping every packet into the foreground live tap
-- packet cues expose typed packet length, transport payload length, TCP flags, ACK/PSH booleans, endpoint fields, flow id, and host/domain association
-- added explicit remote endpoint, owner key, role, address-scope, and app/session context fields for detector records
-- added `sourceAppFlow` records as the package contract for optional Content Filter based source-app attribution
-- added `DetectorFireRecord` for typed detector fire audit metadata
-- added package tests for packet cue projection, remote endpoint derivation, topology owner fields, address scope, source-app attribution projection, and fire-record round trips
+- packet cues expose typed packet length, transport payload length, TCP flags, ACK/PSH booleans, endpoint fields, flow id, canonical flow identity, cue reason, and host/domain association
+- added `PacketCueEmissionPolicy` so packet-cue ranges, directions, ACK/PSH requirements, host-associated packets, and metadata refresh cues are app-configured rather than hardcoded
+- added optional app-visible packet cues through `liveTapIncludePacketCues` plus validation records through `liveTapIncludeValidationRecords`
+- added opt-in `RichPacketLogPolicy`, `RichPacketLogRecord`, and `TunnelRichPacketLogStore` for bounded rich packet metadata JSONL debugging under the App Group
+- added `TelemetryHealthRecord` and `TelemetryStreamLiveness` to foreground snapshots so apps can detect degraded/missing feature families and stream liveness
+- added `TelemetryDegradationPolicy` plus `telemetryReduceOnLowPowerMode` and `telemetryReduceOnThermalPressure` profile keys so low-power and thermal telemetry reduction can be controlled independently
+- added explicit remote endpoint, owner key, app-supplied role, app-injected address-scope, and app/session context fields for detector records
+- changed session context target wording to generic `sessionTarget`
+- kept `role` and `addressScopeFamily` as opaque app-provided strings, with neutral package docs/tests such as `"video-cdn"` and `"example-service"`
+- added `sourceAppFlow` records as the package contract for optional Content Filter based source-app attribution, including source bundle id, canonical flow tuple, time window, and confidence
+- added `DetectorFireRecord` for typed detector fire audit metadata, including source packet milliseconds, cue reason, and canonical flow identity
+- removed built-in platform-specific role/scope derivation; the package now emits packet facts, flow facts, timing facts, attribution facts, and health facts while apps own company/app/platform meaning
+- added package tests for packet cue projection, host JSON export of packet cues with timestamps/liveness sequence, remote endpoint derivation, topology owner fields, address scope, source-app attribution projection, and fire-record round trips
 
 ### Detector Requirements
 
@@ -25,7 +33,7 @@ This file tracks high-level package changes and migration guidance. It is not a 
 - the worker computes one runtime union plan and only activates requested enrichments
 - detector-facing sparse records can be richer than the foreground live tap
 - `flowSlice` remains detector-only by default unless a host opts into exposing it in the live tap
-- `packetCue` remains detector-facing by default
+- `packetCue` remains detector-facing by default unless a host opts into app-visible packet cues
 
 ### Transport and Production Hardening
 
