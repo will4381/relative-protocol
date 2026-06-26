@@ -39,6 +39,7 @@ public struct TunnelProfile: Sendable, Equatable {
     public let liveTapIncludeValidationRecords: Bool
     public let liveTapMaxBytes: Int
     public let packetCuePolicy: PacketCueEmissionPolicy
+    public let addressScopePrefixes: [AddressScopePrefix]
     public let telemetryDegradationPolicy: TelemetryDegradationPolicy
     public let richPacketLogPolicy: RichPacketLogPolicy
     public let signatureFileName: String
@@ -80,6 +81,7 @@ public struct TunnelProfile: Sendable, Equatable {
     ///   - liveTapIncludeValidationRecords: Includes validation-grade debug records in foreground snapshots.
     ///   - liveTapMaxBytes: Approximate memory budget for the live rolling packet tap.
     ///   - packetCuePolicy: Generic packet-level cue emission policy. Defaults to disabled.
+    ///   - addressScopePrefixes: App-injected CIDR catalog used to attach generic address-scope family labels.
     ///   - telemetryDegradationPolicy: Controls whether low power mode and thermal pressure reduce telemetry detail.
     ///   - richPacketLogPolicy: Opt-in durable JSONL packet metadata logging policy for debug builds.
     ///   - signatureFileName: Signature filename loaded by classifier.
@@ -109,6 +111,7 @@ public struct TunnelProfile: Sendable, Equatable {
         liveTapIncludeValidationRecords: Bool = false,
         liveTapMaxBytes: Int,
         packetCuePolicy: PacketCueEmissionPolicy = .disabled,
+        addressScopePrefixes: [AddressScopePrefix] = [],
         telemetryDegradationPolicy: TelemetryDegradationPolicy = .default,
         richPacketLogPolicy: RichPacketLogPolicy = .disabled,
         signatureFileName: String,
@@ -145,6 +148,7 @@ public struct TunnelProfile: Sendable, Equatable {
         self.liveTapIncludeValidationRecords = liveTapIncludeValidationRecords
         self.liveTapMaxBytes = liveTapMaxBytes
         self.packetCuePolicy = packetCuePolicy
+        self.addressScopePrefixes = addressScopePrefixes
         self.telemetryDegradationPolicy = telemetryDegradationPolicy
         self.richPacketLogPolicy = richPacketLogPolicy
         self.signatureFileName = signatureFileName
@@ -169,6 +173,7 @@ public struct TunnelProfile: Sendable, Equatable {
         let dnsStrategy = dnsStrategy(from: providerConfiguration)
         let ipv4RouteStrategy = ipv4RouteStrategy(from: providerConfiguration)
         let packetCuePolicy = packetCuePolicy(from: providerConfiguration)
+        let addressScopePrefixes = addressScopePrefixes(from: providerConfiguration)
         let richPacketLogPolicy = richPacketLogPolicy(from: providerConfiguration)
 
         return TunnelProfile(
@@ -195,6 +200,7 @@ public struct TunnelProfile: Sendable, Equatable {
             liveTapIncludeValidationRecords: bool(providerConfiguration[TunnelProviderConfigurationKey.liveTapIncludeValidationRecords], default: false),
             liveTapMaxBytes: int(providerConfiguration[TunnelProviderConfigurationKey.liveTapMaxBytes], default: 5_000_000),
             packetCuePolicy: packetCuePolicy,
+            addressScopePrefixes: addressScopePrefixes,
             telemetryDegradationPolicy: TelemetryDegradationPolicy(
                 reduceOnLowPowerMode: bool(providerConfiguration[TunnelProviderConfigurationKey.telemetryReduceOnLowPowerMode], default: true),
                 reduceOnThermalPressure: bool(providerConfiguration[TunnelProviderConfigurationKey.telemetryReduceOnThermalPressure], default: true)
@@ -288,6 +294,7 @@ public struct TunnelProfile: Sendable, Equatable {
             throw TunnelProfileValidationError.invalidValue(key: TunnelProviderConfigurationKey.signatureFileName, reason: "must be a single file name without path separators")
         }
         try validateStringArrayProviderValues(providerConfiguration)
+        try validateAddressScopePrefixes(providerConfiguration[TunnelProviderConfigurationKey.addressScopePrefixes])
         try validateDNSStrategy(profile.dnsStrategy)
         try validateDataplaneConfig(profile.dataplaneConfigJSON)
         return profile
@@ -333,6 +340,32 @@ public struct TunnelProfile: Sendable, Equatable {
         }
         if let value = value as? String {
             return Int(value)
+        }
+        return nil
+    }
+
+    private static func exactDouble(_ value: Any?) -> Double? {
+        if let value = value as? Double {
+            return value.isFinite ? value : nil
+        }
+        if let value = value as? Float {
+            let doubleValue = Double(value)
+            return doubleValue.isFinite ? doubleValue : nil
+        }
+        if let value = value as? Int {
+            return Double(value)
+        }
+        if let value = value as? NSNumber {
+            guard !isBooleanNumber(value) else {
+                return nil
+            }
+            let candidate = value.doubleValue
+            return candidate.isFinite ? candidate : nil
+        }
+        if let value = value as? String,
+           let parsed = Double(value),
+           parsed.isFinite {
+            return parsed
         }
         return nil
     }
@@ -443,6 +476,26 @@ public struct TunnelProfile: Sendable, Equatable {
         )
     }
 
+    private static func addressScopePrefixes(from providerConfiguration: [String: Any]) -> [AddressScopePrefix] {
+        guard let rawPrefixes = providerConfiguration[TunnelProviderConfigurationKey.addressScopePrefixes] as? [Any] else {
+            return []
+        }
+        return rawPrefixes.compactMap { rawEntry in
+            guard let entry = rawEntry as? [String: Any],
+                  let cidr = string(entry["cidr"])?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  let family = string(entry["family"])?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !cidr.isEmpty,
+                  !family.isEmpty else {
+                return nil
+            }
+            return AddressScopePrefix(
+                cidr: cidr,
+                family: family,
+                confidence: exactDouble(entry["confidence"]) ?? 0.72
+            )
+        }
+    }
+
     private static func richPacketLogPolicy(from providerConfiguration: [String: Any]) -> RichPacketLogPolicy {
         guard let rawPolicy = providerConfiguration[TunnelProviderConfigurationKey.richPacketLogPolicy] as? [String: Any] else {
             return .disabled
@@ -498,6 +551,38 @@ public struct TunnelProfile: Sendable, Equatable {
             fallthrough
         default:
             return .fixed(legacyMTU)
+        }
+    }
+
+    private static func validateAddressScopePrefixes(_ value: Any?) throws {
+        guard let value else {
+            return
+        }
+        let key = TunnelProviderConfigurationKey.addressScopePrefixes
+        guard let rawPrefixes = value as? [Any] else {
+            throw TunnelProfileValidationError.invalidValue(key: key, reason: "must be an array of prefix dictionaries")
+        }
+        for (index, rawEntry) in rawPrefixes.enumerated() {
+            let entryKey = "\(key)[\(index)]"
+            guard let entry = rawEntry as? [String: Any] else {
+                throw TunnelProfileValidationError.invalidValue(key: entryKey, reason: "must be a dictionary")
+            }
+            guard let cidr = string(entry["cidr"])?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !cidr.isEmpty else {
+                throw TunnelProfileValidationError.invalidValue(key: "\(entryKey).cidr", reason: "must be a CIDR string")
+            }
+            guard let family = string(entry["family"])?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !family.isEmpty,
+                  family.count <= 128 else {
+                throw TunnelProfileValidationError.invalidValue(key: "\(entryKey).family", reason: "must be a non-empty string up to 128 characters")
+            }
+            let confidence = exactDouble(entry["confidence"]) ?? 0.72
+            guard confidence >= 0, confidence <= 1 else {
+                throw TunnelProfileValidationError.invalidValue(key: "\(entryKey).confidence", reason: "must be in 0...1")
+            }
+            guard AddressScopePrefix(cidr: cidr, family: family, confidence: confidence) != nil else {
+                throw TunnelProfileValidationError.invalidValue(key: "\(entryKey).cidr", reason: "must be a valid IPv4 or IPv6 CIDR")
+            }
         }
     }
 

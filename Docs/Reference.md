@@ -185,6 +185,7 @@ For narrative setup, use [Getting Started](GettingStarted.md). For detector desi
 | `liveTapIncludeValidationRecords` | Includes validation-grade debug records in foreground snapshots |
 | `liveTapMaxBytes` | Bounds live tap memory |
 | `packetCuePolicy` | Generic `PacketCueEmissionPolicy` used by detector and live-tap packet cues |
+| `addressScopePrefixes` | App-injected CIDR catalog for generic address-scope labels |
 | `telemetryReduceOnLowPowerMode` | Enables telemetry reduction when Low Power Mode is active |
 | `telemetryReduceOnThermalPressure` | Enables telemetry reduction when thermal state is elevated |
 | `richPacketLogPolicy` | Optional `RichPacketLogPolicy` for bounded rich packet JSONL debug logging |

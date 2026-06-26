@@ -294,6 +294,7 @@ The package supports:
 - app-injected string families such as `"video-cdn"` or `"example-service"`
 - source markers: `.prefix`, `.host`, `.dns`, `.contentFilter`, `.appProvided`
 - optional prefix-based classification through `AddressScopeClassifier`
+- provider configuration through `TunnelProfile.addressScopePrefixes`
 
 There are no built-in platform families. The app owns catalogs and labels.
 
@@ -311,6 +312,20 @@ let pipeline = PacketAnalyticsPipeline(
 ```
 
 Prefix classification is only activated when some detector requests `.addressScope`.
+
+Containing apps can pass the same data through provider configuration:
+
+```swift
+let providerConfiguration: [String: Any] = [
+    "addressScopePrefixes": [
+        [
+            "cidr": "203.0.113.0/24",
+            "family": "video-cdn",
+            "confidence": 0.88
+        ]
+    ]
+]
+```
 
 ## Session Context
 

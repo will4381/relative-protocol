@@ -82,6 +82,7 @@ internal enum DetectorRecordDerivation {
 }
 
 public struct AddressScopePrefix: Sendable, Equatable {
+    public let cidr: String
     public let family: String
     public let confidence: Double
     let addressLength: UInt8
@@ -101,6 +102,7 @@ public struct AddressScopePrefix: Sendable, Equatable {
               prefixLength <= parsed.addressLength * 8 else {
             return nil
         }
+        self.cidr = cidr
         self.family = family
         self.confidence = max(0, min(confidence, 1))
         self.addressLength = parsed.addressLength

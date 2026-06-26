@@ -716,7 +716,8 @@ open class PacketTunnelProviderShell: NEPacketTunnelProvider {
                 maxTrackedFlows: 1_024,
                 flowTTLSeconds: 60
             ),
-            signatureClassifier: classifier
+            signatureClassifier: classifier,
+            addressScopeClassifier: AddressScopeClassifier(prefixes: profile.addressScopePrefixes)
         )
 
         return PacketTelemetryWorker(

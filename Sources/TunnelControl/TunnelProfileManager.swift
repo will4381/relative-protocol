@@ -50,6 +50,7 @@ public enum TunnelProfileManager {
             TunnelProviderConfigurationKey.liveTapIncludeValidationRecords: profile.liveTapIncludeValidationRecords,
             TunnelProviderConfigurationKey.liveTapMaxBytes: profile.liveTapMaxBytes,
             TunnelProviderConfigurationKey.packetCuePolicy: providerConfiguration(for: profile.packetCuePolicy),
+            TunnelProviderConfigurationKey.addressScopePrefixes: providerConfiguration(for: profile.addressScopePrefixes),
             TunnelProviderConfigurationKey.telemetryReduceOnLowPowerMode: profile.telemetryDegradationPolicy.reduceOnLowPowerMode,
             TunnelProviderConfigurationKey.telemetryReduceOnThermalPressure: profile.telemetryDegradationPolicy.reduceOnThermalPressure,
             TunnelProviderConfigurationKey.richPacketLogPolicy: providerConfiguration(for: profile.richPacketLogPolicy),
@@ -113,6 +114,16 @@ public enum TunnelProfileManager {
             "lowerBound": range.lowerBound,
             "upperBound": range.upperBound
         ]
+    }
+
+    private static func providerConfiguration(for prefixes: [AddressScopePrefix]) -> [[String: Any]] {
+        prefixes.map { prefix in
+            [
+                "cidr": prefix.cidr,
+                "family": prefix.family,
+                "confidence": prefix.confidence
+            ]
+        }
     }
 
     private static func providerConfiguration(for policy: RichPacketLogPolicy) -> [String: Any] {

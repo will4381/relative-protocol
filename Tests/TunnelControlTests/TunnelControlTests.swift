@@ -20,8 +20,39 @@ final class TunnelControlTests: XCTestCase {
         XCTAssertFalse(profile.liveTapIncludePacketCues)
         XCTAssertFalse(profile.liveTapIncludeValidationRecords)
         XCTAssertEqual(profile.packetCuePolicy, .disabled)
+        XCTAssertTrue(profile.addressScopePrefixes.isEmpty)
         XCTAssertEqual(profile.telemetryDegradationPolicy, .default)
         XCTAssertEqual(profile.richPacketLogPolicy, .disabled)
+    }
+
+    func testTunnelProfileParsesAddressScopePrefixes() throws {
+        let profile = TunnelProfile.from(
+            providerConfiguration: [
+                TunnelProviderConfigurationKey.addressScopePrefixes: [
+                    [
+                        "cidr": "203.0.113.0/24",
+                        "family": "example-service",
+                        "confidence": 0.91
+                    ],
+                    [
+                        "cidr": "2001:db8:abcd::/48",
+                        "family": "video-cdn"
+                    ],
+                    [
+                        "cidr": "not-a-prefix",
+                        "family": "ignored"
+                    ]
+                ]
+            ]
+        )
+
+        XCTAssertEqual(profile.addressScopePrefixes.count, 2)
+        XCTAssertEqual(profile.addressScopePrefixes[0].cidr, "203.0.113.0/24")
+        XCTAssertEqual(profile.addressScopePrefixes[0].family, "example-service")
+        XCTAssertEqual(profile.addressScopePrefixes[0].confidence, 0.91)
+        XCTAssertEqual(profile.addressScopePrefixes[1].cidr, "2001:db8:abcd::/48")
+        XCTAssertEqual(profile.addressScopePrefixes[1].family, "video-cdn")
+        XCTAssertEqual(profile.addressScopePrefixes[1].confidence, 0.72)
     }
 
     func testTunnelProfileParsesPacketCuePolicy() {
@@ -112,6 +143,23 @@ final class TunnelControlTests: XCTestCase {
             }
             XCTAssertTrue(keys.contains("appGroupID"))
             XCTAssertTrue(keys.contains("engineSocksPort"))
+        }
+    }
+
+    func testRuntimeProfileValidationRejectsInvalidAddressScopePrefix() {
+        var configuration = makeRuntimeProviderConfiguration()
+        configuration[TunnelProviderConfigurationKey.addressScopePrefixes] = [
+            [
+                "cidr": "not-a-prefix",
+                "family": "example-service"
+            ]
+        ]
+
+        XCTAssertThrowsError(try TunnelProfile.validatedRuntimeProfile(providerConfiguration: configuration)) { error in
+            XCTAssertEqual(
+                error as? TunnelProfileValidationError,
+                .invalidValue(key: "addressScopePrefixes[0].cidr", reason: "must be a valid IPv4 or IPv6 CIDR")
+            )
         }
     }
 
@@ -626,6 +674,30 @@ final class TunnelControlTests: XCTestCase {
         XCTAssertEqual((policy["maxTotalBytes"] as? NSNumber)?.intValue, 131_072)
     }
 
+    func testTunnelProfileManagerPersistsAddressScopePrefixes() throws {
+        let manager = NETunnelProviderManager()
+        let firstPrefix = try XCTUnwrap(AddressScopePrefix(cidr: "203.0.113.0/24", family: "example-service", confidence: 0.93))
+        let secondPrefix = try XCTUnwrap(AddressScopePrefix(cidr: "2001:db8:abcd::/48", family: "video-cdn"))
+        let profile = makeProfile(addressScopePrefixes: [firstPrefix, secondPrefix])
+
+        TunnelProfileManager.configure(
+            manager: manager,
+            profile: profile,
+            providerBundleIdentifier: "com.example.tunnel",
+            localizedDescription: "Test Tunnel"
+        )
+
+        let proto = try XCTUnwrap(manager.protocolConfiguration as? NETunnelProviderProtocol)
+        let configuration = try XCTUnwrap(proto.providerConfiguration)
+        let prefixes = try XCTUnwrap(configuration[TunnelProviderConfigurationKey.addressScopePrefixes] as? [[String: Any]])
+        XCTAssertEqual(prefixes.count, 2)
+        XCTAssertEqual(prefixes[0]["cidr"] as? String, "203.0.113.0/24")
+        XCTAssertEqual(prefixes[0]["family"] as? String, "example-service")
+        XCTAssertEqual((prefixes[0]["confidence"] as? NSNumber)?.doubleValue, 0.93)
+        XCTAssertEqual(prefixes[1]["cidr"] as? String, "2001:db8:abcd::/48")
+        XCTAssertEqual(prefixes[1]["family"] as? String, "video-cdn")
+    }
+
     func testTunnelProfileManagerPreservesHostOwnedKeysAcrossRepeatedReconfigure() throws {
         let manager = NETunnelProviderManager()
         let existingProto = NETunnelProviderProtocol()
@@ -860,6 +932,7 @@ final class TunnelControlTests: XCTestCase {
         tcpMultipathHandoverEnabled: Bool = false,
         relayUseUDP: Bool = false,
         ipv4RouteStrategy: TunnelIPv4RouteStrategy? = nil,
+        addressScopePrefixes: [AddressScopePrefix] = [],
         richPacketLogPolicy: RichPacketLogPolicy = .disabled
     ) -> TunnelProfile {
         TunnelProfile(
@@ -883,6 +956,7 @@ final class TunnelControlTests: XCTestCase {
             liveTapEnabled: false,
             liveTapIncludeFlowSlices: false,
             liveTapMaxBytes: 5_000_000,
+            addressScopePrefixes: addressScopePrefixes,
             richPacketLogPolicy: richPacketLogPolicy,
             signatureFileName: "app_signatures.json",
             relayEndpoint: RelayEndpoint(host: "127.0.0.1", port: 1080, useUDP: relayUseUDP),

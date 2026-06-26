@@ -29,6 +29,7 @@ enum TunnelProviderConfigurationKey {
     static let liveTapIncludeValidationRecords = "liveTapIncludeValidationRecords"
     static let liveTapMaxBytes = "liveTapMaxBytes"
     static let packetCuePolicy = "packetCuePolicy"
+    static let addressScopePrefixes = "addressScopePrefixes"
     static let telemetryReduceOnLowPowerMode = "telemetryReduceOnLowPowerMode"
     static let telemetryReduceOnThermalPressure = "telemetryReduceOnThermalPressure"
     static let richPacketLogPolicy = "richPacketLogPolicy"
@@ -64,6 +65,7 @@ enum TunnelProviderConfigurationKey {
         liveTapIncludeValidationRecords,
         liveTapMaxBytes,
         packetCuePolicy,
+        addressScopePrefixes,
         telemetryReduceOnLowPowerMode,
         telemetryReduceOnThermalPressure,
         richPacketLogPolicy,

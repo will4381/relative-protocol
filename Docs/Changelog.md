@@ -20,6 +20,7 @@ This file tracks high-level package changes and migration guidance. It is not a 
 - added `TelemetryHealthRecord` and `TelemetryStreamLiveness` to foreground snapshots so apps can detect degraded/missing feature families and stream liveness
 - added `TelemetryDegradationPolicy` plus `telemetryReduceOnLowPowerMode` and `telemetryReduceOnThermalPressure` profile keys so low-power and thermal telemetry reduction can be controlled independently
 - added explicit remote endpoint, owner key, app-supplied role, app-injected address-scope, and app/session context fields for detector records
+- added `addressScopePrefixes` provider configuration so apps can inject generic CIDR-to-family labels into tunnel-side detector records
 - changed session context target wording to generic `sessionTarget`
 - kept `role` and `addressScopeFamily` as opaque app-provided strings, with neutral package docs/tests such as `"video-cdn"` and `"example-service"`
 - added `sourceAppFlow` records as the package contract for optional Content Filter based source-app attribution, including source bundle id, canonical flow tuple, time window, and confidence

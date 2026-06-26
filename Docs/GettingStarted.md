@@ -100,6 +100,7 @@ Important fields in `TunnelProfile`:
 - `liveTapIncludeValidationRecords`
 - `liveTapMaxBytes`
 - `packetCuePolicy`
+- `addressScopePrefixes`
 - `richPacketLogPolicy`
 - `signatureFileName`
 - `relayEndpoint`
